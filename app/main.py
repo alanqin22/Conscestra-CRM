@@ -25,6 +25,7 @@ v2.2.0 — Added Store module (CRM Commerce View).
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
@@ -338,6 +339,7 @@ async def lifespan(app: FastAPI):
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.cron import CronTrigger
+        from apscheduler.triggers.interval import IntervalTrigger
         # All daily jobs run at 10 PM US Eastern. Using the named zone (not a
         # fixed UTC offset) means the same wall-clock 22:00 ET fires correctly
         # on Railway (UTC host) AND on a local machine in any timezone, and it
@@ -415,11 +417,15 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             misfire_grace_time=1800,
         )
-        # Notification triage — daily 21:55 ET, just before the seed/emit passes.
-        # Self-gates on NOTIF_TRIAGE_ENABLED; dry-run unless NOTIF_TRIAGE_APPLY=1.
+        # Notification triage — every NOTIF_TRIAGE_EVERY_HOURS (<24, e.g. 2 = the
+        # orchestrator keeps unread handled ON TIME), else the legacy nightly
+        # 21:55 ET run. Self-gates on NOTIF_TRIAGE_ENABLED; dry-run unless
+        # NOTIF_TRIAGE_APPLY=1. Retention (pass F) rides along on every run.
+        _triage_hours = int(os.getenv("NOTIF_TRIAGE_EVERY_HOURS", "24"))
         _scheduler.add_job(
             _run_notification_triage,
-            trigger=CronTrigger(hour=21, minute=55), # 9:55 PM ET — triage alert backlog
+            trigger=(IntervalTrigger(hours=max(1, _triage_hours))
+                     if _triage_hours < 24 else CronTrigger(hour=21, minute=55)),
             id="notification_triage",
             replace_existing=True,
             misfire_grace_time=3600,
@@ -598,6 +604,18 @@ app.include_router(analytics_router,     dependencies=_DATA)
 app.include_router(notifications_router, dependencies=_DATA)
 app.include_router(orchestrator_router,  dependencies=_DATA)
 
+# -- SSE push for notifications (EventSource can't send auth headers, so this
+#    follows the read posture of the data endpoints).
+from app.core.notify_stream import router as notify_stream_router
+app.include_router(notify_stream_router, dependencies=_DATA)
+
+# -- External integrations: calendar feed (PUBLIC — calendar clients can't send
+#    headers; guarded by CALENDAR_FEED_TOKEN) + ERP CSV exports (admin).
+from app.core.integrations import router_public as integrations_public_router
+from app.core.integrations import router_admin as integrations_admin_router
+app.include_router(integrations_public_router)
+app.include_router(integrations_admin_router, dependencies=_ADMIN)
+
 # -- Store module (direct SP routing — no AI agent).
 #    PUBLIC: the customer-facing storefront must be browsable without a CRM login.
 app.include_router(store_router)
@@ -605,6 +623,12 @@ app.include_router(store_router)
 # -- Auth module (direct DB routing — no AI agent). MUST stay open: it issues the
 #    sessions the other endpoints check (login can't require being logged in).
 app.include_router(auth_router)
+
+# -- Consent / unsubscribe (CASL). MUST stay open: recipients opt out via the
+#    signed link in commercial emails without logging in (links are HMAC-signed,
+#    so the endpoint can't be used to unsubscribe arbitrary addresses).
+from app.core.consent import router as consent_router
+app.include_router(consent_router)
 
 # -- Email agent (SMTP/IMAP + LangGraph)
 app.include_router(email_router, dependencies=_DATA)
@@ -679,6 +703,10 @@ _CHAT_PAGES = [
     "orchestrator-mgmt.html",
     "order-mgmt.html",
     "store-home.html",
+    "executives-mgmt.html",
+    "admin-users.html",
+    "governance-mgmt.html",
+    "index.html",
 ]
 
 def _register_chat_page(filename: str) -> None:

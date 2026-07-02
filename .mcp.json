@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "conscestra-crm": {
+      "command": "d:/a/crm_agent/venv/Scripts/python.exe",
+      "args": ["d:/a/crm_agent/app/mcp_server.py"],
+      "env": {
+        "CRM_API_URL": "http://localhost:8000"
+      }
+    }
+  }
+}

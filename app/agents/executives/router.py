@@ -105,3 +105,61 @@ async def upsert_executive(payload: Dict[str, Any]):
 def delete_executive(executive_id: str):
     _exec("DELETE FROM executives WHERE executive_id=%s", (executive_id,))
     return {"status": "deleted", "executive_id": executive_id}
+
+
+# ── Company profile (single row) — CASL sender identity ────────────────────
+# Read by app/core/consent.py for the commercial-email footer; edited from the
+# Company Profile card on executives-mgmt.html.
+
+def _ensure_company_profile(cur) -> None:
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS company_profile ("
+        " profile_id INT PRIMARY KEY DEFAULT 1 CHECK (profile_id = 1),"
+        " company_name TEXT NOT NULL DEFAULT 'Conscestra CRM',"
+        " mailing_address TEXT NOT NULL DEFAULT '',"
+        " contact_email TEXT NOT NULL DEFAULT 'info@agentorc.ca',"
+        " updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+        " updated_by TEXT)")
+    cur.execute(
+        "INSERT INTO company_profile (profile_id) VALUES (1) "
+        "ON CONFLICT (profile_id) DO NOTHING")
+
+
+@router.get("/company-profile")
+def get_company_profile():
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            _ensure_company_profile(cur)
+            cur.execute("SELECT company_name, mailing_address, contact_email, "
+                        "updated_at FROM company_profile WHERE profile_id=1")
+            r = cur.fetchone()
+        conn.commit()
+        return {"company_name": r[0], "mailing_address": r[1],
+                "contact_email": r[2], "updated_at": r[3]}
+    finally:
+        conn.close()
+
+
+@router.put("/company-profile")
+def update_company_profile(payload: Dict[str, Any]):
+    f = payload or {}
+    name = (f.get("company_name") or "").strip()
+    addr = (f.get("mailing_address") or "").strip()
+    email = (f.get("contact_email") or "").strip()
+    if not name or not addr:
+        raise HTTPException(400, "company_name and mailing_address are required "
+                                 "(CASL sender identification)")
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            _ensure_company_profile(cur)
+            cur.execute(
+                "UPDATE company_profile SET company_name=%s, mailing_address=%s, "
+                "contact_email=%s, updated_at=now() WHERE profile_id=1",
+                (name, addr, email or "info@agentorc.ca"))
+        conn.commit()
+        logger.info(f"[executives] company profile updated: {name} / {addr[:60]}")
+        return {"status": "updated"}
+    finally:
+        conn.close()

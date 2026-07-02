@@ -168,6 +168,18 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "exec_markdown": text,
             }}]}
 
+        # ── web_search — live internet lookup (ddgs free → Tavily fallback) ──
+        if parsed_json.get("mode") == "web_search":
+            from app.core.web_tools import web_answer
+            text = web_answer(
+                parsed_json.get("query") or state.get("user_input", ""),
+                url=parsed_json.get("url"),
+            )
+            return {**state, "db_rows": [{"result": {
+                "metadata": {"status": "success", "code": 0, "mode": "web_search"},
+                "web_markdown": text,
+            }}]}
+
         # ── UI-only marker modes — no DB call; formatter emits a [MODE:*]
         # marker the frontend uses to open an inline form.
         _ui_only_modes = {'show_order_form', 'ask_order_identifier'}

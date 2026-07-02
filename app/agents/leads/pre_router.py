@@ -90,7 +90,27 @@ def route_request(body: dict, chat_input: dict, session_id: str) -> dict:
 
     raw = (chat_input.get('message') or body.get('message') or '').strip()
     msg = raw.lower()
+
+    # ── Deterministic web-search route ───────────────────────────────────────
+    # Explicit "search the web…" phrasings go straight to mode=web_search so
+    # they never depend on the AI agent's JSON discipline (with session history
+    # it sometimes replies "I can only assist with CRM queries" instead of
+    # emitting the web_search JSON).
+    _web_m = re.match(
+        r'^(?:please\s+)?(?:can\s+you\s+)?(?:search|browse|look\s*up|google)\s+'
+        r'(?:on\s+|in\s+)?the\s+(?:web|internet)\s*(?:for|about|:)?\s*(.*)$',
+        raw, re.IGNORECASE)
+    if _web_m:
+        _q = (_web_m.group(1) or '').strip().rstrip('?.!') or raw
+        logger.info(f'-> ROUTED: web_search (deterministic) query={_q[:80]!r}')
+        return {'router_action': True, 'params': {'mode': 'web_search', 'query': _q}}
     logger.info(f'Message: {raw[:120]}')
+
+    # ── Web-intent guard — "search the web…", "look up … online" must reach
+    # the AI agent (mode=web_search), not the deterministic search regexes.
+    if msg and re.search(r'\b(?:web|internet|online)\b', msg):
+        logger.info('→ PASSTHRU: web-intent message (AI agent handles web_search)')
+        return {'router_action': False, 'current_message': raw}
 
     # ── routerAction short-circuit (v3.1) ───────────────────────────────────
     # HTML direct-SP calls send routerAction=True + mode in chatInput with no

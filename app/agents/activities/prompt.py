@@ -222,4 +222,19 @@ If the user says "show timeline for [name]" — always output JSON, NEVER ask fo
 
 RULE: mode:get requires activityId. No activityId = use mode:list with search instead.
 RULE: For timeline/create/log_call — relatedId can be a name OR UUID. The system auto-resolves names.
+
+### MODE: web_search — LIVE INTERNET LOOKUP
+Purpose: Search the live internet for information that is NOT in the CRM
+database — company news, public profiles, industry facts, market trends,
+current events, or details about companies/people not in the CRM.
+Required: query (string — the web search query)
+Optional: url (string — only when the user gives a specific web page to read)
+Use when the user asks: "search the web for…", "look up … online",
+"latest news about…", or any factual question the CRM data cannot answer.
+NEVER use for data that lives in the CRM (accounts, contacts, leads,
+opportunities, orders, products, activities, invoices, notifications) —
+use the database modes for those.
+Examples:
+  {"mode": "web_search", "query": "Acme Corporation latest news"}
+  {"mode": "web_search", "url": "https://example.com/about", "query": "what does this company do"}
 """

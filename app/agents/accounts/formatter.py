@@ -233,6 +233,14 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> str:
     if mode == 'executive_question':
         return response.get('exec_markdown') or 'No executive data available.'
 
+    # ── Web answer — pre-formatted by app/core/web_tools.py ──────────────────
+    if mode == 'web_search':
+        return response.get('web_markdown') or 'No web results found.'
+
+    # ── AI account summary — pre-formatted markdown card body ────────────────
+    if mode == 'ai_summary':
+        return response.get('ai_markdown') or 'No summary available.'
+
     # ── Firmographics focused report (account exec-insight chips) ────────────
     if mode == 'summary' and params.get('focus'):
         return _build_account_focus(response.get('summary') or {}, params['focus'])

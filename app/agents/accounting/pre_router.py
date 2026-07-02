@@ -120,6 +120,20 @@ def route_request(message: str, chat_input: dict) -> Dict[str, Any]:
     raw = (message or '').strip()
     msg = raw.lower()
 
+    # ── Deterministic web-search route ───────────────────────────────────────
+    # Explicit "search the web…" phrasings go straight to mode=web_search so
+    # they never depend on the AI agent's JSON discipline (with session history
+    # it sometimes replies "I can only assist with CRM queries" instead of
+    # emitting the web_search JSON).
+    _web_m = re.match(
+        r'^(?:please\s+)?(?:can\s+you\s+)?(?:search|browse|look\s*up|google)\s+'
+        r'(?:on\s+|in\s+)?the\s+(?:web|internet)\s*(?:for|about|:)?\s*(.*)$',
+        raw, re.IGNORECASE)
+    if _web_m:
+        _q = (_web_m.group(1) or '').strip().rstrip('?.!') or raw
+        logger.info(f'-> ROUTED: web_search (deterministic) query={_q[:80]!r}')
+        return {'router_action': True, 'params': {'mode': 'web_search', 'query': _q}}
+
     logger.info('=== Accounting Pre-Router v3.4 ===')
     logger.info(f'Message: {raw}')
 

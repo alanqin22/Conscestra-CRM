@@ -191,6 +191,17 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
             'success': True,
         }
 
+    # ── Web answer — pre-formatted by app/core/web_tools.py ──────────────────
+    if params_mode == 'web_search':
+        _resp = clean_obj(_parse_response(db_rows))
+        return {
+            'output': _resp.get('web_markdown') or 'No web results found.',
+            'mode': 'web_search',
+            'reportMode': 'web_search',
+            'entity': 'orders',
+            'success': True,
+        }
+
     response    = clean_obj(_parse_response(db_rows))
     mode        = _detect_mode(response, params_mode)
     context     = params.get('context')

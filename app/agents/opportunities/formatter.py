@@ -387,6 +387,16 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
         return {'output': response.get('exec_markdown') or 'No executive data available.',
                 'mode': 'executive_question', 'report_mode': 'executive_question'}
 
+    # ── Web answer — pre-formatted by app/core/web_tools.py ──────────────────
+    if mode == 'web_search':
+        return {'output': response.get('web_markdown') or 'No web results found.',
+                'mode': 'web_search', 'report_mode': 'web_search'}
+
+    # ── AI deal summary — pre-formatted markdown card body ───────────────────
+    if mode == 'ai_summary':
+        return {'output': response.get('ai_markdown') or 'No summary available.',
+                'mode': 'ai_summary', 'report_mode': 'ai_summary'}
+
     # ── UI-only marker modes — frontend opens the inline form ────────────────
     _ui_form_messages = {
         'show_opportunity_form':                'Opening the Create Opportunity form below…',
