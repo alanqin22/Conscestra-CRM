@@ -105,6 +105,7 @@ class ContactChatResponse(BaseModel):
 
 # Mode → reportMode mapping consumed by the HTML frontend
 _REPORT_MODE_MAP = {
+    "web_search":         "web_search",
     "list":              "list",
     "get_details":       "detail",
     "create":            "detail",

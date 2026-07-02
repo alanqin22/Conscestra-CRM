@@ -227,6 +227,33 @@ Purpose: Aggregated statistics, counts by type/industry/status, revenue overview
 Required: None
 Example: {"mode": "summary"}
 
+### MODE: ai_summary — AI ACCOUNT SUMMARY (360 synthesis)
+Purpose: A decision-grade AI-written summary of ONE account — snapshot,
+momentum, risks, live agent signals, and recommended next actions.
+Required: accountName (or accountId)
+Use when the user asks: "summarize <account>", "AI summary for <account>",
+"give me the picture on <account>", "brief me on <account>".
+NOT for aggregate statistics across all accounts — that is MODE: summary.
+Examples:
+  {"mode": "ai_summary", "accountName": "Costa Retail Group"}
+  {"mode": "ai_summary", "accountId": "uuid-here"}
+
+### MODE: web_search — LIVE INTERNET LOOKUP
+Purpose: Search the live internet for information that is NOT in the CRM
+database — company news, public company profiles, industry facts, market
+trends, current events, or details about companies not yet in the CRM.
+Required: query (string — the web search query)
+Optional: url (string — only when the user gives a specific web page to read)
+Use when the user asks: "search the web for…", "look up … online",
+"latest news about…", "what does <company> do?", "who is <company>?",
+or any factual question the CRM data cannot answer.
+NEVER use for data that lives in the CRM (accounts, contacts, orders,
+opportunities, invoices) — use the database modes for those.
+Examples:
+  {"mode": "web_search", "query": "Acme Corporation latest news"}
+  {"mode": "web_search", "query": "Canada manufacturing industry outlook 2026"}
+  {"mode": "web_search", "url": "https://example.com/about", "query": "what does this company do"}
+
 ---
 
 ## FIELD REFERENCE

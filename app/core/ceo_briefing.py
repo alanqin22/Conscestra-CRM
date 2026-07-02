@@ -264,12 +264,100 @@ def _decision(d: Dict[str, Any]) -> str:
             f"({_money(inv[2])}, {inv[3]} days overdue).")
 
 
+# ── Live web intelligence (app/core/web_tools.py — ddgs free, Tavily fallback) ──
+# One external-market topic per role, fetched once per day (in-process cache).
+# The briefing NEVER fails on web errors — the section is simply omitted.
+_WEB_TOPICS = {
+    "CEO": ("Market &amp; External Intelligence",
+            "CRM software industry news and market trends this week"),
+    "CFO": ("Market Rates &amp; Finance Watch",
+            "current Bank of Canada interest rate and CAD to USD exchange rate"),
+    "CRO": ("Market &amp; Competitive Watch",
+            "B2B sales trends and enterprise software buying news this week"),
+    "COO": ("Operations &amp; Supply-Chain Watch",
+            "supply chain and business operations news this week"),
+}
+_web_cache: Dict[str, Any] = {}
+
+
+def _host(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url).hostname or url).replace("www.", "")
+    except Exception:
+        return url
+
+
+def _web_intel(role: str):
+    """Fetch the role's daily external topic from the live web.
+    Returns {'title', 'body_md', 'sources': [urls]} or None (never raises)."""
+    cfg = _WEB_TOPICS.get(role)
+    if not cfg:
+        return None
+    title, topic = cfg
+    key = f"{role}:{datetime.now().strftime('%Y-%m-%d')}"
+    if key in _web_cache:
+        return _web_cache[key]
+    result = None
+    try:
+        from app.core.web_tools import web_answer
+        md = web_answer(topic) or ""
+        if md and "couldn't reach" not in md:
+            import re as _re
+            lines = md.split("\n")
+            src_at = next((i for i in range(len(lines) - 1, -1, -1)
+                           if _re.match(r"^\s*(\*\*)?sources?:?", lines[i], _re.IGNORECASE)), -1)
+            body = "\n".join(lines[:src_at]).strip() if src_at >= 0 else md.strip()
+            src_block = "\n".join(lines[src_at:]) if src_at >= 0 else ""
+            urls = [u.rstrip(".,;") for u in _re.findall(r"https?://[^\s)>\]]+", src_block)]
+            if body:
+                result = {"title": title, "body_md": body, "sources": urls[:4]}
+    except Exception as exc:
+        logger.warning(f"[ceo_briefing] web intel fetch failed for {role}: {exc}")
+    _web_cache[key] = result
+    return result
+
+
+def _web_intel_html(web, INK, MUTE, ACCENT) -> str:
+    """Markdown body + source links → email-safe inline-CSS HTML."""
+    import re as _re
+    items, blocks = [], []
+    for ln in (web.get("body_md") or "").split("\n"):
+        s = ln.strip()
+        if not s:
+            continue
+        s = _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+        s = _re.sub(r"^#{1,3}\s+", "", s)
+        if s.startswith(("- ", "* ")) or s.startswith("• "):
+            items.append(f'<li style="margin:4px 0;">{s.lstrip("-*• ").strip()}</li>')
+        else:
+            blocks.append(f'<div style="margin:4px 0;">{s}</div>')
+    html = "".join(blocks)
+    if items:
+        html += f'<ul style="margin:4px 0 0;padding-left:18px;">{"".join(items)}</ul>'
+    if web.get("sources"):
+        links = " &nbsp;&middot;&nbsp; ".join(
+            f'<a href="{u}" style="color:{ACCENT};text-decoration:none;font-weight:600;">{_host(u)}</a>'
+            for u in web["sources"])
+        html += f'<div style="font-size:11px;color:{MUTE};margin-top:8px;">Sources: {links}</div>'
+    return f'<div style="font-size:13px;line-height:1.5;color:{INK};">{html}</div>'
+
+
+def _web_intel_text(web) -> List[str]:
+    out = [ln.strip() for ln in (web.get("body_md") or "").split("\n") if ln.strip()]
+    lines = [f"   {ln}" for ln in out]
+    if web.get("sources"):
+        lines.append("   Sources: " + ", ".join(web["sources"]))
+    return lines
+
+
 # ── Rendering ───────────────────────────────────────────────────────────────────
 
 def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
     today = datetime.now().strftime("%B %-d, %Y") if os.name != "nt" else datetime.now().strftime("%B %d, %Y")
     at_risk_total = float(d["ar_amt"] or 0) + float(d["slipped_amt"] or 0)
     decision = _decision(d)
+    web = _web_intel("CEO")
 
     # Card #1 — "captured": yesterday if it had revenue, else the most recent
     # active day (so a gap day shows real revenue, not a bare $0).
@@ -322,6 +410,10 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
         flag = "  (large balance, 45d+)" if float(r[2]) > 25000 and int(r[3]) >= 45 else ""
         t.append(f"   - Overdue invoice {r[0]} — {r[1]}: {_money(r[2])}, {r[3]}d overdue{flag}")
     t.append("")
+    if web:
+        t.append("6. MARKET & EXTERNAL INTELLIGENCE (LIVE WEB)")
+        t.extend(_web_intel_text(web))
+        t.append("")
     t.append(f"#1 CEO ACTION: {decision}")
     t.append("")
     t.append("— Conscestra CRM · the orchestration of customer intelligence")
@@ -397,6 +489,13 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
             f'<b>{_money(r[2])}</b>, {r[3]}d overdue'
             + (f' <span style="color:{MUTE}">(large balance, 45d+)</span>' if float(r[2])>25000 and int(r[3])>=45 else '')))))
 
+    if web:
+        h.append(section(
+            f'6 &middot; {web["title"]} '
+            f'<span style="background:#e8f3ec;color:#1e7c45;font-size:9px;font-weight:700;'
+            f'letter-spacing:.05em;padding:2px 7px;border-radius:999px;vertical-align:middle;">LIVE WEB</span>',
+            _web_intel_html(web, INK, MUTE, ACCENT)))
+
     # Footer
     h.append(f'<tr><td style="padding:20px 28px 24px;font-family:{SANS};">'
              f'<div style="border-top:1px solid {LINE};padding-top:13px;font-size:11px;color:{MUTE};line-height:1.55;">'
@@ -446,6 +545,7 @@ def render_role(d: Dict[str, Any], deltas: Dict[str, Any], role: str) -> Dict[st
     today = datetime.now().strftime("%B %d, %Y")
     subtitle, kpi_keys, sections = _ROLE_CFG[role]
     vals = _metric_values(d)
+    web = _web_intel(role)
     NAVY, INK, MUTE, LINE, CARD, ACCENT = "#15233f", "#26304a", "#7b8497", "#e7ecf3", "#f7f9fc", "#b08a46"
     SANS = "Arial,Helvetica,sans-serif"
 
@@ -484,6 +584,12 @@ def render_role(d: Dict[str, Any], deltas: Dict[str, Any], role: str) -> Dict[st
     for s in sections:
         title, inner = sec_html[s]
         h.append(section(title, inner))
+    if web:
+        h.append(section(
+            f'{web["title"]} '
+            f'<span style="background:#e8f3ec;color:#1e7c45;font-size:9px;font-weight:700;'
+            f'letter-spacing:.05em;padding:2px 7px;border-radius:999px;vertical-align:middle;">LIVE WEB</span>',
+            _web_intel_html(web, INK, MUTE, ACCENT)))
     h.append(f'<tr><td style="padding:20px 28px 24px;font-family:{SANS};">'
              f'<div style="border-top:1px solid {LINE};padding-top:13px;font-size:11px;color:{MUTE};">'
              f'Generated by <b style="color:{NAVY};">Conscestra CRM</b> for the {role}. Reply to ask the Orchestrator a follow-up.</div></td></tr>')
@@ -491,6 +597,9 @@ def render_role(d: Dict[str, Any], deltas: Dict[str, Any], role: str) -> Dict[st
 
     text = (f"{role} MORNING BRIEFING — {today}  ({subtitle})\n\n"
             + "\n".join(f"  {_META.get(k,(k,))[0]}: {_fmt_metric(k, vals.get(k))}{_delta_text(deltas,k)}" for k in kpi_keys))
+    if web:
+        text += ("\n\n" + web["title"].replace("&amp;", "&").upper() + " (LIVE WEB)\n"
+                 + "\n".join(_web_intel_text(web))).replace("**", "")
     return {"subject": f"{role} Morning Briefing - {today}", "html": "".join(h), "text": text}
 
 
@@ -621,9 +730,23 @@ def ceo_briefing_status():
 
 
 @router.get("/ceo-briefing/preview")
-def ceo_briefing_preview():
-    """Render the briefing WITHOUT sending (HTML + text). Admin-gated."""
-    return build_briefing()
+def ceo_briefing_preview(role: str = "CEO"):
+    """Render a briefing WITHOUT sending (HTML + text). Admin-gated.
+    ?role=CEO|CFO|CRO|COO — CEO is the flagship layout, others the role view."""
+    role = (role or "CEO").upper()
+    if role == "CEO":
+        return build_briefing()
+    if role not in _ROLE_CFG:
+        return {"error": f"Unknown role '{role}'. Use CEO, CFO, CRO or COO."}
+    d = gather()
+    values = _metric_values(d)
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            deltas = _compute_deltas(values, _previous_metrics(cur))
+    finally:
+        conn.close()
+    return render_role(d, deltas, role)
 
 
 @router.post("/ceo-briefing/send-now")

@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="", tags=["Accounting"])
 
 _REPORT_MODE_MAP = {
+    "web_search":         "web_search",
     "generate_invoice":          "invoice_generated",
     "record_payment":            "payment_recorded",
     "void_invoice":              "invoice_voided",

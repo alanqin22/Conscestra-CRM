@@ -23,6 +23,44 @@ verifiable audit trail.
 
 _Safe by default · Opt-in outreach · Fully audited · No sign-up to explore_
 
+---
+
+## 🆕 What's New — July 2026
+
+**The headline: every AI agent now reaches beyond the CRM — onto the live
+internet, into your calendar and accounting tools, and out to any AI assistant
+via MCP.**
+
+- **🌐 Live Web Intelligence** — all 11 agents + the Orchestrator answer from
+  the live internet with cited sources ("Search the web for…"): free-forever
+  search (DuckDuckGo → Tavily fallback) with page synthesis, rendered as a
+  formal *Web Intelligence Briefing* card. Every module page has a
+  *Live web lookup* chip panel.
+- **🔌 MCP Server** — connect Claude (or any MCP-capable assistant) directly to
+  Conscestra: ask any agent, pull the company pulse, run AI summaries, dispatch
+  A2A capabilities (dry-run by default, governance-gated writes).
+  `app/mcp_server.py` + `.mcp.json`, docs in `docs/mcp_server.md`.
+- **🧠 AI 360 Summaries** — one click on an account, contact, or deal produces a
+  decision-grade synthesis (Snapshot · Momentum · Risks · Next actions) that
+  folds in live cross-agent blackboard signals.
+- **📨 Governed Autosend is live** — overdue invoices now *send* their own
+  reminders: CASL consent + one-click unsubscribe + verified-recipient gate +
+  a human **approval-queue console** (`governance-mgmt.html`) for
+  medium-confidence actions. Company sender identity is managed in the
+  Executives console.
+- **📈 Executive briefings with live market intel** — the CEO/CFO/CRO/COO
+  morning emails each carry a live-web section (market trends, rates & FX,
+  competitive watch, supply chain) with cited sources.
+- **⚡ Real-time everything** — Server-Sent-Events push for notifications (no
+  polling), an every-2-hours triage sweep that digests/resolves alert noise,
+  and an Orchestrator catch-all that settles *every* bus event with a proper
+  mark — plus a root-level gate so noise never enters the work queue at all.
+- **🔗 Open integrations** — subscribe to CRM activities from Google/Outlook
+  Calendar (ICS feed) and export invoices/payments as QuickBooks-ready CSV
+  (`docs/integrations.md`).
+
+---
+
 ### Conscestra CRM — The Conscious Orchestration of Customer Intelligence
 
 The name itself reveals the philosophy. **Conscestra** combines *conscious* and

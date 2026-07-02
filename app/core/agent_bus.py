@@ -18,8 +18,10 @@ and may delegate to peer agents in-process (the Accounting→Email pilot below).
 SAFETY / GOVERNANCE
 -------------------
   • Opt-in: does nothing unless AGENT_BUS_ENABLED=1.
-  • Only event_types with a registered handler are ever touched. Everything else
-    (incl. the 1,554 legacy 'invoice_overdue' rows) is left strictly alone.
+  • Only event_types with a registered handler are ever touched — UNLESS
+    AGENT_BUS_CATCHALL=1, in which case the Orchestrator's handle_default
+    settles every other type too (react → blackboard signal / observe →
+    last-touch note / ack — see the DEFAULT HANDLER section).
   • Boot cutoff: by default only events created at/after daemon start are
     processed (set AGENT_BUS_BACKFILL_MINUTES>0 to reach back). No mass replay.
   • Batch-capped, locked (locked_by/locked_at, 5-min stale-lock reclaim), and
@@ -35,6 +37,7 @@ CONFIG (env)
   AGENT_BUS_MAX_ATTEMPTS       5     retries before status='failed'
   AGENT_BUS_AUTOSEND           0     1 = actually send via Email agent
   AGENT_BUS_BACKFILL_MINUTES   0     >0 = also process recent pre-boot events
+  AGENT_BUS_CATCHALL           0     1 = Orchestrator settles unhandled types
 """
 
 from __future__ import annotations
@@ -83,9 +86,11 @@ HANDLERS: Dict[str, Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = {}
 # ============================================================================
 
 def _claim_batch_sync(cutoff: datetime) -> List[Dict[str, Any]]:
-    """Atomically claim up to BATCH pending events whose type has a handler."""
+    """Atomically claim up to BATCH pending events whose type has a handler.
+    With AGENT_BUS_CATCHALL=1, ANY pending type is claimed — unhandled types
+    are settled by the Orchestrator's handle_default."""
     types = list(HANDLERS.keys())
-    if not types:
+    if not types and not CATCHALL:
         return []
     conn = get_connection()
     try:
@@ -97,7 +102,7 @@ def _claim_batch_sync(cutoff: datetime) -> List[Dict[str, Any]]:
                     FROM   event_queue q
                     JOIN   events e ON e.event_uuid = q.event_uuid
                     WHERE  q.status = 'pending'
-                      AND  e.event_type = ANY(%(types)s)
+                      AND  (%(catchall)s OR e.event_type = ANY(%(types)s))
                       AND  e.created_at >= %(cutoff)s
                       AND  (q.next_attempt_at IS NULL OR q.next_attempt_at <= now())
                       AND  (q.locked_at IS NULL OR q.locked_at < now() - interval '5 minutes')
@@ -113,7 +118,8 @@ def _claim_batch_sync(cutoff: datetime) -> List[Dict[str, Any]]:
                 WHERE  q.queue_uuid = c.queue_uuid
                 RETURNING q.event_uuid, q.attempts
                 """,
-                {"types": types, "cutoff": cutoff, "batch": BATCH, "worker": WORKER_ID},
+                {"types": types, "cutoff": cutoff, "batch": BATCH,
+                 "worker": WORKER_ID, "catchall": CATCHALL},
             )
             # Key claimed rows by event_uuid. There is now one queue row per event
             # (enforced by UNIQUE(event_uuid) + ON CONFLICT — see
@@ -997,6 +1003,122 @@ HANDLERS["order.status_changed"] = handle_order_status_changed
 
 
 # ============================================================================
+# DEFAULT HANDLER — Orchestrator cooperation for every OTHER event type
+# ============================================================================
+# Before this, only event types with a bespoke handler were ever claimed —
+# ~92% of the queue (CRUD echoes like activity.completed, product.updated)
+# sat pending forever. With AGENT_BUS_CATCHALL=1 the Orchestrator handles the
+# rest cooperatively and every row is settled with a proper mark:
+#
+#   REACT   — meaningful business moments post a typed signal to the shared
+#             blackboard on the OWNING entity/account, where the other agents
+#             already read context (ai_summary 360s, dunning holds, …).
+#   OBSERVE — CRUD echoes upsert a 'recent_activity' last-touch note on the
+#             entity (one row per entity — the blackboard upserts per
+#             (entity, author, topic), so bulk noise coalesces).
+#   ACK     — lineage/handler-emitted events (dunning_drafted, outreach_
+#             scheduled, supervisor.alert) are acknowledged only — reacting to
+#             them could feed back into the bus.
+#
+# All dispositions return ok → the consumer marks the row 'completed' and
+# stores {"action": "reacted"|"observed"|"acked", ...} in error_context.
+# Deterministic by design: no LLM per event (cost + loop safety).
+
+CATCHALL = _flag("AGENT_BUS_CATCHALL", "0")   # v1.1 — orchestrator catch-all
+
+# Lineage / self-emitted types — acknowledge only (loop safety).
+_ACK_ONLY = {"invoice.dunning_drafted", "lead.outreach_scheduled",
+             "supervisor.alert", "supervisor.briefing"}
+
+# event_type → (blackboard topic, severity, human note template)
+_REACTIONS = {
+    "opportunity.closed_won":  ("deal_won",       "info",    "Deal WON — account is an advocate candidate"),
+    "opportunity.closed_lost": ("deal_lost",      "warning", "Deal LOST — churn/competitor signal"),
+    "opportunity.stage_changed": ("stage_moved",  "info",    "Deal moved stage"),
+    "product.stock_changed":   ("stock_changed",  "info",    "Stock level changed"),
+    "contact.email_verified":  ("email_verified", "info",    "Contact verified their email — engaged"),
+    "lead.converted":          ("lead_converted", "info",    "Lead converted"),
+    "account.created":         ("new_account",    "info",    "New account created"),
+    "invoice_issued":          ("invoice_issued", "info",    "Invoice issued"),
+}
+
+# entity types whose activity is worth a last-touch note on the blackboard
+_OBSERVABLE = {"account", "contact", "lead", "opportunity", "product",
+               "order", "invoice", "payment", "activity"}
+
+
+def _resolve_account_sync(entity_type: str, entity_id: str) -> Optional[str]:
+    """Best-effort owning-account lookup so signals land where agents read."""
+    col = {"opportunity": ("opportunities", "opportunity_id"),
+           "contact": ("contacts", "contact_id"),
+           "invoice": ("invoices", "invoice_id"),
+           "order": ("orders", "order_id"),
+           "activity": ("activities", "activity_id")}.get(entity_type)
+    if not col:
+        return None
+    table, pk = col
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT account_id::text FROM {table} WHERE {pk}=%s::uuid",
+                        (entity_id,))
+            r = cur.fetchone()
+            return r[0] if r and r[0] else None
+    finally:
+        conn.close()
+
+
+async def handle_default(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Orchestrator catch-all — settle any event without a bespoke handler."""
+    et = event["event_type"]
+    entity_type = (event.get("entity_type") or "").lower()
+    entity_id = str(event["entity_uuid"]) if event.get("entity_uuid") else None
+
+    if et in _ACK_ONLY or not entity_id:
+        return {"status": "ok", "action": "acked", "handled_by": "orchestrator",
+                "reason": "lineage/no-entity event — acknowledged"}
+
+    from app.core import blackboard
+
+    reaction = _REACTIONS.get(et)
+    if reaction:
+        topic, severity, note = reaction
+        # Post on the owning account when resolvable (where agents read
+        # context), and always on the entity itself.
+        target_acct = await asyncio.to_thread(_resolve_account_sync, entity_type, entity_id)
+        posted_to = []
+        try:
+            await asyncio.to_thread(
+                blackboard.post, entity_type, entity_id, "orchestrator", topic,
+                f"{note} ({et})", {"event_type": et}, 0.7, severity, 168)
+            posted_to.append(entity_type)
+            if target_acct and entity_type != "account":
+                await asyncio.to_thread(
+                    blackboard.post, "account", target_acct, "orchestrator", topic,
+                    f"{note} — via {entity_type} ({et})",
+                    {"event_type": et, entity_type: entity_id}, 0.7, severity, 168)
+                posted_to.append("account")
+        except Exception as exc:
+            logger.warning(f"[agent_bus] catchall blackboard post failed for {et}: {exc}")
+        return {"status": "ok", "action": "reacted", "handled_by": "orchestrator",
+                "topic": topic, "posted_to": posted_to}
+
+    if entity_type in _OBSERVABLE:
+        try:
+            await asyncio.to_thread(
+                blackboard.post, entity_type, entity_id, "orchestrator",
+                "recent_activity", f"Last touch: {et}",
+                {"event_type": et}, 0.5, "info", 72)
+        except Exception as exc:
+            logger.warning(f"[agent_bus] catchall observe failed for {et}: {exc}")
+        return {"status": "ok", "action": "observed", "handled_by": "orchestrator",
+                "topic": "recent_activity"}
+
+    return {"status": "ok", "action": "acked", "handled_by": "orchestrator",
+            "reason": f"no reaction defined for entity_type={entity_type!r}"}
+
+
+# ============================================================================
 # TICK + LOOP
 # ============================================================================
 
@@ -1008,7 +1130,8 @@ async def run_once() -> Dict[str, Any]:
     for ev in events:
         et = ev["event_type"]
         try:
-            result = await HANDLERS[et](ev)
+            handler = HANDLERS.get(et) or handle_default
+            result = await handler(ev)
             await asyncio.to_thread(_complete_sync, ev["event_uuid"], result)
             summary["results"].append({"event": et, **result})
         except Exception as exc:

@@ -281,6 +281,10 @@ def format_response(db_rows: List[Dict[str, Any]], params: Dict[str, Any]) -> st
     if mode == 'executive_question':
         return response.get('exec_markdown') or 'No executive data available.'
 
+    # ── Web answer — pre-formatted by app/core/web_tools.py ──────────────────
+    if mode == 'web_search':
+        return response.get('web_markdown') or 'No web results found.'
+
     # ── UI-only marker modes — frontend opens the inline form ────────────────
     _ui_form_messages = {
         'show_invoice_form':       'Opening the Generate Invoice form below…',

@@ -92,8 +92,22 @@ def send_email(
     body_text: str,
     from_name: str = 'Conscestra CRM Team',
     bcc: Optional[str] = None,
+    commercial: bool = False,
 ) -> Dict[str, Any]:
-    """Send an email. Uses Resend API when RESEND_API_KEY is set, otherwise SMTP."""
+    """Send an email. Uses Resend API when RESEND_API_KEY is set, otherwise SMTP.
+
+    commercial=True marks a CASL commercial electronic message: the recipient
+    is checked against the email_suppression opt-out list (send is skipped if
+    unsubscribed) and the compliance footer (sender identification +
+    unsubscribe link) is appended. Transactional callers leave the default."""
+    if commercial:
+        from app.core.consent import guard_outbound
+        allowed, body_html, body_text = guard_outbound(to, body_html, body_text)
+        if not allowed:
+            logger.info(f"[send_email] SKIPPED commercial email to unsubscribed {to!r}")
+            return {'success': False, 'skipped': 'unsubscribed', 'to': to,
+                    'message': f'{to} has unsubscribed from commercial email'}
+
     addr     = _email_address()
     password = _email_password()
     host     = _smtp_host()

@@ -132,6 +132,18 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "exec_markdown": text,
             }}]}
 
+        # ── web_search — live internet lookup (ddgs free → Tavily fallback) ──
+        if parsed_json.get("mode") == "web_search":
+            from app.core.web_tools import web_answer
+            text = web_answer(
+                parsed_json.get("query") or state.get("user_input", ""),
+                url=parsed_json.get("url"),
+            )
+            return {**state, "db_rows": [{"result": {
+                "metadata": {"status": "success", "code": 0, "mode": "web_search"},
+                "web_markdown": text,
+            }}]}
+
         # ── UI-only marker modes — no DB call; formatter emits a [MODE:*]
         # marker the frontend uses to open an inline form.
         _ui_only_modes = {'show_account_form', 'show_account_update_form'}
@@ -484,7 +496,8 @@ LEFT JOIN LATERAL (
         # resolve to UUID via direct SQL before calling sp_accounts.
         # Tries exact match first, then word-based ILIKE (e.g. "Apex Solutions"
         # matches "Apex Digital Solutions") — only accepts unambiguous results.
-        _lookup_modes = {'get', 'timeline', 'financials', 'update', 'archive', 'restore'}
+        _lookup_modes = {'get', 'timeline', 'financials', 'update', 'archive', 'restore',
+                         'ai_summary'}
         if (parsed_json.get('mode') in _lookup_modes and
                 parsed_json.get('accountName') and
                 not parsed_json.get('accountId')):
@@ -526,6 +539,22 @@ LEFT JOIN LATERAL (
                         parsed_json = {k: v for k, v in parsed_json.items() if k != 'accountName'}
             except Exception as _ne:
                 logger.warning(f"Name resolution failed for '{_aname}': {_ne}")
+
+        # ── ai_summary — decision-grade AI synthesis of the account 360 ──────
+        # Runs AFTER name resolution so accountName has become accountId.
+        if parsed_json.get("mode") == "ai_summary":
+            aid = parsed_json.get("accountId")
+            if not aid:
+                _missing = parsed_json.get("accountName") or "that account"
+                return {**state, "db_rows": [{"result": {
+                    "metadata": {"status": "error", "code": -404,
+                                 "message": f"Could not find an account matching '{_missing}'"}}}]}
+            from app.agents.accounts.ai_summary import build_account_ai_summary
+            text = build_account_ai_summary(str(aid))
+            return {**state, "db_rows": [{"result": {
+                "metadata": {"status": "success", "code": 0, "mode": "ai_summary"},
+                "ai_markdown": text,
+            }}]}
 
         query, _ = build_accounts_query(parsed_json)
         logger.info(f"Built sp_accounts query for mode: {parsed_json.get('mode')}")

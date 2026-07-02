@@ -55,6 +55,13 @@ class Settings(BaseSettings):
     smtp_from: str = "noreply@agentorc.ca"
     smtp_tls: bool = True
 
+    # ── Web access (free internet tools — see app/core/web_tools.py) ──────────
+    # Search runs on ddgs (DuckDuckGo, free, no key). Tavily is an optional
+    # fallback: free tier = 1,000 searches/month, used only when ddgs fails.
+    web_search_enabled: bool = True
+    web_fetch_max_chars: int = 4000
+    tavily_api_key: str = ""
+
     # ── Azure Speech (browser STT — Bing-style engine for Edge sensitivity) ───
     # If unset, /voice/azure-token returns 503 and the frontend falls back to
     # the browser's built-in Web Speech API.

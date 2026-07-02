@@ -77,6 +77,9 @@ CAP     = int(os.getenv("NOTIF_TRIAGE_CAP", "5000"))
 # crash). 0 disables a given retention.
 NOTIF_RETENTION_DAYS = int(os.getenv("NOTIF_RETENTION_DAYS", "7"))   # delete READ notifications older than this
 EVENT_RETENTION_DAYS = int(os.getenv("EVENT_RETENTION_DAYS", "14"))  # delete settled/old events + queue rows
+# Belt-and-braces: any HANDLED (non-unread) notification CREATED this long ago
+# is deleted regardless of when it was marked read. 0 disables.
+NOTIF_HANDLED_MAX_AGE_DAYS = int(os.getenv("NOTIF_HANDLED_MAX_AGE_DAYS", "30"))
 
 _UNREAD = ("pending", "sent", "unread")
 
@@ -585,13 +588,19 @@ def _retention(cur, apply: bool) -> Dict[str, Any]:
                            "notif_days": NOTIF_RETENTION_DAYS, "event_days": EVENT_RETENTION_DAYS}
     verb = "deleted" if apply else "would_delete"
 
-    # 1) READ notifications past the retention window
-    n_sql_where = ("read_at IS NOT NULL AND read_at < now() - (%(d)s || ' days')::interval")
+    # 1) READ notifications past the retention window (keyed on read_at), PLUS
+    #    any handled row CREATED more than NOTIF_HANDLED_MAX_AGE_DAYS ago —
+    #    covers rows whose read_at is recent because a bulk sweep marked them.
+    n_sql_where = (
+        "( (read_at IS NOT NULL AND read_at < now() - (%(d)s || ' days')::interval)"
+        "  OR (%(h)s > 0 AND status NOT IN ('pending','sent','unread')"
+        "      AND created_at < now() - (%(h)s || ' days')::interval) )")
+    _params = {"d": NOTIF_RETENTION_DAYS, "h": NOTIF_HANDLED_MAX_AGE_DAYS}
     if apply:
-        cur.execute(f"DELETE FROM notifications WHERE {n_sql_where}", {"d": NOTIF_RETENTION_DAYS})
+        cur.execute(f"DELETE FROM notifications WHERE {n_sql_where}", _params)
         n_notif = cur.rowcount
     else:
-        cur.execute(f"SELECT count(*) FROM notifications WHERE {n_sql_where}", {"d": NOTIF_RETENTION_DAYS})
+        cur.execute(f"SELECT count(*) FROM notifications WHERE {n_sql_where}", _params)
         n_notif = int(cur.fetchone()[0])
 
     # 2) event_queue: settled rows + legacy pending past the window

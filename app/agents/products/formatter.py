@@ -357,6 +357,10 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> str:
     if mode == 'executive_question':
         return response.get('exec_markdown') or 'No executive data available.'
 
+    # ── Web answer — pre-formatted by app/core/web_tools.py ──────────────────
+    if mode == 'web_search':
+        return response.get('web_markdown') or 'No web results found.'
+
     # ── UI-only marker modes (no DB hit) ─────────────────────────────────────
     # The HTML response dispatcher matches [MODE:show_*_form] and opens the
     # corresponding inline form instead of rendering text.

@@ -118,6 +118,7 @@ class AccountChatResponse(BaseModel):
 
 # Mode → reportMode mapping consumed by the HTML frontend
 _REPORT_MODE_MAP = {
+    "web_search":         "web_search",
     "list":       "list",
     "get":        "get",
     "create":     "create",

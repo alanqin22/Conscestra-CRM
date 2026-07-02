@@ -142,6 +142,7 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 subject   = str(parsed_json.get('subject') or ''),
                 body_html = str(parsed_json.get('bodyHtml') or parsed_json.get('body_html') or ''),
                 body_text = str(parsed_json.get('bodyText') or parsed_json.get('body_text') or ''),
+                commercial=True,   # CASL: suppression check + unsubscribe footer
             )
             _log_sent_email(parsed_json.get('to', ''),
                             parsed_json.get('subject', ''), mode)
@@ -292,6 +293,7 @@ def _handle_send_template(params: dict) -> dict:
         body_text = body_text,
         from_name = from_name,
         bcc       = bcc,
+        commercial=True,   # CASL: template sends are commercial messages
     )
 
     if result.get('success'):

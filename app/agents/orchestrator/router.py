@@ -284,6 +284,23 @@ async def orchestrator_chat(req: OrchChatRequest):
         return JSONResponse({'sessionId': session_id, 'success': False,
                              'output': 'Please provide a message.', 'mode': 'error'})
 
+    # ── 0a. Live web lookup — deterministic "search the web…" route ──────────
+    # Handled by the Orchestrator itself (app/core/web_tools.py) so web
+    # questions never depend on keyword routing, which could land them on
+    # agents without web_search (e.g. notifications-chat via 'alerts').
+    _web_m = re.match(
+        r'^(?:please\s+)?(?:can\s+you\s+)?(?:search|browse|look\s*up|google)\s+'
+        r'(?:on\s+|in\s+)?the\s+(?:web|internet)\s*(?:for|about|:)?\s*(.*)$',
+        message, re.IGNORECASE)
+    if _web_m:
+        from app.core.web_tools import web_answer
+        _q = (_web_m.group(1) or '').strip().rstrip('?.!') or message
+        logger.info(f'→ web_search (deterministic): {_q[:80]!r}')
+        text = await asyncio.to_thread(web_answer, _q)
+        return JSONResponse({'sessionId': session_id, 'success': True,
+                             'mode': 'web_search', 'output': text,
+                             'rawParams': {'mode': 'web_search', 'query': _q}})
+
     # ── 0. Capability routing (Phase 2 — A2A) ────────────────────────────────
     # Route by *capability* via the A2A registry instead of keyword matching.
     # Additive: only these explicit handles trigger it.

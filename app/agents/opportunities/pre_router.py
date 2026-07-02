@@ -245,6 +245,36 @@ def _match_nl(message: str) -> Optional[dict]:
     raw = message.strip()
     msg = raw.lower()
 
+    # ── Deterministic web-search route ───────────────────────────────────────
+    # Explicit "search the web…" phrasings go straight to mode=web_search so
+    # they never depend on the AI agent's JSON discipline (with session history
+    # it sometimes replies "I can only assist with CRM queries" instead of
+    # emitting the web_search JSON).
+    _web_m = re.match(
+        r'^(?:please\s+)?(?:can\s+you\s+)?(?:search|browse|look\s*up|google)\s+'
+        r'(?:on\s+|in\s+)?the\s+(?:web|internet)\s*(?:for|about|:)?\s*(.*)$',
+        raw, re.IGNORECASE)
+    if _web_m:
+        _q = (_web_m.group(1) or '').strip().rstrip('?.!') or raw
+        logger.info(f'-> ROUTED: web_search (deterministic) query={_q[:80]!r}')
+        # _match_nl returns bare params — the caller wraps them in the
+        # routed envelope, unlike the other agents' route_request functions.
+        return {'mode': 'web_search', 'query': _q}
+
+    # ── Deterministic AI-summary route (bare params — caller wraps) ─────────
+    # "Summarize <deal>" / "AI summary for <deal>" → mode=ai_summary.
+    _ais_m = re.match(
+        r'^(?:ai\s+summary\s+(?:of|for)\s+|summari[sz]e\s+)(?:the\s+)?'
+        r'(?:deal\s+|opp(?:ortunity)?\s+)?["\']?(.+?)["\']?\s*$',
+        raw, re.IGNORECASE)
+    if _ais_m:
+        _nm = _ais_m.group(1).strip()
+        _generic = {'opportunity', 'opportunities', 'all opportunities', 'deal',
+                    'deals', 'all deals', 'pipeline', 'summary', 'statistics'}
+        if _nm.lower() not in _generic and ' by ' not in _nm.lower():
+            logger.info(f'-> ROUTED: ai_summary (deterministic) opp={_nm!r}')
+            return {'mode': 'ai_summary', 'opportunityName': _nm}
+
     # show_details:<UUID>
     m = re.match(r'^show_details:([0-9a-f-]{36})$', raw, re.IGNORECASE)
     if m:

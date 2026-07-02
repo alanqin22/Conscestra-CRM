@@ -113,3 +113,9 @@ deploy_config.ps1
 deploy_winscp.log
 # HTML pages deploy separately to agentorc.ca (cPanel) — never commit them.
 *.html
+
+# ── Loose credential files (never commit) ──────────────────────────────
+authentication.txt
+docs/raillway password and url.txt
+docs/railway upload.txt
+45b23d9a1f8e4c7b8d2a6c9e3f1b4d8a.txt

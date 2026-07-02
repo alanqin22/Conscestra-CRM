@@ -148,6 +148,7 @@ class ProductChatResponse(BaseModel):
 
 
 _REPORT_MODE_MAP = {
+    "web_search":         "web_search",
     "list":               "list",
     "get_details":        "get_details",
     "add":                "add_confirmation",

@@ -224,6 +224,14 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> str:
     if mode == 'executive_question':
         return response.get('exec_markdown') or 'No executive data available.'
 
+    # ── Web answer — pre-formatted by app/core/web_tools.py ──────────────────
+    if mode == 'web_search':
+        return response.get('web_markdown') or 'No web results found.'
+
+    # ── AI contact summary — pre-formatted markdown card body ────────────────
+    if mode == 'ai_summary':
+        return response.get('ai_markdown') or 'No summary available.'
+
     # ── UI-only marker modes — frontend opens the inline form ────────────────
     _ui_form_messages = {
         'show_contact_form':        'Opening the Create Contact form below…',
