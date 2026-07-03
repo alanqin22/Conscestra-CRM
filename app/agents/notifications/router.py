@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from .graph import get_graph
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,8 @@ async def _handle_notifications(req: NotificationChatRequest) -> NotificationCha
             success=fmt_result.get("success", True),
         )
 
+    except WritePermissionError as e:
+        raise HTTPException(status_code=e.http_status, detail=str(e))
     except Exception as e:
         logger.error(f"Notifications chat error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

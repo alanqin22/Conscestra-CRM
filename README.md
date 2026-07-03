@@ -23,6 +23,74 @@ verifiable audit trail.
 
 _Safe by default · Opt-in outreach · Fully audited · No sign-up to explore_
 
+---
+
+## 🆕 What's New — July 2026
+
+**Data security is the top priority at Conscestra CRM.** This release hardens
+every layer of the platform — identity, authorization, transport, and session
+governance — while keeping the live demo free to explore.
+
+- **🔐 Defense-in-depth write protection** — every create / update / delete now
+  requires an authorized sign-in, enforced **twice**: once at the API gate and
+  again at the single database chokepoint. Even a free-text AI command
+  ("delete invoice 1001…") from a read-only caller is stopped before any SQL
+  runs. Financial operations — generate invoice, record payment, void
+  invoice — are explicitly covered.
+- **🛡️ One-switch security posture** — `API_SECURITY_MODE` = `open` ·
+  `public-read` · `locked`. The frontend reads the live posture and adapts:
+  read-only browsing with a polished sign-in dialog under *public-read*, a
+  firm "Back to Home" under *locked* — and a blocked action never loses your
+  in-progress form.
+- **📧 Admin-only Email module** — reading and sending mail as the company
+  mailbox always requires an administrator sign-in, in **every** posture. The
+  public Contact Us form stays open.
+- **🚦 Brute-force protection** — per-IP and per-account sign-in rate limiting
+  with lockout, password-reset throttling, and `[security]`-tagged audit
+  logging on every failure.
+- **⏱️ Session governance** — DB-backed sessions that store only SHA-256 token
+  hashes, a 15-minute sliding idle timeout with an 8-hour absolute cap, true
+  server-side sign-out, and a signed-in chip with one-click **Sign out** on
+  every page.
+- **🌐 Locked-down CORS** — the API accepts browser calls only from
+  agentorc.ca origins (environment-configurable).
+- **👥 Role tiers (RBAC)** — admin / member / viewer resolved at sign-in and
+  enforced end-to-end, including natural-language writes.
+
+**Also new: every AI agent now reaches beyond the CRM — onto the live
+internet, into your calendar and accounting tools, and out to any AI assistant
+via MCP.**
+
+- **🌐 Live Web Intelligence** — all 11 agents + the Orchestrator answer from
+  the live internet with cited sources ("Search the web for…"): free-forever
+  search (DuckDuckGo → Tavily fallback) with page synthesis, rendered as a
+  formal *Web Intelligence Briefing* card. Every module page has a
+  *Live web lookup* chip panel.
+- **🔌 MCP Server** — connect Claude (or any MCP-capable assistant) directly to
+  Conscestra: ask any agent, pull the company pulse, run AI summaries, dispatch
+  A2A capabilities (dry-run by default, governance-gated writes).
+  `app/mcp_server.py` + `.mcp.json`, docs in `docs/mcp_server.md`.
+- **🧠 AI 360 Summaries** — one click on an account, contact, or deal produces a
+  decision-grade synthesis (Snapshot · Momentum · Risks · Next actions) that
+  folds in live cross-agent blackboard signals.
+- **📨 Governed Autosend is live** — overdue invoices now *send* their own
+  reminders: CASL consent + one-click unsubscribe + verified-recipient gate +
+  a human **approval-queue console** (`governance-mgmt.html`) for
+  medium-confidence actions. Company sender identity is managed in the
+  Executives console.
+- **📈 Executive briefings with live market intel** — the CEO/CFO/CRO/COO
+  morning emails each carry a live-web section (market trends, rates & FX,
+  competitive watch, supply chain) with cited sources.
+- **⚡ Real-time everything** — Server-Sent-Events push for notifications (no
+  polling), an every-2-hours triage sweep that digests/resolves alert noise,
+  and an Orchestrator catch-all that settles *every* bus event with a proper
+  mark — plus a root-level gate so noise never enters the work queue at all.
+- **🔗 Open integrations** — subscribe to CRM activities from Google/Outlook
+  Calendar (ICS feed) and export invoices/payments as QuickBooks-ready CSV
+  (`docs/integrations.md`).
+
+---
+
 ### Conscestra CRM — The Conscious Orchestration of Customer Intelligence
 
 The name itself reveals the philosophy. **Conscestra** combines *conscious* and

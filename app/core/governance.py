@@ -128,7 +128,8 @@ def pending() -> List[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT approval_uuid, action_type, proposed_by, entity_type,
-                          entity_id, confidence, severity, created_at
+                          entity_id, params, confidence, severity, created_at,
+                          expires_at
                    FROM action_approvals
                    WHERE status='pending' AND (expires_at IS NULL OR expires_at>now())
                    ORDER BY created_at""")
@@ -139,7 +140,36 @@ def pending() -> List[Dict[str, Any]]:
                 d["approval_uuid"] = str(d["approval_uuid"])
                 d["entity_id"] = str(d["entity_id"]) if d["entity_id"] else None
                 d["confidence"] = float(d["confidence"]) if d["confidence"] is not None else None
-                d["created_at"] = d["created_at"].isoformat() if d["created_at"] else None
+                for k in ("created_at", "expires_at"):
+                    d[k] = d[k].isoformat() if d[k] else None
+                out.append(d)
+            return out
+    finally:
+        conn.close()
+
+
+def history(limit: int = 30) -> List[Dict[str, Any]]:
+    """Recent decided/expired proposals — the audit trail for the admin UI."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT approval_uuid, action_type, proposed_by, entity_type,
+                          entity_id, confidence, severity, status, decided_by,
+                          decided_at, decision_reason, result, created_at
+                   FROM action_approvals
+                   WHERE status <> 'pending'
+                   ORDER BY COALESCE(decided_at, created_at) DESC
+                   LIMIT %s""", (int(limit),))
+            cols = [c[0] for c in cur.description]
+            out = []
+            for r in cur.fetchall():
+                d = dict(zip(cols, r))
+                d["approval_uuid"] = str(d["approval_uuid"])
+                d["entity_id"] = str(d["entity_id"]) if d["entity_id"] else None
+                d["confidence"] = float(d["confidence"]) if d["confidence"] is not None else None
+                for k in ("created_at", "decided_at"):
+                    d[k] = d[k].isoformat() if d[k] else None
                 out.append(d)
             return out
     finally:
@@ -220,6 +250,37 @@ def governance_status():
 @router.get("/governance/queue")
 def governance_queue():
     return {"pending": pending()}
+
+
+@router.get("/governance/history")
+def governance_history(limit: int = 30):
+    return {"history": history(limit)}
+
+
+class _DeleteBody(BaseModel):
+    ids: List[str]
+
+
+@router.post("/governance/history/delete")
+def governance_history_delete(body: _DeleteBody):
+    """Delete decided audit rows (executed/failed/rejected/expired). Pending
+    actions can never be deleted — they must be approved or rejected first."""
+    ids = [i for i in (body.ids or []) if i]
+    if not ids:
+        return {"deleted": 0}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM action_approvals "
+                "WHERE approval_uuid = ANY(%s::uuid[]) AND status <> 'pending' "
+                "RETURNING approval_uuid", (ids,))
+            n = len(cur.fetchall())
+        conn.commit()
+        logger.info(f"[governance] deleted {n} decided history row(s)")
+        return {"deleted": n, "requested": len(ids)}
+    finally:
+        conn.close()
 
 
 class _Decision(BaseModel):

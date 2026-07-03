@@ -90,6 +90,36 @@ def route_request(message: str, chat_input: dict) -> Dict[str, Any]:
     raw = (message or '').strip()
     msg = raw.lower()
 
+    # ── Deterministic web-search route ───────────────────────────────────────
+    # Explicit "search the web…" phrasings go straight to mode=web_search so
+    # they never depend on the AI agent's JSON discipline (with session history
+    # it sometimes replies "I can only assist with CRM queries" instead of
+    # emitting the web_search JSON).
+    _web_m = re.match(
+        r'^(?:please\s+)?(?:can\s+you\s+)?(?:search|browse|look\s*up|google)\s+'
+        r'(?:on\s+|in\s+)?the\s+(?:web|internet)\s*(?:for|about|:)?\s*(.*)$',
+        raw, re.IGNORECASE)
+    if _web_m:
+        _q = (_web_m.group(1) or '').strip().rstrip('?.!') or raw
+        logger.info(f'-> ROUTED: web_search (deterministic) query={_q[:80]!r}')
+        return {'router_action': True, 'params': {'mode': 'web_search', 'query': _q}}
+
+    # ── Deterministic AI-summary route ───────────────────────────────────────
+    # "AI summary for <name>" / "Summarize <name>" → mode=ai_summary. Requires
+    # a concrete person name so aggregate phrasings are never hijacked.
+    _ais_m = re.match(
+        r'^(?:ai\s+summary\s+(?:of|for)\s+|summari[sz]e\s+(?:contact\s+)?|brief\s+me\s+on\s+)'
+        r'["\']?([A-Za-z][A-Za-z\-\'. ]{2,50}?)["\']?\s*$',
+        raw, re.IGNORECASE)
+    if _ais_m:
+        _nm = _ais_m.group(1).strip()
+        _generic = {'contact', 'contacts', 'all contacts', 'the contact',
+                    'this contact', 'summary', 'statistics'}
+        if _nm.lower() not in _generic and ' by ' not in _nm.lower():
+            logger.info(f'-> ROUTED: ai_summary (deterministic) contact={_nm!r}')
+            return {'router_action': True,
+                    'params': {'mode': 'ai_summary', 'contactName': _nm}}
+
     logger.info('=== Contact Pre-Router v3.2 ===')
     logger.info(f'Message: {raw[:120]}')
 
@@ -103,6 +133,12 @@ def route_request(message: str, chat_input: dict) -> Dict[str, Any]:
         current = _build_passthru_message(raw, chat_input)
         logger.info(f'-> PASSTHRU: AI Agent | currentMessage: {current[:120]}')
         return {'router_action': False, 'current_message': current}
+
+    # ── Web-intent guard — "search the web…", "look up … online" must reach
+    # the AI agent (mode=web_search), not the deterministic search regexes.
+    if msg and re.search(r'\b(?:web|internet|online)\b', msg):
+        logger.info('-> PASSTHRU: web-intent message (AI agent handles web_search)')
+        return passthru()
 
     # ── Executive questions (CEO / CFO / VP bank) ─────────────────────────────
     # Interrogative phrasings route to the shared executive Q&A layer with the

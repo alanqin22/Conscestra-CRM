@@ -30,6 +30,7 @@ from .prompt import ACTIVITY_AGENT_SYSTEM_PROMPT
 from .pre_router import route_request
 from .sql_builder import build_activities_query
 from .formatter import format_response
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +280,18 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "exec_markdown": text,
             }}]}
 
+        # ── web_search — live internet lookup (ddgs free → Tavily fallback) ──
+        if parsed_json.get("mode") == "web_search":
+            from app.core.web_tools import web_answer
+            text = web_answer(
+                parsed_json.get("query") or state.get("user_input", ""),
+                url=parsed_json.get("url"),
+            )
+            return {**state, "db_rows": [{"result": {
+                "metadata": {"status": "success", "code": 0, "mode": "web_search"},
+                "web_markdown": text,
+            }}]}
+
         # Safety guard: mode:get without activityId → fall back to list search
         if parsed_json.get("mode") in ("get", "update", "complete", "reopen", "delete") \
                 and not parsed_json.get("activityId"):
@@ -485,6 +498,8 @@ SELECT json_build_object(
 
         return {**state, "db_rows": db_rows}
 
+    except WritePermissionError:
+        raise
     except Exception as e:
         logger.error(f"Activities database error: {e}", exc_info=True)
         return {**state, "db_rows": [{"result": {

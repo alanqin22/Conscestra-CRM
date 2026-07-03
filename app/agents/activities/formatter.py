@@ -252,6 +252,13 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
                 'report_mode': 'executive_question',
                 'success': True}
 
+    # ── Web answer — pre-formatted by app/core/web_tools.py ──────────────────
+    if mode == 'web_search':
+        return {'output': response.get('web_markdown') or 'No web results found.',
+                'mode': 'web_search',
+                'report_mode': 'web_search',
+                'success': True}
+
     is_error = (
         metadata.get('status') == 'error'
         or (isinstance(metadata.get('code'), (int, float)) and metadata.get('code') not in (0, None))

@@ -35,6 +35,7 @@ from .prompt import OPPORTUNITY_AGENT_SYSTEM_PROMPT
 from .pre_router import route_request
 from .sql_builder import build_opportunities_query
 from .formatter import format_response
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,18 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "exec_markdown": text,
             }}]}
 
+        # ── web_search — live internet lookup (ddgs free → Tavily fallback) ──
+        if parsed_json.get("mode") == "web_search":
+            from app.core.web_tools import web_answer
+            text = web_answer(
+                parsed_json.get("query") or state.get("user_input", ""),
+                url=parsed_json.get("url"),
+            )
+            return {**state, "db_rows": [{"result": {
+                "metadata": {"status": "success", "code": 0, "mode": "web_search"},
+                "web_markdown": text,
+            }}]}
+
         # ── UI-only marker modes — no DB call; formatter emits a [MODE:*]
         # marker that the frontend dispatcher uses to open an inline form.
         _ui_only_modes = {
@@ -172,6 +185,24 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "metadata": {"status": "success", "code": 0, "mode": parsed_json.get("mode")}
             }}]}
 
+        # ── ai_summary — decision-grade AI synthesis of the deal ─────────────
+        if parsed_json.get("mode") == "ai_summary":
+            from app.agents.opportunities.ai_summary import (
+                build_opportunity_ai_summary, resolve_opportunity)
+            oid = parsed_json.get("opportunityId") or parsed_json.get("opportunity_id")
+            if not oid:
+                oid, _err = resolve_opportunity(
+                    parsed_json.get("opportunityName") or parsed_json.get("name") or "")
+                if not oid:
+                    return {**state, "db_rows": [{"result": {
+                        "metadata": {"status": "error", "code": -404,
+                                     "message": f"Could not summarize: {_err}"}}}]}
+            text = build_opportunity_ai_summary(str(oid))
+            return {**state, "db_rows": [{"result": {
+                "metadata": {"status": "success", "code": 0, "mode": "ai_summary"},
+                "ai_markdown": text,
+            }}]}
+
         query, _ = build_opportunities_query(parsed_json)
         logger.info(f"Built sp_opportunities query for mode: {parsed_json.get('mode')}")
 
@@ -179,6 +210,8 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"sp_opportunities returned {len(db_rows)} rows")
         return {**state, "db_rows": db_rows}
 
+    except WritePermissionError:
+        raise
     except Exception as e:
         logger.error(f"Opportunities database error: {e}", exc_info=True)
         return {**state, "db_rows": [{"result": {

@@ -254,6 +254,14 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
             'dashboardData': {}, 'summaryMetrics': {}, 'params': {}, 'meta': {}
         }
 
+    # ── Web answer — pre-formatted by app/core/web_tools.py ──────────────────
+    if str(params.get('mode') or '') == 'web_search':
+        return {
+            'output': response.get('web_markdown') or 'No web results found.',
+            'mode': 'web_search', 'success': True,
+            'dashboardData': {}, 'summaryMetrics': {}, 'params': {}, 'meta': {}
+        }
+
     # ── Error check ───────────────────────────────────────────────────────────
     if not response or response.get('error'):
         error_msg = response.get('message') or 'Unknown error'

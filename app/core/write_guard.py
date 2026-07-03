@@ -32,9 +32,15 @@ def current_role() -> Optional[str]:
 
 
 class WritePermissionError(Exception):
-    """Raised when a read-only caller attempts a write SP. Agents' db_node catch
-    this and surface the message to the user (no partial write occurs — the guard
-    runs before the SQL executes)."""
+    """Raised when a read-only caller attempts a write SP (no partial write occurs
+    — the guard runs before the SQL executes). Agents' db_node re-raise it past
+    their generic -500 handler so the router can answer with the real HTTP status:
+    401 for anonymous (the frontend auth shim opens the sign-in modal) or 403 for
+    a signed-in read-only viewer."""
+
+    def __init__(self, message: str, http_status: int = 403):
+        super().__init__(message)
+        self.http_status = http_status
 
 
 # Pull the resolved operation from `sp_x(p_mode := 'create' …)` / `p_action := …`.
@@ -53,7 +59,13 @@ def guard_query(query: str) -> None:
         return
     m = _MODE_RE.search(query or "")
     if m and m.group(1).lower() in WRITE_MODES:
+        if role == "anonymous":
+            raise WritePermissionError(
+                "Please sign in to create, update, or delete records.",
+                http_status=401,
+            )
         raise WritePermissionError(
             "Read-only access: only Admin or authorized users may create, update, "
-            "or delete records. Please sign in with a writer account to make changes."
+            "or delete records. Please sign in with a writer account to make changes.",
+            http_status=403,
         )

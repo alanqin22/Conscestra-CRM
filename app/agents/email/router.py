@@ -10,6 +10,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from .graph import get_graph
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,8 @@ async def email_chat(req: EmailChatRequest):
             subject=fmt_result.get("subject"),
         )
 
+    except WritePermissionError as e:
+        raise HTTPException(status_code=e.http_status, detail=str(e))
     except Exception as e:
         logger.error(f"Email chat error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
@@ -242,7 +245,13 @@ In the meantime, feel free to explore our AI-powered CRM platform at
         logger.warning(f"Contact form auto-reply failed: {r2.get('message')}")
 
 
-@router.post("/contact")
+# Public sub-router: the ONLY email endpoint anonymous visitors may call.
+# The main email router is admin-gated in main.py (it can send mail as
+# info@agentorc.ca), but the site's Contact Us form must keep working.
+public_router = APIRouter(prefix="", tags=["Email"])
+
+
+@public_router.post("/contact")
 async def contact_form(data: ContactFormRequest, background_tasks: BackgroundTasks):
     """Receive Contact Us form, forward to info@agentorc.ca in background."""
     if not data.name.strip() or not data.email.strip() or not data.message.strip():

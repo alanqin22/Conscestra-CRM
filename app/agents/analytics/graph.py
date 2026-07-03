@@ -32,6 +32,7 @@ from .prompt import ANALYTICS_AGENT_SYSTEM_PROMPT
 from .pre_router import route_request
 from .sql_builder import build_analytics_query
 from .formatter import format_response
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,18 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "exec_markdown": text,
             }}]}
 
+        # ── web_search — live internet lookup (ddgs free → Tavily fallback) ──
+        if parsed_json.get("mode") == "web_search":
+            from app.core.web_tools import web_answer
+            text = web_answer(
+                parsed_json.get("query") or state.get("user_input", ""),
+                url=parsed_json.get("url"),
+            )
+            return {**state, "db_rows": [{"result": {
+                "metadata": {"status": "success", "code": 0, "mode": "web_search"},
+                "web_markdown": text,
+            }}]}
+
         query, _ = build_analytics_query(parsed_json)
         logger.info(f"Built sp_analytics query for reportType: {parsed_json.get('reportType')}")
 
@@ -152,6 +165,8 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"sp_analytics returned {len(db_rows)} rows")
         return {**state, "db_rows": db_rows}
 
+    except WritePermissionError:
+        raise
     except Exception as e:
         logger.error(f"Analytics database error: {e}", exc_info=True)
         return {**state, "db_rows": [{"result": {

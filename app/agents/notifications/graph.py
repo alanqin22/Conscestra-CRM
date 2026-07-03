@@ -32,6 +32,7 @@ from .prompt import NOTIFICATION_AGENT_SYSTEM_PROMPT
 from .pre_router import route_request
 from .sql_builder import build_notifications_query
 from .formatter import format_response
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +190,8 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"sp_notifications returned {len(db_rows)} rows")
         return {**state, "db_rows": db_rows}
 
+    except WritePermissionError:
+        raise
     except Exception as e:
         logger.error(f"Notifications database error: {e}", exc_info=True)
         return {**state, "db_rows": [{"result": {

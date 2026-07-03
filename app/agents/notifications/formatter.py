@@ -295,6 +295,9 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
         total_pages = int(pag.get('total_pages') or 1)
         total_rec   = int(pag.get('total_records') if pag.get('total_records') is not None else len(notifications))
         page_size   = int(pag.get('page_size') or pag.get('limit') or 50)
+        # Unread count across the whole view (not just this page) — matches the
+        # home "Unread alerts" KPI. -1 = SP not re-deployed yet (hide the chip).
+        unread_rec  = int(pag.get('unread_records')) if pag.get('unread_records') is not None else -1
 
         out.append(f'**Employee:** {employee_name}')
         # Embed page/total + bulk-action buttons in a single marker so the
@@ -305,6 +308,7 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
             f'[LISTHEADER:page={cur_page}'
             f':totalPages={total_pages}'
             f':total={total_rec}'
+            f':unread={unread_rec}'
             f':pageSize={page_size}]'
         )
         out.append('')

@@ -110,6 +110,37 @@ def route_request(message: str, chat_input: dict) -> Dict[str, Any]:
     raw = (message or '').strip()
     msg = raw.lower()
 
+    # ── Deterministic web-search route ───────────────────────────────────────
+    # Explicit "search the web…" phrasings go straight to mode=web_search so
+    # they never depend on the AI agent's JSON discipline (with session history
+    # it sometimes replies "I can only assist with CRM queries" instead of
+    # emitting the web_search JSON).
+    _web_m = re.match(
+        r'^(?:please\s+)?(?:can\s+you\s+)?(?:search|browse|look\s*up|google)\s+'
+        r'(?:on\s+|in\s+)?the\s+(?:web|internet)\s*(?:for|about|:)?\s*(.*)$',
+        raw, re.IGNORECASE)
+    if _web_m:
+        _q = (_web_m.group(1) or '').strip().rstrip('?.!') or raw
+        logger.info(f'-> ROUTED: web_search (deterministic) query={_q[:80]!r}')
+        return {'router_action': True, 'params': {'mode': 'web_search', 'query': _q}}
+
+    # ── Deterministic AI-summary route ───────────────────────────────────────
+    # "AI summary for <name>" / "Summarize <name>" → mode=ai_summary with the
+    # account name. Requires a concrete name so it never hijacks the aggregate
+    # statistics mode ("account summary", "summarize accounts by industry").
+    _ais_m = re.match(
+        r'^(?:ai\s+summary\s+(?:of|for)\s+|summari[sz]e\s+(?:account\s+)?|brief\s+me\s+on\s+)'
+        r'["\']?([A-Za-z][A-Za-z0-9&.\-\' ]{2,60}?)["\']?\s*$',
+        raw, re.IGNORECASE)
+    if _ais_m:
+        _nm = _ais_m.group(1).strip()
+        _generic = {'account', 'accounts', 'all accounts', 'the account',
+                    'this account', 'summary', 'statistics'}
+        if _nm.lower() not in _generic and ' by ' not in _nm.lower():
+            logger.info(f'-> ROUTED: ai_summary (deterministic) account={_nm!r}')
+            return {'router_action': True,
+                    'params': {'mode': 'ai_summary', 'accountName': _nm}}
+
     logger.info('=== Account Pre-Router v3.0 ===')
     logger.info(f'Message: {raw}')
 

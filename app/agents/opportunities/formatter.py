@@ -387,6 +387,16 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
         return {'output': response.get('exec_markdown') or 'No executive data available.',
                 'mode': 'executive_question', 'report_mode': 'executive_question'}
 
+    # ── Web answer — pre-formatted by app/core/web_tools.py ──────────────────
+    if mode == 'web_search':
+        return {'output': response.get('web_markdown') or 'No web results found.',
+                'mode': 'web_search', 'report_mode': 'web_search'}
+
+    # ── AI deal summary — pre-formatted markdown card body ───────────────────
+    if mode == 'ai_summary':
+        return {'output': response.get('ai_markdown') or 'No summary available.',
+                'mode': 'ai_summary', 'report_mode': 'ai_summary'}
+
     # ── UI-only marker modes — frontend opens the inline form ────────────────
     _ui_form_messages = {
         'show_opportunity_form':                'Opening the Create Opportunity form below…',
@@ -602,10 +612,13 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
             out.append('**No opportunities found matching your criteria.**')
             out.append('')
         else:
+            # Header must be 'Opportunity ID' with the FULL UUID — the mgmt page
+            # keys rows by lowercased header ('opportunity id') and wires the
+            # Details/Update buttons to the value (it truncates for display).
             out.append(_md_header([
                 'Opportunity', 'Stage', 'Probability', 'Amount', 'Weighted',
                 'Account', 'Contact', 'Lead Source', 'Owner', 'Close Date',
-                'Created At', 'Updated At', 'Opp ID',
+                'Created At', 'Updated At', 'Opportunity ID',
             ]))
             for opp in opportunities:
                 stage = opp.get('stage') or ''
@@ -625,7 +638,7 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
                     _fmt_date(opp.get('close_date')),
                     _fmt_dt(opp.get('created_at')),
                     _fmt_dt(opp.get('updated_at')),
-                    _trunc_uuid(opp.get('opportunity_id')),
+                    str(opp.get('opportunity_id') or 'N/A'),
                 ]))
             out.append('')
 

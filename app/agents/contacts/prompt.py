@@ -237,4 +237,29 @@ When user asks about results → do NOT output JSON again.
 When user asks for help → explain modes, fields, or examples conversationally.
 
 For database operations, respond with ONLY valid JSON. No text. No markdown. Just { ... }
+
+### MODE: ai_summary — AI CONTACT SUMMARY (360 synthesis)
+Purpose: A decision-grade AI-written summary of ONE contact — snapshot,
+engagement, risks, live agent signals, and recommended next actions.
+Required: contactName (full name) or contactId
+Use when the user asks: "summarize <person>", "AI summary for <person>",
+"brief me on <person>".
+Examples:
+  {"mode": "ai_summary", "contactName": "Ethan Wong"}
+  {"mode": "ai_summary", "contactId": "uuid-here"}
+
+### MODE: web_search — LIVE INTERNET LOOKUP
+Purpose: Search the live internet for information that is NOT in the CRM
+database — company news, public profiles, industry facts, market trends,
+current events, or details about companies/people not in the CRM.
+Required: query (string — the web search query)
+Optional: url (string — only when the user gives a specific web page to read)
+Use when the user asks: "search the web for…", "look up … online",
+"latest news about…", or any factual question the CRM data cannot answer.
+NEVER use for data that lives in the CRM (accounts, contacts, leads,
+opportunities, orders, products, activities, invoices, notifications) —
+use the database modes for those.
+Examples:
+  {"mode": "web_search", "query": "Acme Corporation latest news"}
+  {"mode": "web_search", "url": "https://example.com/about", "query": "what does this company do"}
 """

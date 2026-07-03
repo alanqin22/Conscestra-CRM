@@ -61,6 +61,9 @@ else:
 
 _POSTURE = ("open" if not API_AUTH_ENABLED else
             "public-read" if API_PUBLIC_READ else "locked")
+# Public name — surfaced via /auth-health so the frontend shim can adapt its
+# sign-in notice (locked → "Back to Home"; public-read → "Continue browsing").
+SECURITY_POSTURE = _POSTURE
 logger.info(f"[security] data-endpoint posture: {_POSTURE} "
             f"(API_AUTH_ENABLED={int(API_AUTH_ENABLED)}, API_PUBLIC_READ={int(API_PUBLIC_READ)})")
 
@@ -91,6 +94,9 @@ def _bearer(request: Request) -> Optional[str]:
 # explicit 'mode'/'action' in the request body (the structured create/update/
 # delete forms). Default-deny by listing writes; unknown/absent modes (NL reads,
 # list/get/report/forecast) are allowed.
+# ⚠ When adding a NEW write mode to any agent, add it here too — otherwise both
+# the HTTP gate and the deep write guard treat it as a read.
+# Coverage test: scratch/test_write_modes.py.
 WRITE_MODES = {
     "create", "update", "delete", "edit", "save", "remove", "add",
     "change_stage", "close_won", "close_lost", "convert", "qualify", "disqualify",
@@ -98,6 +104,15 @@ WRITE_MODES = {
     "cancel", "approve", "reject", "send",
     "add_product", "update_product", "remove_product", "update_stock", "adjust",
     "show_lead_form", "show_lead_update_form",  # forms that lead to writes
+    # Module-specific write modes (same names in the request body and in the
+    # SQL's p_mode, so both the HTTP gate and the deep write guard catch them):
+    "generate_invoice", "record_payment", "void_invoice",      # accounting
+    "score",                                                   # leads
+    "send_email", "send_template",                             # email
+    "mark_read", "mark_unread", "mark_all_read",               # notifications
+    "mark_all_unread", "click",
+    "advance_statuses",                                        # orders
+    "send_verification", "verify_email",                       # contacts
 }
 
 
@@ -113,10 +128,12 @@ async def require_admin(request: Request) -> bool:
         provided = request.headers.get("x-admin-token") or _bearer(request) or ""
         if secrets.compare_digest(provided, ADMIN_API_TOKEN):
             return True
-    # 2. human admin via session
-    if API_AUTH_ENABLED:
+    # 2. human admin via session — accepted regardless of the data-endpoint
+    #    posture (admin-only modules like Email must work in every mode).
+    token = _bearer(request)
+    if token:
         from app.agents.auth.router import get_session
-        sess = get_session(_bearer(request) or "")
+        sess = get_session(token)
         if sess and sess.get("role") == "admin":
             request.state.session = sess
             return True
