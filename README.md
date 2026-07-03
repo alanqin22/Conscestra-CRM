@@ -27,7 +27,37 @@ _Safe by default · Opt-in outreach · Fully audited · No sign-up to explore_
 
 ## 🆕 What's New — July 2026
 
-**The headline: every AI agent now reaches beyond the CRM — onto the live
+**Data security is the top priority at Conscestra CRM.** This release hardens
+every layer of the platform — identity, authorization, transport, and session
+governance — while keeping the live demo free to explore.
+
+- **🔐 Defense-in-depth write protection** — every create / update / delete now
+  requires an authorized sign-in, enforced **twice**: once at the API gate and
+  again at the single database chokepoint. Even a free-text AI command
+  ("delete invoice 1001…") from a read-only caller is stopped before any SQL
+  runs. Financial operations — generate invoice, record payment, void
+  invoice — are explicitly covered.
+- **🛡️ One-switch security posture** — `API_SECURITY_MODE` = `open` ·
+  `public-read` · `locked`. The frontend reads the live posture and adapts:
+  read-only browsing with a polished sign-in dialog under *public-read*, a
+  firm "Back to Home" under *locked* — and a blocked action never loses your
+  in-progress form.
+- **📧 Admin-only Email module** — reading and sending mail as the company
+  mailbox always requires an administrator sign-in, in **every** posture. The
+  public Contact Us form stays open.
+- **🚦 Brute-force protection** — per-IP and per-account sign-in rate limiting
+  with lockout, password-reset throttling, and `[security]`-tagged audit
+  logging on every failure.
+- **⏱️ Session governance** — DB-backed sessions that store only SHA-256 token
+  hashes, a 15-minute sliding idle timeout with an 8-hour absolute cap, true
+  server-side sign-out, and a signed-in chip with one-click **Sign out** on
+  every page.
+- **🌐 Locked-down CORS** — the API accepts browser calls only from
+  agentorc.ca origins (environment-configurable).
+- **👥 Role tiers (RBAC)** — admin / member / viewer resolved at sign-in and
+  enforced end-to-end, including natural-language writes.
+
+**Also new: every AI agent now reaches beyond the CRM — onto the live
 internet, into your calendar and accounting tools, and out to any AI assistant
 via MCP.**
 

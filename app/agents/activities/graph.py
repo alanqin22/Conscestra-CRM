@@ -30,6 +30,7 @@ from .prompt import ACTIVITY_AGENT_SYSTEM_PROMPT
 from .pre_router import route_request
 from .sql_builder import build_activities_query
 from .formatter import format_response
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +498,8 @@ SELECT json_build_object(
 
         return {**state, "db_rows": db_rows}
 
+    except WritePermissionError:
+        raise
     except Exception as e:
         logger.error(f"Activities database error: {e}", exc_info=True)
         return {**state, "db_rows": [{"result": {

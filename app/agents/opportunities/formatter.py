@@ -612,10 +612,13 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
             out.append('**No opportunities found matching your criteria.**')
             out.append('')
         else:
+            # Header must be 'Opportunity ID' with the FULL UUID — the mgmt page
+            # keys rows by lowercased header ('opportunity id') and wires the
+            # Details/Update buttons to the value (it truncates for display).
             out.append(_md_header([
                 'Opportunity', 'Stage', 'Probability', 'Amount', 'Weighted',
                 'Account', 'Contact', 'Lead Source', 'Owner', 'Close Date',
-                'Created At', 'Updated At', 'Opp ID',
+                'Created At', 'Updated At', 'Opportunity ID',
             ]))
             for opp in opportunities:
                 stage = opp.get('stage') or ''
@@ -635,7 +638,7 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
                     _fmt_date(opp.get('close_date')),
                     _fmt_dt(opp.get('created_at')),
                     _fmt_dt(opp.get('updated_at')),
-                    _trunc_uuid(opp.get('opportunity_id')),
+                    str(opp.get('opportunity_id') or 'N/A'),
                 ]))
             out.append('')
 

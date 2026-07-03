@@ -22,6 +22,7 @@ from .pre_router import route_request
 from .sql_builder import build_email_query
 from .formatter import format_response
 from .smtp_imap import send_email, fetch_inbox, search_inbox
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,8 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"EmailAgent DB returned {len(db_rows)} rows for mode={mode}")
         return {**state, "db_rows": db_rows, "extra": extra}
 
+    except WritePermissionError:
+        raise
     except Exception as e:
         logger.error(f"EmailAgent DB/Email node error: {e}", exc_info=True)
         return {**state, "db_rows": [{"result": {

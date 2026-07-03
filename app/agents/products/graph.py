@@ -26,6 +26,7 @@ from .prompt import PRODUCT_AGENT_SYSTEM_PROMPT
 from .pre_router import route_request
 from .sql_builder import build_products_query
 from .formatter import format_response
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +216,8 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         return {**state, "db_rows": db_rows, "parsed_json": parsed_json}
 
+    except WritePermissionError:
+        raise
     except Exception as e:
         logger.error(f"Products database error: {e}", exc_info=True)
         return {**state, "db_rows": [{"result": {

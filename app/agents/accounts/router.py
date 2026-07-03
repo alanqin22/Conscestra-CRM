@@ -24,6 +24,7 @@ from app.core.graph_utils import AgentState
 from app.core.config import settings
 from .graph import get_graph
 from .formatter import _parse_response
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +209,8 @@ async def account_chat(req: AccountChatRequest):
             success=True,
         )
 
+    except WritePermissionError as e:
+        raise HTTPException(status_code=e.http_status, detail=str(e))
     except Exception as e:
         logger.error(f"Account chat error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

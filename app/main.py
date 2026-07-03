@@ -30,7 +30,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
@@ -526,6 +526,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Safety net: any WritePermissionError that escapes an agent (all routers map it
+# themselves) becomes the real HTTP status — 401 anonymous (frontend auth shim
+# opens the sign-in modal) / 403 signed-in viewer — instead of a generic 500.
+from app.core.write_guard import WritePermissionError
+
+
+@app.exception_handler(WritePermissionError)
+async def _write_permission_handler(request: Request, exc: WritePermissionError):
+    return JSONResponse(status_code=exc.http_status, content={"detail": str(exc)})
+
+
 class _PrivateNetworkMiddleware(BaseHTTPMiddleware):
     """Intercept Chrome Private Network Access preflights before CORSMiddleware.
 
@@ -549,11 +560,24 @@ class _PrivateNetworkMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+# Browser origins allowed to call the API (security hardening — CORS). Defaults
+# to the production site + local dev; override with a comma-separated
+# CORS_ALLOW_ORIGINS ('*' re-opens to everyone, e.g. for a throwaway demo).
+_CORS_ORIGINS = [o.strip() for o in os.getenv(
+    "CORS_ALLOW_ORIGINS",
+    "https://agentorc.ca,https://www.agentorc.ca,"
+    "http://localhost:8000,http://127.0.0.1:8000",
+).split(",") if o.strip()]
+logger.info(f"[security] CORS allow_origins: {_CORS_ORIGINS}")
+
+from app.core.rate_limit import POSTURE as _RATE_LIMIT_POSTURE
+logger.info(_RATE_LIMIT_POSTURE)
+
 # Middleware stack — registered in reverse execution order (last added = first run).
 # 1. CORSMiddleware  — added first → runs second
 # 2. _PrivateNetworkMiddleware — added second → runs first (intercepts before CORS)
 app.add_middleware(CORSMiddleware,
-                   allow_origins=["*"],
+                   allow_origins=_CORS_ORIGINS,
                    allow_credentials=False,
                    allow_methods=["*"],
                    allow_headers=["*"])
@@ -630,8 +654,13 @@ app.include_router(auth_router)
 from app.core.consent import router as consent_router
 app.include_router(consent_router)
 
-# -- Email agent (SMTP/IMAP + LangGraph)
-app.include_router(email_router, dependencies=_DATA)
+# -- Email agent (SMTP/IMAP + LangGraph) — ADMIN-ONLY regardless of the data
+#    posture: this module reads the info@agentorc.ca mailbox and sends mail as
+#    it, so public-read must not expose it. Admin = ADMIN_API_TOKEN or a
+#    signed-in admin-role session. The public Contact Us form stays open.
+from app.agents.email.router import public_router as email_public_router
+app.include_router(email_router, dependencies=_ADMIN)
+app.include_router(email_public_router)
 
 # -- Voice (Azure Speech token mint)
 app.include_router(voice_router, dependencies=_DATA)

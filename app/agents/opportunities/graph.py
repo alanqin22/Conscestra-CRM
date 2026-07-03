@@ -35,6 +35,7 @@ from .prompt import OPPORTUNITY_AGENT_SYSTEM_PROMPT
 from .pre_router import route_request
 from .sql_builder import build_opportunities_query
 from .formatter import format_response
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,8 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"sp_opportunities returned {len(db_rows)} rows")
         return {**state, "db_rows": db_rows}
 
+    except WritePermissionError:
+        raise
     except Exception as e:
         logger.error(f"Opportunities database error: {e}", exc_info=True)
         return {**state, "db_rows": [{"result": {

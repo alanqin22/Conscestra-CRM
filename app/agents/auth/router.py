@@ -47,10 +47,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import psycopg2
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.core.database import get_connection
+from app.core.rate_limit import (
+    AUTH_RATE_LIMIT, client_ip, reset_requests,
+    signin_ip_attempts, signin_user_fails,
+)
 from app.agents.email.smtp_imap import send_email
 
 logger = logging.getLogger(__name__)
@@ -90,8 +94,14 @@ else:
 # DB-backed session store (table: auth_sessions — see sql/auth_sessions.sql).
 # Survives restarts and works across multiple instances. Only the SHA-256 hash
 # of the token is stored, so a DB leak cannot replay live sessions.
+#
+# Two expiries: an absolute TTL (8h) and a sliding idle timeout — a session
+# unused for AUTH_IDLE_MINUTES is invalidated on next use (0 disables).
+# Activity slides last_seen_at forward (throttled to one UPDATE per minute).
 # ---------------------------------------------------------------------------
 _SESSION_TTL_HOURS = 8
+_IDLE_TIMEOUT_MINUTES = int(os.getenv("AUTH_IDLE_MINUTES", "15").strip() or 0)
+_LAST_SEEN_TOUCH_SECONDS = 60
 
 
 def _token_hash(token: str) -> str:
@@ -180,27 +190,34 @@ def _new_session(
 
 
 def get_session(token: str) -> Optional[Dict[str, Any]]:
-    """Return session dict if the token is valid and not expired; else None.
-    Expired rows are purged opportunistically."""
+    """Return session dict if the token is valid, not expired, and not idle
+    beyond AUTH_IDLE_MINUTES; else None. Dead rows are purged opportunistically;
+    activity slides last_seen_at forward (throttled)."""
     if not token:
         return None
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """SELECT account_id, credential_id, identifier, lead_id, contact_id,
-                          first_name, last_name, source_table, role, expires_at
-                   FROM auth_sessions WHERE token_hash = %s""",
-                (_token_hash(token),),
-            )
+            # SELECT * so a not-yet-migrated DB (no last_seen_at) keeps working —
+            # the idle check simply skips when the column is absent.
+            cur.execute("SELECT * FROM auth_sessions WHERE token_hash = %s",
+                        (_token_hash(token),))
             row = cur.fetchone()
             if not row:
                 return None
             sess = dict(zip([d[0] for d in cur.description], row))
-            if sess["expires_at"] <= datetime.now(timezone.utc):
+            now = datetime.now(timezone.utc)
+            last_seen = sess.get("last_seen_at")
+            idle = (_IDLE_TIMEOUT_MINUTES > 0 and last_seen is not None and
+                    last_seen + timedelta(minutes=_IDLE_TIMEOUT_MINUTES) <= now)
+            if sess["expires_at"] <= now or idle:
                 cur.execute("DELETE FROM auth_sessions WHERE token_hash = %s", (_token_hash(token),))
                 conn.commit()
                 return None
+            if last_seen is not None and (now - last_seen).total_seconds() > _LAST_SEEN_TOUCH_SECONDS:
+                cur.execute("UPDATE auth_sessions SET last_seen_at = now() WHERE token_hash = %s",
+                            (_token_hash(token),))
+                conn.commit()
             return sess
     finally:
         conn.close()
@@ -220,11 +237,20 @@ def _invalidate_session(token: str) -> None:
 
 
 def active_auth_sessions() -> int:
-    """Return count of live sessions (purges expired ones as a side-effect)."""
+    """Return count of live sessions (purges expired/idle ones as a side-effect)."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM auth_sessions WHERE expires_at <= now()")
+            if _IDLE_TIMEOUT_MINUTES > 0:
+                try:
+                    cur.execute(
+                        "DELETE FROM auth_sessions "
+                        "WHERE last_seen_at <= now() - make_interval(mins => %s)",
+                        (_IDLE_TIMEOUT_MINUTES,),
+                    )
+                except psycopg2.Error:
+                    conn.rollback()  # last_seen_at not migrated yet — skip idle purge
             cur.execute("SELECT count(*) FROM auth_sessions")
             return int(cur.fetchone()[0])
     finally:
@@ -400,12 +426,14 @@ def _bootstrap_contact(
 
 @router.get("/auth-health")
 async def auth_health():
+    from app.core.auth_dep import SECURITY_POSTURE
     return {
         "status":          "healthy",
         "module":          "auth",
         "version":         "1.0.0",
         "hash_algo":       _HASH_ALGO,
         "sessions_active": active_auth_sessions(),
+        "security_mode":   SECURITY_POSTURE,  # open | public-read | locked
     }
 
 
@@ -527,11 +555,41 @@ async def signup(req: SignUpRequest):
     )
 
 
+def _signin_rejected(identifier: str, ip: str) -> HTTPException:
+    """Record a failed sign-in for rate limiting + alerting; return the 401."""
+    fails = signin_user_fails.record(identifier) if AUTH_RATE_LIMIT else 0
+    logger.warning(
+        f"[security] signin FAILED — identifier={identifier!r} ip={ip} "
+        f"fails_in_window={fails}"
+    )
+    return HTTPException(status_code=401, detail="Invalid credentials")
+
+
 @router.post("/auth/signin", response_model=AuthResponse)
-async def signin(req: SignInRequest):
+async def signin(req: SignInRequest, request: Request):
     """Verify credential via sp_signin_multi_table (leads → accounts → contacts lookup)."""
     identifier = req.identifier.strip().lower()
+    ip = client_ip(request)
     logger.info(f"Signin — identifier={identifier!r}")
+
+    # Brute-force / credential-stuffing throttle (security hardening #4).
+    if AUTH_RATE_LIMIT:
+        if signin_ip_attempts.record(ip) > signin_ip_attempts.max_events:
+            logger.warning(f"[security] signin RATE-LIMITED (per-IP) — ip={ip}")
+            raise HTTPException(
+                status_code=429,
+                detail="Too many sign-in attempts. Please wait a few minutes and try again.",
+            )
+        if signin_user_fails.is_limited(identifier):
+            logger.warning(
+                f"[security] signin LOCKED (per-account fail limit) — "
+                f"identifier={identifier!r} ip={ip}"
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed sign-in attempts for this account. "
+                       "Please wait a few minutes or reset your password.",
+            )
 
     try:
         row = _db_fetchone(
@@ -543,11 +601,11 @@ async def signin(req: SignInRequest):
         raise HTTPException(status_code=500, detail="Authentication error")
 
     if not row or not row[0]:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise _signin_rejected(identifier, ip)
 
     payload = row[0]
     if not payload.get("success"):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise _signin_rejected(identifier, ip)
 
     credential_id = str(payload["credential_id"])
     lead_id       = str(payload["lead_id"])       if payload.get("lead_id")    else None
@@ -598,6 +656,7 @@ async def signin(req: SignInRequest):
         role=access_role,
     )
 
+    signin_user_fails.reset(identifier)  # successful login clears the fail window
     logger.info(f"Signin OK — lead={lead_id} account={account_id} role={access_role}")
     return AuthResponse(
         success=True,
@@ -674,12 +733,22 @@ async def change_password(req: ChangePasswordRequest):
 
 
 @router.post("/auth/password-reset/request", response_model=AuthResponse)
-async def password_reset_request(req: PasswordResetRequestModel):
+async def password_reset_request(req: PasswordResetRequestModel, request: Request):
     """Generate a single-use password reset token.
 
     Production note: email the returned token to the user; remove
     ``reset_token`` from the response and never log it.
     """
+    identifier = req.identifier.strip().lower()
+    if AUTH_RATE_LIMIT and reset_requests.record(identifier) > reset_requests.max_events:
+        logger.warning(
+            f"[security] password-reset RATE-LIMITED — "
+            f"identifier={identifier!r} ip={client_ip(request)}"
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many reset requests for this account. Please try again later.",
+        )
     try:
         row = _db_fetchone(
             "SELECT public.create_password_reset_token(%s::text,%s::text,%s::int) AS token",

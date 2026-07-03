@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from app.core.graph_utils import AgentState
 from .graph import get_graph
 from .formatter import _parse_response
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,8 @@ async def contact_chat(req: ContactChatRequest):
             success=True,
         )
 
+    except WritePermissionError as e:
+        raise HTTPException(status_code=e.http_status, detail=str(e))
     except Exception as e:
         logger.error(f"Contact chat error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

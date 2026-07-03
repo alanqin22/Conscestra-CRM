@@ -31,6 +31,7 @@ from app.core.database import execute_sp
 from .pre_router import route_request
 from .sql_builder import build_store_query, CHECKOUT_SENTINEL
 from .formatter import format_response
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,8 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
         db_rows  = execute_sp(query)
         logger.info(f"Store SP returned {len(db_rows)} rows")
         return {**state, "db_rows": db_rows}
+    except WritePermissionError:
+        raise
     except Exception as exc:
         logger.error(f"Store DB error: {exc}", exc_info=True)
         error_row = [{"result": {

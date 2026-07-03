@@ -31,6 +31,7 @@ from .prompt import ACCOUNT_AGENT_SYSTEM_PROMPT
 from .pre_router import route_request
 from .sql_builder import build_accounts_query
 from .formatter import format_response
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -563,6 +564,8 @@ LEFT JOIN LATERAL (
         logger.info(f"sp_accounts returned {len(db_rows)} rows")
         return {**state, "parsed_json": parsed_json, "db_rows": db_rows}
 
+    except WritePermissionError:
+        raise
     except Exception as e:
         logger.error(f"Accounts database error: {e}", exc_info=True)
         return {**state, "db_rows": [{"result": {

@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from app.core.graph_utils import AgentState
 from .graph import get_graph
+from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +247,8 @@ async def accounting_chat(req: AccountingChatRequest):
             totalRecords=total_records,
         )
 
+    except WritePermissionError as e:
+        raise HTTPException(status_code=e.http_status, detail=str(e))
     except Exception as e:
         logger.error(f"Accounting chat error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

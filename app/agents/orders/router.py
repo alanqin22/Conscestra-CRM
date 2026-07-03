@@ -23,6 +23,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from app.core.write_guard import WritePermissionError
+
 from .graph import get_graph
 
 logger = logging.getLogger(__name__)
@@ -221,6 +223,11 @@ async def _handle_chat(req: OrderChatRequest) -> JSONResponse:
         )
         return JSONResponse(content=response)
 
+    except WritePermissionError as e:
+        return JSONResponse(
+            status_code=e.http_status,
+            content={"detail": str(e), "output": str(e), "success": False},
+        )
     except Exception as e:
         logger.error(f"Orders graph error: {e}", exc_info=True)
         return JSONResponse(
