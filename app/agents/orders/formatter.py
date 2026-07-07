@@ -371,13 +371,14 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
                 out.append(f'**Search:** "{search_term}"')
             out.append('')
             out.append('### Orders Summary')
-            out.append('| # | Order Number | Order ID | Account | Contact | Date | Status | Total | Items |')
-            out.append('| --- | --- | --- | --- | --- | --- | --- | --- | --- |')
+            out.append('| # | Order Number | Order ID | Account | Contact | Email | Date | Status | Total | Items |')
+            out.append('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
             for idx, o in enumerate(orders):
                 badge = {'completed': '✅', 'cancelled': '❌', 'shipped': '🚚', 'delivered': '📦'}.get((o.get('status') or '').lower(), '🕐')
                 out.append(
                     f"| {idx+1} | {o.get('order_number') or 'N/A'} | {_full_uuid(o.get('order_id'))} {badge} "
                     f"| {o.get('account_name') or 'N/A'} | {o.get('contact_name') or 'N/A'} "
+                    f"| {o.get('contact_email') or 'N/A'} "
                     f"| {_fmt_dt(o.get('order_date'))} | {o.get('status') or 'Unknown'} "
                     f"| {_fmt_currency(o.get('total_amount', 0))} | {o.get('item_count') or len(o.get('items') or [])} |"
                 )
