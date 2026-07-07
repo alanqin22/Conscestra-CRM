@@ -153,9 +153,46 @@ def detect_churn_risk(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def detect_bus_stall(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Ops heartbeat: the whole agent stack rides one process — if the bus
+    consumer dies silently, cooperation stops with no error anywhere. Two
+    independent checks: (a) bus enabled but the asyncio task is dead;
+    (b) handler-type queue rows sitting unclaimed far beyond the poll cadence."""
+    try:
+        from app.core import agent_bus
+        if agent_bus.ENABLED and not (agent_bus._task and not agent_bus._task.done()):
+            return _signal("bus_stalled", "high",
+                           "Agent bus ENABLED but the consumer loop is not running",
+                           "consumer_running", 0, "orchestrator",
+                           "Restart the backend; check logs for the crash that "
+                           "killed the consumer task")
+        stale_after = max(agent_bus.POLL_SECS * 10, 600)
+        types = list(agent_bus.HANDLERS.keys())
+        if agent_bus.ENABLED and types:
+            rows = execute_sp(
+                "SELECT count(*) AS n FROM event_queue q "
+                "JOIN events e ON e.event_uuid = q.event_uuid "
+                "WHERE q.status='pending' AND q.last_attempt_at IS NULL "
+                "  AND e.event_type = ANY(%(t)s) "
+                "  AND q.created_at BETWEEN now() - interval '1 day' "
+                "                       AND now() - make_interval(secs => %(s)s)",
+                {"t": types, "s": stale_after})
+            n = int(rows[0].get("n") or 0) if rows else 0
+            if n:
+                return _signal("bus_stalled", "high",
+                               f"{n} handler-type event(s) unclaimed for "
+                               f">{stale_after // 60} min — consumer may be wedged",
+                               "unclaimed_events", n, "orchestrator",
+                               "Check GET /agent-bus/status and recent errors; "
+                               "restart if the loop is stuck")
+    except Exception as exc:
+        logger.debug(f"[supervisor] bus heartbeat check failed: {exc}")
+    return None
+
+
 DETECTORS: List[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = [
     detect_ar_spike, detect_slipped_deals, detect_unbilled_orders, detect_unworked_leads,
-    detect_churn_risk,
+    detect_churn_risk, detect_bus_stall,
 ]
 
 
@@ -186,11 +223,44 @@ def _emit_alert(sig: Dict[str, Any]) -> None:
         {"id": str(_uuid.uuid4()), "p": payload})
 
 
+AUTOACT_CONF = float(os.getenv("SUPERVISOR_AUTOACT_CONF", "0.85"))
+
+
+def _govern_autoact(action: str, sig: Dict[str, Any]) -> Optional[str]:
+    """Gate a supervisor auto-action through governance policy. Returns a note
+    when governance DIVERTED the action (proposed/skipped); None means the
+    policy says act — caller executes. With default thresholds (0.85 ≥ ACT_MIN
+    0.8) behavior is unchanged but now policy-evaluated; tightening GOV_ACT_MIN
+    above SUPERVISOR_AUTOACT_CONF routes these into the approval queue."""
+    from app.core import governance
+    if not governance.ENABLED:
+        return None
+    d = governance.decide(AUTOACT_CONF)
+    if d == "act":
+        return None
+    if d == "skip":
+        return f"{action} skipped by governance (conf {AUTOACT_CONF} < propose_min)"
+    rows = execute_sp(
+        "SELECT count(*) AS n FROM action_approvals "
+        "WHERE action_type=%(a)s AND status='pending'", {"a": action})
+    if rows and int(rows[0].get("n") or 0):
+        return f"{action} already awaiting approval"
+    aid = governance.propose(action, "supervisor", {"cap": 25},
+                             severity=sig.get("severity"), confidence=AUTOACT_CONF)
+    return f"proposed {action} for approval ({aid[:8]})"
+
+
 def _autoact(sig: Dict[str, Any]) -> Optional[str]:
     if sig.get("auto") == "ar":
+        note = _govern_autoact("supervisor.emit_dunning", sig)
+        if note:
+            return note
         execute_sp("SELECT fn_emit_overdue_invoice_events(25) AS r")
         return "emitted overdue-invoice events"
     if sig.get("auto") == "leads":
+        note = _govern_autoact("supervisor.emit_hot_leads", sig)
+        if note:
+            return note
         execute_sp("SELECT fn_emit_hot_lead_events(25) AS r")
         return "emitted hot-lead events"
     if sig.get("auto") == "churn_campaign":

@@ -22,12 +22,14 @@ CONFIG (env)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from app.core.database import get_connection
@@ -209,6 +211,7 @@ def route_approval(approval_uuid: str, action_type: str,
     if GOV_ROUTE_EMAIL and chosen.get("auto_email_enabled") and chosen.get("email"):
         try:
             from app.agents.email.smtp_imap import send_email
+            links = decision_links(approval_uuid)
             send_email(
                 to=chosen["email"],
                 subject=f"Approval needed: {action_type}"
@@ -218,11 +221,23 @@ def route_approval(approval_uuid: str, action_type: str,
                            f"<p><b>{action_type}</b>"
                            + (f" — ${amount:,.0f}" if amount else "")
                            + f"<br>Approval ID: {approval_uuid}</p>"
-                           f"<p>Review it in the governance queue.</p>"),
+                           f'<p style="margin:18px 0;">'
+                           f'<a href="{links["approve"]}" style="background:#1e7c45;'
+                           f'color:#fff;padding:10px 22px;border-radius:6px;'
+                           f'text-decoration:none;font-weight:700;">✓ Approve</a>'
+                           f'&nbsp;&nbsp;'
+                           f'<a href="{links["reject"]}" style="background:#a33a3a;'
+                           f'color:#fff;padding:10px 22px;border-radius:6px;'
+                           f'text-decoration:none;font-weight:700;">✕ Reject</a></p>'
+                           f'<p style="color:#7b8497;font-size:12px;">One-click, '
+                           f'signed links — no sign-in needed. Or review the full '
+                           f'context in the governance queue.</p>'),
                 body_text=(f"Approval needed: {action_type}"
                            + (f" (${amount:,.0f})" if amount else "")
                            + f"\nApproval ID: {approval_uuid}\n"
-                           f"Assigned to: {label}\nReview in the governance queue."),
+                           f"Assigned to: {label}\n\n"
+                           f"Approve: {links['approve']}\n"
+                           f"Reject:  {links['reject']}\n"),
             )   # internal/administrative — transactional, not commercial
         except Exception as exc:
             logger.warning(f"[governance] route email failed: {exc}")
@@ -240,7 +255,7 @@ def _row(approval_uuid: str) -> Optional[Dict[str, Any]]:
             cur.execute(
                 """SELECT approval_uuid, action_type, proposed_by, entity_type,
                           entity_id, params, confidence, severity, status,
-                          created_at, expires_at
+                          created_at, expires_at, result, executed_at
                    FROM action_approvals WHERE approval_uuid=%s::uuid""",
                 (approval_uuid,))
             r = cur.fetchone()
@@ -351,7 +366,15 @@ async def _execute(ap: Dict[str, Any]) -> Dict[str, Any]:
         entity=EntityRef(ap["entity_type"], ap["entity_id"]) if ap.get("entity_type") else None,
         confidence=1.0, govern_bypass=True)
     res = await dispatch(req)
-    return {"ok": res.ok, "output": res.output, "error": res.error}
+    out = {"ok": res.ok, "output": res.output, "error": res.error}
+    # Persist the structured result when it serializes — undo() needs it to
+    # know WHAT was created (e.g. the campaign_uuid to cancel).
+    try:
+        json.dumps(res.data)
+        out["data"] = res.data
+    except (TypeError, ValueError):
+        pass
+    return out
 
 
 async def approve(approval_uuid: str, decided_by: str = "human",
@@ -377,6 +400,127 @@ def reject(approval_uuid: str, decided_by: str = "human",
         return {"ok": False, "error": f"not pending (status={ap['status']})"}
     _set(approval_uuid, "rejected", decided_by, reason)
     return {"ok": True, "status": "rejected", "approval_uuid": approval_uuid}
+
+
+# ============================================================================
+# Stale-approval expiry — pending items don't linger as silent liabilities
+# ============================================================================
+
+def expire_stale() -> Dict[str, Any]:
+    """Flip pending approvals past their expires_at to 'expired' (audited).
+    pending() already filters them out of the live queue; this makes the state
+    honest in the table too. Scheduled nightly + POST /governance/expire."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE action_approvals
+                   SET status='expired', decided_by='system',
+                       decided_at=now(),
+                       decision_reason='expired unactioned (TTL passed)'
+                   WHERE status='pending' AND expires_at IS NOT NULL
+                     AND expires_at < now()
+                   RETURNING approval_uuid::text, action_type""")
+            rows = cur.fetchall()
+        conn.commit()
+    finally:
+        conn.close()
+    if rows:
+        logger.info(f"[governance] expired {len(rows)} stale approval(s): "
+                    f"{[r[1] for r in rows]}")
+    return {"expired": len(rows),
+            "items": [{"approval_uuid": r[0], "action_type": r[1]} for r in rows]}
+
+
+# ============================================================================
+# Reversibility — undo an EXECUTED action (per-action-type handlers)
+# ============================================================================
+
+UNDO_WINDOW_HOURS = int(os.getenv("GOV_UNDO_WINDOW_HOURS", "72"))
+
+
+def _undo_campaign_winback(ap: Dict[str, Any]) -> Dict[str, Any]:
+    from app.core import marketing
+    cid = (((ap.get("result") or {}).get("data") or {}) or {}).get("campaign_uuid")
+    if not cid:
+        return {"ok": False, "error": "no campaign_uuid recorded on the approval"}
+    return marketing.cancel_campaign(
+        cid, f"undone via governance approval {ap['approval_uuid'][:8]}")
+
+
+# action_type → handler(approval_row) -> {'ok': bool, ...}. An action is
+# reversible only if a handler exists AND the handler can still unwind it —
+# handlers must report what could NOT be reversed (e.g. real emails sent).
+_UNDO = {
+    "campaign.winback": _undo_campaign_winback,
+}
+
+
+async def undo(approval_uuid: str, decided_by: str = "human",
+               reason: Optional[str] = None) -> Dict[str, Any]:
+    """Reverse an executed action within GOV_UNDO_WINDOW_HOURS. Status becomes
+    'undone'; the undo outcome is merged into the audit row's result."""
+    ap = _row(approval_uuid)
+    if not ap:
+        return {"ok": False, "error": "not found"}
+    if ap["status"] != "executed":
+        return {"ok": False, "error": f"only executed actions can be undone "
+                                      f"(status={ap['status']})"}
+    handler = _UNDO.get(ap["action_type"])
+    if not handler:
+        return {"ok": False, "error": f"'{ap['action_type']}' is not reversible "
+                f"(no undo handler; e.g. sent email cannot be unsent)"}
+    executed_at = ap.get("executed_at")
+    if executed_at is not None:
+        from datetime import datetime, timezone, timedelta
+        if datetime.now(timezone.utc) - executed_at > timedelta(hours=UNDO_WINDOW_HOURS):
+            return {"ok": False, "error": f"undo window closed "
+                    f"({UNDO_WINDOW_HOURS}h after execution)"}
+    try:
+        res = await asyncio.to_thread(handler, ap)
+    except Exception as exc:
+        return {"ok": False, "error": f"undo handler failed: {exc}"}
+    if res.get("ok"):
+        _set(approval_uuid, "undone", decided_by,
+             reason or "undone via governance",
+             result={**(ap.get("result") or {}), "undo": res})
+    return {"ok": bool(res.get("ok")), "status": "undone" if res.get("ok") else ap["status"],
+            "approval_uuid": approval_uuid, "undo": res}
+
+
+# ============================================================================
+# One-click decisions — HMAC-signed approve/reject links (like unsubscribe)
+# ============================================================================
+# The routed-approval email carries per-action signed links, so the executive
+# decides from their phone without a CRM session. The token binds
+# (approval_uuid, action) to a server secret; approve()/reject() refuse
+# non-pending rows, so links are single-use by construction.
+
+def _link_secret() -> bytes:
+    s = (os.getenv("GOV_LINK_SECRET") or os.getenv("UNSUBSCRIBE_SECRET")
+         or os.getenv("ADMIN_API_TOKEN") or "")
+    return s.encode("utf-8")
+
+
+def decision_token(approval_uuid: str, action: str) -> str:
+    import hashlib
+    import hmac as _hmac
+    return _hmac.new(_link_secret(), f"{approval_uuid}:{action}".encode("utf-8"),
+                     hashlib.sha256).hexdigest()[:32]
+
+
+def _verify_token(approval_uuid: str, action: str, token: str) -> bool:
+    import hmac as _hmac
+    if not _link_secret() or not token:
+        return False
+    return _hmac.compare_digest(decision_token(approval_uuid, action), token)
+
+
+def decision_links(approval_uuid: str) -> Dict[str, str]:
+    base = (os.getenv("APP_URL", "") or "http://localhost:8000").rstrip("/")
+    return {a: (f"{base}/governance/decide?g={approval_uuid}"
+                f"&a={a}&t={decision_token(approval_uuid, a)}")
+            for a in ("approve", "reject")}
 
 
 # ============================================================================
@@ -441,3 +585,66 @@ async def governance_approve(approval_uuid: str, body: _Decision = _Decision()):
 @router.post("/governance/reject/{approval_uuid}")
 def governance_reject(approval_uuid: str, body: _Decision = _Decision()):
     return reject(approval_uuid, body.decided_by, body.reason)
+
+
+@router.post("/governance/undo/{approval_uuid}")
+async def governance_undo(approval_uuid: str, body: _Decision = _Decision()):
+    """Reverse an executed action (within GOV_UNDO_WINDOW_HOURS, if its
+    action_type has an undo handler)."""
+    return await undo(approval_uuid, body.decided_by, body.reason)
+
+
+@router.post("/governance/expire")
+def governance_expire():
+    """Flip pending approvals past their TTL to 'expired' (also runs nightly)."""
+    return expire_stale()
+
+
+# ── Public one-click decision endpoint (token IS the auth) ──────────────────
+
+public_router = APIRouter(tags=["governance-public"])
+
+_DECIDE_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title></head>
+<body style="font-family:Arial,Helvetica,sans-serif;background:#eef1f6;margin:0;padding:40px 16px;">
+<div style="max-width:460px;margin:0 auto;background:#fff;border:1px solid #e1e6ef;border-radius:8px;padding:28px;">
+<div style="font-family:Georgia,serif;font-size:11px;letter-spacing:.22em;color:#b08a46;font-weight:700;text-transform:uppercase;">Conscestra CRM</div>
+<h2 style="color:#15233f;margin:10px 0 6px;">{title}</h2>
+<p style="color:#26304a;font-size:14px;line-height:1.55;">{body}</p>
+</div></body></html>"""
+
+
+@public_router.get("/governance/decide", response_class=HTMLResponse)
+async def governance_decide_link(g: str = "", a: str = "", t: str = ""):
+    """One-click approve/reject from the routed-approval email. The HMAC token
+    binds (approval, action); non-pending rows refuse re-decisions, so a link
+    can only ever be used once."""
+    action = (a or "").strip().lower()
+    if action not in ("approve", "reject") or not _verify_token(g, action, t):
+        return HTMLResponse(_DECIDE_PAGE.format(
+            title="Link not valid",
+            body="This decision link is invalid or was tampered with. "
+                 "Open the governance queue in the CRM instead."), status_code=403)
+    ap = _row(g)
+    if not ap:
+        return HTMLResponse(_DECIDE_PAGE.format(
+            title="Not found", body="This approval no longer exists."), status_code=404)
+    if ap["status"] != "pending":
+        return HTMLResponse(_DECIDE_PAGE.format(
+            title="Already decided",
+            body=f"This approval was already <b>{ap['status']}</b>. "
+                 f"Nothing further happened."))
+    if action == "approve":
+        res = await approve(g, decided_by="email-link")
+        ok = res.get("ok")
+        return HTMLResponse(_DECIDE_PAGE.format(
+            title="Approved ✓" if ok else "Approved — execution failed",
+            body=(f"<b>{ap['action_type']}</b> was approved and "
+                  f"{'executed' if ok else 'queued but FAILED to execute'}."
+                  + (f"<br><br>{res.get('result', {}).get('error') or ''}"
+                     if not ok else ""))))
+    res = reject(g, decided_by="email-link")
+    return HTMLResponse(_DECIDE_PAGE.format(
+        title="Rejected ✓",
+        body=f"<b>{ap['action_type']}</b> was rejected. No action was taken."))

@@ -197,6 +197,22 @@ def _sp_campaign_winback(p: Dict[str, Any]) -> Any:
     return marketing.winback_campaign_sp(p or {})
 
 
+def _sp_supervisor_emit_dunning(p: Dict[str, Any]) -> Any:
+    """Supervisor auto-action (executed on approval): kick the dunning loop."""
+    from app.core.database import execute_sp
+    rows = execute_sp("SELECT fn_emit_overdue_invoice_events(%(c)s) AS r",
+                      {"c": int((p or {}).get("cap", 25))})
+    return {"emitted_invoice_overdue_events": rows[0].get("r") if rows else 0}
+
+
+def _sp_supervisor_emit_hot_leads(p: Dict[str, Any]) -> Any:
+    """Supervisor auto-action (executed on approval): kick the hot-lead loop."""
+    from app.core.database import execute_sp
+    rows = execute_sp("SELECT fn_emit_hot_lead_events(%(c)s) AS r",
+                      {"c": int((p or {}).get("cap", 25))})
+    return {"emitted_lead_scored_events": rows[0].get("r") if rows else 0}
+
+
 # ---- peer handoff / negotiation -------------------------------------------
 async def delegate(parent: "A2ARequest", sub_intent: str,
                    params: Optional[Dict[str, Any]] = None,
@@ -281,6 +297,16 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "CASL-gated, drafts unless AUTOSEND). Proposed by the supervisor "
                "on churn spikes; executes on governance approval",
                sp=_sp_campaign_winback),
+    Capability("supervisor.emit_dunning", "supervisor", "", "write",
+               lambda p: "emit overdue-invoice dunning events",
+               "kick the Accounting dunning loop (supervisor auto-action; "
+               "queued for approval when governance tightens ACT_MIN)",
+               sp=_sp_supervisor_emit_dunning),
+    Capability("supervisor.emit_hot_leads", "supervisor", "", "write",
+               lambda p: "emit hot-lead outreach events",
+               "kick the hot-lead outreach loop (supervisor auto-action; "
+               "queued for approval when governance tightens ACT_MIN)",
+               sp=_sp_supervisor_emit_hot_leads),
     # Composite (peer handoff): fans out to Accounting + Leads and composes.
     Capability("crm.pipeline_snapshot", "orchestrator", "", "read",
                lambda p: "", "financial + hot-lead snapshot composed from peers",

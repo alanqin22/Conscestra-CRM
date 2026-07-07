@@ -270,6 +270,18 @@ def _run_emit_sequence_step_events() -> None:
         logger.error(f"[Sequences] step emit failed: {exc}", exc_info=True)
 
 
+def _run_governance_expiry() -> None:
+    """Scheduled job: flip pending approvals past their TTL to 'expired' so the
+    queue stays honest (best-effort; tolerates the table not existing)."""
+    try:
+        from app.core.governance import expire_stale
+        res = expire_stale()
+        if res.get("expired"):
+            logger.info(f"[Governance] expired {res['expired']} stale approval(s)")
+    except Exception as exc:
+        logger.error(f"[Governance] expiry failed: {exc}", exc_info=True)
+
+
 def _run_intelligence_scoring() -> None:
     """Scheduled job: nightly customer-intelligence scoring pass — persists
     churn risk / RFM / preferred channel per customer account and posts
@@ -451,6 +463,15 @@ async def lifespan(app: FastAPI):
             id="emit_sequence_step_events",
             replace_existing=True,
             misfire_grace_time=1800,
+        )
+        # Governance expiry — nightly 21:45 ET: stale pending approvals →
+        # 'expired' (audited) instead of lingering as silent liabilities.
+        _scheduler.add_job(
+            _run_governance_expiry,
+            trigger=CronTrigger(hour=21, minute=45),
+            id="governance_expiry",
+            replace_existing=True,
+            misfire_grace_time=3600,
         )
         # Customer-intelligence scoring — nightly 22:35 ET, after the seed and
         # advance passes so profiles reflect the day's final state. Self-gates
@@ -770,6 +791,10 @@ app.include_router(qualification_router, dependencies=_ADMIN)
 # -- Governance (Phase 5 — confidence-gating + approval queue)
 from app.core.governance import router as governance_router
 app.include_router(governance_router, dependencies=_ADMIN)
+# One-click approve/reject from the routed-approval email — PUBLIC because the
+# HMAC token is the authorization (same pattern as the unsubscribe endpoint).
+from app.core.governance import public_router as governance_public_router
+app.include_router(governance_public_router)
 
 # -- Admin Users console (manage auth_credentials). Router self-gates on require_admin.
 from app.agents.admin_users.router import router as admin_users_router

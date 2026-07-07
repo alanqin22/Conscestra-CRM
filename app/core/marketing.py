@@ -362,6 +362,40 @@ def campaign_results(campaign_uuid: str) -> Dict[str, Any]:
     return out
 
 
+def cancel_campaign(campaign_uuid: str, reason: str = "cancelled") -> Dict[str, Any]:
+    """Cancel a campaign (governance undo target). Honest about limits: draft
+    rows are neutralized, but emails ALREADY SENT cannot be unsent — the count
+    of irreversible sends is reported back to the audit trail."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT status, count(*) FROM marketing_sends
+                   WHERE campaign_uuid=%s::uuid GROUP BY 1""", (campaign_uuid,))
+            sends = dict(cur.fetchall())
+            cur.execute(
+                """UPDATE marketing_campaigns
+                   SET status='cancelled',
+                       stats = stats || jsonb_build_object('cancelled_reason', %s)
+                   WHERE campaign_uuid=%s::uuid AND status <> 'cancelled'
+                   RETURNING name""",
+                (reason, campaign_uuid))
+            row = cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    if not row:
+        return {"ok": False, "error": "campaign not found or already cancelled"}
+    sent = int(sends.get("sent", 0))
+    logger.info(f"[marketing] cancelled campaign {row[0]!r} ({reason}); "
+                f"irreversible sends={sent}")
+    return {"ok": True, "campaign": row[0], "status": "cancelled",
+            "drafts_neutralized": int(sends.get("drafted", 0)),
+            "already_sent_irreversible": sent,
+            "note": ("all recipients were drafts — fully reversed" if not sent
+                     else f"{sent} email(s) were already sent and cannot be unsent")}
+
+
 # ── Agent-initiated win-back (the supervisor → governance → A2A showcase) ────
 
 def winback_campaign_sp(params: Dict[str, Any]) -> Dict[str, Any]:
