@@ -114,6 +114,15 @@ deploy_winscp.log
 # HTML pages deploy separately to agentorc.ca (cPanel) — never commit them.
 *.html
 
+# Scratch/working files and Railway SQL deploys — local only, never commit.
+/scratch/
+/sql/
+/sp/
+*.sql
+
+# Claude Code workspace (skills, local settings) — local only.
+.claude/
+
 # ── Loose credential files (never commit) ──────────────────────────────
 authentication.txt
 docs/raillway password and url.txt

@@ -148,6 +148,22 @@ cost, fully explainable:
   sentiment** distilled from their inbound emails.
 - **Expected next purchase date** projected from their historical cadence.
 
+## Every Lead Arrives Qualified
+
+The vision's qualification card is real — and every number on it is earned,
+not guessed:
+
+- **Win probability from history**: "82%" means 82% of settled leads in the
+  same score band actually converted — smoothed so small samples can't scream
+  certainty, sharpening as more leads settle.
+- **Recommended sales rep, with the reason**: ranked by who already manages
+  accounts in the lead's industry, then by lightest current lead load —
+  *"David: manages 4 Software accounts, current load 2 open leads."*
+- **Company enrichment with real providers**: plug in Apollo or People Data
+  Labs with one env var, or use the built-in **keyless web lookup** — and
+  because enrichment only ever gap-fills, a low-confidence result can never
+  overwrite what a human entered.
+
 ## Agents That Run Multi-Step Plays
 
 One-shot reactions became **cadences** — durable, multi-day playbooks that
@@ -168,19 +184,49 @@ Inbound email is a first-class signal: every reply is matched to its contact
 or lead, recorded on the timeline, and can end a running play — complaints
 escalate automatically to the account owner.
 
-## Marketing Under Consent, Approvals Under Authority
+## Marketing That Generates, Tests, and Asks Permission
 
 The **Marketing agent** builds campaigns as segments over the intelligence
-profiles (churn band, lifetime value, industry, preferred channel) with
-personalized templates — and every send passes the CASL compliance stack:
-suppression list, verified recipients, unsubscribe footer. Campaigns measure
-their own results: replies and orders attributed since launch.
+profiles (churn band, lifetime value, industry, preferred channel) — and now
+**writes them too**: campaign content is LLM-drafted from the segment
+description (with a deterministic template fallback), always preserving the
+personalization placeholders. Every campaign can carry an **A/B subject
+pair**; recipients split 50/50 and results report reply rates per variant
+with a leading-subject verdict.
 
-Governance approvals now **route themselves to the right executive**: the
-system extracts the dollar amount, matches the action domain (finance →
-CFO, revenue → CRO, operations → COO), and respects each executive's
-approval-authority limit — escalating only when the amount demands it. Every
-morning briefing lists the approvals awaiting that executive's decision.
+Every send still passes the CASL compliance stack — suppression list,
+verified recipients, unsubscribe footer — and campaigns measure their own
+results: replies and orders attributed since launch.
+
+The showcase: when the supervisor detects a **churn spike**, it doesn't just
+alert — it *proposes a win-back campaign to the governance queue*. The
+proposal routes to the CRO; a human approval executes it. An agent initiating
+commercial action, entirely within policy.
+
+## Approve From Your Phone. Undo When You Must.
+
+Governance approvals **route themselves to the right executive**: the system
+extracts the dollar amount, matches the action domain (finance → CFO,
+revenue → CRO, operations → COO), and respects each executive's
+approval-authority limit — escalating only when the amount demands it.
+
+The routed email carries **one-click Approve / Reject buttons** — HMAC-signed
+links, single-use by construction, no sign-in needed. The executive decides
+from their phone; the CRM renders a confirmation page and executes.
+
+And because accountable autonomy cuts both ways:
+
+- **Undo** — an executed action can be reversed within its undo window; the
+  audit trail records honestly what could not be un-done (a sent email stays
+  sent).
+- **Expiry** — pending approvals past their TTL flip to *expired* nightly,
+  never lingering as silent liabilities.
+- **Policy-gated autonomy** — even the supervisor's own auto-actions run
+  through the confidence policy; tighten one threshold and they queue for
+  approval instead of acting.
+- **A heartbeat on the machinery itself** — if the event-bus consumer ever
+  dies silently, a supervisor detector raises a high-severity alert. The
+  watchers are watched.
 
 ## The System Grades Its Own Homework
 
@@ -326,8 +372,9 @@ _Listed in the same order as the launcher page on [agentorc.ca](https://agentorc
 - **Agents that cooperate automatically** — an event-driven cooperation bus lets agents react to each other's work instead of waiting to be asked: a store order makes the Email agent send order-confirmation and shipped notices to the buyer (real SMTP, gated on a **verified, opted-in** address), overdue invoices auto-draft tiered dunning, hot leads auto-schedule outreach, and settled milestones self-complete — all idempotent and safe-by-default (`AGENT_BUS_AUTOSEND=0` keeps it draft-only until you flip it on).
 - **Multi-step agent cadences** — a durable sequences engine (`agent_sequences` + a `sequence.step_due` event loop) runs timed playbooks: hot-lead follow-up (intro draft → reminder → meeting offer → nurture) and the churn-save play (support context check → win-back draft → executive escalation), each exiting early on engagement, conversion, or a new order. Multi-day steps align to the customer's learned preferred hour.
 - **Persistent customer intelligence** — a nightly deterministic scorer writes a living profile per customer (churn risk vs their own median order gap, RFM/LTV, preferred channel + engagement hour, interests from ordered categories, inbound-email sentiment) that feeds the AI 360s, the supervisor's churn detector, and campaign segmentation — with the full component breakdown persisted for explainability.
-- **Marketing campaigns on the CASL stack** — segment the customer base by churn band / LTV / industry / channel, personalize a template, and launch through the existing consent infrastructure (suppression list, verified-address gate, unsubscribe footer); draft-only unless autosend is explicitly enabled *and* the launch is confirmed. Results measure replies and orders attributed since launch.
-- **Approvals routed by authority** — governance proposals extract the dollar amount and self-assign to the right executive by role affinity and smallest-sufficient approval limit; assignments emit audit events and appear in each executive's morning briefing.
+- **Marketing campaigns on the CASL stack** — segment the customer base by churn band / LTV / industry / channel, LLM-draft the content (deterministic template fallback, placeholders enforced), optionally A/B two subjects (50/50 split, per-variant reply attribution + leading verdict), and launch through the existing consent infrastructure (suppression list, verified-address gate, unsubscribe footer); draft-only unless autosend is explicitly enabled *and* the launch is confirmed. A supervisor-detected churn spike can *propose* a win-back campaign through the governance queue — agents initiating commercial action within policy.
+- **Leads qualified with earned numbers** — win probability is the smoothed historical conversion rate of settled leads in the same score band; the recommended rep is ranked by industry-account experience then current load, with the reason attached; company enrichment supports Apollo / People Data Labs / a keyless web lookup, all gap-fill-only.
+- **Approvals routed by authority, decided in one click** — governance proposals extract the dollar amount and self-assign to the right executive by role affinity and smallest-sufficient approval limit; the routed email carries HMAC-signed single-use Approve/Reject buttons (no sign-in). Executed actions can be **undone** within a window (with honest irreversibility reporting), stale approvals expire nightly, supervisor auto-actions obey the same confidence policy, and a heartbeat detector alerts if the bus consumer ever dies silently.
 - **Inbound email as CRM signal** — every inbound message is matched to its contact/lead, logged as a timeline activity, and emitted onto the bus; complaints auto-escalate (blackboard note + urgent owner task), and replies end running cadences.
 - **A learning loop** — nightly churn predictions are snapshotted and calibrated against actual ordering a month later; the CEO briefing includes an agent performance report card (cadence save-rates, campaign conversion, prediction precision). Evidence-only: thresholds are recommended, never silently changed.
 - **Self-serve signup that actually converts** — a store signup creates a lead and sends an OTP verification email; on verify it **auto-converts to a verified account + contact** (authored by the owning AI agents), carrying the buyer's firmographics and **CASL/GDPR marketing consent** — so checkout then flows straight through with no manual data entry.
@@ -365,7 +412,8 @@ crm_agent/
     │   ├── governance.py          ← Confidence gates + executive approval routing
     │   ├── sequences.py           ← Multi-step timed playbooks (cadences)
     │   ├── intelligence.py        ← Nightly customer-intelligence profiles
-    │   ├── marketing.py           ← Segment → CASL-gated campaigns → measure
+    │   ├── marketing.py           ← Segment → draft (LLM) → A/B → CASL-gated launch → measure
+    │   ├── qualification.py       ← Win probability + recommended-rep card
     │   └── learning.py            ← Agent performance analytics + calibration
     └── agents/
         │  ── 10 conversational AI agents (LangGraph + pre-router + LLM) ──
