@@ -148,7 +148,8 @@ def detect_churn_risk(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return _signal("churn_risk", "high" if n >= CHURN_MIN * 2 else "medium",
                        f"{n} customers at high churn risk · {_money(ltv)} lifetime value exposed",
                        "high_churn_accounts", n, "accounts",
-                       "Review /intelligence/at-risk and launch save plays for the top-LTV accounts")
+                       "Review /intelligence/at-risk and launch save plays for the top-LTV accounts",
+                       auto="churn_campaign")
     return None
 
 
@@ -192,6 +193,29 @@ def _autoact(sig: Dict[str, Any]) -> Optional[str]:
     if sig.get("auto") == "leads":
         execute_sp("SELECT fn_emit_hot_lead_events(25) AS r")
         return "emitted hot-lead events"
+    if sig.get("auto") == "churn_campaign":
+        # An agent INITIATING commercial action — so it goes through policy:
+        # the campaign is PROPOSED to the governance queue and routed to the
+        # right executive; only an approval executes campaign.winback (which
+        # itself stays draft-only without AUTOSEND). Idempotent: one open
+        # proposal / recent campaign at a time.
+        from app.core import governance
+        rows = execute_sp(
+            "SELECT count(*) AS n FROM action_approvals "
+            "WHERE action_type='campaign.winback' AND status='pending'")
+        if rows and int(rows[0].get("n") or 0):
+            return "win-back campaign already awaiting approval"
+        rows = execute_sp(
+            "SELECT count(*) AS n FROM marketing_campaigns "
+            "WHERE name LIKE 'Win-back%%' AND created_at > now() - interval '7 days'")
+        if rows and int(rows[0].get("n") or 0):
+            return "win-back campaign already ran this week"
+        aid = governance.propose(
+            "campaign.winback", "supervisor",
+            {"segment": {"churn_band": ["high"]},
+             "goal": "win back high-churn-risk customers detected by the supervisor"},
+            severity=sig.get("severity"), confidence=0.6)
+        return f"proposed win-back campaign for approval ({aid[:8]})"
     return None
 
 

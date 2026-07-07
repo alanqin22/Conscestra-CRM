@@ -122,23 +122,90 @@ def _personalize(template: str, r: Dict[str, Any]) -> str:
 # ============================================================================
 
 def create_campaign(name: str, subject: str, body_template: str,
-                    segment: Dict[str, Any], created_by: str = "admin") -> Dict[str, Any]:
+                    segment: Dict[str, Any], created_by: str = "admin",
+                    subject_b: Optional[str] = None) -> Dict[str, Any]:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO marketing_campaigns
-                     (name, subject, body_template, segment, created_by)
-                   VALUES (%s, %s, %s, %s::jsonb, %s)
+                     (name, subject, subject_b, body_template, segment, created_by)
+                   VALUES (%s, %s, %s, %s, %s::jsonb, %s)
                    RETURNING campaign_uuid::text""",
-                (name, subject, body_template, json.dumps(segment or {}), created_by),
+                (name, subject, subject_b, body_template,
+                 json.dumps(segment or {}), created_by),
             )
             cid = cur.fetchone()[0]
         conn.commit()
         return {"status": "ok", "campaign_uuid": cid,
+                "ab_test": bool(subject_b),
                 "audience_preview": len(resolve_segment(segment))}
     finally:
         conn.close()
+
+
+# ── Content generation (the "generate" half) ─────────────────────────────────
+
+_FALLBACK_CONTENT = {
+    "high": {
+        "subject": "We miss you at {{account_name}}, {{first_name}}",
+        "subject_b": "{{first_name}}, a thank-you for {{account_name}}",
+        "body_template": (
+            "Hi {{first_name}},\n\nIt's been a while since {{account_name}} last "
+            "ordered, and we wanted to check in. As a thank-you for your business "
+            "(you've trusted us with {{ltv}} over the years), here's 10% off your "
+            "next order.\n\nIs there anything we could be doing better? Just reply "
+            "— a human reads every answer.\n\nWarm regards,\nThe Conscestra team"),
+    },
+    "default": {
+        "subject": "Something new for {{account_name}}",
+        "subject_b": "{{first_name}}, picked for {{account_name}}",
+        "body_template": (
+            "Hi {{first_name}},\n\nBased on what {{account_name}} usually orders, "
+            "we thought you'd want to see what's new this month.\n\nReply to this "
+            "email and we'll put a tailored list together.\n\nBest,\n"
+            "The Conscestra team"),
+    },
+}
+
+
+def draft_campaign_content(segment: Dict[str, Any],
+                           goal: str = "") -> Dict[str, Any]:
+    """LLM-drafted subject/subject_b/body for a segment, with a deterministic
+    fallback so campaign creation always succeeds. Placeholders are preserved:
+    {{first_name}} {{account_name}} {{ltv}}."""
+    bands = segment.get("churn_band") or []
+    bands = [bands] if isinstance(bands, str) else list(bands)
+    fallback_key = "high" if "high" in bands else "default"
+    fallback = {**_FALLBACK_CONTENT[fallback_key], "source": "template"}
+
+    seg_desc = ", ".join(f"{k}={v}" for k, v in (segment or {}).items()) or "all customers"
+    prompt = (
+        "You write concise B2B win-back/nurture emails for a CRM. Produce ONLY a "
+        "JSON object with keys subject, subject_b (an alternative subject for an "
+        "A/B test), and body_template (plain text, under 120 words, friendly, no "
+        "hard sell). You MUST use the literal placeholders {{first_name}}, "
+        "{{account_name}} and may use {{ltv}} — do not invent other placeholders "
+        "or any numbers.\n"
+        f"Audience segment: {seg_desc}.\n"
+        f"Campaign goal: {goal or 'reconnect and invite a reply'}.")
+    try:
+        import re as _re
+        from app.core.graph_utils import _get_llm
+        resp = _get_llm().invoke([{"role": "user", "content": prompt}])
+        raw = resp.content if hasattr(resp, "content") else str(resp)
+        m = _re.search(r"\{.*\}", raw, _re.S)   # tolerate ```json fences/prose
+        data = json.loads(m.group(0)) if m else {}
+        if data.get("subject") and data.get("body_template"):
+            return {"subject": str(data["subject"])[:200],
+                    "subject_b": (str(data["subject_b"])[:200]
+                                  if data.get("subject_b") else None),
+                    "body_template": str(data["body_template"])[:4000],
+                    "source": "llm"}
+        logger.warning("[marketing] LLM draft missing keys — using template")
+    except Exception as exc:
+        logger.warning(f"[marketing] LLM draft failed ({exc}) — using template")
+    return fallback
 
 
 def _campaign(campaign_uuid: str) -> Optional[Dict[str, Any]]:
@@ -147,8 +214,8 @@ def _campaign(campaign_uuid: str) -> Optional[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT campaign_uuid::text, name, status, segment, subject,
-                          body_template, channel, created_by, created_at,
-                          launched_at, stats
+                          subject_b, body_template, channel, created_by,
+                          created_at, launched_at, stats
                    FROM marketing_campaigns WHERE campaign_uuid=%s::uuid""",
                 (campaign_uuid,),
             )
@@ -178,7 +245,11 @@ def launch_campaign(campaign_uuid: str, confirm: bool = False) -> Dict[str, Any]
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            for r in recipients:
+            for i, r in enumerate(recipients):
+                # A/B: alternate recipients between subject variants when a
+                # subject_b exists (deterministic 50/50 by list position).
+                variant = "B" if camp.get("subject_b") and i % 2 else "A"
+                subject_tpl = camp["subject_b"] if variant == "B" else camp["subject"]
                 status, detail = "drafted", None
                 if consent.is_suppressed(r["email"]):
                     status, detail = "suppressed", "CASL opt-out"
@@ -190,7 +261,7 @@ def launch_campaign(campaign_uuid: str, confirm: bool = False) -> Dict[str, Any]
                             from app.agents.email.smtp_imap import send_email
                             res = send_email(
                                 to=r["email"],
-                                subject=_personalize(camp["subject"], r),
+                                subject=_personalize(subject_tpl, r),
                                 body_html=_personalize(camp["body_template"], r)
                                     .replace("\n", "<br>"),
                                 body_text=_personalize(camp["body_template"], r),
@@ -207,12 +278,12 @@ def launch_campaign(campaign_uuid: str, confirm: bool = False) -> Dict[str, Any]
                 cur.execute(
                     """INSERT INTO marketing_sends
                          (campaign_uuid, account_id, contact_id, email, status,
-                          detail, sent_at)
-                       VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s,
+                          detail, variant, sent_at)
+                       VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s,
                                CASE WHEN %s = 'sent' THEN now() END)
                        ON CONFLICT (campaign_uuid, email) DO NOTHING""",
                     (campaign_uuid, r["account_id"], r["contact_id"], r["email"],
-                     status, detail, status),
+                     status, detail, variant, status),
                 )
                 if cur.rowcount:
                     counts[status] += 1
@@ -258,14 +329,78 @@ def campaign_results(campaign_uuid: str) -> Dict[str, Any]:
                                           WHERE campaign_uuid=%s::uuid)""",
                 (since, campaign_uuid))
             n_orders, order_value = cur.fetchone()
+            # A/B: replies attributed per subject variant
+            cur.execute(
+                """SELECT ms.variant, count(*) AS recipients,
+                          count(*) FILTER (WHERE EXISTS (
+                              SELECT 1 FROM activities ac
+                              WHERE ac.account_id = ms.account_id
+                                AND ac.direction = 'inbound'
+                                AND ac.created_at > %s)) AS replied
+                   FROM marketing_sends ms
+                   WHERE ms.campaign_uuid = %s::uuid GROUP BY 1 ORDER BY 1""",
+                (since, campaign_uuid))
+            variants = {v: {"recipients": n, "replied": rep,
+                            "reply_rate": round(rep / n, 3) if n else None}
+                        for v, n, rep in cur.fetchall()}
     finally:
         conn.close()
-    return {"campaign": camp["name"], "status": camp["status"],
-            "launched_at": camp["launched_at"].isoformat() if camp["launched_at"] else None,
-            "sends": sends,
-            "engagement": {"accounts_replied": replies,
-                           "orders_since_launch": n_orders,
-                           "order_value_since_launch": float(order_value or 0)}}
+    out = {"campaign": camp["name"], "status": camp["status"],
+           "launched_at": camp["launched_at"].isoformat() if camp["launched_at"] else None,
+           "sends": sends,
+           "engagement": {"accounts_replied": replies,
+                          "orders_since_launch": n_orders,
+                          "order_value_since_launch": float(order_value or 0)}}
+    if camp.get("subject_b") and len(variants) > 1:
+        a, b = variants.get("A", {}), variants.get("B", {})
+        winner = None
+        if a.get("reply_rate") is not None and b.get("reply_rate") is not None \
+                and a["reply_rate"] != b["reply_rate"]:
+            winner = "A" if a["reply_rate"] > b["reply_rate"] else "B"
+        out["ab_test"] = {"subject_a": camp["subject"], "subject_b": camp["subject_b"],
+                          "variants": variants, "leading": winner}
+    return out
+
+
+# ── Agent-initiated win-back (the supervisor → governance → A2A showcase) ────
+
+def winback_campaign_sp(params: Dict[str, Any]) -> Dict[str, Any]:
+    """A2A structured handler for intent 'campaign.winback' — executed when a
+    governance-queued proposal is APPROVED (or dispatched by an admin). Creates
+    and launches a win-back campaign for high-churn customers. The approval IS
+    the launch confirmation; real email still additionally requires
+    AGENT_BUS_AUTOSEND=1 (drafts otherwise). Idempotent: one win-back per 7d."""
+    from datetime import date
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT campaign_uuid::text, name FROM marketing_campaigns
+                   WHERE name LIKE 'Win-back%%' AND status <> 'cancelled'
+                     AND created_at > now() - interval '7 days' LIMIT 1""")
+            dup = cur.fetchone()
+    finally:
+        conn.close()
+    if dup:
+        return {"status": "skipped",
+                "reason": f"win-back campaign already exists this week ({dup[1]})",
+                "campaign_uuid": dup[0]}
+
+    segment = params.get("segment") or {"churn_band": ["high"]}
+    content = {k: params[k] for k in ("subject", "subject_b", "body_template")
+               if params.get(k)}
+    if "subject" not in content or "body_template" not in content:
+        content = draft_campaign_content(segment, params.get("goal", "win back "
+                                         "high-churn-risk customers"))
+    created = create_campaign(
+        params.get("name") or f"Win-back — {date.today().isoformat()}",
+        content["subject"], content["body_template"], segment,
+        created_by=params.get("proposed_by", "supervisor"),
+        subject_b=content.get("subject_b"))
+    launch = launch_campaign(created["campaign_uuid"], confirm=True)
+    return {"status": "ok", "campaign_uuid": created["campaign_uuid"],
+            "content_source": content.get("source", "params"),
+            "ab_test": created["ab_test"], "launch": launch}
 
 
 # ============================================================================
@@ -298,7 +433,23 @@ def marketing_create(body: Dict[str, Any]):
         if not body.get(k):
             return {"status": "error", "reason": f"missing {k}"}
     return create_campaign(body["name"], body["subject"], body["body_template"],
-                           body.get("segment") or {}, body.get("created_by", "admin"))
+                           body.get("segment") or {}, body.get("created_by", "admin"),
+                           subject_b=body.get("subject_b"))
+
+
+@router.post("/marketing/draft")
+def marketing_draft(body: Dict[str, Any]):
+    """LLM-draft campaign content for a segment (deterministic fallback).
+    Pass create=true to also create the draft campaign in one step."""
+    segment = body.get("segment") or {}
+    content = draft_campaign_content(segment, body.get("goal", ""))
+    if body.get("create"):
+        created = create_campaign(
+            body.get("name") or "Drafted campaign", content["subject"],
+            content["body_template"], segment, body.get("created_by", "admin"),
+            subject_b=content.get("subject_b"))
+        return {**content, **created}
+    return content
 
 
 @router.post("/marketing/segment-preview")

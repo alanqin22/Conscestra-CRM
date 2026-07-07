@@ -763,6 +763,10 @@ app.include_router(marketing_router, dependencies=_ADMIN)
 from app.core.learning import router as learning_router
 app.include_router(learning_router, dependencies=_ADMIN)
 
+# -- Lead qualification (win probability + recommended rep)
+from app.core.qualification import router as qualification_router
+app.include_router(qualification_router, dependencies=_ADMIN)
+
 # -- Governance (Phase 5 — confidence-gating + approval queue)
 from app.core.governance import router as governance_router
 app.include_router(governance_router, dependencies=_ADMIN)

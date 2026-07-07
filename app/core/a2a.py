@@ -191,6 +191,12 @@ def _sp_account_context(p: Dict[str, Any]) -> Any:
     return blackboard.context("account", aid)
 
 
+def _sp_campaign_winback(p: Dict[str, Any]) -> Any:
+    """Marketing: create + launch a win-back campaign (executed on approval)."""
+    from app.core import marketing
+    return marketing.winback_campaign_sp(p or {})
+
+
 # ---- peer handoff / negotiation -------------------------------------------
 async def delegate(parent: "A2ARequest", sub_intent: str,
                    params: Optional[Dict[str, Any]] = None,
@@ -268,6 +274,13 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                           f"{p.get('invoice_number', '')} for {p.get('amount', '')}, "
                           f"{p.get('days_overdue', '')} days overdue"),
                "send an overdue-invoice payment reminder"),
+    Capability("campaign.winback", "marketing", "/marketing/campaigns", "write",
+               lambda p: "launch a win-back campaign for high-churn customers",
+               "create + launch a win-back marketing campaign (segment defaults "
+               "to churn_band=high; content LLM-drafted with template fallback; "
+               "CASL-gated, drafts unless AUTOSEND). Proposed by the supervisor "
+               "on churn spikes; executes on governance approval",
+               sp=_sp_campaign_winback),
     # Composite (peer handoff): fans out to Accounting + Leads and composes.
     Capability("crm.pipeline_snapshot", "orchestrator", "", "read",
                lambda p: "", "financial + hot-lead snapshot composed from peers",

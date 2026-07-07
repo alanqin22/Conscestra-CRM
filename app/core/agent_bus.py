@@ -523,12 +523,28 @@ async def handle_lead_scored(event: Dict[str, Any]) -> Dict[str, Any]:
     await asyncio.to_thread(_record_lead_outreach_sync, ctx, event.get("correlation_id"))
     name = f"{ctx.get('first_name') or ''} {ctx.get('last_name') or ''}".strip()
 
+    # Qualification card: historical win probability + recommended rep
+    # (deterministic; best-effort — the outreach above already stands).
+    qual = {}
+    try:
+        from app.core import qualification
+        qual = await asyncio.to_thread(qualification.qualify, lead_id) or {}
+    except Exception as exc:
+        logger.warning(f"[agent_bus] qualification failed: {exc}")
+
     # Phase 4: post to the shared blackboard so other agents see this hot lead.
     from app.core import blackboard
+    rep = qual.get("recommended_rep") or {}
+    wp = qual.get("win_probability")
+    note = f"Hot lead (score {ctx['score']}) — outreach scheduled"
+    if wp is not None:
+        note += (f"; win probability {wp:.0%}"
+                 + (f"; recommended rep {rep['rep']}" if rep.get("rep") else ""))
     await asyncio.to_thread(
-        blackboard.post, "lead", lead_id, "leads", "hot_lead",
-        f"Hot lead (score {ctx['score']}) — outreach scheduled",
-        {"score": ctx["score"], "name": name, "company": ctx.get("company")},
+        blackboard.post, "lead", lead_id, "leads", "hot_lead", note,
+        {"score": ctx["score"], "name": name, "company": ctx.get("company"),
+         "win_probability": wp, "recommended_rep": rep.get("rep"),
+         "rep_reason": rep.get("reason")},
         0.9, "info", 72)
 
     # Start the multi-step follow-up cadence (no-op unless SEQUENCES_ENABLED;
