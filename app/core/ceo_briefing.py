@@ -234,6 +234,27 @@ def gather() -> Dict[str, Any]:
                 "FROM accounting_invoice_pipeline v LEFT JOIN accounts a ON a.account_id=v.account_id "
                 "WHERE v.payment_status IN ('unpaid','partial') AND v.due_date::date < CURRENT_DATE "
                 "ORDER BY v.computed_balance_due DESC LIMIT 3")
+        # Governance approvals awaiting a decision (routed to executives).
+        # Best-effort: tolerate the governance/routing migrations not existing.
+        try:
+            with conn.cursor() as cur2:
+                approvals = _rows(cur2,
+                    "SELECT action_type, proposed_by, COALESCE(assigned_to,'unassigned'), "
+                    "       COALESCE(amount,0), created_at::date "
+                    "FROM action_approvals "
+                    "WHERE status='pending' AND (expires_at IS NULL OR expires_at>now()) "
+                    "ORDER BY COALESCE(amount,0) DESC, created_at LIMIT 5")
+        except Exception as exc:
+            logger.warning(f"[ceo_briefing] approvals query skipped: {exc}")
+            conn.rollback()
+            approvals = []
+        # Agent performance report card (learning loop) — best-effort.
+        try:
+            from app.core.learning import agent_performance
+            perf = agent_performance(30)
+        except Exception as exc:
+            logger.warning(f"[ceo_briefing] agent performance skipped: {exc}")
+            perf = None
         return {
             "rev_yest": rev_yest, "rev_7d": rev_7d,
             "rev_recent_date": rev_recent_date, "rev_recent_amt": rev_recent_amt,
@@ -244,6 +265,7 @@ def gather() -> Dict[str, Any]:
             "new_leads_7d": new_leads_7d, "overdue_acts": overdue_acts,
             "sentiment_7d": sentiment_7d, "sentiment_n": sentiment_n,
             "closing": closing, "biggest": biggest, "atrisk": atrisk, "big_inv": big_inv,
+            "approvals": approvals, "perf": perf,
         }
     finally:
         conn.close()
@@ -353,6 +375,27 @@ def _web_intel_text(web) -> List[str]:
 
 # ── Rendering ───────────────────────────────────────────────────────────────────
 
+def _perf_lines(perf: Dict[str, Any]) -> List[str]:
+    """Agent report card → compact human lines (shared by text + HTML)."""
+    if not perf:
+        return []
+    out: List[str] = []
+    for pb, d in sorted((perf.get("cadences") or {}).items()):
+        mix = ", ".join(f"{o} {n}" for o, n in sorted(d["outcomes"].items()))
+        rate = (f"{d['success_rate']:.0%}" if d.get("success_rate") is not None
+                else "n/a")
+        out.append(f"{pb}: {d['ended']} play(s) ended · success {rate} ({mix})")
+    c = perf.get("campaigns") or {}
+    if c.get("launched"):
+        sends = ", ".join(f"{k} {v}" for k, v in sorted((c.get("sends") or {}).items()))
+        out.append(f"campaigns: {c['launched']} launched · {sends or 'no sends'} · "
+                   f"{c['accounts_replied']} account(s) replied · "
+                   f"{c['orders']} order(s) ({_money(c['order_value'])})")
+    for v in (perf.get("churn_calibration") or {}).get("verdict") or []:
+        out.append(f"churn model: {v}")
+    return out
+
+
 def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
     today = datetime.now().strftime("%B %-d, %Y") if os.name != "nt" else datetime.now().strftime("%B %d, %Y")
     at_risk_total = float(d["ar_amt"] or 0) + float(d["slipped_amt"] or 0)
@@ -410,6 +453,18 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
         flag = "  (large balance, 45d+)" if float(r[2]) > 25000 and int(r[3]) >= 45 else ""
         t.append(f"   - Overdue invoice {r[0]} — {r[1]}: {_money(r[2])}, {r[3]}d overdue{flag}")
     t.append("")
+    if d.get("approvals"):
+        t.append("APPROVALS AWAITING DECISION (governance queue)")
+        for r in d["approvals"]:
+            amt = f" — {_money(r[3])}" if float(r[3] or 0) else ""
+            t.append(f"   - {r[0]}{amt} · proposed by {r[1]} · assigned to {r[2]} ({r[4]})")
+        t.append("")
+    perf_lines = _perf_lines(d.get("perf"))
+    if perf_lines:
+        t.append("AGENT PERFORMANCE (30D) — is the automation earning its keep?")
+        for ln in perf_lines:
+            t.append(f"   - {ln}")
+        t.append("")
     if web:
         t.append("6. MARKET & EXTERNAL INTELLIGENCE (LIVE WEB)")
         t.extend(_web_intel_text(web))
@@ -488,6 +543,18 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
         lis(d["big_inv"], lambda r: (f'Overdue invoice {r[0]} <span style="color:{MUTE}">({r[1]})</span> — '
             f'<b>{_money(r[2])}</b>, {r[3]}d overdue'
             + (f' <span style="color:{MUTE}">(large balance, 45d+)</span>' if float(r[2])>25000 and int(r[3])>=45 else '')))))
+
+    if d.get("approvals"):
+        h.append(section(
+            'Approvals Awaiting Your Decision',
+            lis(d["approvals"], lambda r: (
+                f'<b>{r[0]}</b>'
+                + (f' — <b>{_money(r[3])}</b>' if float(r[3] or 0) else '')
+                + f' <span style="color:{MUTE}">proposed by {r[1]} · assigned to {r[2]} ({r[4]})</span>'))))
+
+    if perf_lines:
+        h.append(section('Agent Performance — Last 30 Days',
+                         lis(perf_lines, lambda ln: ln)))
 
     if web:
         h.append(section(
@@ -584,6 +651,15 @@ def render_role(d: Dict[str, Any], deltas: Dict[str, Any], role: str) -> Dict[st
     for s in sections:
         title, inner = sec_html[s]
         h.append(section(title, inner))
+    # Approvals routed to THIS executive (assigned_to is "ROLE Full Name")
+    mine = [r for r in d.get("approvals", []) if str(r[2]).startswith(role)]
+    if mine:
+        h.append(section(
+            'Approvals Awaiting Your Decision',
+            lis(mine, lambda r: (
+                f'<b>{r[0]}</b>'
+                + (f' — <b>{_money(r[3])}</b>' if float(r[3] or 0) else '')
+                + f' <span style="color:{MUTE}">proposed by {r[1]} ({r[4]})</span>'))))
     if web:
         h.append(section(
             f'{web["title"]} '

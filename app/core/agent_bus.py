@@ -531,11 +531,24 @@ async def handle_lead_scored(event: Dict[str, Any]) -> Dict[str, Any]:
         {"score": ctx["score"], "name": name, "company": ctx.get("company")},
         0.9, "info", 72)
 
+    # Start the multi-step follow-up cadence (no-op unless SEQUENCES_ENABLED;
+    # one active run per lead). Best-effort — the outreach above already stands.
+    cadence = None
+    try:
+        from app.core import sequences
+        cadence = await asyncio.to_thread(
+            sequences.start, "lead_followup", "lead", lead_id,
+            {"score": ctx["score"], "name": name},
+            "leads", event.get("correlation_id"))
+    except Exception as exc:
+        logger.warning(f"[agent_bus] lead_followup cadence start failed: {exc}")
+
     return {
         "status": "ok",
         "action": "outreach scheduled",
         "lead": name,
         "score": ctx["score"],
+        "cadence": (cadence or {}).get("status"),
         "handoff": "lead.outreach_scheduled → Notifications inbox",
     }
 
@@ -1000,6 +1013,86 @@ async def handle_order_status_changed(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 HANDLERS["order.status_changed"] = handle_order_status_changed
+
+
+# ============================================================================
+# HANDLER #7  —  email.received  →  Email agent escalates complaints
+# ============================================================================
+# The inbound bridge (app/agents/email/inbound_bridge.py) already recorded the
+# inbound activity — that row IS the engagement signal for cadences/campaigns/
+# intelligence, so most intents are simply acked here. COMPLAINTS escalate:
+# a warning note on the shared blackboard (where churn_save's context check
+# reads) + an urgent owner task. Idempotent per (entity, sender) per 24h.
+
+async def handle_email_received(event: Dict[str, Any]) -> Dict[str, Any]:
+    import json as _json
+    payload = event.get("payload") or {}
+    if isinstance(payload, str):
+        payload = _json.loads(payload or "{}")
+    ctx = payload.get("context") or {}
+    intent = (ctx.get("intent") or "").lower()
+    entity_type = (event.get("entity_type") or "").lower()
+    entity_id = str(event["entity_uuid"]) if event.get("entity_uuid") else None
+
+    if intent != "complaint" or entity_type not in ("account", "lead") or not entity_id:
+        return {"status": "ok", "action": "acked",
+                "reason": f"intent={intent or 'n/a'} — activity row is the signal"}
+
+    sender = ctx.get("from") or "unknown sender"
+    subject = ctx.get("subject") or "(no subject)"
+
+    def _escalate_sync() -> str:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                id_col = "account_id" if entity_type == "account" else "lead_id"
+                cur.execute(
+                    f"""SELECT 1 FROM activities
+                        WHERE {id_col} = %s::uuid AND type='task'
+                          AND subject LIKE 'COMPLAINT –%%'
+                          AND description LIKE %s
+                          AND created_at > now() - interval '24 hours'
+                        LIMIT 1""",
+                    (entity_id, f"%{sender}%"))
+                if cur.fetchone():
+                    return "already escalated within 24h"
+                cur.execute(
+                    f"""SELECT owner_id FROM {'accounts' if entity_type == 'account' else 'leads'}
+                        WHERE {'account_id' if entity_type == 'account' else 'lead_id'} = %s::uuid""",
+                    (entity_id,))
+                r = cur.fetchone()
+                cur.execute(
+                    """INSERT INTO activities
+                         (type, status, subject, description, due_at, direction,
+                          channel, owner_id, related_type, related_id,
+                          account_id, lead_id, created_at, updated_at)
+                       VALUES ('task', 'open', %s, %s, now() + interval '4 hours',
+                               'outbound', 'email', %s, %s, %s::uuid,
+                               %s::uuid, %s::uuid, now(), now())""",
+                    (f"COMPLAINT – {sender}",
+                     f"Inbound complaint ({subject!r}) from {sender}. "
+                     f"Respond within 4 hours; a churn-save context check will "
+                     f"pick this up from the blackboard.",
+                     r[0] if r else None, entity_type, entity_id,
+                     entity_id if entity_type == "account" else None,
+                     entity_id if entity_type == "lead" else None))
+            conn.commit()
+            return "escalated"
+        finally:
+            conn.close()
+
+    outcome = await asyncio.to_thread(_escalate_sync)
+    if outcome == "escalated":
+        from app.core import blackboard
+        await asyncio.to_thread(
+            blackboard.post, entity_type, entity_id, "support", "complaint",
+            f"Complaint received from {sender}: {subject}",
+            {"from": sender, "subject": subject}, 0.9, "warning", 24 * 14)
+    return {"status": "ok", "action": outcome, "intent": "complaint",
+            "handled_by": "email/support"}
+
+
+HANDLERS["email.received"] = handle_email_received
 
 
 # ============================================================================
