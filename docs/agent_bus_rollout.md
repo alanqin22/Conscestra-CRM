@@ -13,6 +13,53 @@ Pre-flight (already verified): Railway has the base event bus
 
 ---
 
+## ✅ STATUS — verified 2026-07-07 (read-only DB probe + local smoke)
+
+**Done already:**
+
+- **Step 2 SQL: 100% applied on Railway.** All 14 checks pass — double-enqueue
+  fix (`UNIQUE(event_uuid)`, 0 dup rows), `event_types.queue_enabled` gate,
+  pilot event types + `fn_emit_*`, invoice self-resolve trigger,
+  `activity.overdue_flagged` / `order.status_changed` / `supervisor.alert`
+  catalog rows, `agent_blackboard`, `action_approvals`, `email_suppression`
+  (CASL), leads enrichment columns. Probe script:
+  `scratchpad railway_readiness_probe.py` (SELECT-only).
+- **Stage A/B are live and working in prod:** last 14 days show 350 dunning
+  drafts + 49 hot-lead outreach activities, 33 `supervisor.alert` events (latest
+  same-day), and live blackboard notes (`ar_risk` 18, `hot_lead` 7).
+- **Local stack proof:** `scratch/smoke_all_phases.py` → **12/12 PASS**
+  (Phases 1–5; 23 A2A capabilities). Script now sends the admin bearer
+  (`ADMIN_API_TOKEN`/`SMOKE_TOKEN`) since the security hardening.
+
+**Remaining gap — the deployed build is STALE (predates the 4 newest handlers
++ catch-all):** 235 pending `event_queue` rows never attempted:
+
+| type | rows | pattern |
+|---|---|---|
+| `opportunity.stage_changed` | 88 | **accruing now** (~20/day) — needs catch-all |
+| `invoice_paid` | 73 | stopped 2026-06-24 — stale, handler post-dates deploy |
+| `order.status_changed` | 73 | stopped 2026-06-24 — same |
+| `lead.created` | 1 | same |
+
+**Next actions (in order):**
+
+1. **Redeploy `master`** on Railway (carries all 6 bespoke handlers, catch-all,
+   notif-triage/retention, pipeline hygiene, CEO briefing — all inert without flags).
+2. Set **`AGENT_BUS_CATCHALL=1`** so `opportunity.stage_changed` settles instead
+   of accruing.
+3. **`POST /agent-bus/drain`** (admin token) to settle the 235-row backlog —
+   boot-cutoff bypass; capped + idempotent; re-run until drained.
+4. Confirm flag stages below: A/B appear ON; verify C (`GOV_ENABLED`) is set
+   **before** ever flipping D/E (`action_approvals` is empty — consistent with
+   C not yet on, or no medium-confidence writes yet).
+5. Anomaly to check post-deploy: event_queue holds **zero completed rows** even
+   though drafts are created daily — either `EVENT_RETENTION_DAYS` is aggressive
+   on Railway or a manual purge swept settled rows. `GET /agent-bus/status` +
+   the Step 5 queue query should show completions after the redeploy; if not,
+   investigate before Stage D.
+
+---
+
 ## Step 1 — Deploy the backend
 
 Railway deploys `master` (commits `9ee1297 → e1a5a91`). With no env flags set the
@@ -51,11 +98,18 @@ Tunables (optional): `AGENT_BUS_OVERDUE_MAX` (nightly dunning cap, code constant
 default 25), `GOV_ACT_MIN`/`GOV_PROPOSE_MIN` (0.8/0.5), `SUPERVISOR_*_MIN`
 thresholds.
 
+Later additions, same one-at-a-time discipline (each has its own APPLY/dry-run
+gate): `AGENT_BUS_CATCHALL=1` (settle unhandled event types — required to stop
+`opportunity.stage_changed` accrual), `NOTIF_TRIAGE_ENABLED=1` →
+`NOTIF_TRIAGE_APPLY=1` (alert-backlog sweep + retention),
+`PIPELINE_HYGIENE_ENABLED=1` → `PIPELINE_HYGIENE_APPLY=1` (stale-deal cleanup),
+`CEO_BRIEFING_ENABLED=1` + `CEO_BRIEFING_EMAIL` (daily 08:00 ET brief).
+
 ## Step 4 — Smoke test on Railway
 
 ```
 GET  /agent-bus/status          # enabled + running, handlers loaded
-GET  /a2a/capabilities          # 22 capabilities
+GET  /a2a/capabilities          # 23 capabilities
 GET  /supervisor/status         # detectors + thresholds
 POST /supervisor/run-once       # breaches + briefing
 GET  /governance/status         # gate thresholds

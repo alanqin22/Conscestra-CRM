@@ -62,8 +62,20 @@ def _gather(account_id: str) -> Dict[str, Any]:
                 "FROM activities WHERE account_id=%s", (account_id,))
             contacts = _one(cur,
                 "SELECT COUNT(*) FROM contacts WHERE account_id=%s", (account_id,))
+            # Persisted customer-intelligence profile (nightly scorer) —
+            # best-effort: tolerate the table not existing yet.
+            try:
+                intel = _one(cur,
+                    "SELECT churn_risk, churn_band, ltv, order_recency_days, "
+                    "       typical_gap_days, next_purchase_due, preferred_channel, "
+                    "       computed_at::date, preferred_hour, interests, "
+                    "       sentiment_score, sentiment_label "
+                    "FROM account_intelligence WHERE account_id=%s", (account_id,))
+            except Exception:
+                conn.rollback()
+                intel = ()
         return {"acct": acct, "rev": rev, "opps": opps, "ar": ar,
-                "acts": acts, "contacts": contacts}
+                "acts": acts, "contacts": contacts, "intel": intel}
     finally:
         conn.close()
 
@@ -81,6 +93,23 @@ def _fact_sheet(d: Dict[str, Any], notes: List[Dict[str, Any]]) -> str:
         f"Overdue activities: {d['acts'][0] or 0}"
         + (f", last touch {d['acts'][1]}" if d['acts'][1] else ""),
     ]
+    intel = d.get("intel") or ()
+    if intel:
+        (risk, band, ltv, rec, gap, next_due, chan, as_of,
+         pref_hour, interests, senti_score, senti_label) = intel
+        lines.append(
+            f"Intelligence profile (nightly scorer, as of {as_of}): "
+            f"churn risk {float(risk):.2f} ({band}) — {rec}d since last order vs "
+            f"typical {gap}d gap; LTV {_money(ltv)}"
+            + (f"; prefers {chan}" if chan else "")
+            + (f", typically engages around {int(pref_hour):02d}:00 ET"
+               if pref_hour is not None else "")
+            + (f"; next purchase expected ~{next_due}" if next_due else ""))
+        if interests:
+            lines.append(f"Buys mostly: {', '.join(interests)}")
+        if senti_label:
+            lines.append(f"Customer-voice sentiment (90d): {senti_label} "
+                         f"({float(senti_score):+.2f})")
     if d["opps"]:
         lines.append("Open opportunities:")
         for o in d["opps"]:

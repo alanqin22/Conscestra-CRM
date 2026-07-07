@@ -93,9 +93,144 @@ def propose(action_type: str, proposed_by: str, params: Dict[str, Any],
         conn.commit()
         logger.info(f"[governance] proposed {action_type} by {proposed_by} "
                     f"(conf={confidence}) → {aid[:8]}")
+        # Route to the right decision-maker (best-effort: tolerates the
+        # governance_routing migration not being applied yet).
+        try:
+            route_approval(aid, action_type, params or {})
+        except Exception as exc:
+            logger.warning(f"[governance] routing skipped for {aid[:8]}: {exc}")
         return aid
     finally:
         conn.close()
+
+
+# ============================================================================
+# Executive routing — who decides this approval?
+# ============================================================================
+
+GOV_ROUTE_EMAIL = _flag("GOV_ROUTE_EMAIL")   # 1 = email the assigned executive
+
+_AMOUNT_KEYS = ("amount", "total_amount", "total", "value", "balance",
+                "computed_balance_due", "ltv")
+
+# action_type keyword → executive role that owns the call
+_ROLE_AFFINITY = (
+    (("invoice", "payment", "dunning", "refund", "credit", "write_off", "ar"), "CFO"),
+    (("opportunity", "deal", "discount", "campaign", "winback", "lead", "email"), "CRO"),
+    (("order", "inventory", "shipment", "stock", "activity"), "COO"),
+)
+
+
+def _amount_from(params: Dict[str, Any]) -> float:
+    for k in _AMOUNT_KEYS:
+        v = (params or {}).get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+def _affinity_role(action_type: str) -> str:
+    at = (action_type or "").lower()
+    for keywords, role in _ROLE_AFFINITY:
+        if any(k in at for k in keywords):
+            return role
+    return "CEO"
+
+
+def route_approval(approval_uuid: str, action_type: str,
+                   params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Assign the approval to an executive: prefer the role that owns this kind
+    of action, then the SMALLEST sufficient approval_authority_limit (delegate
+    down, escalate only when the amount demands it; NULL limit = unlimited).
+    Records the assignment, emits an approval.routed audit event, notifies the
+    executive (in_app when they map to an employee; email when GOV_ROUTE_EMAIL)."""
+    amount = _amount_from(params)
+    role = _affinity_role(action_type)
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT executive_id::text, role_code, full_name, email,
+                          approval_authority_limit, auto_email_enabled,
+                          employee_uuid::text
+                   FROM executives WHERE is_active""")
+            execs = [dict(zip([d[0] for d in cur.description], r))
+                     for r in cur.fetchall()]
+            if not execs:
+                return None
+
+            def limit_of(e):
+                lim = e["approval_authority_limit"]
+                return float(lim) if lim is not None else float("inf")
+
+            candidates = [e for e in execs if limit_of(e) >= amount] or \
+                [max(execs, key=limit_of)]   # nobody sufficient → highest authority
+            # role match first; then smallest sufficient limit; then stable order
+            chosen = sorted(candidates,
+                            key=lambda e: (e["role_code"] != role,
+                                           limit_of(e), e["role_code"]))[0]
+            label = f"{chosen['role_code']} {chosen['full_name']}"
+
+            cur.execute(
+                """UPDATE action_approvals
+                   SET amount=%s, assigned_executive_id=%s::uuid, assigned_to=%s
+                   WHERE approval_uuid=%s::uuid""",
+                (amount, chosen["executive_id"], label, approval_uuid))
+
+            cur.execute(
+                "SELECT emit_event(%s,%s,%s,%s,%s,%s)",
+                ("approval.routed", "approval", approval_uuid,
+                 json.dumps({"context": {"action_type": action_type,
+                                         "amount": amount, "assigned_to": label,
+                                         "affinity_role": role}}),
+                 None, "governance"))
+            event_uuid = cur.fetchone()[0]
+
+            if chosen.get("employee_uuid"):
+                cur.execute(
+                    """INSERT INTO notifications
+                         (employee_uuid, event_uuid, channel, status, title, body, metadata)
+                       VALUES (%s::uuid, %s, 'in_app', 'pending', %s, %s, %s)""",
+                    (chosen["employee_uuid"], event_uuid,
+                     f"🛡️ Approval needed: {action_type}" +
+                     (f" (${amount:,.0f})" if amount else ""),
+                     f"Proposed action awaits your decision. Review in the "
+                     f"governance queue (approval {approval_uuid[:8]}).",
+                     json.dumps({"kind": "approval_routed",
+                                 "approval_uuid": approval_uuid})))
+        conn.commit()
+    finally:
+        conn.close()
+
+    if GOV_ROUTE_EMAIL and chosen.get("auto_email_enabled") and chosen.get("email"):
+        try:
+            from app.agents.email.smtp_imap import send_email
+            send_email(
+                to=chosen["email"],
+                subject=f"Approval needed: {action_type}"
+                        + (f" (${amount:,.0f})" if amount else ""),
+                body_html=(f"<p>A proposed action requires your decision "
+                           f"(within your authority as {label}).</p>"
+                           f"<p><b>{action_type}</b>"
+                           + (f" — ${amount:,.0f}" if amount else "")
+                           + f"<br>Approval ID: {approval_uuid}</p>"
+                           f"<p>Review it in the governance queue.</p>"),
+                body_text=(f"Approval needed: {action_type}"
+                           + (f" (${amount:,.0f})" if amount else "")
+                           + f"\nApproval ID: {approval_uuid}\n"
+                           f"Assigned to: {label}\nReview in the governance queue."),
+            )   # internal/administrative — transactional, not commercial
+        except Exception as exc:
+            logger.warning(f"[governance] route email failed: {exc}")
+
+    logger.info(f"[governance] routed {approval_uuid[:8]} → {label} "
+                f"(amount=${amount:,.0f}, affinity={role})")
+    return {"assigned_to": label, "amount": amount,
+            "executive_id": chosen["executive_id"]}
 
 
 def _row(approval_uuid: str) -> Optional[Dict[str, Any]]:
@@ -126,13 +261,23 @@ def pending() -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """SELECT approval_uuid, action_type, proposed_by, entity_type,
-                          entity_id, params, confidence, severity, created_at,
-                          expires_at
-                   FROM action_approvals
-                   WHERE status='pending' AND (expires_at IS NULL OR expires_at>now())
-                   ORDER BY created_at""")
+            try:
+                cur.execute(
+                    """SELECT approval_uuid, action_type, proposed_by, entity_type,
+                              entity_id, params, confidence, severity, created_at,
+                              expires_at, amount, assigned_to
+                       FROM action_approvals
+                       WHERE status='pending' AND (expires_at IS NULL OR expires_at>now())
+                       ORDER BY created_at""")
+            except Exception:
+                conn.rollback()   # routing migration not applied yet
+                cur.execute(
+                    """SELECT approval_uuid, action_type, proposed_by, entity_type,
+                              entity_id, params, confidence, severity, created_at,
+                              expires_at
+                       FROM action_approvals
+                       WHERE status='pending' AND (expires_at IS NULL OR expires_at>now())
+                       ORDER BY created_at""")
             cols = [c[0] for c in cur.description]
             out = []
             for r in cur.fetchall():

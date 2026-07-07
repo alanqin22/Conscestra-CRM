@@ -240,16 +240,31 @@ def process_inbound_email(email: Dict[str, Any], own_address: str) -> bool:
     import json as _json
 
     skip_reason = should_skip(email, own_address)
-    if skip_reason:
+    # Rate-limited senders are still REAL customer touches — only own-address /
+    # noreply-pattern mail bypasses the CRM bridge entirely.
+    if skip_reason and not skip_reason.startswith('rate-limited'):
         logger.debug(f"Auto-reply skipped: {skip_reason}")
         return False
 
     intent = classify_intent(email)
     logger.info(f"Inbound email intent={intent!r} from={email.get('from','')!r} subject={email.get('subject','')!r}")
 
+    # Bridge into the CRM: inbound activity on the matched contact/lead +
+    # email.received bus event. This is what makes cadence exits ('engaged' /
+    # 're-engaged'), campaign reply attribution, and engagement recency real.
+    try:
+        from app.agents.email.inbound_bridge import record_inbound
+        record_inbound(email, intent)
+    except Exception as exc:
+        logger.warning(f"inbound bridge failed (non-fatal): {exc}")
+
     # Capture customer-voice sentiment for EVERY inbound email (feeds the
     # executive snapshot) — independent of whether we auto-reply.
     store_inbound_sentiment(email, intent)
+
+    if skip_reason:
+        logger.debug(f"Auto-reply skipped: {skip_reason}")
+        return False
 
     if intent not in ('general_inquiry', 'support_request'):
         logger.info(f"Intent '{intent}' does not trigger auto-reply.")

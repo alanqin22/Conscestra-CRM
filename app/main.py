@@ -251,6 +251,40 @@ def _run_emit_hot_lead_events() -> None:
         logger.error(f"[AgentBus] hot-lead emit failed: {exc}", exc_info=True)
 
 
+def _run_emit_sequence_step_events() -> None:
+    """Scheduled job: emit sequence.step_due events for due playbook steps,
+    feeding the agent-bus consumer (multi-step cadences — app/core/sequences.py).
+
+    Gated on both the agent bus and SEQUENCES_ENABLED. Idempotent
+    (one event / sequence / step / 2h)."""
+    try:
+        from app.core import agent_bus, sequences
+        if not (agent_bus.ENABLED and sequences.ENABLED):
+            return
+        from app.core.database import execute_sp
+        rows = execute_sp("SELECT fn_emit_sequence_step_events(50) AS result")
+        n = rows[0].get('result') if rows else 0
+        if n:
+            logger.info(f"[Sequences] emitted {n} sequence.step_due event(s)")
+    except Exception as exc:
+        logger.error(f"[Sequences] step emit failed: {exc}", exc_info=True)
+
+
+def _run_intelligence_scoring() -> None:
+    """Scheduled job: nightly customer-intelligence scoring pass — persists
+    churn risk / RFM / preferred channel per customer account and posts
+    churn_risk blackboard notes for the high band. No-op unless INTEL_ENABLED=1."""
+    try:
+        from app.core import intelligence
+        if not intelligence.ENABLED:
+            return
+        res = intelligence.run_scoring_sync()
+        logger.info(f"[Intelligence] scored={res['scored']} bands={res['bands']} "
+                    f"high_notes={res['high_risk_notes_posted']}")
+    except Exception as exc:
+        logger.error(f"[Intelligence] scoring failed: {exc}", exc_info=True)
+
+
 def _run_supervisor_tick() -> None:
     """Scheduled job: proactive supervisor tick (Phase 3) — read the executive
     KPI pack, detect breaches, emit supervisor.alert events. No-op unless
@@ -405,6 +439,26 @@ async def lifespan(app: FastAPI):
             _run_emit_hot_lead_events,
             trigger=CronTrigger(hour=22, minute=30), # 10:30 PM ET — emit lead.scored (Hot)
             id="emit_hot_lead_events",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        # Agent sequences (cadences) — every 30 min, turn due playbook steps into
+        # sequence.step_due bus events. Self-gates on AGENT_BUS_ENABLED +
+        # SEQUENCES_ENABLED. Steps are day-granularity; 30 min is ample.
+        _scheduler.add_job(
+            _run_emit_sequence_step_events,
+            trigger=IntervalTrigger(minutes=30),
+            id="emit_sequence_step_events",
+            replace_existing=True,
+            misfire_grace_time=1800,
+        )
+        # Customer-intelligence scoring — nightly 22:35 ET, after the seed and
+        # advance passes so profiles reflect the day's final state. Self-gates
+        # on INTEL_ENABLED. Feeds ai_summary + the supervisor churn detector.
+        _scheduler.add_job(
+            _run_intelligence_scoring,
+            trigger=CronTrigger(hour=22, minute=35),
+            id="intelligence_scoring",
             replace_existing=True,
             misfire_grace_time=3600,
         )
@@ -691,6 +745,23 @@ app.include_router(pipeline_hygiene_router, dependencies=_ADMIN)
 # -- Blackboard (Phase 4 — shared agent memory)
 from app.core.blackboard import router as blackboard_router
 app.include_router(blackboard_router, dependencies=_ADMIN)
+
+# -- Agent sequences (multi-step timed playbooks / cadences). Importing the
+#    module also registers the sequence.step_due bus handler.
+from app.core.sequences import router as sequences_router
+app.include_router(sequences_router, dependencies=_ADMIN)
+
+# -- Customer intelligence (nightly churn/preference profile scorer)
+from app.core.intelligence import router as intelligence_router
+app.include_router(intelligence_router, dependencies=_ADMIN)
+
+# -- Marketing agent (segment → CASL-gated campaigns → measure)
+from app.core.marketing import router as marketing_router
+app.include_router(marketing_router, dependencies=_ADMIN)
+
+# -- Learning loop (agent performance analytics + churn calibration read-side)
+from app.core.learning import router as learning_router
+app.include_router(learning_router, dependencies=_ADMIN)
 
 # -- Governance (Phase 5 — confidence-gating + approval queue)
 from app.core.governance import router as governance_router

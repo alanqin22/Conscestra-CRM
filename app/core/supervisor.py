@@ -52,6 +52,7 @@ AR_OVERDUE_MIN = _int("SUPERVISOR_AR_OVERDUE_MIN", 10)
 SLIPPED_MIN    = _int("SUPERVISOR_SLIPPED_MIN", 10)
 UNBILLED_MIN   = _int("SUPERVISOR_UNBILLED_MIN", 3)
 UNWORKED_MIN   = _int("SUPERVISOR_UNWORKED_MIN", 25)
+CHURN_MIN      = _int("SUPERVISOR_CHURN_MIN", 5)   # high-band at-risk customers
 
 ALERT_DEDUPE_HOURS = 12   # one alert per rule per this window
 
@@ -131,8 +132,29 @@ def detect_unworked_leads(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def detect_churn_risk(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Reads the nightly customer-intelligence profile (account_intelligence)
+    rather than the KPI pack. Tolerates the table not existing yet."""
+    try:
+        rows = execute_sp(
+            "SELECT count(*) AS n, COALESCE(SUM(ltv),0) AS ltv "
+            "FROM account_intelligence WHERE churn_band='high'")
+        r = rows[0] if rows else {}
+        n, ltv = int(_num(r.get("n"))), _num(r.get("ltv"))
+    except Exception as exc:
+        logger.debug(f"[supervisor] churn detector skipped: {exc}")
+        return None
+    if n >= CHURN_MIN:
+        return _signal("churn_risk", "high" if n >= CHURN_MIN * 2 else "medium",
+                       f"{n} customers at high churn risk · {_money(ltv)} lifetime value exposed",
+                       "high_churn_accounts", n, "accounts",
+                       "Review /intelligence/at-risk and launch save plays for the top-LTV accounts")
+    return None
+
+
 DETECTORS: List[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = [
     detect_ar_spike, detect_slipped_deals, detect_unbilled_orders, detect_unworked_leads,
+    detect_churn_risk,
 ]
 
 
@@ -242,7 +264,8 @@ def supervisor_status():
     return {"enabled": ENABLED, "autoact": AUTOACT,
             "detectors": [d.__name__ for d in DETECTORS],
             "thresholds": {"ar_overdue_min": AR_OVERDUE_MIN, "slipped_min": SLIPPED_MIN,
-                           "unbilled_min": UNBILLED_MIN, "unworked_min": UNWORKED_MIN}}
+                           "unbilled_min": UNBILLED_MIN, "unworked_min": UNWORKED_MIN,
+                           "churn_min": CHURN_MIN}}
 
 
 @router.post("/supervisor/run-once")
