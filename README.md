@@ -148,117 +148,88 @@ cost, fully explainable:
   sentiment** distilled from their inbound emails.
 - **Expected next purchase date** projected from their historical cadence.
 
-## Every Lead Arrives Qualified
+## Every Lead Arrives Ready for Action
 
-The vision's qualification card is real — and every number on it is earned,
-not guessed:
+Conscestra doesn't simply capture leads — it prepares them for your sales
+team.
 
-- **Win probability from history**: "82%" means 82% of settled leads in the
-  same score band actually converted — smoothed so small samples can't scream
-  certainty, sharpening as more leads settle.
-- **Recommended sales rep, with the reason**: ranked by who already manages
-  accounts in the lead's industry, then by lightest current lead load —
-  *"David: manages 4 Software accounts, current load 2 open leads."*
-- **Company enrichment with real providers**: plug in Apollo or People Data
-  Labs with one env var, or use the built-in **keyless web lookup** — and
-  because enrichment only ever gap-fills, a low-confidence result can never
-  overwrite what a human entered.
+Every new lead is automatically enriched, verified, and intelligently scored.
+Historical conversion data predicts the probability of closing, while AI
+recommends the best sales representative based on industry expertise, customer
+history, and current workload. External enrichment fills in missing business
+information without ever overwriting human-entered data, ensuring your CRM
+becomes more complete over time while preserving data integrity.
 
-## Agents That Run Multi-Step Plays
+## AI Agents Execute Complete Business Workflows
 
-One-shot reactions became **cadences** — durable, multi-day playbooks that
-act, wait, re-check, and escalate without human coordination:
+Traditional automation reacts once.
 
-- A hot lead triggers a follow-up play: intro email draft, reminder after
-  three days, meeting offer, then nurture — and the play **exits itself the
-  moment the lead engages**.
-- A customer entering high churn risk triggers the **churn-save play**:
-  Support consolidates complaint context, Marketing drafts a personalized
-  win-back offer on the customer's preferred channel, and management is
-  alerted if silence persists. A new order or an inbound reply ends the play
-  as *won back*.
-- Multi-day steps schedule themselves at the customer's preferred engagement
-  hour.
+Conscestra's AI Agents execute complete, multi-step business plays.
 
-Inbound email is a first-class signal: every reply is matched to its contact
-or lead, recorded on the timeline, and can end a running play — complaints
-escalate automatically to the account owner.
+A promising lead automatically enters a personalized follow-up sequence.
+Emails are drafted, reminders scheduled, meetings proposed, and nurturing
+continues until the prospect responds or the opportunity closes.
 
-## Marketing That Generates, Tests, and Asks Permission
+Customers showing signs of churn trigger retention plays that combine customer
+history, support interactions, and AI-generated win-back campaigns. New
+orders, customer replies, or resolved issues automatically conclude the
+workflow.
 
-The **Marketing agent** builds campaigns as segments over the intelligence
-profiles (churn band, lifetime value, industry, preferred channel) — and now
-**writes them too**: campaign content is LLM-drafted from the segment
-description (with a deterministic template fallback), always preserving the
-personalization placeholders. Every campaign can carry an **A/B subject
-pair**; recipients split 50/50 and results report reply rates per variant
-with a leading-subject verdict.
+Every inbound email becomes a live business signal — matched to the correct
+customer, recorded on the timeline, and capable of triggering the next
+intelligent action. Marketing campaigns are generated directly from customer
+segments, optimized through A/B testing, and always respect consent,
+suppression lists, verified recipients, and unsubscribe preferences.
 
-Every send still passes the CASL compliance stack — suppression list,
-verified recipients, unsubscribe footer — and campaigns measure their own
-results: replies and orders attributed since launch.
+Your business keeps moving — even while your team sleeps.
 
-The showcase: when the supervisor detects a **churn spike**, it doesn't just
-alert — it *proposes a win-back campaign to the governance queue*. The
-proposal routes to the CRO; a human approval executes it. An agent initiating
-commercial action, entirely within policy.
+## Autonomous, Yet Always Governed
 
-## Approve From Your Phone. Undo When You Must.
+AI should never act without accountability.
 
-Governance approvals **route themselves to the right executive**: the system
-extracts the dollar amount, matches the action domain (finance → CFO,
-revenue → CRO, operations → COO), and respects each executive's
-approval-authority limit — escalating only when the amount demands it.
+Every commercial action follows intelligent governance policies. Approval
+requests are automatically routed to the appropriate executive based on
+business function, approval authority, and financial limits. Executives can
+approve or reject requests from any device with secure one-click actions — no
+login required.
 
-The routed email carries **one-click Approve / Reject buttons** — HMAC-signed
-links, single-use by construction, no sign-in needed. The executive decides
-from their phone; the CRM renders a confirmation page and executes.
+Where appropriate, actions can be reversed within configurable time windows,
+approval requests automatically expire, confidence thresholds determine when
+human review is required, and continuous health monitoring ensures every
+automation remains transparent and reliable.
 
-And because accountable autonomy cuts both ways:
+Even the supervisors are supervised.
 
-- **Undo** — an executed action can be reversed within its undo window; the
-  audit trail records honestly what could not be un-done (a sent email stays
-  sent).
-- **Expiry** — pending approvals past their TTL flip to *expired* nightly,
-  never lingering as silent liabilities.
-- **Policy-gated autonomy** — even the supervisor's own auto-actions run
-  through the confidence policy; tighten one threshold and they queue for
-  approval instead of acting.
-- **A heartbeat on the machinery itself** — if the event-bus consumer ever
-  dies silently, a supervisor detector raises a high-severity alert. The
-  watchers are watched.
+## AI That Learns From Results
 
-## The System Grades Its Own Homework
+Conscestra continuously measures its own performance.
 
-Autonomy without accountability is noise. Conscestra closes the learning
-loop:
+Predictions are compared against actual business outcomes. Churn forecasts,
+sales probabilities, marketing campaigns, and automated workflows are
+evaluated against real-world results, allowing the platform to recommend
+evidence-based improvements rather than relying on assumptions.
 
-- Every night's churn predictions are **snapshotted**, and a month later the
-  system **calibrates itself** — comparing who it flagged against who
-  actually stopped ordering, and recommending threshold adjustments from
-  evidence.
-- The CEO briefing carries an **Agent Performance report card**: cadence
-  save-rates, campaign conversion, prediction precision — is the automation
-  earning its keep?
-- Tuning stays a human decision. The system presents evidence; it never
-  silently rewires itself.
+Each morning, executives receive a concise AI Performance Briefing
+highlighting conversion rates, customer retention, campaign effectiveness,
+prediction accuracy, and the measurable business impact delivered by every AI
+Agent.
+
+Every recommendation is supported by evidence. Nothing changes without
+oversight.
 
 ## Governance Before Autonomy
 
-Autonomous systems create value only when they remain accountable. For this
-reason, governance is embedded into every layer of the platform.
+Powerful AI demands responsible governance.
 
-Outreach remains opt-in and safe by default. Overdue invoice reminders may
-draft and prepare themselves, but delivery remains governed by consent
-management, verified recipients, unsubscribe controls, and optional human
-approval workflows.
+Every automated action operates within transparent business policies.
+Communications respect customer consent, verified recipients, suppression
+lists, and unsubscribe preferences. Financial decisions follow approval
+hierarchies. Every action is logged, attributable, reviewable, and fully
+auditable.
 
-Agents draft before they send. Customers decide whether they wish to receive
-communication. Every message remains attributable, reviewable, and
-reversible.
+AI Agents prepare. People remain in control.
 
-Automation without accountability is risk. **Conscestra refuses to separate
-the two.**
+Because autonomous systems create value only when they earn trust.
 
 ## Security as a Foundational Principle
 
