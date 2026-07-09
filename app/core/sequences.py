@@ -34,6 +34,24 @@ Append to PLAYBOOKS: a list of steps, each {"wait_hours": H, "action": name}.
 wait_hours is the delay from the PREVIOUS step (step 1: from start()). Implement
 the action as `def _act_<name>(seq, ctx) -> dict` and add it to _ACTIONS, and an
 exit-check per entity type in _exit_reason() if the defaults don't fit.
+
+BRANCHING (conditional routing) — playbooks are graphs now, not just lines
+--------------------------------------------------------------------------
+Optional step fields (all backward compatible — plain steps run linearly):
+  "id": name          addressable step name (default: the action name)
+  "next": id | None   where the flow goes after acting (default: next list
+                      item; None = complete the run). Side-branch steps —
+                      reachable only via a goto — sit AFTER a `next: None`
+                      step so the linear walk never falls into them.
+  "branch": [{"when": <condition>, "goto": <id>, "outcome": <opt>}]
+                      evaluated when the step comes DUE, before acting:
+                      first matching condition redirects — the TARGET step
+                      acts now instead. Conditions live in _CONDITIONS
+                      (deterministic entity/blackboard checks, no LLM).
+Signal routing: SIGNAL_ROUTES lets an exit-check outcome ROUTE instead of
+merely ending the run (e.g. lead replies mid-cadence → book the meeting
+while it's hot, then complete). Each signal routes at most once per run and
+branch jumps are capped (MAX_JUMPS) — no cycles.
 """
 
 from __future__ import annotations
@@ -64,22 +82,46 @@ PLAYBOOKS: Dict[str, List[Dict[str, Any]]] = {
         {"wait_hours": 2,   "action": "draft_intro_email"},
         {"wait_hours": 72,  "action": "reminder_task"},
         {"wait_hours": 96,  "action": "offer_meeting"},
-        {"wait_hours": 168, "action": "move_to_nurture"},
+        {"wait_hours": 168, "action": "move_to_nurture", "next": None},
+        # Side branch — reached only when the lead ENGAGES mid-cadence (see
+        # SIGNAL_ROUTES): don't just end the run, book the meeting while hot.
+        {"id": "book_meeting", "wait_hours": 1, "action": "book_meeting",
+         "next": None},
     ],
     # The churn-save play (accounts) — started by the intelligence scorer when
     # an account ENTERS the high churn band. The vision's "Sales flags churn →
     # Support checks complaints → offer goes out → escalate" story:
     #   1 (+1h)  Support beat: consolidate complaint/risk context, task the owner
     #   2 (+2d)  Marketing beat: personalized win-back offer DRAFT (their channel)
+    #            — UNLESS there's an open complaint: a discount on top of an
+    #            unresolved grievance reads as tone-deaf; escalate instead.
     #   3 (+5d)  Escalation beat: still silent → executive-outreach task
     # Exits early when the account is SAVED: new order (won_back), inbound touch
     # (re-engaged), or churn risk back to low (risk_subsided).
     "churn_save": [
         {"wait_hours": 1,   "action": "churn_context_check"},
-        {"wait_hours": 48,  "action": "churn_offer_draft"},
+        {"wait_hours": 48,  "action": "churn_offer_draft",
+         "branch": [{"when": "complaint_on_blackboard",
+                     "goto": "churn_exec_escalation",
+                     "outcome": "complaint_escalated"}]},
         {"wait_hours": 120, "action": "churn_exec_escalation"},
     ],
 }
+
+# Exit-check outcomes that ROUTE to a step instead of ending the run.
+# Only 'completed'-status signals route (moot/cancelled always end); each
+# signal routes at most once per run (context.routed), so a re-fire of the
+# same signal completes the run normally.
+SIGNAL_ROUTES: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "lead_followup": {"engaged": {"goto": "book_meeting"}},
+}
+
+MAX_JUMPS = 3   # branch-goto cap per run — a playbook typo can't loop forever
+
+
+def _step_index(steps: List[Dict[str, Any]]) -> Dict[str, int]:
+    """step id (default: action name) → 0-based list index."""
+    return {(s.get("id") or s["action"]): i for i, s in enumerate(steps)}
 
 
 # ============================================================================
@@ -94,9 +136,14 @@ def start(playbook: str, entity_type: str, entity_uuid: str,
     active run already exists for (playbook, entity)."""
     if not ENABLED:
         return {"status": "skipped", "reason": "SEQUENCES_ENABLED=0"}
-    steps = PLAYBOOKS.get(playbook)
-    if not steps:
+    spec = get_playbook(playbook)
+    if not spec:
         return {"status": "error", "reason": f"unknown playbook {playbook!r}"}
+    if spec.get("entity_type") and spec["entity_type"] != entity_type:
+        return {"status": "error",
+                "reason": f"playbook {playbook!r} targets "
+                          f"{spec['entity_type']!r} entities, not {entity_type!r}"}
+    steps = spec["steps"]
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -184,8 +231,12 @@ def _aligned_step_at(wait_hours: int, preferred_hour: Optional[int]):
     return target
 
 
-def _advance_sync(sequence_uuid: str, from_step: int, wait_hours: int,
-                  result: Dict[str, Any], next_at=None) -> None:
+def _advance_sync(sequence_uuid: str, from_step: int, to_step: int,
+                  wait_hours: int, result: Dict[str, Any], next_at=None,
+                  context: Optional[Dict[str, Any]] = None) -> None:
+    """Move the pointer to `to_step` (1-based; linear = from_step+1, but branch
+    gotos may land anywhere). Optionally persists updated run context (routing
+    history). Guarded on the current step so a redelivered event can't double-fire."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -193,10 +244,13 @@ def _advance_sync(sequence_uuid: str, from_step: int, wait_hours: int,
                 """UPDATE agent_sequences
                    SET step_no = %s,
                        next_step_at = COALESCE(%s, now() + make_interval(hours => %s)),
-                       last_result = %s::jsonb, updated_at = now()
+                       last_result = %s::jsonb,
+                       context = COALESCE(%s::jsonb, context),
+                       updated_at = now()
                    WHERE sequence_uuid = %s::uuid
                      AND status = 'active' AND step_no = %s""",
-                (from_step + 1, next_at, wait_hours, json.dumps(result),
+                (to_step, next_at, wait_hours, json.dumps(result),
+                 json.dumps(context) if context is not None else None,
                  sequence_uuid, from_step),
             )
         conn.commit()
@@ -313,6 +367,37 @@ def _exit_reason_sync(seq: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 
 # ============================================================================
+# BRANCH CONDITIONS — deterministic checks a due step can route on.
+# fn(seq, entity) -> bool; keep them cheap, fresh-state, and LLM-free.
+# ============================================================================
+
+def _cond_complaint_on_blackboard(seq: Dict[str, Any],
+                                  entity: Optional[Dict[str, Any]]) -> bool:
+    """An unexpired complaint note exists for this entity (posted by the
+    email.received handler / support agent)."""
+    try:
+        from app.core import blackboard
+        return bool(blackboard.read(seq["entity_type"], seq["entity_uuid"],
+                                    "complaint"))
+    except Exception as exc:
+        logger.warning(f"[sequences] complaint condition failed (treat False): {exc}")
+        return False
+
+
+def _cond_overdue_ar(seq: Dict[str, Any],
+                     entity: Optional[Dict[str, Any]]) -> bool:
+    """The account carries overdue invoices (from the intelligence profile) —
+    e.g. don't lead with a discount while their balance is past due."""
+    return bool(int((entity or {}).get("overdue_invoices") or 0))
+
+
+_CONDITIONS = {
+    "complaint_on_blackboard": _cond_complaint_on_blackboard,
+    "overdue_ar":              _cond_overdue_ar,
+}
+
+
+# ============================================================================
 # STEP ACTIONS — internal CRM records only (drafts/tasks), never SMTP
 # ============================================================================
 
@@ -395,6 +480,27 @@ def _act_offer_meeting(seq: Dict[str, Any], lead: Dict[str, Any]) -> Dict[str, A
          f"concrete time slots — lower-friction than another email thread."),
         due_hours=24, owner_id=lead.get("owner_id"), lead_id=lead["lead_id"])
     return {"action": "offer_meeting", "activity": "meeting offer created"}
+
+
+def _act_book_meeting(seq: Dict[str, Any], lead: Dict[str, Any]) -> Dict[str, Any]:
+    """Signal-routed step: the lead ENGAGED mid-cadence. Strike while hot —
+    urgent owner task to lock a meeting within 24h, plus a blackboard note so
+    every agent sees the lead is live."""
+    from app.core import blackboard
+    name = _lead_display(lead)
+    _insert_activity_sync(
+        "meeting",
+        f"Cadence WIN: {name} replied – book the meeting NOW",
+        (f"{name} engaged mid-cadence (inbound reply). Momentum is highest in "
+         f"the first 24 hours — propose two concrete slots today and confirm "
+         f"the meeting. Auto-routed by the lead_followup cadence."),
+        due_hours=4, owner_id=lead.get("owner_id"), lead_id=lead["lead_id"])
+    blackboard.post(
+        "lead", lead["lead_id"], "orchestrator", "hot_engagement",
+        f"{name} replied mid-cadence — meeting-booking task issued",
+        {"playbook": seq["playbook"], "score": lead.get("score")},
+        0.9, "info", 24 * 7)
+    return {"action": "book_meeting", "activity": "meeting-booking task created"}
 
 
 def _act_move_to_nurture(seq: Dict[str, Any], lead: Dict[str, Any]) -> Dict[str, Any]:
@@ -518,6 +624,7 @@ _ACTIONS = {
     "draft_intro_email":     _act_draft_intro_email,
     "reminder_task":         _act_reminder_task,
     "offer_meeting":         _act_offer_meeting,
+    "book_meeting":          _act_book_meeting,
     "move_to_nurture":       _act_move_to_nurture,
     "churn_context_check":   _act_churn_context_check,
     "churn_offer_draft":     _act_churn_offer_draft,
@@ -529,12 +636,124 @@ _LOADERS = {"lead": _load_lead_sync, "account": _load_account_sync}
 
 
 # ============================================================================
+# PLAYBOOKS AS DATA — agent_playbooks rows override the code PLAYBOOKS
+# (improvement #5: a new cadence ships as a ROW, not a deploy). Rows are
+# validated against the action/condition registries so arbitrary code can
+# never enter through the table; invalid rows are skipped with a warning
+# (code fallback still applies).
+# ============================================================================
+
+_pb_cache = {"at": 0.0, "v": {}}
+
+
+def validate_playbook(spec: Dict[str, Any]) -> List[str]:
+    """All the reasons this playbook spec is unusable ([] = valid)."""
+    errs: List[str] = []
+    et = spec.get("entity_type")
+    if et and et not in _LOADERS:
+        errs.append(f"entity_type {et!r} has no loader "
+                    f"(known: {sorted(_LOADERS)})")
+    steps = spec.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return errs + ["steps must be a non-empty list"]
+    ids: List[str] = []
+    for i, s in enumerate(steps, 1):
+        if not isinstance(s, dict):
+            errs.append(f"step {i}: not an object")
+            continue
+        if s.get("action") not in _ACTIONS:
+            errs.append(f"step {i}: unknown action {s.get('action')!r} "
+                        f"(registered: {sorted(_ACTIONS)})")
+        try:
+            if int(s.get("wait_hours")) < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            errs.append(f"step {i}: wait_hours must be an int ≥ 0")
+        ids.append(s.get("id") or str(s.get("action")))
+    if len(set(ids)) != len(ids):
+        errs.append(f"duplicate step ids: {sorted({x for x in ids if ids.count(x) > 1})}")
+    known = set(ids)
+    for i, s in enumerate(steps, 1):
+        if not isinstance(s, dict):
+            continue
+        if "next" in s and s["next"] is not None and s["next"] not in known:
+            errs.append(f"step {i}: next {s['next']!r} is not a step id")
+        for rule in (s.get("branch") or []):
+            if not isinstance(rule, dict):
+                errs.append(f"step {i}: branch rule not an object")
+                continue
+            if rule.get("when") not in _CONDITIONS:
+                errs.append(f"step {i}: unknown branch condition {rule.get('when')!r} "
+                            f"(registered: {sorted(_CONDITIONS)})")
+            if rule.get("goto") not in known:
+                errs.append(f"step {i}: branch goto {rule.get('goto')!r} is not a step id")
+    for outcome, route in (spec.get("signal_routes") or {}).items():
+        if not isinstance(route, dict) or route.get("goto") not in known:
+            errs.append(f"signal route {outcome!r}: goto "
+                        f"{(route or {}).get('goto')!r} is not a step id")
+    return errs
+
+
+def _load_db_playbooks_sync() -> Dict[str, Dict[str, Any]]:
+    """Enabled agent_playbooks rows → validated specs (invalid rows skipped).
+    Tolerates the table not existing (returns {})."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT playbook, entity_type, steps, signal_routes "
+                        "FROM agent_playbooks WHERE enabled")
+            rows = cur.fetchall()
+    except Exception as exc:
+        logger.debug(f"[sequences] agent_playbooks read skipped: {exc}")
+        return {}
+    finally:
+        conn.close()
+    out: Dict[str, Dict[str, Any]] = {}
+    for name, et, steps, routes in rows:
+        if isinstance(steps, str):
+            steps = json.loads(steps or "[]")
+        if isinstance(routes, str):
+            routes = json.loads(routes or "{}")
+        spec = {"steps": steps, "signal_routes": routes or {},
+                "entity_type": et, "source": "db"}
+        errs = validate_playbook(spec)
+        if errs:
+            logger.warning(f"[sequences] DB playbook {name!r} invalid — "
+                           f"skipped (code fallback applies): {errs}")
+            continue
+        out[name] = spec
+    return out
+
+
+def db_playbooks(force: bool = False) -> Dict[str, Dict[str, Any]]:
+    import time
+    if force or time.time() - _pb_cache["at"] > 60:
+        _pb_cache["v"] = _load_db_playbooks_sync()
+        _pb_cache["at"] = time.time()
+    return _pb_cache["v"]
+
+
+def get_playbook(name: str) -> Optional[Dict[str, Any]]:
+    """Resolved spec {'steps','signal_routes','entity_type','source'} —
+    a DB row overrides the code playbook of the same name."""
+    spec = db_playbooks().get(name)
+    if spec:
+        return spec
+    steps = PLAYBOOKS.get(name)
+    if steps is None:
+        return None
+    return {"steps": steps, "signal_routes": SIGNAL_ROUTES.get(name) or {},
+            "entity_type": None, "source": "code"}
+
+
+# ============================================================================
 # BUS HANDLER — sequence.step_due
 # ============================================================================
 
 async def handle_sequence_step_due(event: Dict[str, Any]) -> Dict[str, Any]:
     """Run one due step of a playbook instance: re-validate, exit early if the
-    goal is met/moot, act, advance (or complete after the last step)."""
+    goal is met/moot (or ROUTE if the signal has a route), evaluate the due
+    step's branch conditions, act, advance along the graph (or complete)."""
     seq_id = str(event["entity_uuid"])
     payload = event.get("payload") or {}
     if isinstance(payload, str):
@@ -551,20 +770,43 @@ async def handle_sequence_step_due(event: Dict[str, Any]) -> Dict[str, Any]:
     if ev_step is not None and int(ev_step) != step_no:
         return {"status": "skipped", "reason": "stale step event"}
 
-    steps = PLAYBOOKS.get(seq["playbook"])
+    spec = await asyncio.to_thread(get_playbook, seq["playbook"])
+    steps = (spec or {}).get("steps")
     if not steps or not (1 <= step_no <= len(steps)):
         await asyncio.to_thread(_finish_sync, seq_id, "failed",
                                 f"unknown playbook/step {seq['playbook']}#{step_no}",
                                 {}, seq.get("correlation_id"))
         return {"status": "error", "reason": f"unknown playbook {seq['playbook']!r}"}
 
-    # Goal met or moot? End the cadence instead of acting.
+    index = _step_index(steps)
+    run_ctx = seq.get("context") or {}
+    if isinstance(run_ctx, str):
+        run_ctx = json.loads(run_ctx or "{}")
+    routed = dict(run_ctx.get("routed") or {})
+    jumps = list(run_ctx.get("jumps") or [])
+
+    act_idx = step_no - 1          # 0-based step that will act
+    redirect: Optional[str] = None
+    outcome_override: Optional[str] = None
+    ctx_dirty = False
+
+    # Goal met or moot? Either ROUTE (signal has a route, once per run) or end.
     exit_ = await asyncio.to_thread(_exit_reason_sync, seq)
     if exit_:
-        await asyncio.to_thread(_finish_sync, seq_id, exit_["status"],
-                                exit_["outcome"], {"exited_at_step": step_no},
-                                seq.get("correlation_id"))
-        return {"status": "ok", "action": "exited", **exit_}
+        route = (spec.get("signal_routes") or {}).get(exit_["outcome"])
+        tgt = index.get(route["goto"]) if route else None
+        if (route and exit_["status"] == "completed" and tgt is not None
+                and exit_["outcome"] not in routed):
+            act_idx = tgt
+            redirect = f"signal:{exit_['outcome']}->{route['goto']}"
+            outcome_override = route.get("outcome") or exit_["outcome"]
+            routed[exit_["outcome"]] = route["goto"]
+            ctx_dirty = True
+        else:
+            await asyncio.to_thread(_finish_sync, seq_id, exit_["status"],
+                                    exit_["outcome"], {"exited_at_step": step_no},
+                                    seq.get("correlation_id"))
+            return {"status": "ok", "action": "exited", **exit_}
 
     loader = _LOADERS.get(seq["entity_type"])
     entity = await asyncio.to_thread(loader, seq["entity_uuid"]) if loader else None
@@ -573,19 +815,56 @@ async def handle_sequence_step_due(event: Dict[str, Any]) -> Dict[str, Any]:
                                 {}, seq.get("correlation_id"))
         return {"status": "skipped", "reason": "entity missing"}
 
-    action_name = steps[step_no - 1]["action"]
-    result = await asyncio.to_thread(_ACTIONS[action_name], seq, entity)
+    # Branch conditions of the DUE step (skipped when a signal already routed).
+    if not redirect:
+        for rule in (steps[act_idx].get("branch") or []):
+            cond = _CONDITIONS.get(rule.get("when", ""))
+            tgt = index.get(rule.get("goto", ""))
+            if not cond or tgt is None or tgt == act_idx:
+                continue
+            if len(jumps) >= MAX_JUMPS:
+                logger.warning(f"[sequences] {seq_id} hit MAX_JUMPS — "
+                               f"continuing linearly")
+                break
+            if await asyncio.to_thread(cond, seq, entity):
+                redirect = f"branch:{rule['when']}->{rule['goto']}"
+                jumps.append({"from": step_no, "to": tgt + 1,
+                              "when": rule["when"]})
+                act_idx = tgt
+                outcome_override = rule.get("outcome")
+                ctx_dirty = True
+                break
 
-    if step_no >= len(steps):
-        await asyncio.to_thread(_finish_sync, seq_id, "completed", "exhausted",
+    step = steps[act_idx]
+    result = await asyncio.to_thread(_ACTIONS[step["action"]], seq, entity)
+    if redirect:
+        result["routed"] = redirect
+
+    # Where does the flow go after the ACTED step? Explicit `next` wins
+    # (None = complete); default is the following list item; past the end
+    # completes. An unknown `next` id completes too (fail safe, logged).
+    if "next" in step:
+        next_idx = index.get(step["next"]) if step["next"] else None
+        if step["next"] and next_idx is None:
+            logger.warning(f"[sequences] {seq['playbook']}: unknown next "
+                           f"{step['next']!r} — completing run")
+    else:
+        next_idx = act_idx + 1 if act_idx + 1 < len(steps) else None
+
+    acted = f"{act_idx + 1}/{len(steps)}"
+    if next_idx is None:
+        outcome = outcome_override or "exhausted"
+        await asyncio.to_thread(_finish_sync, seq_id, "completed", outcome,
                                 result, seq.get("correlation_id"))
-        return {"status": "ok", "step": f"{step_no}/{len(steps)}", **result,
-                "sequence": "completed (exhausted)"}
+        return {"status": "ok", "step": acted, **result,
+                "sequence": f"completed ({outcome})"}
 
-    next_wait = int(steps[step_no]["wait_hours"])
+    next_wait = int(steps[next_idx]["wait_hours"])
     aligned = _aligned_step_at(next_wait, (entity or {}).get("preferred_hour"))
-    await asyncio.to_thread(_advance_sync, seq_id, step_no, next_wait, result, aligned)
-    return {"status": "ok", "step": f"{step_no}/{len(steps)}", **result,
+    new_ctx = {**run_ctx, "routed": routed, "jumps": jumps} if ctx_dirty else None
+    await asyncio.to_thread(_advance_sync, seq_id, step_no, next_idx + 1,
+                            next_wait, result, aligned, new_ctx)
+    return {"status": "ok", "step": acted, **result,
             "next_step_in_hours": next_wait,
             **({"aligned_to_preferred_hour": aligned.isoformat()} if aligned else {})}
 
@@ -611,9 +890,12 @@ def sequences_status():
             counts = dict(cur.fetchall())
     finally:
         conn.close()
-    return {"enabled": ENABLED,
-            "playbooks": {k: [s["action"] for s in v] for k, v in PLAYBOOKS.items()},
-            "counts": counts}
+    merged = {k: {"source": "code", "steps": [s["action"] for s in v]}
+              for k, v in PLAYBOOKS.items()}
+    for k, spec in db_playbooks(force=True).items():
+        merged[k] = {"source": "db",
+                     "steps": [s["action"] for s in spec["steps"]]}
+    return {"enabled": ENABLED, "playbooks": merged, "counts": counts}
 
 
 @router.get("/sequences/list")
@@ -633,6 +915,108 @@ def sequences_list(status: str = "active", limit: int = 50):
     finally:
         conn.close()
     return {"status": status, "count": len(rows), "sequences": rows}
+
+
+@router.get("/sequences/playbooks")
+def sequences_playbooks():
+    """Every playbook, resolved: DB rows (including disabled) + code built-ins.
+    A DB row named like a code playbook overrides it while enabled."""
+    out = {k: {"source": "code", "entity_type": None, "enabled": True,
+               "steps": v, "signal_routes": SIGNAL_ROUTES.get(k) or {}}
+           for k, v in PLAYBOOKS.items()}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT playbook, entity_type, steps, signal_routes, "
+                        "enabled, description, updated_by, updated_at "
+                        "FROM agent_playbooks ORDER BY playbook")
+            for name, et, steps, routes, enabled, desc, by, at in cur.fetchall():
+                out[name] = {
+                    "source": "db", "entity_type": et, "enabled": enabled,
+                    "steps": steps, "signal_routes": routes or {},
+                    "description": desc, "updated_by": by,
+                    "updated_at": at.isoformat() if at else None,
+                    "overrides_code": name in PLAYBOOKS,
+                    "errors": validate_playbook(
+                        {"entity_type": et, "steps": steps,
+                         "signal_routes": routes or {}}) or None}
+    except Exception as exc:
+        logger.debug(f"[sequences] playbooks listing (table missing?): {exc}")
+    finally:
+        conn.close()
+    return {"registries": {"actions": sorted(_ACTIONS),
+                           "conditions": sorted(_CONDITIONS),
+                           "entity_types": sorted(_LOADERS)},
+            "playbooks": out}
+
+
+@router.put("/sequences/playbooks/{name}")
+def sequences_playbook_upsert(name: str, body: Dict[str, Any]):
+    """Create or update a playbook as data. Validated against the registered
+    action/condition registries — a row that names an unregistered action is
+    refused, so this endpoint can never introduce new code paths."""
+    spec = {"entity_type": body.get("entity_type"),
+            "steps": body.get("steps"),
+            "signal_routes": body.get("signal_routes") or {}}
+    if not spec["entity_type"]:
+        return {"ok": False, "errors": ["entity_type is required (lead|account)"]}
+    errs = validate_playbook(spec)
+    if errs:
+        return {"ok": False, "errors": errs}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO agent_playbooks
+                     (playbook, entity_type, steps, signal_routes, enabled,
+                      description, updated_by)
+                   VALUES (%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)
+                   ON CONFLICT (playbook) DO UPDATE
+                   SET entity_type=EXCLUDED.entity_type, steps=EXCLUDED.steps,
+                       signal_routes=EXCLUDED.signal_routes,
+                       enabled=EXCLUDED.enabled,
+                       description=EXCLUDED.description,
+                       updated_by=EXCLUDED.updated_by, updated_at=now()""",
+                (name, spec["entity_type"], json.dumps(spec["steps"]),
+                 json.dumps(spec["signal_routes"]),
+                 bool(body.get("enabled", True)), body.get("description"),
+                 body.get("updated_by", "admin")))
+        conn.commit()
+    finally:
+        conn.close()
+    _pb_cache["at"] = 0.0     # take effect immediately
+    logger.info(f"[sequences] playbook {name!r} upserted "
+                f"(enabled={body.get('enabled', True)})")
+    return {"ok": True, "playbook": name, "source": "db",
+            "overrides_code": name in PLAYBOOKS,
+            "steps": len(spec["steps"])}
+
+
+@router.delete("/sequences/playbooks/{name}")
+def sequences_playbook_delete(name: str):
+    """Remove a DB playbook (code fallback, if any, applies again). Refused
+    while active runs depend on it and no code fallback exists — they would
+    orphan and fail their next step."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            if name not in PLAYBOOKS:
+                cur.execute("SELECT count(*) FROM agent_sequences "
+                            "WHERE playbook=%s AND status='active'", (name,))
+                n = cur.fetchone()[0]
+                if n:
+                    return {"ok": False,
+                            "error": f"{n} active run(s) use {name!r} and no code "
+                                     f"fallback exists — cancel them first"}
+            cur.execute("DELETE FROM agent_playbooks WHERE playbook=%s "
+                        "RETURNING playbook", (name,))
+            deleted = cur.fetchone() is not None
+        conn.commit()
+    finally:
+        conn.close()
+    _pb_cache["at"] = 0.0
+    return {"ok": deleted, "playbook": name,
+            "fallback": "code" if name in PLAYBOOKS else None}
 
 
 @router.post("/sequences/start")

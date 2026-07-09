@@ -213,6 +213,21 @@ def _sp_supervisor_emit_hot_leads(p: Dict[str, Any]) -> Any:
     return {"emitted_lead_scored_events": rows[0].get("r") if rows else 0}
 
 
+def _sp_objectives_report(p: Dict[str, Any]) -> Any:
+    """Goal-oriented supervisor (Phase 8): objectives vs targets, live."""
+    from app.core import objectives
+    return {"objectives": objectives.report()}
+
+
+def _sp_tuning_adjust(p: Dict[str, Any]) -> Any:
+    """Learning loop: write a governed model parameter (executed on approval).
+    tuning.apply() enforces the hard bounds + band ordering."""
+    from app.core import tuning
+    return tuning.apply(str(p.get("param") or ""), float(p.get("value")),
+                        updated_by="governance",
+                        reason=p.get("why") or "approved tuning.adjust")
+
+
 # ---- peer handoff / negotiation -------------------------------------------
 async def delegate(parent: "A2ARequest", sub_intent: str,
                    params: Optional[Dict[str, Any]] = None,
@@ -307,6 +322,18 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "kick the hot-lead outreach loop (supervisor auto-action; "
                "queued for approval when governance tightens ACT_MIN)",
                sp=_sp_supervisor_emit_hot_leads),
+    Capability("objectives.report", "supervisor", "", "read",
+               lambda p: "business objectives status",
+               "goal-oriented supervisor: every business objective with live "
+               "metric value, expected trajectory point, judgment "
+               "(achieved/on_track/at_risk/off_track) and trend",
+               sp=_sp_objectives_report),
+    Capability("tuning.adjust", "learning", "", "write",
+               lambda p: (f"set {p.get('param', '?')} to {p.get('value', '?')}"),
+               "write a governed model parameter (churn-band thresholds); "
+               "proposed by the learning loop from calibration evidence, "
+               "bounds-enforced, executes on governance approval, undoable",
+               sp=_sp_tuning_adjust),
     # Composite (peer handoff): fans out to Accounting + Leads and composes.
     Capability("crm.pipeline_snapshot", "orchestrator", "", "read",
                lambda p: "", "financial + hot-lead snapshot composed from peers",

@@ -58,8 +58,29 @@ def _flag(name: str, default: str = "0") -> bool:
 ENABLED = _flag("INTEL_ENABLED")
 
 # Churn bands + component weights (documented in the module docstring).
+# HIGH_BAND/MEDIUM_BAND are the code DEFAULTS — effective values come from the
+# governed agent_tuning store (calibration-proposed, human-approved
+# tuning.adjust actions) via effective_bands().
 HIGH_BAND, MEDIUM_BAND = 0.70, 0.40
 W_LATENESS, W_ENGAGEMENT, W_AR, W_LOST = 0.55, 0.25, 0.10, 0.10
+
+_bands_cache = {"at": 0.0, "v": (HIGH_BAND, MEDIUM_BAND)}
+
+
+def effective_bands() -> tuple:
+    """(high, medium) thresholds — agent_tuning override else the defaults.
+    Cached ~60s so per-account scoring doesn't hammer the table."""
+    import time
+    if time.time() - _bands_cache["at"] > 60:
+        try:
+            from app.core import tuning
+            _bands_cache["v"] = (tuning.current("intelligence.high_band"),
+                                 tuning.current("intelligence.medium_band"))
+        except Exception as exc:
+            logger.debug(f"[intelligence] tuning read failed, defaults used: {exc}")
+            _bands_cache["v"] = (HIGH_BAND, MEDIUM_BAND)
+        _bands_cache["at"] = time.time()
+    return _bands_cache["v"]
 MIN_GAP_DAYS = 30       # floor for "typical gap" so one-off buyers aren't instantly late
 DEFAULT_GAP_DAYS = 90   # assumed rhythm for single-order accounts
 
@@ -207,7 +228,8 @@ def _score(m: Dict[str, Any]) -> Dict[str, Any]:
 
     risk = _clamp(W_LATENESS * c_late + W_ENGAGEMENT * c_eng
                   + W_AR * c_ar + W_LOST * c_lost)
-    band = "high" if risk >= HIGH_BAND else "medium" if risk >= MEDIUM_BAND else "low"
+    hi, med = effective_bands()
+    band = "high" if risk >= hi else "medium" if risk >= med else "low"
     return {
         "churn_risk": round(risk, 3), "churn_band": band,
         "components": {"lateness": round(c_late, 3), "engagement": round(c_eng, 3),
@@ -424,9 +446,10 @@ def calibrate(horizon_days: int = 30, window_days: int = 30) -> Dict[str, Any]:
                 and high["churn_rate"] < low["churn_rate"]):
             verdict.append("⚠ Bands are INVERTED (low churns more than high) — "
                            "review the component weights.")
+    hi, med = effective_bands()
     return {"horizon_days": horizon_days, "window_days": window_days,
             "bands": bands, "verdict": verdict,
-            "thresholds": {"high": HIGH_BAND, "medium": MEDIUM_BAND},
+            "thresholds": {"high": hi, "medium": med},
             "weights": {"lateness": W_LATENESS, "engagement": W_ENGAGEMENT,
                         "ar": W_AR, "lost_deal": W_LOST}}
 
@@ -474,7 +497,7 @@ def intelligence_status():
     return {"enabled": ENABLED, "bands": bands,
             "weights": {"lateness": W_LATENESS, "engagement": W_ENGAGEMENT,
                         "ar": W_AR, "lost_deal": W_LOST},
-            "thresholds": {"high": HIGH_BAND, "medium": MEDIUM_BAND}}
+            "thresholds": dict(zip(("high", "medium"), effective_bands()))}
 
 
 @router.get("/intelligence/account/{account_id}")

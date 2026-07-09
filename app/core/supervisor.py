@@ -340,6 +340,20 @@ def run_supervisor_tick(force: bool = False) -> Dict[str, Any]:
     summary = {"enabled": ENABLED, "autoact": AUTOACT, "checked": len(DETECTORS),
                "breaches": [b["rule"] for b in breaches], "alerted": alerted,
                "acted": acted, "briefing": _briefing(breaches)}
+
+    # Goal-oriented pass (Phase 8): detectors watch symptoms, objectives
+    # pursue outcomes. Best-effort — a failure here never breaks the tick.
+    try:
+        from app.core import objectives
+        obj = objectives.run_objectives_pass(force=force)
+        if not obj.get("skipped"):
+            summary["objectives"] = {
+                "evaluated": obj.get("evaluated"),
+                "alerted": obj.get("alerted"), "acted": obj.get("acted")}
+            if obj.get("briefing"):
+                summary["briefing"] += "\n\n" + obj["briefing"]
+    except Exception as exc:
+        logger.warning(f"[supervisor] objectives pass failed: {exc}")
     if breaches:
         logger.info(f"[supervisor] tick — breaches={summary['breaches']} "
                     f"alerted={alerted} acted={acted}")

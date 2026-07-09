@@ -234,20 +234,25 @@ def gather() -> Dict[str, Any]:
                 "FROM accounting_invoice_pipeline v LEFT JOIN accounts a ON a.account_id=v.account_id "
                 "WHERE v.payment_status IN ('unpaid','partial') AND v.due_date::date < CURRENT_DATE "
                 "ORDER BY v.computed_balance_due DESC LIMIT 3")
-        # Governance approvals awaiting a decision (routed to executives).
-        # Best-effort: tolerate the governance/routing migrations not existing.
-        try:
-            with conn.cursor() as cur2:
-                approvals = _rows(cur2,
-                    "SELECT action_type, proposed_by, COALESCE(assigned_to,'unassigned'), "
-                    "       COALESCE(amount,0), created_at::date "
-                    "FROM action_approvals "
-                    "WHERE status='pending' AND (expires_at IS NULL OR expires_at>now()) "
-                    "ORDER BY COALESCE(amount,0) DESC, created_at LIMIT 5")
-        except Exception as exc:
-            logger.warning(f"[ceo_briefing] approvals query skipped: {exc}")
-            conn.rollback()
-            approvals = []
+        # Governance approvals awaiting a decision (routed to executives),
+        # with the independent critic's verdict when the migration exists.
+        # Best-effort: tolerate the governance/routing/critic migrations not existing.
+        approvals = []
+        for cols in ("       COALESCE(amount,0), created_at::date, "
+                     "       critique->>'stance', critique->>'summary' ",
+                     "       COALESCE(amount,0), created_at::date "):
+            try:
+                with conn.cursor() as cur2:
+                    approvals = _rows(cur2,
+                        "SELECT action_type, proposed_by, COALESCE(assigned_to,'unassigned'), "
+                        + cols +
+                        "FROM action_approvals "
+                        "WHERE status='pending' AND (expires_at IS NULL OR expires_at>now()) "
+                        "ORDER BY COALESCE(amount,0) DESC, created_at LIMIT 5")
+                break
+            except Exception as exc:
+                logger.warning(f"[ceo_briefing] approvals query fallback: {exc}")
+                conn.rollback()
         # Agent performance report card (learning loop) — best-effort.
         try:
             from app.core.learning import agent_performance
@@ -255,6 +260,13 @@ def gather() -> Dict[str, Any]:
         except Exception as exc:
             logger.warning(f"[ceo_briefing] agent performance skipped: {exc}")
             perf = None
+        # Business objectives (goal-oriented supervisor) — best-effort.
+        try:
+            from app.core.objectives import report as objectives_report
+            objectives = objectives_report()
+        except Exception as exc:
+            logger.warning(f"[ceo_briefing] objectives skipped: {exc}")
+            objectives = []
         return {
             "rev_yest": rev_yest, "rev_7d": rev_7d,
             "rev_recent_date": rev_recent_date, "rev_recent_amt": rev_recent_amt,
@@ -265,7 +277,7 @@ def gather() -> Dict[str, Any]:
             "new_leads_7d": new_leads_7d, "overdue_acts": overdue_acts,
             "sentiment_7d": sentiment_7d, "sentiment_n": sentiment_n,
             "closing": closing, "biggest": biggest, "atrisk": atrisk, "big_inv": big_inv,
-            "approvals": approvals, "perf": perf,
+            "approvals": approvals, "perf": perf, "objectives": objectives,
         }
     finally:
         conn.close()
@@ -375,6 +387,43 @@ def _web_intel_text(web) -> List[str]:
 
 # ── Rendering ───────────────────────────────────────────────────────────────────
 
+_CRITIC_ICON = {"endorse": "✅", "caution": "⚠️", "object": "⛔"}
+_CRITIC_COLOR = {"endorse": "#1e7c45", "caution": "#a8720a", "object": "#a33a3a"}
+
+
+def _critic_text(r) -> str:
+    """Approval row → critic verdict line ('' when the row carries none)."""
+    if len(r) > 6 and r[5]:
+        return f"{_CRITIC_ICON.get(r[5], '•')} critic {r[5].upper()}: {r[6]}"
+    return ""
+
+
+def _critic_html(r) -> str:
+    if len(r) > 6 and r[5]:
+        col = _CRITIC_COLOR.get(r[5], "#7b8497")
+        return (f'<br><span style="color:{col};font-size:12px;">'
+                f'{_CRITIC_ICON.get(r[5], "•")} critic {r[5]}: {r[6]}</span>')
+    return ""
+
+
+def _objective_lines(objs: List[Any]) -> List[str]:
+    """Business objectives → compact human lines (shared by text + HTML)."""
+    out: List[str] = []
+    for o in objs or []:
+        if o.get("status") == "achieved":
+            out.append(f"{o['name']}: ACHIEVED (target {o['target']:g})")
+            continue
+        if o.get("value") is None:
+            continue
+        st = (o.get("status") or "").replace("_", " ").upper()
+        trend = f", {o['trend']}" if o.get("trend") else ""
+        unit = "%" if o.get("unit") == "%" else ""
+        out.append(f"{o['name']}: {o['value']:g}{unit} vs expected "
+                   f"{o.get('expected', o['target']):g} → target {o['target']:g}"
+                   f" · {st}{trend}")
+    return out
+
+
 def _perf_lines(perf: Dict[str, Any]) -> List[str]:
     """Agent report card → compact human lines (shared by text + HTML)."""
     if not perf:
@@ -458,6 +507,15 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
         for r in d["approvals"]:
             amt = f" — {_money(r[3])}" if float(r[3] or 0) else ""
             t.append(f"   - {r[0]}{amt} · proposed by {r[1]} · assigned to {r[2]} ({r[4]})")
+            ct = _critic_text(r)
+            if ct:
+                t.append(f"       {ct}")
+        t.append("")
+    obj_lines = _objective_lines(d.get("objectives"))
+    if obj_lines:
+        t.append("BUSINESS OBJECTIVES — what the agent fleet is pursuing")
+        for ln in obj_lines:
+            t.append(f"   - {ln}")
         t.append("")
     perf_lines = _perf_lines(d.get("perf"))
     if perf_lines:
@@ -550,7 +608,12 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
             lis(d["approvals"], lambda r: (
                 f'<b>{r[0]}</b>'
                 + (f' — <b>{_money(r[3])}</b>' if float(r[3] or 0) else '')
-                + f' <span style="color:{MUTE}">proposed by {r[1]} · assigned to {r[2]} ({r[4]})</span>'))))
+                + f' <span style="color:{MUTE}">proposed by {r[1]} · assigned to {r[2]} ({r[4]})</span>'
+                + _critic_html(r)))))
+
+    if obj_lines:
+        h.append(section('Business Objectives — What the Agent Fleet Is Pursuing',
+                         lis(obj_lines, lambda ln: ln)))
 
     if perf_lines:
         h.append(section('Agent Performance — Last 30 Days',
@@ -659,7 +722,8 @@ def render_role(d: Dict[str, Any], deltas: Dict[str, Any], role: str) -> Dict[st
             lis(mine, lambda r: (
                 f'<b>{r[0]}</b>'
                 + (f' — <b>{_money(r[3])}</b>' if float(r[3] or 0) else '')
-                + f' <span style="color:{MUTE}">proposed by {r[1]} ({r[4]})</span>'))))
+                + f' <span style="color:{MUTE}">proposed by {r[1]} ({r[4]})</span>'
+                + _critic_html(r)))))
     if web:
         h.append(section(
             f'{web["title"]} '

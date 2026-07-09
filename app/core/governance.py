@@ -95,10 +95,19 @@ def propose(action_type: str, proposed_by: str, params: Dict[str, Any],
         conn.commit()
         logger.info(f"[governance] proposed {action_type} by {proposed_by} "
                     f"(conf={confidence}) → {aid[:8]}")
+        # Independent critique FIRST (best-effort) so the routed notification
+        # and email carry the second opinion alongside the proposal.
+        critique = None
+        try:
+            from app.core import critic
+            critique = critic.review(aid, action_type, params or {},
+                                     entity_type, entity_id)
+        except Exception as exc:
+            logger.warning(f"[governance] critique skipped for {aid[:8]}: {exc}")
         # Route to the right decision-maker (best-effort: tolerates the
         # governance_routing migration not being applied yet).
         try:
-            route_approval(aid, action_type, params or {})
+            route_approval(aid, action_type, params or {}, critique=critique)
         except Exception as exc:
             logger.warning(f"[governance] routing skipped for {aid[:8]}: {exc}")
         return aid
@@ -142,13 +151,29 @@ def _affinity_role(action_type: str) -> str:
     return "CEO"
 
 
+_STANCE_ICON = {"endorse": "✅", "caution": "⚠️", "object": "⛔"}
+
+
+def _critic_line(critique: Optional[Dict[str, Any]]) -> str:
+    """One human line summarizing the critic's verdict ('' when absent)."""
+    if not critique:
+        return ""
+    icon = _STANCE_ICON.get(critique.get("stance", ""), "•")
+    return (f"{icon} Critic ({critique.get('stance', '?').upper()}): "
+            f"{critique.get('summary', '')}")
+
+
 def route_approval(approval_uuid: str, action_type: str,
-                   params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                   params: Dict[str, Any],
+                   critique: Optional[Dict[str, Any]] = None
+                   ) -> Optional[Dict[str, Any]]:
     """Assign the approval to an executive: prefer the role that owns this kind
     of action, then the SMALLEST sufficient approval_authority_limit (delegate
     down, escalate only when the amount demands it; NULL limit = unlimited).
     Records the assignment, emits an approval.routed audit event, notifies the
-    executive (in_app when they map to an employee; email when GOV_ROUTE_EMAIL)."""
+    executive (in_app when they map to an employee; email when GOV_ROUTE_EMAIL).
+    When a critic critique is supplied, it rides along in the notification,
+    the audit event, and the one-click decision email."""
     amount = _amount_from(params)
     role = _affinity_role(action_type)
 
@@ -188,11 +213,13 @@ def route_approval(approval_uuid: str, action_type: str,
                 ("approval.routed", "approval", approval_uuid,
                  json.dumps({"context": {"action_type": action_type,
                                          "amount": amount, "assigned_to": label,
-                                         "affinity_role": role}}),
+                                         "affinity_role": role,
+                                         "critic_stance": (critique or {}).get("stance")}}),
                  None, "governance"))
             event_uuid = cur.fetchone()[0]
 
             if chosen.get("employee_uuid"):
+                critic_note = _critic_line(critique)
                 cur.execute(
                     """INSERT INTO notifications
                          (employee_uuid, event_uuid, channel, status, title, body, metadata)
@@ -201,9 +228,11 @@ def route_approval(approval_uuid: str, action_type: str,
                      f"🛡️ Approval needed: {action_type}" +
                      (f" (${amount:,.0f})" if amount else ""),
                      f"Proposed action awaits your decision. Review in the "
-                     f"governance queue (approval {approval_uuid[:8]}).",
+                     f"governance queue (approval {approval_uuid[:8]})."
+                     + (f"\n{critic_note}" if critic_note else ""),
                      json.dumps({"kind": "approval_routed",
-                                 "approval_uuid": approval_uuid})))
+                                 "approval_uuid": approval_uuid,
+                                 "critic_stance": (critique or {}).get("stance")})))
         conn.commit()
     finally:
         conn.close()
@@ -212,6 +241,26 @@ def route_approval(approval_uuid: str, action_type: str,
         try:
             from app.agents.email.smtp_imap import send_email
             links = decision_links(approval_uuid)
+            # Critic block — the independent second opinion, right above the
+            # decision buttons where it matters.
+            findings = [f for f in (critique or {}).get("findings", [])
+                        if f.get("verdict") in ("fail", "warn")][:4]
+            critic_html = ""
+            critic_text = ""
+            if critique:
+                col = {"endorse": "#1e7c45", "caution": "#a8720a",
+                       "object": "#a33a3a"}.get(critique.get("stance"), "#26304a")
+                items = "".join(f'<li style="margin:2px 0;">{f["note"]}</li>'
+                                for f in findings)
+                critic_html = (
+                    f'<div style="border-left:4px solid {col};background:#f6f8fb;'
+                    f'padding:10px 14px;margin:14px 0;font-size:13px;">'
+                    f'<b style="color:{col};">{_critic_line(critique)}</b>'
+                    + (f'<ul style="margin:6px 0 0 18px;padding:0;">{items}</ul>'
+                       if items else "")
+                    + '</div>')
+                critic_text = ("\n" + _critic_line(critique) + "\n"
+                               + "".join(f"  - {f['note']}\n" for f in findings))
             send_email(
                 to=chosen["email"],
                 subject=f"Approval needed: {action_type}"
@@ -221,6 +270,7 @@ def route_approval(approval_uuid: str, action_type: str,
                            f"<p><b>{action_type}</b>"
                            + (f" — ${amount:,.0f}" if amount else "")
                            + f"<br>Approval ID: {approval_uuid}</p>"
+                           + critic_html +
                            f'<p style="margin:18px 0;">'
                            f'<a href="{links["approve"]}" style="background:#1e7c45;'
                            f'color:#fff;padding:10px 22px;border-radius:6px;'
@@ -235,8 +285,9 @@ def route_approval(approval_uuid: str, action_type: str,
                 body_text=(f"Approval needed: {action_type}"
                            + (f" (${amount:,.0f})" if amount else "")
                            + f"\nApproval ID: {approval_uuid}\n"
-                           f"Assigned to: {label}\n\n"
-                           f"Approve: {links['approve']}\n"
+                           f"Assigned to: {label}\n"
+                           + critic_text +
+                           f"\nApprove: {links['approve']}\n"
                            f"Reject:  {links['reject']}\n"),
             )   # internal/administrative — transactional, not commercial
         except Exception as exc:
@@ -280,12 +331,12 @@ def pending() -> List[Dict[str, Any]]:
                 cur.execute(
                     """SELECT approval_uuid, action_type, proposed_by, entity_type,
                               entity_id, params, confidence, severity, created_at,
-                              expires_at, amount, assigned_to
+                              expires_at, amount, assigned_to, critique
                        FROM action_approvals
                        WHERE status='pending' AND (expires_at IS NULL OR expires_at>now())
                        ORDER BY created_at""")
             except Exception:
-                conn.rollback()   # routing migration not applied yet
+                conn.rollback()   # routing/critic migrations not applied yet
                 cur.execute(
                     """SELECT approval_uuid, action_type, proposed_by, entity_type,
                               entity_id, params, confidence, severity, created_at,
@@ -448,11 +499,20 @@ def _undo_campaign_winback(ap: Dict[str, Any]) -> Dict[str, Any]:
         cid, f"undone via governance approval {ap['approval_uuid'][:8]}")
 
 
+def _undo_tuning_adjust(ap: Dict[str, Any]) -> Dict[str, Any]:
+    from app.core import tuning
+    param = (ap.get("params") or {}).get("param")
+    if not param:
+        return {"ok": False, "error": "no param recorded on the approval"}
+    return tuning.revert(param)
+
+
 # action_type → handler(approval_row) -> {'ok': bool, ...}. An action is
 # reversible only if a handler exists AND the handler can still unwind it —
 # handlers must report what could NOT be reversed (e.g. real emails sent).
 _UNDO = {
     "campaign.winback": _undo_campaign_winback,
+    "tuning.adjust": _undo_tuning_adjust,
 }
 
 
@@ -598,6 +658,23 @@ async def governance_undo(approval_uuid: str, body: _Decision = _Decision()):
 def governance_expire():
     """Flip pending approvals past their TTL to 'expired' (also runs nightly)."""
     return expire_stale()
+
+
+@router.post("/governance/critique/{approval_uuid}")
+async def governance_critique_one(approval_uuid: str):
+    """(Re)run the independent critic on one approval — e.g. after resolving a
+    complaint, to refresh the verdict before deciding."""
+    import asyncio as _aio
+    from app.core import critic
+    return await _aio.to_thread(critic.review, approval_uuid)
+
+
+@router.post("/governance/critique")
+async def governance_critique_backfill():
+    """Critique every live pending approval that has none yet."""
+    import asyncio as _aio
+    from app.core import critic
+    return await _aio.to_thread(critic.review_pending)
 
 
 # ── Public one-click decision endpoint (token IS the auth) ──────────────────

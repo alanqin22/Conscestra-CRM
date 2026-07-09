@@ -170,6 +170,15 @@ A promising lead automatically enters a personalized follow-up sequence.
 Emails are drafted, reminders scheduled, meetings proposed, and nurturing
 continues until the prospect responds or the opportunity closes.
 
+These workflows are not straight lines — they **branch on live business
+signals**. A prospect who replies mid-sequence is routed to an immediate
+meeting-booking step while the momentum is hot. A churn-risk customer with an
+open complaint skips the discount offer entirely — a promotion on top of an
+unresolved grievance reads as tone-deaf — and escalates straight to an
+executive. And because playbooks are stored as governed data rather than
+code, a new cadence ships as a configuration change, validated against the
+registered building blocks, without a deployment.
+
 Customers showing signs of churn trigger retention plays that combine customer
 history, support interactions, and AI-generated win-back campaigns. New
 orders, customer replies, or resolved issues automatically conclude the
@@ -183,6 +192,22 @@ suppression lists, verified recipients, and unsubscribe preferences.
 
 Your business keeps moving — even while your team sleeps.
 
+## Agents That Pursue Business Goals, Not Just Events
+
+Beyond reacting to events, Conscestra's supervisor is **goal-oriented**.
+Leadership declares business objectives — *cut overdue invoices in half in 90
+days*, *lift lead conversion 20%*, *keep high-churn exposure below five
+accounts* — and the agent fleet pursues them.
+
+Each objective is projected along its path from baseline to target. Every
+supervisor cycle measures the live metric, judges the trajectory —
+**achieved, on track, at risk, or off track** — and records the daily
+history. Falling behind raises an alert with the numbers attached; an
+off-track objective can trigger its owning agent's recovery play, always
+through governance.
+
+Thresholds watch symptoms. **Objectives pursue outcomes.**
+
 ## Autonomous, Yet Always Governed
 
 AI should never act without accountability.
@@ -192,6 +217,14 @@ requests are automatically routed to the appropriate executive based on
 business function, approval authority, and financial limits. Executives can
 approve or reject requests from any device with secure one-click actions — no
 login required.
+
+And no proposal arrives alone. Before an executive decides, an **independent
+critic agent** cross-checks every queued action against live business state:
+Does the campaign segment actually reach anyone? Do target customers have
+open complaints or overdue balances? Is this a duplicate request? The verdict
+— endorse, caution, or object — travels with the approval into the queue, the
+decision email, and the morning briefing. The critic never decides; it makes
+sure the human deciding sees what the proposer might have missed.
 
 Where appropriate, actions can be reversed within configurable time windows,
 approval requests automatically expire, confidence thresholds determine when
@@ -214,8 +247,16 @@ highlighting conversion rates, customer retention, campaign effectiveness,
 prediction accuracy, and the measurable business impact delivered by every AI
 Agent.
 
-Every recommendation is supported by evidence. Nothing changes without
-oversight.
+When the evidence is strong enough, the platform goes one step further: it
+**proposes its own tuning**. If a month of real outcomes shows the churn
+model raising too many false alarms, Conscestra drafts a bounded threshold
+adjustment — evidence attached, reviewed by the critic, routed to the right
+executive — and applies it only when a human approves. Every change is
+reversible, rate-limited by a cooldown, and confined within hard safety
+bounds the system can never propose beyond.
+
+Self-improvement without self-mutation: the system proposes, people ratify.
+Nothing changes without oversight.
 
 ## Governance Before Autonomy
 
@@ -341,13 +382,17 @@ _Listed in the same order as the launcher page on [agentorc.ca](https://agentorc
 - **Orchestrator agent** — symphonic multi-agent workflows (Daily Briefing, Pipeline Health, Revenue Snapshot, Weekly Report, Team Activity, New Business, Follow-ups Due, System Alerts, Company Pulse) plus an executive Q&A bank shared with every other agent for interrogative "executive question" phrasings.
 - **4 supporting modules** — Email (SMTP/IMAP + LangGraph), Store (direct-SP catalogue), Auth (direct DB), Voice (Azure Speech token mint), plus a Home-Index KPI dashboard.
 - **Agents that cooperate automatically** — an event-driven cooperation bus lets agents react to each other's work instead of waiting to be asked: a store order makes the Email agent send order-confirmation and shipped notices to the buyer (real SMTP, gated on a **verified, opted-in** address), overdue invoices auto-draft tiered dunning, hot leads auto-schedule outreach, and settled milestones self-complete — all idempotent and safe-by-default (`AGENT_BUS_AUTOSEND=0` keeps it draft-only until you flip it on).
-- **Multi-step agent cadences** — a durable sequences engine (`agent_sequences` + a `sequence.step_due` event loop) runs timed playbooks: hot-lead follow-up (intro draft → reminder → meeting offer → nurture) and the churn-save play (support context check → win-back draft → executive escalation), each exiting early on engagement, conversion, or a new order. Multi-day steps align to the customer's learned preferred hour.
+- **Multi-step agent cadences that BRANCH** — a durable sequences engine (`agent_sequences` + a `sequence.step_due` event loop) runs timed playbooks as **graphs, not lines**: hot-lead follow-up (intro draft → reminder → meeting offer → nurture) and the churn-save play (support context check → win-back draft → executive escalation), each exiting early on engagement, conversion, or a new order. Steps carry conditional routing — a mid-cadence reply routes to an urgent book-the-meeting step instead of just ending the run; an open complaint at offer time skips the discount and escalates. Deterministic conditions from a registry, loop-capped, and multi-day steps align to the customer's learned preferred hour.
+- **Playbooks as data** — cadences live in an `agent_playbooks` table with the code built-ins as fallback: a new play (steps, waits, branch rules, signal routes) ships as a validated row via `PUT /sequences/playbooks/{name}` — no deploy. Every step action and branch condition must reference the registered handler registries, so data authors compose from vetted building blocks and arbitrary code can never enter through the table.
+- **Goal-oriented supervisor** — declared business objectives (`business_objectives`: metric, baseline → target, horizon, owning agent, optional recovery play) are evaluated every supervisor tick against a linear trajectory with slack: achieved / on_track / at_risk / off_track, plus trend from daily snapshots. Off-track objectives raise `objective.at_risk` events and can trigger their agent's governed play; the CEO briefing carries a 🎯 objectives section. Detectors watch symptoms; objectives pursue outcomes.
+- **An independent critic on every approval** — before an executive decides, a verifier agent cross-checks the proposal against live CRM state and the shared blackboard (zero-recipient segments, open complaints, overdue AR in a campaign audience, duplicate requests, dunning holds, real-send posture) and attaches a structured verdict — endorse / caution / object — with named, numbered findings. It rides in the queue API, the one-click decision email, and the morning briefing. Deterministic, explainable, advice-only.
+- **Calibration-proposed tuning** — when a month of snapshots shows the churn model miscalibrated (precision below 30%, miss rate above 20%), the learning loop drafts a bounded threshold adjustment as a `tuning.adjust` governance proposal with the evidence attached; approval writes the governed `agent_tuning` store the scorer reads live, undo reverts it, hard min/max bounds and a 14-day cooldown keep it conservative. The system proposes; people ratify.
 - **Persistent customer intelligence** — a nightly deterministic scorer writes a living profile per customer (churn risk vs their own median order gap, RFM/LTV, preferred channel + engagement hour, interests from ordered categories, inbound-email sentiment) that feeds the AI 360s, the supervisor's churn detector, and campaign segmentation — with the full component breakdown persisted for explainability.
 - **Marketing campaigns on the CASL stack** — segment the customer base by churn band / LTV / industry / channel, LLM-draft the content (deterministic template fallback, placeholders enforced), optionally A/B two subjects (50/50 split, per-variant reply attribution + leading verdict), and launch through the existing consent infrastructure (suppression list, verified-address gate, unsubscribe footer); draft-only unless autosend is explicitly enabled *and* the launch is confirmed. A supervisor-detected churn spike can *propose* a win-back campaign through the governance queue — agents initiating commercial action within policy.
 - **Leads qualified with earned numbers** — win probability is the smoothed historical conversion rate of settled leads in the same score band; the recommended rep is ranked by industry-account experience then current load, with the reason attached; company enrichment supports Apollo / People Data Labs / a keyless web lookup, all gap-fill-only.
 - **Approvals routed by authority, decided in one click** — governance proposals extract the dollar amount and self-assign to the right executive by role affinity and smallest-sufficient approval limit; the routed email carries HMAC-signed single-use Approve/Reject buttons (no sign-in). Executed actions can be **undone** within a window (with honest irreversibility reporting), stale approvals expire nightly, supervisor auto-actions obey the same confidence policy, and a heartbeat detector alerts if the bus consumer ever dies silently.
 - **Inbound email as CRM signal** — every inbound message is matched to its contact/lead, logged as a timeline activity, and emitted onto the bus; complaints auto-escalate (blackboard note + urgent owner task), and replies end running cadences.
-- **A learning loop** — nightly churn predictions are snapshotted and calibrated against actual ordering a month later; the CEO briefing includes an agent performance report card (cadence save-rates, campaign conversion, prediction precision). Evidence-only: thresholds are recommended, never silently changed.
+- **A learning loop** — nightly churn predictions are snapshotted and calibrated against actual ordering a month later; the CEO briefing includes an agent performance report card (cadence save-rates, campaign conversion, prediction precision). Thresholds are never silently changed — strong evidence becomes a governance proposal a human ratifies (see calibration-proposed tuning above).
 - **Self-serve signup that actually converts** — a store signup creates a lead and sends an OTP verification email; on verify it **auto-converts to a verified account + contact** (authored by the owning AI agents), carrying the buyer's firmographics and **CASL/GDPR marketing consent** — so checkout then flows straight through with no manual data entry.
 - **Hybrid routing** — common intents (search, list, update, delete) skip the LLM entirely for sub-second response; novel phrasings fall through to GPT-4o-mini.
 - **Voice everywhere** — Azure Speech SDK (Bing-style) primary, Web Speech API fallback, with BFCache-safe cleanup across navigation.
@@ -380,12 +425,15 @@ crm_agent/
     │   ├── agent_bus.py           ← Event-bus consumer + cooperation handlers
     │   ├── a2a.py / blackboard.py ← Agent-to-agent protocol + shared memory
     │   ├── supervisor.py          ← Proactive KPI-breach detection
+    │   ├── objectives.py          ← Goal-oriented supervisor (business objectives)
     │   ├── governance.py          ← Confidence gates + executive approval routing
-    │   ├── sequences.py           ← Multi-step timed playbooks (cadences)
+    │   ├── critic.py              ← Independent verifier on every queued approval
+    │   ├── sequences.py           ← Branching timed playbooks (cadences as data)
     │   ├── intelligence.py        ← Nightly customer-intelligence profiles
     │   ├── marketing.py           ← Segment → draft (LLM) → A/B → CASL-gated launch → measure
     │   ├── qualification.py       ← Win probability + recommended-rep card
-    │   └── learning.py            ← Agent performance analytics + calibration
+    │   ├── learning.py            ← Agent performance analytics + calibration
+    │   └── tuning.py              ← Calibration-proposed, human-ratified parameters
     └── agents/
         │  ── 10 conversational AI agents (LangGraph + pre-router + LLM) ──
         ├── accounts/         prompt | pre_router | sql_builder | formatter | graph | router

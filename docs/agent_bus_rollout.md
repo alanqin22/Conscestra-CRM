@@ -75,6 +75,11 @@ psql "$RAILWAY_DB_URL" -f sql/resolve_stale_overdue_events.sql     # 4 clear Rai
 psql "$RAILWAY_DB_URL" -f sql/supervisor.sql                       # 5 supervisor.alert type + subscriptions
 psql "$RAILWAY_DB_URL" -f sql/blackboard.sql                       # 6 agent_blackboard table
 psql "$RAILWAY_DB_URL" -f sql/governance.sql                       # 7 action_approvals table
+psql "$RAILWAY_DB_URL" -f sql/business_objectives.sql              # 8 Phase 8 goal-oriented supervisor
+                                                                   #   (AFTER account_intelligence.sql — churn seed reads it)
+psql "$RAILWAY_DB_URL" -f sql/governance_critic.sql                # 9 critic columns on action_approvals
+psql "$RAILWAY_DB_URL" -f sql/agent_tuning.sql                     # 10 governed model parameters (learning write-side)
+psql "$RAILWAY_DB_URL" -f sql/agent_playbooks.sql                  # 11 playbooks-as-data (cadences ship as rows)
 ```
 
 Each ends with a verify `SELECT`. After this, **A2A (Phase 2) and the blackboard
@@ -103,17 +108,30 @@ gate): `AGENT_BUS_CATCHALL=1` (settle unhandled event types — required to stop
 `opportunity.stage_changed` accrual), `NOTIF_TRIAGE_ENABLED=1` →
 `NOTIF_TRIAGE_APPLY=1` (alert-backlog sweep + retention),
 `PIPELINE_HYGIENE_ENABLED=1` → `PIPELINE_HYGIENE_APPLY=1` (stale-deal cleanup),
-`CEO_BRIEFING_ENABLED=1` + `CEO_BRIEFING_EMAIL` (daily 08:00 ET brief).
+`CEO_BRIEFING_ENABLED=1` + `CEO_BRIEFING_EMAIL` (daily 08:00 ET brief),
+`OBJECTIVES_ENABLED=1` → later `OBJECTIVES_AUTOACT=1` (Phase 8 goal-oriented
+supervisor: alerts on at-risk objectives first; AUTOACT lets off-track
+objectives run their governed play — turn on only after GOV_ENABLED),
+`TUNING_PROPOSALS_ENABLED=1` (weekly calibration→tuning proposals — queues
+governed `tuning.adjust` approvals only, parameters change on approval;
+meaningful once account_intelligence_history snapshots are ≥30 days old).
 
 ## Step 4 — Smoke test on Railway
 
 ```
 GET  /agent-bus/status          # enabled + running, handlers loaded
-GET  /a2a/capabilities          # 23 capabilities
+GET  /a2a/capabilities          # 27 capabilities (incl. objectives.report)
 GET  /supervisor/status         # detectors + thresholds
-POST /supervisor/run-once       # breaches + briefing
+POST /supervisor/run-once       # breaches + briefing (+ 🎯 objectives section)
 GET  /governance/status         # gate thresholds
-GET  /governance/queue          # pending approvals
+GET  /governance/queue          # pending approvals (each with its critic critique)
+POST /governance/critique       # backfill critic onto pending approvals without one
+GET  /objectives/list           # objectives vs targets (value/expected/status/trend)
+POST /objectives/run-once       # forced objectives pass
+GET  /tuning/status             # governed params: value/default/bounds/last change
+POST /tuning/propose            # forced calibration→proposal pass
+GET  /sequences/playbooks       # all playbooks resolved (code + db, registries)
+PUT  /sequences/playbooks/{x}   # add/override a cadence as data (validated)
 ```
 (`scratch/smoke_all_phases.py` is the local equivalent — point it at the Railway
 URL for a full 1→5 check.)

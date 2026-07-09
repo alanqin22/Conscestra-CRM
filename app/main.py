@@ -272,7 +272,8 @@ def _run_emit_sequence_step_events() -> None:
 
 def _run_governance_expiry() -> None:
     """Scheduled job: flip pending approvals past their TTL to 'expired' so the
-    queue stays honest (best-effort; tolerates the table not existing)."""
+    queue stays honest (best-effort; tolerates the table not existing). Also
+    backfills the independent critic onto any pending approval without one."""
     try:
         from app.core.governance import expire_stale
         res = expire_stale()
@@ -280,6 +281,13 @@ def _run_governance_expiry() -> None:
             logger.info(f"[Governance] expired {res['expired']} stale approval(s)")
     except Exception as exc:
         logger.error(f"[Governance] expiry failed: {exc}", exc_info=True)
+    try:
+        from app.core import critic
+        res = critic.review_pending()
+        if res.get("reviewed"):
+            logger.info(f"[Critic] backfilled {res['reviewed']} critique(s)")
+    except Exception as exc:
+        logger.error(f"[Critic] backfill failed: {exc}", exc_info=True)
 
 
 def _run_intelligence_scoring() -> None:
@@ -295,6 +303,37 @@ def _run_intelligence_scoring() -> None:
                     f"high_notes={res['high_risk_notes_posted']}")
     except Exception as exc:
         logger.error(f"[Intelligence] scoring failed: {exc}", exc_info=True)
+
+
+def _run_tuning_proposals() -> None:
+    """Scheduled job (weekly): calibration → governance-proposed tuning. Reads
+    the churn model's calibration and, when the evidence warrants, queues
+    bounded tuning.adjust proposals for human approval. Proposes only — a
+    parameter changes ONLY when an executive approves. No-op unless
+    TUNING_PROPOSALS_ENABLED=1 (propose_from_calibration self-gates)."""
+    try:
+        from app.core.tuning import propose_from_calibration
+        res = propose_from_calibration()
+        if res.get("proposed") or res.get("inverted"):
+            logger.info(f"[Tuning] proposed={res.get('proposed')} "
+                        f"inverted={res.get('inverted')} skipped={res.get('skipped')}")
+    except Exception as exc:
+        logger.error(f"[Tuning] proposal pass failed: {exc}", exc_info=True)
+
+
+def _run_objectives_pass() -> None:
+    """Scheduled job: nightly goal-oriented objectives pass (Phase 8) — snapshot
+    every active business objective (weekends included, when the supervisor tick
+    doesn't run) and alert on at-risk/off-track ones. Runs after intelligence
+    scoring so the churn metric reads tonight's bands. No-op unless
+    OBJECTIVES_ENABLED=1 (run_objectives_pass self-gates)."""
+    try:
+        from app.core.objectives import run_objectives_pass
+        res = run_objectives_pass()
+        if res.get("alerted") or res.get("acted"):
+            logger.info(f"[Objectives] alerted={res['alerted']} acted={res['acted']}")
+    except Exception as exc:
+        logger.error(f"[Objectives] pass failed: {exc}", exc_info=True)
 
 
 def _run_supervisor_tick() -> None:
@@ -480,6 +519,27 @@ async def lifespan(app: FastAPI):
             _run_intelligence_scoring,
             trigger=CronTrigger(hour=22, minute=35),
             id="intelligence_scoring",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        # Business objectives (Phase 8, goal-oriented supervisor) — nightly
+        # 22:50 ET, after intelligence scoring (22:35) so the churn metric sees
+        # fresh bands. Guarantees a daily snapshot even on weekends, when the
+        # supervisor tick (which also runs the pass) is off.
+        _scheduler.add_job(
+            _run_objectives_pass,
+            trigger=CronTrigger(hour=22, minute=50),
+            id="objectives_pass",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        # Calibration→tuning proposals — weekly, Monday 23:15 ET (after the
+        # nightly scoring stack). Self-gates on TUNING_PROPOSALS_ENABLED;
+        # queues governed tuning.adjust proposals, never writes parameters.
+        _scheduler.add_job(
+            _run_tuning_proposals,
+            trigger=CronTrigger(day_of_week="mon", hour=23, minute=15),
+            id="tuning_proposals",
             replace_existing=True,
             misfire_grace_time=3600,
         )
@@ -783,6 +843,14 @@ app.include_router(marketing_router, dependencies=_ADMIN)
 # -- Learning loop (agent performance analytics + churn calibration read-side)
 from app.core.learning import router as learning_router
 app.include_router(learning_router, dependencies=_ADMIN)
+
+# -- Business objectives (Phase 8 — goal-oriented supervisor)
+from app.core.objectives import router as objectives_router
+app.include_router(objectives_router, dependencies=_ADMIN)
+
+# -- Governed tuning (calibration-proposed, human-approved model parameters)
+from app.core.tuning import router as tuning_router
+app.include_router(tuning_router, dependencies=_ADMIN)
 
 # -- Lead qualification (win probability + recommended rep)
 from app.core.qualification import router as qualification_router
