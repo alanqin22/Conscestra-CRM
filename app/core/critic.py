@@ -257,11 +257,171 @@ def _checks_tuning_adjust(ap: Dict[str, Any]) -> List[Dict[str, str]]:
     return out
 
 
+def _checks_kb_publish(ap: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Sanity-check a knowledge-article proposal: complete + useful content,
+    no near-duplicate already answering the same question, traceable source."""
+    out: List[Dict[str, str]] = []
+    from app.core import knowledge
+    p = ap.get("params") or {}
+    title = str(p.get("title") or "").strip()
+    answer = str(p.get("answer") or "").strip()
+    if not title or not str(p.get("problem") or "").strip() or not answer:
+        return [_f("complete", "fail",
+                   "title, problem and answer are all required — refuse")]
+    if len(answer) < knowledge.MIN_ANSWER_CHARS:
+        out.append(_f("complete", "fail",
+                      f"answer is {len(answer)} chars — too short to help "
+                      f"the next customer"))
+    else:
+        out.append(_f("complete", "ok", "title/problem/answer present"))
+    dup = knowledge.search(title, limit=1, min_rank=0.12)
+    if dup:
+        out.append(_f("near_duplicate", "warn",
+                      f"an active article already covers this: "
+                      f"\"{dup[0]['title'][:60]}\" — consider updating it instead"))
+    else:
+        out.append(_f("near_duplicate", "ok", "no similar active article"))
+    if p.get("source_ref"):
+        out.append(_f("traceable_source", "ok",
+                      "mined from a recorded support thread"))
+    else:
+        out.append(_f("traceable_source", "warn",
+                      "no source thread recorded — unverifiable provenance"))
+    return out
+
+
+def _checks_meeting_book(ap: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Sanity-check a meeting-booking proposal: target reachable, requested
+    slot free and within business hours (auto-slot is always fine)."""
+    out: List[Dict[str, str]] = []
+    from app.core import booking
+    p = ap.get("params") or {}
+    et = str(p.get("entity_type") or ("lead" if p.get("lead_id") else "account"))
+    eid = str(p.get("entity_id") or p.get("lead_id") or p.get("account_id") or "")
+    info = booking._entity_info(et, eid) if eid else None
+    if not info:
+        return [_f("target_exists", "fail",
+                   f"{et} {eid or '(missing)'} not found — nobody to meet")]
+    out.append(_f("target_exists", "ok", f"meeting with {info['display']}"))
+    if not info.get("email"):
+        out.append(_f("reachable", "warn",
+                      "no email on file — the invite can only be delivered "
+                      "manually (meeting still records internally)"))
+    else:
+        out.append(_f("reachable", "ok", "prospect has an email address"))
+    start_iso = p.get("start")
+    if start_iso:
+        try:
+            from datetime import datetime, timedelta
+            start = datetime.fromisoformat(str(start_iso))
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=booking.ET)
+            dur = int(p.get("duration_min", booking.SLOT_MIN))
+            if booking._conflicts(info["owner_id"], start,
+                                  start + timedelta(minutes=dur)):
+                out.append(_f("slot_free", "fail",
+                              "requested slot conflicts with an existing "
+                              "meeting on the owner's calendar"))
+            else:
+                out.append(_f("slot_free", "ok", "requested slot is free"))
+            et_start = start.astimezone(booking.ET)
+            if not (booking.BUSINESS_START <= et_start.hour < booking.BUSINESS_END
+                    and et_start.weekday() < 5):
+                out.append(_f("business_hours", "warn",
+                              f"requested slot is outside ET business hours "
+                              f"({et_start.strftime('%a %H:%M')})"))
+        except (TypeError, ValueError):
+            out.append(_f("slot_free", "fail",
+                          f"unparseable start time {start_iso!r}"))
+    else:
+        out.append(_f("slot_free", "ok",
+                      "auto-slot — engine picks the first free business-hour slot"))
+    return out
+
+
+def _checks_scoring_activate(ap: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Sanity-check a model activation: candidate exists, evidence is thick
+    enough, and it actually beats the base rate (and the incumbent)."""
+    out: List[Dict[str, str]] = []
+    from app.core import scoring
+    p = ap.get("params") or {}
+    version = p.get("version")
+    row = scoring._model_row("WHERE version=%s", (int(version or 0),)) \
+        if version else None
+    if not row:
+        return [_f("candidate_exists", "fail",
+                   f"model v{version} not found — nothing to activate")]
+    out.append(_f("candidate_exists", "ok", f"candidate v{version} on record"))
+    m = row.get("metrics") or {}
+    n = int(m.get("samples") or 0)
+    if n < scoring.MIN_SAMPLES:
+        out.append(_f("evidence_size", "fail",
+                      f"trained on only {n} settled leads "
+                      f"(< {scoring.MIN_SAMPLES}) — too thin to trust"))
+    else:
+        out.append(_f("evidence_size", "ok",
+                      f"{n} settled leads ({m.get('positives')} converted)"))
+    brier, base = m.get("brier"), m.get("baseline_brier")
+    if brier is not None and base is not None:
+        if float(brier) >= float(base):
+            out.append(_f("beats_baseline", "fail",
+                          f"holdout brier {brier} is not better than the "
+                          f"predict-the-base-rate baseline {base} — the model "
+                          f"adds nothing"))
+        else:
+            out.append(_f("beats_baseline", "ok",
+                          f"brier {brier} vs baseline {base}"))
+    cur = scoring.active_model()
+    if cur and (cur.get("metrics") or {}).get("brier") is not None \
+            and brier is not None \
+            and float(brier) > float(cur["metrics"]["brier"]):
+        out.append(_f("vs_incumbent", "warn",
+                      f"candidate brier {brier} is worse than the active "
+                      f"v{cur['version']}'s {cur['metrics']['brier']} — "
+                      f"activating would be a downgrade"))
+    return out
+
+
+def _checks_sms_send(ap: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Sanity-check an SMS proposal: usable number, sane length, real-send
+    posture made explicit (an SMS cannot be unsent)."""
+    out: List[Dict[str, str]] = []
+    from app.core import telephony
+    p = ap.get("params") or {}
+    to = telephony.normalize_phone(str(p.get("to") or ""))
+    if not to:
+        return [_f("number_usable", "fail",
+                   f"unusable phone number {p.get('to')!r}")]
+    out.append(_f("number_usable", "ok", f"E.164 {to}"))
+    body = str(p.get("body") or "")
+    if not body.strip():
+        out.append(_f("body_present", "fail", "empty message body"))
+    elif len(body) > telephony.SMS_MAX_CHARS:
+        out.append(_f("body_present", "warn",
+                      f"{len(body)} chars (> {telephony.SMS_MAX_CHARS}) — "
+                      f"will split into many segments; tighten it"))
+    else:
+        out.append(_f("body_present", "ok", f"{len(body)} chars"))
+    if telephony.AUTOSEND:
+        out.append(_f("send_posture", "warn",
+                      "SMS_AUTOSEND=1 — approving SENDS A REAL SMS "
+                      "immediately; it cannot be unsent"))
+    else:
+        out.append(_f("send_posture", "ok",
+                      "drafts only (SMS_AUTOSEND off) — approval creates an "
+                      "owner task, no outbound SMS"))
+    return out
+
+
 _ACTION_CHECKS: Dict[str, Callable[[Dict[str, Any]], List[Dict[str, str]]]] = {
     "campaign.winback":          _checks_campaign_winback,
     "supervisor.emit_dunning":   _checks_emit_dunning,
     "supervisor.emit_hot_leads": _checks_emit_hot_leads,
     "tuning.adjust":             _checks_tuning_adjust,
+    "kb.publish":                _checks_kb_publish,
+    "meeting.book":              _checks_meeting_book,
+    "scoring.activate":          _checks_scoring_activate,
+    "sms.send":                  _checks_sms_send,
 }
 
 

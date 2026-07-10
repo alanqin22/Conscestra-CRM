@@ -128,7 +128,7 @@ def qualify(lead_id: str) -> Dict[str, Any]:
     _id, first, last, company, industry, score, status = row
     wp = win_probability(score)
     rep = recommend_rep(industry)
-    return {
+    card = {
         "lead_id": _id,
         "name": f"{first or ''} {last or ''}".strip() or company,
         "company": company, "industry": industry, "status": status,
@@ -136,6 +136,20 @@ def qualify(lead_id: str) -> Dict[str, Any]:
         "win_probability": wp["probability"], "win_basis": wp["basis"],
         "recommended_rep": rep,
     }
+    # Predictive scoring v2: when a governed model is ACTIVE, its P(convert)
+    # supersedes the band-history heuristic (best-effort — heuristic stands
+    # if the model store is absent or no version is active).
+    try:
+        from app.core import scoring
+        pred = scoring.predict_for(_id)
+        if pred:
+            card.update(win_probability=pred["probability"],
+                        win_basis=pred["basis"],
+                        win_model={"version": pred["model_version"],
+                                   "contributions": pred["contributions"]})
+    except Exception:
+        pass
+    return card
 
 
 router = APIRouter(tags=["qualification"])

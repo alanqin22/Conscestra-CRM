@@ -80,6 +80,9 @@ psql "$RAILWAY_DB_URL" -f sql/business_objectives.sql              # 8 Phase 8 g
 psql "$RAILWAY_DB_URL" -f sql/governance_critic.sql                # 9 critic columns on action_approvals
 psql "$RAILWAY_DB_URL" -f sql/agent_tuning.sql                     # 10 governed model parameters (learning write-side)
 psql "$RAILWAY_DB_URL" -f sql/agent_playbooks.sql                  # 11 playbooks-as-data (cadences ship as rows)
+psql "$RAILWAY_DB_URL" -f sql/knowledge_base.sql                   # 12 knowledge base (service knowledge loop)
+psql "$RAILWAY_DB_URL" -f sql/lead_scoring_model.sql               # 13 predictive lead-scoring model store
+psql "$RAILWAY_DB_URL" -f sql/telephony.sql                        # 14 sms.received event type + subscriptions
 ```
 
 Each ends with a verify `SELECT`. After this, **A2A (Phase 2) and the blackboard
@@ -114,7 +117,21 @@ supervisor: alerts on at-risk objectives first; AUTOACT lets off-track
 objectives run their governed play — turn on only after GOV_ENABLED),
 `TUNING_PROPOSALS_ENABLED=1` (weekly calibration→tuning proposals — queues
 governed `tuning.adjust` approvals only, parameters change on approval;
-meaningful once account_intelligence_history snapshots are ≥30 days old).
+meaningful once account_intelligence_history snapshots are ≥30 days old),
+`KB_DRAFT_ENABLED=1` (nightly 23:00 ET knowledge mining: resolved support
+threads → LLM-drafted `kb.publish` proposals — publishes only on approval;
+KB retrieval into the auto-reply is on by default, kill `KB_RAG_ENABLED=0`),
+`SCORING_TRAIN_ENABLED=1` (weekly Mon 23:30 ET predictive lead-scoring
+training — trains a candidate on settled leads and PROPOSES activation via
+`scoring.activate`; refuses honestly until ≥30 settled with ≥5 of each
+outcome; a model can never activate itself),
+`TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`/`TWILIO_FROM_NUMBER` +
+`SMS_AUTOSEND=1` (telephony channel: outbound SMS/agent voice calls really
+send — otherwise everything drafts as owner tasks; trial accounts only reach
+verified numbers). To receive inbound SMS on Railway, point the Twilio
+number's messaging webhook at `POST https://<railway-app>/telephony/sms/inbound`
+(signature-validated; replies use the KB-grounded auto-reply,
+`SMS_AUTOREPLY=0` for plain acks).
 
 ## Step 4 — Smoke test on Railway
 
@@ -132,7 +149,39 @@ GET  /tuning/status             # governed params: value/default/bounds/last cha
 POST /tuning/propose            # forced calibration→proposal pass
 GET  /sequences/playbooks       # all playbooks resolved (code + db, registries)
 PUT  /sequences/playbooks/{x}   # add/override a cadence as data (validated)
+GET  /context/{type}/{id}       # context-hydration pack + rendered block
+GET  /knowledge/list            # KB articles (uses counter = which knowledge earns its keep)
+POST /knowledge/draft-pass      # forced mining pass (resolved threads → proposals)
+GET  /booking/availability      # free business-hour slots for an owner
+POST /booking/book              # book a meeting (activity + signed .ics invite link)
+POST /planner/plan              # bounded goal→plan (execute=true runs reads, queues writes)
+GET  /scoring/status            # active model + latest candidate + metrics
+POST /scoring/train             # forced train→propose pass
+GET  /telephony/status          # Twilio config + autosend/autoreply posture
+POST /telephony/sms/send        # admin SMS (agents go through A2A sms.send)
 ```
+
+The bounded planner needs NO SQL and NO flag: plans are validated against the
+capability registry (≤6 steps, ≤2 writes), reads execute deterministically,
+and every write becomes a critic-reviewed governance approval — the plan's
+goal + correlation id ride on the approvals for end-to-end audit.
+
+PII minimization needs NO SQL and NO flag (on by default; kill
+`PII_MASK_ENABLED=0`): customer-authored text and CRM context blocks are
+masked (emails → `j***@domain`, phones/cards → last-4) before any LLM
+prompt — auto-reply, knowledge mining, context injection. Operational agent
+commands and user-typed chat are deliberately NOT masked (the agent needs
+the field to act; sends stay gated by AUTOSEND/consent).
+
+Meeting booking needs NO SQL and NO new flag: the booked meeting is an
+internal activity; the invite email obeys the existing AUTOSEND + verified-
+address gates (otherwise the owner gets a send-manually task with the signed
+link). Cadence auto-booking kill switch: `BOOKING_AUTOBOOK=0`.
+
+Context hydration ("born with context") needs NO SQL and NO flag — it is on by
+default (read-only; `CONTEXT_HYDRATION_ENABLED=0` kills it instantly). It
+auto-prepends the entity's compact 360 block to A2A NL dispatches and
+personalizes the inbound auto-reply for known senders.
 (`scratch/smoke_all_phases.py` is the local equivalent — point it at the Railway
 URL for a full 1→5 check.)
 

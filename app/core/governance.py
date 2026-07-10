@@ -507,12 +507,39 @@ def _undo_tuning_adjust(ap: Dict[str, Any]) -> Dict[str, Any]:
     return tuning.revert(param)
 
 
+def _undo_kb_publish(ap: Dict[str, Any]) -> Dict[str, Any]:
+    from app.core import knowledge
+    aid = (((ap.get("result") or {}).get("data") or {}) or {}).get("article_uuid")
+    if not aid:
+        return {"ok": False, "error": "no article_uuid recorded on the approval"}
+    return knowledge.retire(aid, f"undone via governance approval "
+                                 f"{ap['approval_uuid'][:8]}")
+
+
 # action_type → handler(approval_row) -> {'ok': bool, ...}. An action is
 # reversible only if a handler exists AND the handler can still unwind it —
 # handlers must report what could NOT be reversed (e.g. real emails sent).
+def _undo_meeting_book(ap: Dict[str, Any]) -> Dict[str, Any]:
+    from app.core import booking
+    aid = (((ap.get("result") or {}).get("data") or {}) or {}).get("activity_id")
+    if not aid:
+        return {"ok": False, "error": "no activity_id recorded on the approval"}
+    return booking.cancel(aid, f"undone via governance approval "
+                               f"{ap['approval_uuid'][:8]}")
+
+
+def _undo_scoring_activate(ap: Dict[str, Any]) -> Dict[str, Any]:
+    from app.core import scoring
+    prev = (((ap.get("result") or {}).get("data") or {}) or {}).get("previous_version")
+    return scoring.deactivate_to(prev)
+
+
 _UNDO = {
     "campaign.winback": _undo_campaign_winback,
     "tuning.adjust": _undo_tuning_adjust,
+    "kb.publish": _undo_kb_publish,
+    "meeting.book": _undo_meeting_book,
+    "scoring.activate": _undo_scoring_activate,
 }
 
 

@@ -228,6 +228,50 @@ def _sp_tuning_adjust(p: Dict[str, Any]) -> Any:
                         reason=p.get("why") or "approved tuning.adjust")
 
 
+def _sp_kb_publish(p: Dict[str, Any]) -> Any:
+    """Knowledge loop: publish an approved article (executed on approval).
+    knowledge.publish() validates fields + source_ref idempotency."""
+    from app.core import knowledge
+    return knowledge.publish(p or {}, created_by="governance")
+
+
+def _sp_meeting_book(p: Dict[str, Any]) -> Any:
+    """Booking: check the owner's real availability and book the meeting
+    (invite via signed .ics link; email only under AUTOSEND + verified)."""
+    from app.core import booking
+    return booking.book_sp(p or {})
+
+
+def _sp_crm_context(p: Dict[str, Any]) -> Any:
+    """Context hydration: the compact 360 pack any agent starts work with."""
+    from app.core import context as crm_context
+    et = str(p.get("entity_type") or "account")
+    eid = str(p.get("entity_id") or p.get("account_id") or p.get("lead_id") or "")
+    pack = crm_context.hydrate(et, eid)
+    return {"pack": pack, "rendered": crm_context.render(pack)}
+
+
+def _sp_sms_send(p: Dict[str, Any]) -> Any:
+    """Telephony: send one SMS (governed write; SMS_AUTOSEND=0 drafts as a
+    task; irreversible once sent — no undo, same as email)."""
+    from app.core import telephony
+    return telephony.send_sms_sp(p or {})
+
+
+def _sp_scoring_activate(p: Dict[str, Any]) -> Any:
+    """Predictive scoring: make a trained candidate the active model
+    (executed on approval); undo restores the previous version."""
+    from app.core import scoring
+    return scoring.activate_sp(p or {})
+
+
+def _sp_crm_plan(p: Dict[str, Any]) -> Any:
+    """Bounded planner: draft + validate a plan for a goal — NO execution
+    (run via POST /planner/plan with execute=true; writes queue for approval)."""
+    from app.core import planner
+    return planner.draft_plan(str(p.get("goal") or ""))
+
+
 # ---- peer handoff / negotiation -------------------------------------------
 async def delegate(parent: "A2ARequest", sub_intent: str,
                    params: Optional[Dict[str, Any]] = None,
@@ -334,6 +378,49 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "proposed by the learning loop from calibration evidence, "
                "bounds-enforced, executes on governance approval, undoable",
                sp=_sp_tuning_adjust),
+    Capability("meeting.book", "activities", "", "write",
+               lambda p: (f"book a meeting with "
+                          f"{p.get('entity_type', 'lead')} "
+                          f"{p.get('entity_id') or p.get('lead_id') or ''}"),
+               "real meeting booking: availability-checked slot on the "
+               "owner's calendar (ET business hours, preferred-hour aware), "
+               "meeting activity + signed .ics invite link; invite emails "
+               "only under AUTOSEND to verified addresses; undo cancels",
+               sp=_sp_meeting_book),
+    Capability("kb.publish", "email", "", "write",
+               lambda p: f"publish KB article: {p.get('title', '')}",
+               "publish a knowledge-base article (mined from a resolved "
+               "support thread, LLM-drafted, critic-checked); executes on "
+               "governance approval; undo retires the article",
+               sp=_sp_kb_publish),
+    Capability("crm.context", "orchestrator", "", "read",
+               lambda p: f"context: {p.get('entity_type', 'account')} "
+                         f"{p.get('entity_id', '')}",
+               "context hydration: the compact deterministic 360 pack "
+               "(profile, blackboard signals, open money, cadences, pending "
+               "approvals, last touches) for an account/lead/contact — what "
+               "every agent is 'born with'",
+               sp=_sp_crm_context),
+    Capability("sms.send", "email", "", "write",
+               lambda p: f"send SMS to {p.get('to', '?')}",
+               "send one SMS via the Twilio channel (drafts as an owner task "
+               "unless SMS_AUTOSEND=1; trial accounts only reach verified "
+               "numbers; irreversible once sent)",
+               sp=_sp_sms_send),
+    Capability("scoring.activate", "leads", "", "write",
+               lambda p: f"activate lead-scoring model v{p.get('version', '?')}",
+               "make a trained predictive lead-scoring candidate the active "
+               "model (trained weekly on settled leads, proposed with holdout "
+               "evidence, executes on governance approval, undo restores the "
+               "previous version)",
+               sp=_sp_scoring_activate),
+    Capability("crm.plan", "orchestrator", "", "read",
+               lambda p: f"plan: {p.get('goal', '')}",
+               "bounded goal→plan orchestration: draft a validated multi-step "
+               "plan over the registered capabilities (≤6 steps, ≤2 writes) — "
+               "draft only; execution runs reads and queues writes for "
+               "governance approval",
+               sp=_sp_crm_plan),
     # Composite (peer handoff): fans out to Accounting + Leads and composes.
     Capability("crm.pipeline_snapshot", "orchestrator", "", "read",
                lambda p: "", "financial + hot-lead snapshot composed from peers",
@@ -502,6 +589,20 @@ async def dispatch(req: A2ARequest, dry_run: bool = False) -> A2AResult:
     except Exception as exc:
         return A2AResult(False, req.intent, cap.agent, cid,
                          error=f"render failed for '{req.intent}': {exc}")
+
+    # Context hydration ("born with context"): a request that carries an
+    # entity gets the compact CRM context block prepended, so the receiving
+    # agent starts already knowing the customer. Best-effort, read-only,
+    # kill switch CONTEXT_HYDRATION_ENABLED.
+    if req.entity and getattr(req.entity, "id", None):
+        try:
+            from app.core import context as _crm_context
+            block = await asyncio.to_thread(
+                _crm_context.render_for, req.entity.type, req.entity.id)
+            if block:
+                message = f"{block}\n\n{message}"
+        except Exception as exc:
+            logger.debug(f"[a2a] context hydration skipped: {exc}")
 
     session = f"a2a-{req.from_agent}-{cid[:8]}"
     logger.info(f"[a2a] {req.from_agent} → {cap.agent}.{req.intent} "

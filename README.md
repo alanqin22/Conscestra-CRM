@@ -132,6 +132,15 @@ forecast of where attention should move next.
 
 Traditional CRMs record state. **Conscestra models trajectory.**
 
+And no agent starts a task blind. Whenever any agent begins work on a
+customer — an agent-to-agent request, an inbound email, a workflow step —
+it is **born with context**: a compact briefing assembled automatically from
+everything the platform already knows. The churn profile, open balances,
+running workflows, pending approvals, warnings other agents have posted, the
+last conversation. A customer who writes in is never greeted like a
+stranger, and no agent ever asks a question the CRM already knows the
+answer to.
+
 ## Every Customer Has a Living Profile
 
 Beyond the on-demand 360, Conscestra maintains a **persistent customer
@@ -159,6 +168,21 @@ recommends the best sales representative based on industry expertise, customer
 history, and current workload. External enrichment fills in missing business
 information without ever overwriting human-entered data, ensuring your CRM
 becomes more complete over time while preserving data integrity.
+
+And the prediction itself learns. Once enough leads have settled, Conscestra
+trains a **predictive win-probability model** on your own outcomes —
+explainable down to each factor's contribution, measured against an honest
+baseline on held-out history. A model that can't beat "just guess the
+average" is never even proposed; one that can still goes through governance,
+where an executive activates it with one click and can roll it back just as
+easily. Until then, the platform says so plainly rather than inventing
+numbers.
+
+When a hot lead replies, the agent doesn't stop at a to-do. It checks the
+representative's real calendar availability, **books the meeting** at a slot
+aligned to the customer's preferred hour, protects it on the calendar, and
+sends a signed calendar invite — a hot reply becomes a confirmed meeting
+with zero human latency, and a person confirms what the agent committed to.
 
 ## AI Agents Execute Complete Business Workflows
 
@@ -190,7 +214,43 @@ intelligent action. Marketing campaigns are generated directly from customer
 segments, optimized through A/B testing, and always respect consent,
 suppression lists, verified recipients, and unsubscribe preferences.
 
+And email is no longer the only channel. Conscestra learns each customer's
+preferred channel — and can now act on it: agents send **SMS** and place
+**voice calls** through the same governed rails, an inbound text is matched
+to its customer and answered from approved knowledge, and every touch lands
+on the CRM timeline regardless of medium.
+
 Your business keeps moving — even while your team sleeps.
+
+## Every Resolved Case Teaches the Next One
+
+Most support knowledge evaporates the moment a ticket closes. Conscestra
+keeps it.
+
+When a support conversation resolves, an agent pairs the customer's question
+with the team's answer and drafts a **knowledge-base article** — generalized,
+stripped of personal detail, and submitted through governance like any other
+agent action. Once a human approves it, the autonomous auto-reply retrieves
+it to answer the next customer with the same problem, across email and SMS
+alike. Usage counters show which knowledge actually earns its keep.
+
+Every resolved case makes the next answer better. **The help desk compounds.**
+
+## Give It a Goal, Get a Governed Plan
+
+For everything the playbooks don't already cover, executives can hand the
+Orchestrator a **novel goal in plain language** — *"reduce overdue
+receivables this week"* — and get back a concrete multi-step plan.
+
+The planner composes exclusively from the platform's registered agent
+capabilities: plans are hard-capped in size, validated before anything runs,
+read-only steps execute immediately, and **every action with consequences is
+queued for human approval** — reviewed by the independent critic, routed to
+the right executive, reversible like everything else. In testing, the critic
+has rejected the planner's own proposals when the data didn't support them —
+three autonomous layers checking each other before a human ever looks.
+
+The AI supplies judgment. Deterministic rails supply safety.
 
 ## Agents That Pursue Business Goals, Not Just Events
 
@@ -308,6 +368,13 @@ Additional protections include:
 Sessions store only cryptographic token hashes, expire automatically after
 inactivity, and remain constrained by absolute session lifetimes.
 
+Privacy gets the same treatment. Before any customer-authored text reaches
+an external language model, Conscestra **masks personal identifiers** —
+email addresses, phone numbers, card-like digit sequences — while keeping
+what personalization genuinely needs. The model gets the meaning, never the
+identifiers. Operational sends remain governed by consent and autosend
+gates, so private data neither leaks into prompts nor out of them.
+
 Security is not a feature layered onto the platform. **Security is the
 architecture.**
 
@@ -387,6 +454,13 @@ _Listed in the same order as the launcher page on [agentorc.ca](https://agentorc
 - **Goal-oriented supervisor** — declared business objectives (`business_objectives`: metric, baseline → target, horizon, owning agent, optional recovery play) are evaluated every supervisor tick against a linear trajectory with slack: achieved / on_track / at_risk / off_track, plus trend from daily snapshots. Off-track objectives raise `objective.at_risk` events and can trigger their agent's governed play; the CEO briefing carries a 🎯 objectives section. Detectors watch symptoms; objectives pursue outcomes.
 - **An independent critic on every approval** — before an executive decides, a verifier agent cross-checks the proposal against live CRM state and the shared blackboard (zero-recipient segments, open complaints, overdue AR in a campaign audience, duplicate requests, dunning holds, real-send posture) and attaches a structured verdict — endorse / caution / object — with named, numbered findings. It rides in the queue API, the one-click decision email, and the morning briefing. Deterministic, explainable, advice-only.
 - **Calibration-proposed tuning** — when a month of snapshots shows the churn model miscalibrated (precision below 30%, miss rate above 20%), the learning loop drafts a bounded threshold adjustment as a `tuning.adjust` governance proposal with the evidence attached; approval writes the governed `agent_tuning` store the scorer reads live, undo reverts it, hard min/max bounds and a 14-day cooldown keep it conservative. The system proposes; people ratify.
+- **Context hydration ("born with context")** — one deterministic assembly (`context.py`) builds a compact ≤12-line briefing per customer (intelligence profile, blackboard signals, open money, running cadences, pending approvals with critic stances, last touches) and auto-injects it wherever an agent starts work: agent-to-agent dispatches, the inbound auto-reply, an inspection endpoint, and an A2A capability any agent can call.
+- **A knowledge loop for service** — resolved support threads are mined nightly, LLM-drafted into generalized KB articles, critic-checked and human-approved (`kb.publish`, undo retires); the autonomous auto-reply then grounds its answers in approved articles via deterministic Postgres full-text retrieval (no embeddings infra), with per-article usage counters showing which knowledge earns its keep.
+- **Real meeting booking** — availability computed from the rep's actual calendar (ET business hours, conflict-checked, aligned to the customer's learned preferred hour), the meeting activity protected on the calendar, and an HMAC-signed `.ics` invite delivered under the same autosend + verified-address gates as email; the cadence's engaged route auto-books and a confirm task keeps a human in the loop. Governed via A2A `meeting.book`; undo cancels.
+- **Bounded goal→plan orchestration** — the Orchestrator decomposes a novel goal into a plan composed ONLY of registered capabilities (≤6 steps, ≤2 writes, validated before execution); reads run deterministically, every write becomes a critic-reviewed governance approval tagged with the plan's goal and correlation id for end-to-end audit.
+- **Predictive lead scoring v2** — a dependency-free logistic model trained on settled leads (transparent coefficients, per-feature contributions on every prediction), held to a Brier-vs-base-rate bar on holdout data, refusing to train on thin or one-sided history; activation is a governed `scoring.activate` action with undo restoring the previous version, and consumers fall back to the band-history heuristic when no model is active.
+- **PII minimization** — customer-authored text and injected context blocks are deterministically masked (emails → `j***@domain`, phones/cards → last-4; dates, money and invoice numbers stay readable) before reaching the LLM; operational agent commands are deliberately exempt so actions still work, and masking is idempotent with an instant kill switch.
+- **SMS + voice as governed channels** — agents send SMS and place spoken calls through Twilio under the same draft-first autosend gates, every touch logged as a CRM activity; inbound texts are signature-verified, matched to their customer, bridged onto the timeline as bus events, and answered with a KB-grounded, PII-masked reply sized for SMS.
 - **Persistent customer intelligence** — a nightly deterministic scorer writes a living profile per customer (churn risk vs their own median order gap, RFM/LTV, preferred channel + engagement hour, interests from ordered categories, inbound-email sentiment) that feeds the AI 360s, the supervisor's churn detector, and campaign segmentation — with the full component breakdown persisted for explainability.
 - **Marketing campaigns on the CASL stack** — segment the customer base by churn band / LTV / industry / channel, LLM-draft the content (deterministic template fallback, placeholders enforced), optionally A/B two subjects (50/50 split, per-variant reply attribution + leading verdict), and launch through the existing consent infrastructure (suppression list, verified-address gate, unsubscribe footer); draft-only unless autosend is explicitly enabled *and* the launch is confirmed. A supervisor-detected churn spike can *propose* a win-back campaign through the governance queue — agents initiating commercial action within policy.
 - **Leads qualified with earned numbers** — win probability is the smoothed historical conversion rate of settled leads in the same score band; the recommended rep is ranked by industry-account experience then current load, with the reason attached; company enrichment supports Apollo / People Data Labs / a keyless web lookup, all gap-fill-only.
@@ -433,7 +507,14 @@ crm_agent/
     │   ├── marketing.py           ← Segment → draft (LLM) → A/B → CASL-gated launch → measure
     │   ├── qualification.py       ← Win probability + recommended-rep card
     │   ├── learning.py            ← Agent performance analytics + calibration
-    │   └── tuning.py              ← Calibration-proposed, human-ratified parameters
+    │   ├── tuning.py              ← Calibration-proposed, human-ratified parameters
+    │   ├── context.py             ← Context hydration ("born with context" packs)
+    │   ├── knowledge.py           ← Service knowledge loop (mine → govern → retrieve)
+    │   ├── booking.py             ← Real meeting booking (availability + signed .ics)
+    │   ├── planner.py             ← Bounded goal→plan orchestration
+    │   ├── scoring.py             ← Predictive lead scoring (governed activation)
+    │   ├── privacy.py             ← PII masking before any LLM prompt
+    │   └── telephony.py           ← SMS + voice channel (Twilio, governed)
     └── agents/
         │  ── 10 conversational AI agents (LangGraph + pre-router + LLM) ──
         ├── accounts/         prompt | pre_router | sql_builder | formatter | graph | router

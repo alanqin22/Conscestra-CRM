@@ -484,23 +484,55 @@ def _act_offer_meeting(seq: Dict[str, Any], lead: Dict[str, Any]) -> Dict[str, A
 
 def _act_book_meeting(seq: Dict[str, Any], lead: Dict[str, Any]) -> Dict[str, Any]:
     """Signal-routed step: the lead ENGAGED mid-cadence. Strike while hot —
-    urgent owner task to lock a meeting within 24h, plus a blackboard note so
-    every agent sees the lead is live."""
+    actually BOOK the meeting (real availability check + invite via
+    app/core/booking.py) when BOOKING_AUTOBOOK is on; fall back to an urgent
+    owner task if booking can't complete. Blackboard note either way."""
     from app.core import blackboard
     name = _lead_display(lead)
-    _insert_activity_sync(
-        "meeting",
-        f"Cadence WIN: {name} replied – book the meeting NOW",
-        (f"{name} engaged mid-cadence (inbound reply). Momentum is highest in "
-         f"the first 24 hours — propose two concrete slots today and confirm "
-         f"the meeting. Auto-routed by the lead_followup cadence."),
-        due_hours=4, owner_id=lead.get("owner_id"), lead_id=lead["lead_id"])
+    booked = None
+    try:
+        from app.core import booking
+        if booking.AUTOBOOK:
+            booked = booking.book("lead", lead["lead_id"], booked_by="cadence",
+                                  notes=f"Lead replied mid-{seq['playbook']} "
+                                        f"cadence (score {lead.get('score')}).")
+            if not booked.get("ok"):
+                logger.warning(f"[sequences] auto-book failed for {name}: "
+                               f"{booked.get('error')}")
+                booked = None
+    except Exception as exc:
+        logger.warning(f"[sequences] auto-book errored for {name}: {exc}")
+        booked = None
+    if booked:
+        _insert_activity_sync(
+            "task",
+            f"Cadence WIN: meeting auto-booked with {name} – confirm",
+            (f"{name} engaged mid-cadence and a meeting was auto-booked for "
+             f"{booked['when']}"
+             + (" (invite emailed)." if booked.get("emailed")
+                else " — send the invite (see the send-invite task).")
+             + f" Reschedule from the activity if needed."),
+            due_hours=4, owner_id=lead.get("owner_id"), lead_id=lead["lead_id"])
+    else:
+        _insert_activity_sync(
+            "meeting",
+            f"Cadence WIN: {name} replied – book the meeting NOW",
+            (f"{name} engaged mid-cadence (inbound reply). Momentum is highest in "
+             f"the first 24 hours — propose two concrete slots today and confirm "
+             f"the meeting. Auto-routed by the lead_followup cadence."),
+            due_hours=4, owner_id=lead.get("owner_id"), lead_id=lead["lead_id"])
     blackboard.post(
         "lead", lead["lead_id"], "orchestrator", "hot_engagement",
-        f"{name} replied mid-cadence — meeting-booking task issued",
-        {"playbook": seq["playbook"], "score": lead.get("score")},
+        f"{name} replied mid-cadence — "
+        + (f"meeting auto-booked for {booked['when']}" if booked
+           else "meeting-booking task issued"),
+        {"playbook": seq["playbook"], "score": lead.get("score"),
+         **({"activity_id": booked["activity_id"]} if booked else {})},
         0.9, "info", 24 * 7)
-    return {"action": "book_meeting", "activity": "meeting-booking task created"}
+    return {"action": "book_meeting",
+            **({"booked": booked["when"], "activity_id": booked["activity_id"],
+                "emailed": booked["emailed"]} if booked
+               else {"activity": "meeting-booking task created"})}
 
 
 def _act_move_to_nurture(seq: Dict[str, Any], lead: Dict[str, Any]) -> Dict[str, Any]:

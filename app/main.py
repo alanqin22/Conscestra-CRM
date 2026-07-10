@@ -305,6 +305,38 @@ def _run_intelligence_scoring() -> None:
         logger.error(f"[Intelligence] scoring failed: {exc}", exc_info=True)
 
 
+def _run_kb_draft_pass() -> None:
+    """Scheduled job (nightly): the knowledge loop's mining side — pair
+    resolved support threads with their human resolution, LLM-draft articles,
+    and PROPOSE them through governance (kb.publish). Publishes nothing
+    itself. No-op unless KB_DRAFT_ENABLED=1 (draft_pass self-gates)."""
+    try:
+        from app.core.knowledge import draft_pass
+        res = draft_pass()
+        if res.get("proposed"):
+            logger.info(f"[Knowledge] proposed {len(res['proposed'])} article(s) "
+                        f"from {res['threads']} resolved thread(s)")
+    except Exception as exc:
+        logger.error(f"[Knowledge] draft pass failed: {exc}", exc_info=True)
+
+
+def _run_scoring_train() -> None:
+    """Scheduled job (weekly): predictive lead-scoring training — fit a
+    candidate on settled leads and, when it beats the baseline, PROPOSE
+    activating it through governance. A model can never activate itself.
+    No-op unless SCORING_TRAIN_ENABLED=1 (train_and_propose self-gates)."""
+    try:
+        from app.core.scoring import train_and_propose
+        res = train_and_propose()
+        if res.get("proposed") or res.get("trained"):
+            logger.info(f"[Scoring] trained={res.get('trained')} "
+                        f"version={res.get('version')} "
+                        f"proposed={res.get('proposed')} "
+                        f"reason={res.get('reason')}")
+    except Exception as exc:
+        logger.error(f"[Scoring] training failed: {exc}", exc_info=True)
+
+
 def _run_tuning_proposals() -> None:
     """Scheduled job (weekly): calibration → governance-proposed tuning. Reads
     the churn model's calibration and, when the evidence warrants, queues
@@ -533,6 +565,16 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             misfire_grace_time=3600,
         )
+        # Knowledge-loop mining — nightly 23:00 ET: resolved support threads →
+        # LLM-drafted article proposals (governed kb.publish). Self-gates on
+        # KB_DRAFT_ENABLED; publishes nothing without an approval.
+        _scheduler.add_job(
+            _run_kb_draft_pass,
+            trigger=CronTrigger(hour=23, minute=0),
+            id="kb_draft_pass",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
         # Calibration→tuning proposals — weekly, Monday 23:15 ET (after the
         # nightly scoring stack). Self-gates on TUNING_PROPOSALS_ENABLED;
         # queues governed tuning.adjust proposals, never writes parameters.
@@ -540,6 +582,16 @@ async def lifespan(app: FastAPI):
             _run_tuning_proposals,
             trigger=CronTrigger(day_of_week="mon", hour=23, minute=15),
             id="tuning_proposals",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        # Predictive lead-scoring training — weekly, Monday 23:30 ET. Self-
+        # gates on SCORING_TRAIN_ENABLED; trains a candidate and proposes
+        # activation through governance, never activates.
+        _scheduler.add_job(
+            _run_scoring_train,
+            trigger=CronTrigger(day_of_week="mon", hour=23, minute=30),
+            id="scoring_train",
             replace_existing=True,
             misfire_grace_time=3600,
         )
@@ -851,6 +903,39 @@ app.include_router(objectives_router, dependencies=_ADMIN)
 # -- Governed tuning (calibration-proposed, human-approved model parameters)
 from app.core.tuning import router as tuning_router
 app.include_router(tuning_router, dependencies=_ADMIN)
+
+# -- Context hydration (agents "born with context": the compact 360 pack)
+from app.core.context import router as context_router
+app.include_router(context_router, dependencies=_ADMIN)
+
+# -- Knowledge loop (resolved cases → governed KB articles → smarter replies)
+from app.core.knowledge import router as knowledge_router
+app.include_router(knowledge_router, dependencies=_ADMIN)
+
+# -- Bounded planner (goal → validated plan over registered capabilities;
+#    reads execute, writes queue for governance approval)
+from app.core.planner import router as planner_router
+app.include_router(planner_router, dependencies=_ADMIN)
+
+# -- Predictive lead scoring v2 (train → candidate → governed activation)
+from app.core.scoring import router as scoring_router
+app.include_router(scoring_router, dependencies=_ADMIN)
+
+# -- Telephony channel (Twilio SMS + voice). The inbound webhook is PUBLIC —
+#    the X-Twilio-Signature (HMAC over URL+params with the auth token) IS
+#    the authorization; everything else is admin-gated.
+from app.core.telephony import router as telephony_router
+from app.core.telephony import public_router as telephony_public_router
+app.include_router(telephony_router, dependencies=_ADMIN)
+app.include_router(telephony_public_router)
+
+# -- Real meeting booking (availability + booked meeting + signed .ics invite).
+#    The invite link is PUBLIC because the HMAC token is the authorization
+#    (same pattern as unsubscribe / governance decide links).
+from app.core.booking import router as booking_router
+from app.core.booking import public_router as booking_public_router
+app.include_router(booking_router, dependencies=_ADMIN)
+app.include_router(booking_public_router)
 
 # -- Lead qualification (win probability + recommended rep)
 from app.core.qualification import router as qualification_router

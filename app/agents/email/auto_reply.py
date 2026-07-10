@@ -109,6 +109,16 @@ def compose_reply(email: Dict[str, Any], intent: str) -> Optional[Dict[str, str]
     orig_subject = email.get('subject', '(no subject)')
     orig_body    = (email.get('body_text') or email.get('preview') or '').strip()[:600]
 
+    # PII minimization: the customer's raw text goes to the LLM masked
+    # (emails/phones/card-like runs) — kill switch PII_MASK_ENABLED. The KB
+    # retrieval below intentionally uses the RAW text (internal DB search).
+    try:
+        from app.core import privacy
+        masked_subject = privacy.mask(orig_subject)
+        masked_body = privacy.mask(orig_body)
+    except Exception:
+        masked_subject, masked_body = orig_subject, orig_body
+
     intent_guidance = {
         'general_inquiry': (
             "The sender has a general question or greeting. "
@@ -126,6 +136,28 @@ def compose_reply(email: Dict[str, Any], intent: str) -> Optional[Dict[str, str]
 
     guidance = intent_guidance.get(intent, intent_guidance['general_inquiry'])
 
+    # Context hydration: if the sender is a known contact/lead, give the LLM
+    # their compact CRM pack so the reply is personalized — a known customer
+    # with an open overdue invoice or a running cadence gets acknowledged as
+    # such, not greeted like a stranger. Best-effort; kill switch
+    # CONTEXT_HYDRATION_ENABLED.
+    crm_block = ""
+    try:
+        from app.core import context as crm_context
+        crm_block = crm_context.render_for_email(_extract_email_addr(sender_raw))
+    except Exception as exc:
+        logger.debug(f"context hydration skipped for auto-reply: {exc}")
+
+    # Knowledge loop (RAG): ground the reply in APPROVED knowledge-base
+    # answers when the message matches one — every resolved case makes the
+    # next auto-reply smarter. Best-effort; kill switch KB_RAG_ENABLED.
+    kb_block = ""
+    try:
+        from app.core import knowledge
+        kb_block = knowledge.rag_block(orig_subject, orig_body)
+    except Exception as exc:
+        logger.debug(f"knowledge retrieval skipped for auto-reply: {exc}")
+
     system_prompt = (
         "You are the EmailAgent for Conscestra CRM / Agentorc.ca — a Canadian AI orchestration platform. "
         "You write concise, warm, professional email replies on behalf of the Conscestra CRM team. "
@@ -136,12 +168,20 @@ def compose_reply(email: Dict[str, Any], intent: str) -> Optional[Dict[str, str]
     user_prompt = (
         f"Write an auto-reply email.\n\n"
         f"Recipient first name: {first_name}\n"
-        f"Original subject: {orig_subject}\n"
-        f"Original message snippet:\n{orig_body}\n\n"
+        f"Original subject: {masked_subject}\n"
+        f"Original message snippet:\n{masked_body}\n\n"
         f"Intent: {intent}\n"
         f"Guidance: {guidance}\n\n"
-        f"Return ONLY the email body text (no subject line, no 'Hi' prefix — start with the greeting). "
-        f"Keep it under 120 words."
+        + (f"Internal CRM context about this sender (use it ONLY to make the tone "
+           f"and content appropriate — e.g. thank a long-standing customer, "
+           f"acknowledge an ongoing conversation. NEVER quote, reveal, or hint at "
+           f"internal scores, churn risk, financial balances, or process names):\n"
+           f"{crm_block}\n\n" if crm_block else "")
+        + (f"Approved knowledge-base guidance that matches this message — base the "
+           f"SUBSTANCE of your reply on it (adapt the wording, keep it accurate):\n"
+           f"{kb_block}\n\n" if kb_block else "")
+        + f"Return ONLY the email body text (no subject line, no 'Hi' prefix — start with the greeting). "
+          f"Keep it under 120 words."
     )
 
     try:
