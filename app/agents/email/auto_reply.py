@@ -185,7 +185,7 @@ def compose_reply(email: Dict[str, Any], intent: str) -> Optional[Dict[str, str]
     )
 
     try:
-        llm      = _get_llm()
+        llm      = _get_llm(tier="lite")
         response = llm.invoke([
             {'role': 'system',  'content': system_prompt},
             {'role': 'user',    'content': user_prompt},

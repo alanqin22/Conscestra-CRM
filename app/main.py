@@ -912,6 +912,10 @@ app.include_router(context_router, dependencies=_ADMIN)
 from app.core.knowledge import router as knowledge_router
 app.include_router(knowledge_router, dependencies=_ADMIN)
 
+# -- LLM meter (per-agent usage, budgets, tiering — the fleet's fuel gauge)
+from app.core.llm_meter import router as llm_meter_router
+app.include_router(llm_meter_router, dependencies=_ADMIN)
+
 # -- Bounded planner (goal → validated plan over registered capabilities;
 #    reads execute, writes queue for governance approval)
 from app.core.planner import router as planner_router

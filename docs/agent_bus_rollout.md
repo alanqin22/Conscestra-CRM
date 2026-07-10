@@ -131,10 +131,18 @@ psql "$RAILWAY_DB_URL" -f sql/knowledge_base.sql                   # 12 knowledg
 psql "$RAILWAY_DB_URL" -f sql/lead_scoring_model.sql               # 13 predictive lead-scoring model store
 psql "$RAILWAY_DB_URL" -f sql/telephony.sql                        # 14 sms.received event type + subscriptions
 psql "$RAILWAY_DB_URL" -f sql/sdr_sessions.sql                     # 15 durable SDR sessions + rate limiting
+psql "$RAILWAY_DB_URL" -f sql/llm_usage.sql                        # 16 LLM usage metering (fuel gauge)
 ```
 
-**One-paste alternative for steps 8–15:** `sql/railway_cutover_2026_07.sql`
-(the eight migrations concatenated in order; idempotent, verified re-runnable).
+**One-paste alternative for steps 8–16:** `sql/railway_cutover_2026_07.sql`
+(the nine migrations concatenated in order; idempotent, verified re-runnable).
+
+LLM metering is on by default (kill `LLM_METER_ENABLED=0`); budgets are OFF
+until you set `LLM_DAILY_TOKEN_BUDGET` (per-caller default) or
+`LLM_BUDGET_<CALLER>` (e.g. `LLM_BUDGET_SDR=50000`) — over-budget callers
+degrade to their deterministic fallbacks, never crash. `LLM_MODEL_LITE`
+routes SDR/auto-reply/SMS wording to a cheaper model. Monitor at
+`GET /llm/usage`; the CEO briefing carries the daily spend line.
 
 Each ends with a verify `SELECT`. After this, **A2A (Phase 2) and the blackboard
 (Phase 4) are fully live** (no flags) — `/a2a/capabilities`, `/a2a/dispatch`,

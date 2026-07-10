@@ -104,8 +104,17 @@ def agent_performance(days: int = 30) -> Dict[str, Any]:
         logger.debug(f"[learning] calibration skipped: {exc}")
         calibration = {"verdict": [f"calibration unavailable: {exc}"], "bands": {}}
 
+    # ── AI fuel gauge: what did the automation COST? (best-effort) ──────────
+    try:
+        from app.core import llm_meter
+        ai_spend = llm_meter.spend_lines(1)
+    except Exception as exc:
+        logger.debug(f"[learning] llm spend skipped: {exc}")
+        ai_spend = []
+
     return {"window_days": days, "cadences": cadences,
-            "campaigns": campaigns, "churn_calibration": calibration}
+            "campaigns": campaigns, "churn_calibration": calibration,
+            "ai_spend": ai_spend}
 
 
 router = APIRouter(tags=["learning"])

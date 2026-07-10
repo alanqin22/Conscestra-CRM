@@ -442,6 +442,7 @@ def _perf_lines(perf: Dict[str, Any]) -> List[str]:
                    f"{c['orders']} order(s) ({_money(c['order_value'])})")
     for v in (perf.get("churn_calibration") or {}).get("verdict") or []:
         out.append(f"churn model: {v}")
+    out.extend(perf.get("ai_spend") or [])
     return out
 
 

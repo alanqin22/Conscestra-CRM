@@ -53,22 +53,46 @@ class AgentState(TypedDict):
 # LLM FACTORY
 # ============================================================================
 
-def _get_llm():
-    """Return the configured LLM (OpenAI or Ollama ChatModel)."""
+def _get_llm(tier: str = "standard", caller: str = None):
+    """Return the configured LLM (OpenAI or Ollama ChatModel), wrapped in the
+    usage meter (app/core/llm_meter): every invoke is budget-checked and
+    recorded per caller — the fleet's fuel gauge.
+
+    tier="lite" uses LLM_MODEL_LITE when set — for high-volume, low-stakes
+    wording (SDR replies, auto-replies, SMS) that doesn't need the flagship
+    model. caller defaults to the calling module's name (sdr, planner, …)."""
+    import os as _os
+    import sys as _sys
     settings = get_settings()
+    model = settings.llm_model
+    if tier == "lite":
+        model = _os.getenv("LLM_MODEL_LITE", "").strip() or model
+    if caller is None:
+        try:
+            caller = _sys._getframe(1).f_globals.get(
+                "__name__", "unknown").rsplit(".", 1)[-1]
+        except Exception:
+            caller = "unknown"
     if settings.llm_provider == "openai":
-        logger.info(f"Using OpenAI LLM: {settings.llm_model}")
-        return ChatOpenAI(
+        logger.info(f"Using OpenAI LLM: {model} (caller={caller}, tier={tier})")
+        inner = ChatOpenAI(
             api_key=settings.openai_api_key,
-            model=settings.llm_model,
+            model=model,
             temperature=0.1,
         )
-    logger.info(f"Using Ollama LLM: {settings.llm_model}")
-    return ChatOllama(
-        base_url=settings.ollama_base_url,
-        model=settings.llm_model,
-        temperature=0.1,
-    )
+    else:
+        logger.info(f"Using Ollama LLM: {model} (caller={caller}, tier={tier})")
+        inner = ChatOllama(
+            base_url=settings.ollama_base_url,
+            model=model,
+            temperature=0.1,
+        )
+    try:
+        from app.core.llm_meter import MeteredLLM
+        return MeteredLLM(inner, caller=caller, model=model, tier=tier)
+    except Exception as exc:                  # the meter must never break the fleet
+        logger.warning(f"LLM meter unavailable — returning unmetered model: {exc}")
+        return inner
 
 
 def _call_ollama_direct(system_prompt: str, messages: list) -> str:

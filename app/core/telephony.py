@@ -283,7 +283,7 @@ def _compose_sms_reply(sender_display: str, body: str) -> str:
         from app.core import knowledge, privacy
         from app.core.graph_utils import _get_llm
         kb = knowledge.rag_block("sms inquiry", body)
-        resp = _get_llm().invoke([
+        resp = _get_llm(tier="lite").invoke([
             {"role": "system", "content":
                 "You write SMS replies for Conscestra CRM. ONE short paragraph, "
                 "under 300 characters, plain text, no links unless given one, "

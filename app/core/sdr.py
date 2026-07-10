@@ -275,7 +275,7 @@ def _llm_reply(state: Dict[str, Any], history: List[Dict[str, str]],
                  + (f"\n\nApproved knowledge:\n{kb}" if kb else "")}]
         msgs += history[-6:]
         msgs.append({"role": "user", "content": privacy.mask(user_text)[:_MAX_MSG]})
-        resp = _get_llm().invoke(msgs)
+        resp = _get_llm(tier="lite").invoke(msgs)
         text = (resp.content if hasattr(resp, "content") else str(resp)).strip()
         return text[:600] if text else None
     except Exception as exc:
