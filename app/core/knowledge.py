@@ -45,8 +45,12 @@ DRAFT_ENABLED = _flag("KB_DRAFT_ENABLED", "0")
 DRAFT_CAP = int(os.getenv("KB_DRAFT_CAP", "3"))
 
 MIN_RANK = 0.03          # FTS rank below this = not actually relevant
-RAG_MIN_RANK = 0.05      # OR-mode floor: multi-term matches on long email
-                         # queries rank ~0.08, single-word coincidences ~0.02
+RAG_MIN_RANK = 0.01      # OR-mode noise floor only — precision comes from the
+                         # matched-term count (ts_rank dilutes with query
+                         # length, so an absolute floor can't separate a
+                         # 5-of-8-terms hit from a 1-of-4 coincidence)
+RAG_MIN_TERMS = 2        # distinct query terms an article must match
+                         # (1 when the query itself has ≤2 salient terms)
 MIN_ANSWER_CHARS = 40    # publish refuses answers shorter than this
 
 _STOPWORDS = {"the", "and", "for", "with", "your", "from", "this", "that",
@@ -118,13 +122,37 @@ def _mark_used(article_uuids: List[str]) -> None:
         conn.close()
 
 
+def _salient_terms(q: str) -> List[str]:
+    import re as _re
+    return [t for t in dict.fromkeys(_re.findall(r"[a-z0-9]{3,}", q.lower()))
+            if t not in _STOPWORDS][:10]
+
+
+def _matched_terms(terms: List[str], hit: Dict[str, Any]) -> int:
+    """How many distinct query terms this article actually matches (prefix-
+    tolerant both ways: 'pay'~'payment', 'cards'~'card')."""
+    import re as _re
+    text = " ".join([hit.get("title") or "", hit.get("problem") or "",
+                     " ".join(hit.get("keywords") or [])]).lower()
+    words = set(_re.findall(r"[a-z0-9]{3,}", text))
+    n = 0
+    for t in terms:
+        if any(w.startswith(t) or t.startswith(w) for w in words):
+            n += 1
+    return n
+
+
 def rag_block(subject: str, body: str) -> str:
     """Prompt block with the best-matching approved answers ('' when none or
     the kill switch is off). Counts the retrieval as a use."""
     if not RAG_ENABLED:
         return ""
-    hits = search(f"{subject or ''} {str(body or '')[:200]}", limit=2,
-                  min_rank=RAG_MIN_RANK, any_terms=True)
+    query = f"{subject or ''} {str(body or '')[:200]}"
+    terms = _salient_terms(query)
+    need = 1 if len(terms) <= 2 else RAG_MIN_TERMS
+    hits = [h for h in search(query, limit=4, min_rank=RAG_MIN_RANK,
+                              any_terms=True)
+            if _matched_terms(terms, h) >= need][:2]
     if not hits:
         return ""
     _mark_used([h["article_uuid"] for h in hits])
