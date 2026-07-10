@@ -215,12 +215,25 @@ def send_sms_sp(p: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================================
 
 def _valid_signature(url: str, params: Dict[str, str], signature: str) -> bool:
-    """Twilio X-Twilio-Signature: base64(HMAC-SHA1(token, url + k1v1k2v2…))."""
+    """Twilio X-Twilio-Signature: base64(HMAC-SHA1(token, url + k1v1k2v2…)).
+
+    Behind a TLS-terminating proxy (Railway, tunnels) the app may see the URL
+    as http:// while Twilio signed the https:// one — so an http URL is also
+    checked with the scheme upgraded. Still a pure HMAC against the token."""
     if not _token() or not signature:
         return False
-    payload = url + "".join(k + params[k] for k in sorted(params))
-    digest = _hmac.new(_token().encode(), payload.encode(), hashlib.sha1).digest()
-    return _hmac.compare_digest(base64.b64encode(digest).decode(), signature)
+
+    def _check(u: str) -> bool:
+        payload = u + "".join(k + params[k] for k in sorted(params))
+        digest = _hmac.new(_token().encode(), payload.encode(),
+                           hashlib.sha1).digest()
+        return _hmac.compare_digest(base64.b64encode(digest).decode(), signature)
+
+    if _check(url):
+        return True
+    if url.startswith("http://"):
+        return _check("https://" + url[len("http://"):])
+    return False
 
 
 def _match_sender(phone_e164: str) -> Optional[Dict[str, Any]]:
