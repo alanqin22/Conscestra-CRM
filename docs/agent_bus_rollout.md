@@ -159,7 +159,18 @@ GET  /scoring/status            # active model + latest candidate + metrics
 POST /scoring/train             # forced train→propose pass
 GET  /telephony/status          # Twilio config + autosend/autoreply posture
 POST /telephony/sms/send        # admin SMS (agents go through A2A sms.send)
+GET  /sdr/status                # SDR chat/voice gates + active sessions
+POST /sdr/chat                  # PUBLIC prospect chat (gated + rate-limited)
 ```
+
+Autonomous SDR (no SQL): `SDR_CHAT_ENABLED=1` turns on the public web chat
+(per-IP rate limit `SDR_RATE_LIMIT`, deterministic capture state machine,
+LLM wording grounded in the KB, leads created source=sdr_chat, meetings
+booked via the booking engine); `SDR_VOICE_ENABLED=1` turns on conversational
+voice — point the Twilio number's VOICE webhook at
+`POST https://<railway-app>/sdr/voice/inbound` (signature-verified;
+turn-based <Gather input="speech"> loop; media-streams is the future
+upgrade). Both default OFF; the widget lives in store-home.html.
 
 The bounded planner needs NO SQL and NO flag: plans are validated against the
 capability registry (≤6 steps, ≤2 writes), reads execute deterministically,

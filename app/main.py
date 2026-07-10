@@ -929,6 +929,14 @@ from app.core.telephony import public_router as telephony_public_router
 app.include_router(telephony_router, dependencies=_ADMIN)
 app.include_router(telephony_public_router)
 
+# -- Autonomous SDR (prospect-facing web chat + conversational voice).
+#    PUBLIC by nature: chat is gated SDR_CHAT_ENABLED + per-IP rate-limited;
+#    voice webhooks are Twilio-signature-verified + gated SDR_VOICE_ENABLED.
+from app.core.sdr import router as sdr_router
+from app.core.sdr import public_router as sdr_public_router
+app.include_router(sdr_router, dependencies=_ADMIN)
+app.include_router(sdr_public_router)
+
 # -- Real meeting booking (availability + booked meeting + signed .ics invite).
 #    The invite link is PUBLIC because the HMAC token is the authorization
 #    (same pattern as unsubscribe / governance decide links).

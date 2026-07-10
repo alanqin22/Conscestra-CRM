@@ -252,6 +252,26 @@ three autonomous layers checking each other before a human ever looks.
 
 The AI supplies judgment. Deterministic rails supply safety.
 
+## An SDR That Never Sleeps
+
+The front door is staffed too. A prospect landing on the store can open a
+chat — or call the company number — and reach the **autonomous SDR**: it
+answers product questions from the approved knowledge base, captures who
+they are and what they need, creates the lead, and books the intro meeting
+on a real calendar slot, all in one conversation. On the phone, the same
+brain holds a spoken conversation — the caller talks, the agent answers,
+turn by turn.
+
+The design is deliberately conservative: a deterministic state machine —
+not the language model — owns every fact captured and every action taken.
+The model only writes the next sentence, grounded in approved knowledge,
+with no tools and no access to CRM data. Both channels sit behind their own
+on/off switches and rate limits, so the front door opens exactly as wide as
+you choose.
+
+Chat to qualified lead to booked meeting — **before a human ever says
+hello.**
+
 ## Agents That Pursue Business Goals, Not Just Events
 
 Beyond reacting to events, Conscestra's supervisor is **goal-oriented**.
@@ -461,6 +481,7 @@ _Listed in the same order as the launcher page on [agentorc.ca](https://agentorc
 - **Predictive lead scoring v2** — a dependency-free logistic model trained on settled leads (transparent coefficients, per-feature contributions on every prediction), held to a Brier-vs-base-rate bar on holdout data, refusing to train on thin or one-sided history; activation is a governed `scoring.activate` action with undo restoring the previous version, and consumers fall back to the band-history heuristic when no model is active.
 - **PII minimization** — customer-authored text and injected context blocks are deterministically masked (emails → `j***@domain`, phones/cards → last-4; dates, money and invoice numbers stay readable) before reaching the LLM; operational agent commands are deliberately exempt so actions still work, and masking is idempotent with an instant kill switch.
 - **SMS + voice as governed channels** — agents send SMS and place spoken calls through Twilio under the same draft-first autosend gates, every touch logged as a CRM activity; inbound texts are signature-verified, matched to their customer, bridged onto the timeline as bus events, and answered with a KB-grounded, PII-masked reply sized for SMS.
+- **An autonomous SDR at the front door** — one brain, two faces: a public web-chat widget (per-IP rate-limited, kill-switched) and a turn-based conversational phone agent (Twilio speech gathering, signature-verified). A deterministic state machine — never the LLM — captures name/company/need/email, creates the lead idempotently, and books the intro meeting through the booking engine once the prospect says yes to an actual offer; the LLM writes only the conversational wording, grounded in the approved KB, with no tools and no CRM access.
 - **Persistent customer intelligence** — a nightly deterministic scorer writes a living profile per customer (churn risk vs their own median order gap, RFM/LTV, preferred channel + engagement hour, interests from ordered categories, inbound-email sentiment) that feeds the AI 360s, the supervisor's churn detector, and campaign segmentation — with the full component breakdown persisted for explainability.
 - **Marketing campaigns on the CASL stack** — segment the customer base by churn band / LTV / industry / channel, LLM-draft the content (deterministic template fallback, placeholders enforced), optionally A/B two subjects (50/50 split, per-variant reply attribution + leading verdict), and launch through the existing consent infrastructure (suppression list, verified-address gate, unsubscribe footer); draft-only unless autosend is explicitly enabled *and* the launch is confirmed. A supervisor-detected churn spike can *propose* a win-back campaign through the governance queue — agents initiating commercial action within policy.
 - **Leads qualified with earned numbers** — win probability is the smoothed historical conversion rate of settled leads in the same score band; the recommended rep is ranked by industry-account experience then current load, with the reason attached; company enrichment supports Apollo / People Data Labs / a keyless web lookup, all gap-fill-only.
@@ -514,7 +535,8 @@ crm_agent/
     │   ├── planner.py             ← Bounded goal→plan orchestration
     │   ├── scoring.py             ← Predictive lead scoring (governed activation)
     │   ├── privacy.py             ← PII masking before any LLM prompt
-    │   └── telephony.py           ← SMS + voice channel (Twilio, governed)
+    │   ├── telephony.py           ← SMS + voice channel (Twilio, governed)
+    │   └── sdr.py                 ← Autonomous SDR (public chat + voice loop)
     └── agents/
         │  ── 10 conversational AI agents (LangGraph + pre-router + LLM) ──
         ├── accounts/         prompt | pre_router | sql_builder | formatter | graph | router
