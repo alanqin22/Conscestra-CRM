@@ -413,6 +413,37 @@ def _checks_sms_send(ap: Dict[str, Any]) -> List[Dict[str, str]]:
     return out
 
 
+def _checks_data_fix(ap: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Sanity-check a data-quality fix: the problem still exists live (a
+    stale proposal must not run), the cap is honored, evidence attached."""
+    out: List[Dict[str, str]] = []
+    from app.core import data_quality
+    p = ap.get("params") or {}
+    detector = {"data.normalize_phones": "unnormalized_phones",
+                "data.merge_contacts": "duplicate_contacts"}.get(
+                    ap.get("action_type", ""))
+    if detector:
+        live = data_quality.DETECTORS[detector]().get("count", 0)
+        if not live:
+            out.append(_f("still_needed", "fail",
+                          "nothing left to fix — the issue resolved since "
+                          "this was proposed"))
+        else:
+            out.append(_f("still_needed", "ok", f"{live} item(s) still affected"))
+    limit = int(p.get("limit", data_quality.FIX_LIMIT))
+    if limit > data_quality.FIX_LIMIT:
+        out.append(_f("bounded", "warn",
+                      f"requested limit {limit} exceeds DQ_FIX_LIMIT "
+                      f"({data_quality.FIX_LIMIT}) — the executor will cap it"))
+    else:
+        out.append(_f("bounded", "ok", f"capped at {limit} per run"))
+    if (p.get("evidence") or {}).get("samples"):
+        out.append(_f("evidence", "ok", "samples attached"))
+    else:
+        out.append(_f("evidence", "warn", "no samples attached"))
+    return out
+
+
 _ACTION_CHECKS: Dict[str, Callable[[Dict[str, Any]], List[Dict[str, str]]]] = {
     "campaign.winback":          _checks_campaign_winback,
     "supervisor.emit_dunning":   _checks_emit_dunning,
@@ -422,6 +453,8 @@ _ACTION_CHECKS: Dict[str, Callable[[Dict[str, Any]], List[Dict[str, str]]]] = {
     "meeting.book":              _checks_meeting_book,
     "scoring.activate":          _checks_scoring_activate,
     "sms.send":                  _checks_sms_send,
+    "data.normalize_phones":     _checks_data_fix,
+    "data.merge_contacts":       _checks_data_fix,
 }
 
 

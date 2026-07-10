@@ -265,6 +265,18 @@ def _sp_scoring_activate(p: Dict[str, Any]) -> Any:
     return scoring.activate_sp(p or {})
 
 
+def _sp_dq_normalize_phones(p: Dict[str, Any]) -> Any:
+    """Data quality: normalize phones to E.164 (executed on approval; undoable)."""
+    from app.core import data_quality
+    return data_quality.normalize_phones_sp(p or {})
+
+
+def _sp_dq_merge_contacts(p: Dict[str, Any]) -> Any:
+    """Data quality: merge exact-duplicate contacts (executed on approval; undoable)."""
+    from app.core import data_quality
+    return data_quality.merge_contacts_sp(p or {})
+
+
 def _sp_crm_plan(p: Dict[str, Any]) -> Any:
     """Bounded planner: draft + validate a plan for a goal — NO execution
     (run via POST /planner/plan with execute=true; writes queue for approval)."""
@@ -286,9 +298,11 @@ async def delegate(parent: "A2ARequest", sub_intent: str,
 
 async def _compose_pipeline_snapshot(req: "A2ARequest"):
     """Composite capability: one request fans out to peers and composes their
-    structured results — a real agent-to-agent handoff. Returns (data, hops)."""
-    fin = await delegate(req, "accounting.summary")
-    hot = await delegate(req, "leads.list", {"scoreMin": 70, "pageSize": 5})
+    structured results — a real agent-to-agent handoff. Returns (data, hops).
+    The peer calls are independent — they run CONCURRENTLY."""
+    fin, hot = await asyncio.gather(
+        delegate(req, "accounting.summary"),
+        delegate(req, "leads.list", {"scoreMin": 70, "pageSize": 5}))
     recs = (hot.data or {}).get("records") or (hot.data or {}).get("leads") or []
     data = {
         "financials": fin.data if fin.ok else {"error": fin.error},
@@ -414,6 +428,18 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "evidence, executes on governance approval, undo restores the "
                "previous version)",
                sp=_sp_scoring_activate),
+    Capability("data.normalize_phones", "contacts", "", "write",
+               lambda p: "normalize contact/lead phones to E.164",
+               "data-quality fix: normalize unnormalized phone numbers "
+               "(capped per run, before-values recorded, undoable); proposed "
+               "nightly by the data-quality agent, executes on approval",
+               sp=_sp_dq_normalize_phones),
+    Capability("data.merge_contacts", "contacts", "", "write",
+               lambda p: "merge exact-duplicate contacts",
+               "data-quality fix: merge duplicate contacts (same account + "
+               "email) into the oldest — activities reassigned, dupes "
+               "soft-deleted, every move recorded, undoable",
+               sp=_sp_dq_merge_contacts),
     Capability("crm.plan", "orchestrator", "", "read",
                lambda p: f"plan: {p.get('goal', '')}",
                "bounded goal→plan orchestration: draft a validated multi-step "

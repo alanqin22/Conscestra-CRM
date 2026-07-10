@@ -154,6 +154,16 @@ Behavior evals: `EVALS_ENABLED=1` runs five golden scenarios nightly at
 retrieval with deterministic assertions; drift raises a supervisor.alert.
 `GET /evals/status`, `POST /evals/run-once`.
 
+Data-quality agent: `DQ_ENABLED=1` scans nightly at 23:20 ET (duplicate
+contacts, unnormalized phones, unreachable contacts/leads, ownerless
+accounts, duplicate account names) and queues the two SAFE fixes as
+governed, UNDOABLE approvals (`data.normalize_phones`,
+`data.merge_contacts` — capped per run by `DQ_FIX_LIMIT`, before-state
+recorded on the approval). Account merging stays report-only (human's
+call). `GET /data-quality/report`, `POST /data-quality/propose`; the CEO
+briefing carries the hygiene line. No SQL needed. Planner reads and
+composite capabilities now fan out concurrently (no config).
+
 Each ends with a verify `SELECT`. After this, **A2A (Phase 2) and the blackboard
 (Phase 4) are fully live** (no flags) — `/a2a/capabilities`, `/a2a/dispatch`,
 `/blackboard/*` work, and agents will write blackboard notes once the bus runs.

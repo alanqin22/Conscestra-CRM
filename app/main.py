@@ -305,6 +305,19 @@ def _run_intelligence_scoring() -> None:
         logger.error(f"[Intelligence] scoring failed: {exc}", exc_info=True)
 
 
+def _run_dq_propose() -> None:
+    """Scheduled job (nightly): data-quality scan → governed fix proposals
+    (normalize phones, merge duplicate contacts). Fixes only ever QUEUE —
+    execution requires an approval. No-op unless DQ_ENABLED=1."""
+    try:
+        from app.core.data_quality import propose_fixes
+        res = propose_fixes()
+        if res.get("proposed"):
+            logger.info(f"[DataQuality] proposed: {res['proposed']}")
+    except Exception as exc:
+        logger.error(f"[DataQuality] pass failed: {exc}", exc_info=True)
+
+
 def _run_behavior_evals() -> None:
     """Scheduled job (nightly): golden-scenario behavior evals over the
     LLM-facing flows (SDR, auto-reply, planner, KB retrieval) — deterministic
@@ -575,6 +588,15 @@ async def lifespan(app: FastAPI):
             _run_objectives_pass,
             trigger=CronTrigger(hour=22, minute=50),
             id="objectives_pass",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        # Data-quality scan→propose — nightly 23:20 ET. Self-gates on
+        # DQ_ENABLED; fixes queue for approval, nothing mutates directly.
+        _scheduler.add_job(
+            _run_dq_propose,
+            trigger=CronTrigger(hour=23, minute=20),
+            id="dq_propose",
             replace_existing=True,
             misfire_grace_time=3600,
         )
@@ -942,6 +964,10 @@ app.include_router(llm_meter_router, dependencies=_ADMIN)
 # -- Behavior evals (nightly CI for prompts: golden scenarios + drift alerts)
 from app.core.evals import router as evals_router
 app.include_router(evals_router, dependencies=_ADMIN)
+
+# -- Data-quality agent (nightly detectors → governed, undoable fixes)
+from app.core.data_quality import router as dq_router
+app.include_router(dq_router, dependencies=_ADMIN)
 
 # -- Bounded planner (goal → validated plan over registered capabilities;
 #    reads execute, writes queue for governance approval)

@@ -175,22 +175,33 @@ async def run_plan(goal: str, plan: Optional[Dict[str, Any]] = None) -> Dict[str
     cid = str(_uuid.uuid4())
     trace: List[Dict[str, Any]] = []
     proposed: List[Dict[str, Any]] = []
+
+    # READ steps are independent (v1 params never reference prior outputs) —
+    # fan them out CONCURRENTLY; WRITE steps queue sequentially after.
+    import asyncio as _aio
+
+    async def _read(i: int, intent: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            res = await dispatch(A2ARequest(
+                intent=intent, from_agent="planner", params=params,
+                correlation_id=cid))
+            return {"step": i, "intent": intent, "kind": "read", "ok": res.ok,
+                    "output": (res.output or "")[:500], "error": res.error}
+        except Exception as exc:
+            return {"step": i, "intent": intent, "kind": "read",
+                    "ok": False, "error": str(exc)[:200]}
+
+    reads = [(i, s) for i, s in enumerate(drafted["steps"], 1)
+             if s.get("kind") == "read"]
+    read_results = await _aio.gather(
+        *[_read(i, s["intent"], dict(s.get("params") or {})) for i, s in reads])
+    trace.extend(read_results)
+
     for i, step in enumerate(drafted["steps"], 1):
-        intent, params = step["intent"], dict(step.get("params") or {})
         if step.get("kind") == "read":
-            try:
-                res = await dispatch(A2ARequest(
-                    intent=intent, from_agent="planner", params=params,
-                    correlation_id=cid))
-                trace.append({"step": i, "intent": intent, "kind": "read",
-                              "ok": res.ok,
-                              "output": (res.output or "")[:500],
-                              "error": res.error})
-            except Exception as exc:
-                trace.append({"step": i, "intent": intent, "kind": "read",
-                              "ok": False, "error": str(exc)[:200]})
             continue
         # WRITE — never executed by the planner: queue for human approval.
+        intent, params = step["intent"], dict(step.get("params") or {})
         params["plan_goal"] = goal
         params["plan_correlation_id"] = cid
         aid = governance.propose(intent, "planner", params,
@@ -199,6 +210,7 @@ async def run_plan(goal: str, plan: Optional[Dict[str, Any]] = None) -> Dict[str
                          "why": step.get("why")})
         trace.append({"step": i, "intent": intent, "kind": "write",
                       "ok": True, "queued_approval": aid})
+    trace.sort(key=lambda t: t["step"])
 
     logger.info(f"[planner] goal={goal[:80]!r} cid={cid[:8]} "
                 f"steps={len(trace)} proposed={len(proposed)}")

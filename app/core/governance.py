@@ -623,12 +623,26 @@ def _undo_scoring_activate(ap: Dict[str, Any]) -> Dict[str, Any]:
     return scoring.deactivate_to(prev)
 
 
+def _undo_dq_normalize(ap: Dict[str, Any]) -> Dict[str, Any]:
+    from app.core import data_quality
+    return data_quality.undo_normalize_phones(
+        ((ap.get("result") or {}).get("data")) or {})
+
+
+def _undo_dq_merge(ap: Dict[str, Any]) -> Dict[str, Any]:
+    from app.core import data_quality
+    return data_quality.undo_merge_contacts(
+        ((ap.get("result") or {}).get("data")) or {})
+
+
 _UNDO = {
     "campaign.winback": _undo_campaign_winback,
     "tuning.adjust": _undo_tuning_adjust,
     "kb.publish": _undo_kb_publish,
     "meeting.book": _undo_meeting_book,
     "scoring.activate": _undo_scoring_activate,
+    "data.normalize_phones": _undo_dq_normalize,
+    "data.merge_contacts": _undo_dq_merge,
 }
 
 

@@ -112,9 +112,17 @@ def agent_performance(days: int = 30) -> Dict[str, Any]:
         logger.debug(f"[learning] llm spend skipped: {exc}")
         ai_spend = []
 
+    # ── Data-quality pulse (best-effort) ────────────────────────────────────
+    try:
+        from app.core import data_quality
+        dq = data_quality.scan_lines()
+    except Exception as exc:
+        logger.debug(f"[learning] data-quality skipped: {exc}")
+        dq = []
+
     return {"window_days": days, "cadences": cadences,
             "campaigns": campaigns, "churn_calibration": calibration,
-            "ai_spend": ai_spend}
+            "ai_spend": ai_spend + dq}
 
 
 router = APIRouter(tags=["learning"])
