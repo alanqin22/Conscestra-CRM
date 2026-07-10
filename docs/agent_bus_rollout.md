@@ -144,6 +144,16 @@ degrade to their deterministic fallbacks, never crash. `LLM_MODEL_LITE`
 routes SDR/auto-reply/SMS wording to a cheaper model. Monitor at
 `GET /llm/usage`; the CEO briefing carries the daily spend line.
 
+The critic→revise loop needs NO SQL and NO flag: when the critic OBJECTS to
+a revisable draft (kb.publish, meeting.book), the drafting side gets one
+bounded revision, the critic re-reviews, and the approval email carries the
+final verdict with the revision annotated.
+
+Behavior evals: `EVALS_ENABLED=1` runs five golden scenarios nightly at
+23:45 ET (~4 LLM calls) through the SDR, auto-reply, planner and KB
+retrieval with deterministic assertions; drift raises a supervisor.alert.
+`GET /evals/status`, `POST /evals/run-once`.
+
 Each ends with a verify `SELECT`. After this, **A2A (Phase 2) and the blackboard
 (Phase 4) are fully live** (no flags) — `/a2a/capabilities`, `/a2a/dispatch`,
 `/blackboard/*` work, and agents will write blackboard notes once the bus runs.

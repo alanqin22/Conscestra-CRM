@@ -104,6 +104,14 @@ def propose(action_type: str, proposed_by: str, params: Dict[str, Any],
                                      entity_type, entity_id)
         except Exception as exc:
             logger.warning(f"[governance] critique skipped for {aid[:8]}: {exc}")
+        # Critic→revise loop: when the critic OBJECTS to a revisable draft,
+        # the drafting side gets the findings back for ONE bounded revision,
+        # then the critic re-reviews. The human always sees the final state.
+        try:
+            params, critique = _revise_cycle(aid, action_type, params or {},
+                                             entity_type, entity_id, critique)
+        except Exception as exc:
+            logger.warning(f"[governance] revise cycle skipped for {aid[:8]}: {exc}")
         # Route to the right decision-maker (best-effort: tolerates the
         # governance_routing migration not being applied yet).
         try:
@@ -113,6 +121,87 @@ def propose(action_type: str, proposed_by: str, params: Dict[str, Any],
         return aid
     finally:
         conn.close()
+
+
+# ============================================================================
+# Critic→revise loop — one bounded self-correction before the human sees it
+# ============================================================================
+
+def _revise_kb_publish(params: Dict[str, Any],
+                       findings: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+    from app.core import knowledge
+    return knowledge.revise_article(params, findings)
+
+
+def _revise_meeting_book(params: Dict[str, Any],
+                         findings: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+    """Deterministic revision: a conflicting/unparseable requested slot is
+    dropped — the booking engine then auto-picks the first free slot."""
+    slot_failed = any(f.get("check") == "slot_free" and f.get("verdict") == "fail"
+                      for f in findings or [])
+    if slot_failed and params.get("start"):
+        revised = dict(params)
+        revised.pop("start", None)
+        return revised
+    return None
+
+
+# action_type → reviser(params, critic findings) -> revised params or None.
+# Only DRAFT-shaped actions belong here — a revision must never change what
+# the human thinks they are approving in kind, only fix the flagged defects.
+_REVISERS = {
+    "kb.publish": _revise_kb_publish,
+    "meeting.book": _revise_meeting_book,
+}
+
+
+def _revise_cycle(aid: str, action_type: str, params: Dict[str, Any],
+                  entity_type: Optional[str], entity_id: Optional[str],
+                  critique: Optional[Dict[str, Any]]):
+    """If the critic objected and a reviser exists: revise ONCE, persist the
+    new params, re-critique, and annotate the outcome. Returns the final
+    (params, critique) — unchanged when no revision applies."""
+    if not critique or critique.get("stance") != "object":
+        return params, critique
+    reviser = _REVISERS.get(action_type)
+    if not reviser or params.get("_revised"):        # one iteration, ever
+        return params, critique
+    revised = reviser(dict(params), critique.get("findings") or [])
+    if not revised:
+        return params, critique
+    revised["_revised"] = True
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE action_approvals SET params=%s::jsonb "
+                        "WHERE approval_uuid=%s::uuid",
+                        (json.dumps(revised), aid))
+        conn.commit()
+    finally:
+        conn.close()
+    from app.core import critic
+    new_critique = critic.review(aid, action_type, revised,
+                                 entity_type, entity_id)
+    new_critique["revision"] = {
+        "attempted": True,
+        "improved": new_critique.get("stance") != "object",
+        "previous_stance": "object",
+        "fixed": [f.get("check") for f in (critique.get("findings") or [])
+                  if f.get("verdict") == "fail"],
+    }
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE action_approvals SET critique=%s::jsonb "
+                        "WHERE approval_uuid=%s::uuid",
+                        (json.dumps(new_critique), aid))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.debug(f"[governance] revision annotation skipped: {exc}")
+    logger.info(f"[governance] {action_type} {aid[:8]} revised after critic "
+                f"objection → {new_critique.get('stance')}")
+    return revised, new_critique
 
 
 # ============================================================================

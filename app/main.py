@@ -305,6 +305,19 @@ def _run_intelligence_scoring() -> None:
         logger.error(f"[Intelligence] scoring failed: {exc}", exc_info=True)
 
 
+def _run_behavior_evals() -> None:
+    """Scheduled job (nightly): golden-scenario behavior evals over the
+    LLM-facing flows (SDR, auto-reply, planner, KB retrieval) — deterministic
+    assertions, supervisor.alert on drift. No-op unless EVALS_ENABLED=1."""
+    try:
+        from app.core.evals import run_evals
+        res = run_evals()
+        if res.get("failed"):
+            logger.warning(f"[Evals] FAILED: {res['failed']}")
+    except Exception as exc:
+        logger.error(f"[Evals] run failed: {exc}", exc_info=True)
+
+
 def _run_kb_draft_pass() -> None:
     """Scheduled job (nightly): the knowledge loop's mining side — pair
     resolved support threads with their human resolution, LLM-draft articles,
@@ -562,6 +575,16 @@ async def lifespan(app: FastAPI):
             _run_objectives_pass,
             trigger=CronTrigger(hour=22, minute=50),
             id="objectives_pass",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        # Behavior evals — nightly 23:45 ET: golden scenarios through the
+        # LLM-facing flows; supervisor.alert on drift. Self-gates on
+        # EVALS_ENABLED. Runs LAST so it sees the day's final prompt/data state.
+        _scheduler.add_job(
+            _run_behavior_evals,
+            trigger=CronTrigger(hour=23, minute=45),
+            id="behavior_evals",
             replace_existing=True,
             misfire_grace_time=3600,
         )
@@ -915,6 +938,10 @@ app.include_router(knowledge_router, dependencies=_ADMIN)
 # -- LLM meter (per-agent usage, budgets, tiering — the fleet's fuel gauge)
 from app.core.llm_meter import router as llm_meter_router
 app.include_router(llm_meter_router, dependencies=_ADMIN)
+
+# -- Behavior evals (nightly CI for prompts: golden scenarios + drift alerts)
+from app.core.evals import router as evals_router
+app.include_router(evals_router, dependencies=_ADMIN)
 
 # -- Bounded planner (goal → validated plan over registered capabilities;
 #    reads execute, writes queue for governance approval)

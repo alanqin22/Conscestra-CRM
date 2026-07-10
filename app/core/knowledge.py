@@ -267,6 +267,44 @@ def _draft_llm(inbound_subject: str, inbound_text: str,
         return None
 
 
+def revise_article(article: Dict[str, Any],
+                   findings: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+    """Critic→revise loop: one bounded LLM revision of a rejected article,
+    guided by the critic's findings. None on any failure — the original
+    objection then stands (never publish junk to fix junk)."""
+    problems = "; ".join(f"{f.get('check')}: {f.get('note')}"
+                         for f in (findings or [])
+                         if f.get("verdict") in ("fail", "warn")) or "unspecified"
+    try:
+        from app.core import privacy
+        from app.core.graph_utils import _get_llm
+        resp = _get_llm().invoke([
+            {"role": "system", "content":
+                "You revise rejected knowledge-base articles for Conscestra "
+                "CRM. Fix EXACTLY the reviewer's objections; keep everything "
+                "that was fine. Generalize; never include personal data."},
+            {"role": "user", "content":
+                f"Draft article:\n{privacy.mask(json.dumps({k: article.get(k) for k in ('title', 'problem', 'answer', 'keywords')}))}\n\n"
+                f"Reviewer objections:\n{problems}\n\n"
+                'Return ONLY the corrected JSON: {"title": "...", "problem": '
+                '"...", "answer": "<at least 3 helpful sentences>", '
+                '"keywords": ["..."]}'},
+        ])
+        text = resp.content if hasattr(resp, "content") else str(resp)
+        m = _JSON_RE.search(text)
+        art = json.loads(m.group(0)) if m else None
+        if not art or len(str(art.get("answer") or "")) < MIN_ANSWER_CHARS:
+            return None
+        # provenance fields survive the revision
+        for k in ("source_ref", "source"):
+            if article.get(k) is not None:
+                art[k] = article[k]
+        return art
+    except Exception as exc:
+        logger.warning(f"[knowledge] revise failed: {exc}")
+        return None
+
+
 def _resolved_threads(cap: int) -> List[Dict[str, Any]]:
     """Inbound support/complaint emails with a later outbound human touch on
     the same account/lead within 7 days, not yet mined or proposed."""
