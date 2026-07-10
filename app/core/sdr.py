@@ -178,6 +178,62 @@ def _try_book(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 # ============================================================================
+# DURABLE SESSIONS — DB is the source of truth, memory is a write-through
+# cache. A restart (or a second worker) resumes the conversation exactly
+# where the prospect left it; the sdr_sessions migration missing simply
+# degrades to memory-only (best-effort everywhere).
+# ============================================================================
+
+def _db_load_session(session_id: str, channel: str) -> Optional[Dict[str, Any]]:
+    import json as _json
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT state, history FROM sdr_sessions "
+                "WHERE session_id=%s AND updated_at > now() - make_interval(secs => %s)",
+                (session_id, _SESSION_TTL))
+            r = cur.fetchone()
+        if not r:
+            return None
+        state, history = r
+        if isinstance(state, str):
+            state = _json.loads(state or "{}")
+        if isinstance(history, str):
+            history = _json.loads(history or "[]")
+        merged = {**_new_state(), **(state or {})}
+        return {"state": merged, "history": history or [], "at": time.time()}
+    except Exception as exc:
+        logger.debug(f"[sdr] session load skipped (table missing?): {exc}")
+        return None
+    finally:
+        conn.close()
+
+
+def _db_save_session(session_id: str, sess: Dict[str, Any], channel: str) -> None:
+    import json as _json
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO sdr_sessions (session_id, state, history, channel)
+                   VALUES (%s, %s::jsonb, %s::jsonb, %s)
+                   ON CONFLICT (session_id) DO UPDATE
+                   SET state=EXCLUDED.state, history=EXCLUDED.history,
+                       channel=EXCLUDED.channel, updated_at=now()""",
+                (session_id, _json.dumps(sess["state"]),
+                 _json.dumps(sess["history"]), channel))
+            # opportunistic GC — the table stays a working set, not an archive
+            cur.execute("DELETE FROM sdr_sessions "
+                        "WHERE updated_at < now() - interval '2 days'")
+        conn.commit()
+    except Exception as exc:
+        logger.debug(f"[sdr] session save skipped (table missing?): {exc}")
+    finally:
+        conn.close()
+
+
+# ============================================================================
 # WORDING — LLM for the next line only (deterministic script as fallback)
 # ============================================================================
 
@@ -235,8 +291,11 @@ def converse(session_id: str, user_text: str, channel: str = "chat") -> Dict[str
     now = time.time()
     for sid in [s for s, v in _SESSIONS.items() if now - v["at"] > _SESSION_TTL]:
         _SESSIONS.pop(sid, None)
-    sess = _SESSIONS.setdefault(session_id,
-                                {"state": _new_state(), "history": [], "at": now})
+    sess = _SESSIONS.get(session_id)
+    if sess is None:                       # cache miss → resume from the DB
+        sess = _db_load_session(session_id, channel) \
+            or {"state": _new_state(), "history": [], "at": now}
+        _SESSIONS[session_id] = sess
     sess["at"] = now
     state = sess["state"]
     user_text = (user_text or "").strip()[:_MAX_MSG]
@@ -283,6 +342,7 @@ def converse(session_id: str, user_text: str, channel: str = "chat") -> Dict[str
     sess["history"] += [{"role": "user", "content": user_text[:300]},
                         {"role": "assistant", "content": reply[:300]}]
     sess["history"] = sess["history"][-12:]
+    _db_save_session(session_id, sess, channel)
     return {"reply": reply, "state": state, "done": done}
 
 
@@ -291,6 +351,24 @@ def converse(session_id: str, user_text: str, channel: str = "chat") -> Dict[str
 # ============================================================================
 
 def _rate_ok(ip: str) -> bool:
+    """Windowed per-IP limit — DB-backed so it survives restarts and is
+    shared across workers; memory fallback when the table is missing."""
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM sdr_rate_events "
+                            "WHERE ip=%s AND at < now() - make_interval(secs => %s)",
+                            (ip, _RATE_WINDOW))
+                cur.execute("INSERT INTO sdr_rate_events (ip) VALUES (%s)", (ip,))
+                cur.execute("SELECT count(*) FROM sdr_rate_events WHERE ip=%s", (ip,))
+                n = cur.fetchone()[0]
+            conn.commit()
+            return n <= RATE_LIMIT
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug(f"[sdr] DB rate limit skipped (table missing?): {exc}")
     now = time.time()
     hits = [t for t in _RATES.get(ip, []) if now - t < _RATE_WINDOW]
     hits.append(now)

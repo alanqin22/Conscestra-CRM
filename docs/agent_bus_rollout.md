@@ -13,6 +13,53 @@ Pre-flight (already verified): Railway has the base event bus
 
 ---
 
+## 🚀 CUTOVER 2026-07-10 — the complete go-live sequence (do these in order)
+
+Everything from both improvement rounds is on `master` and locally proven.
+This list converts it into a running 24/7 system. Steps marked 🧑 are yours
+(console/dashboard actions); the rest is copy-paste.
+
+1. 🧑 **Rotate the Twilio auth token** (Console → Account → API keys & tokens →
+   request secondary token → promote). It was exposed during setup. Update
+   `TWILIO_AUTH_TOKEN` in local `.env` — and use the NEW value in step 3.
+2. **Deploy the backend**: Railway deploys `master` (latest commits carry the
+   objectives/critic/tuning/playbooks/knowledge/scoring/telephony/SDR stack +
+   durable SDR sessions). Inert without flags — safe to deploy first.
+3. 🧑 **Railway env vars** — add alongside the existing flags:
+   ```
+   OBJECTIVES_ENABLED=1          TUNING_PROPOSALS_ENABLED=1
+   KB_DRAFT_ENABLED=1            SCORING_TRAIN_ENABLED=1
+   SDR_CHAT_ENABLED=1            SDR_VOICE_ENABLED=1
+   TWILIO_ACCOUNT_SID=ACxxxx     TWILIO_AUTH_TOKEN=<rotated>
+   TWILIO_FROM_NUMBER=+16593997878
+   SMS_AUTOSEND=1                AGENT_BUS_CATCHALL=1
+   FORWARDED_ALLOW_IPS=*         # uvicorn behind Railway's proxy: real
+                                 # client scheme/IP for Twilio signatures
+                                 # and SDR rate limiting
+   ```
+   (OBJECTIVES_AUTOACT / GOV_ACT_MIN tuning etc. stay at their staged pace.)
+4. **Apply SQL steps 8–15** in one paste:
+   `psql "$RAILWAY_DB_URL" -f sql/railway_cutover_2026_07.sql`
+5. **Drain the stale-build backlog** (the pre-existing item): the deploy in
+   step 2 carries the catch-all; run `POST /agent-bus/drain` (admin) and watch
+   pending settle.
+6. 🧑 **Repoint the Twilio number** (Console → Active numbers → +1 659 399 7878):
+   - Voice "A call comes in" → `https://<railway-app>/sdr/voice/inbound` (POST)
+   - Messaging "A message comes in" → `https://<railway-app>/telephony/sms/inbound` (POST)
+   (These currently point at the temporary trycloudflare tunnel.)
+7. 🧑 **Publish the HTML** you deploy yourself: `index.html` (advanced-round
+   narrative) and `store-home.html` (SDR chat widget) to agentorc.ca.
+8. **Smoke test** (5 minutes): `GET /health` → `GET /sdr/status`,
+   `/telephony/status`, `/objectives/list`, `/tuning/status`,
+   `/knowledge/list`, `/scoring/status`, `/a2a/capabilities` (34) → then call
+   and text the number, and send one web-chat message from the store page.
+9. **Watch for a week**: `/governance/queue` (critic-annotated approvals →
+   your inbox), supervisor briefings, `/learning/performance`. The nightly/
+   weekly jobs begin producing on their own schedule — calibration-driven
+   tuning proposals become meaningful ~2026-08-06.
+
+---
+
 ## ✅ STATUS — verified 2026-07-07 (read-only DB probe + local smoke)
 
 **Done already:**
@@ -83,7 +130,11 @@ psql "$RAILWAY_DB_URL" -f sql/agent_playbooks.sql                  # 11 playbook
 psql "$RAILWAY_DB_URL" -f sql/knowledge_base.sql                   # 12 knowledge base (service knowledge loop)
 psql "$RAILWAY_DB_URL" -f sql/lead_scoring_model.sql               # 13 predictive lead-scoring model store
 psql "$RAILWAY_DB_URL" -f sql/telephony.sql                        # 14 sms.received event type + subscriptions
+psql "$RAILWAY_DB_URL" -f sql/sdr_sessions.sql                     # 15 durable SDR sessions + rate limiting
 ```
+
+**One-paste alternative for steps 8–15:** `sql/railway_cutover_2026_07.sql`
+(the eight migrations concatenated in order; idempotent, verified re-runnable).
 
 Each ends with a verify `SELECT`. After this, **A2A (Phase 2) and the blackboard
 (Phase 4) are fully live** (no flags) — `/a2a/capabilities`, `/a2a/dispatch`,
