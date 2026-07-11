@@ -15,6 +15,10 @@ Pre-flight (already verified): Railway has the base event bus
 
 ## 🚀 CUTOVER 2026-07-10 — the complete go-live sequence (do these in order)
 
+> **Progress:** step 4 (SQL bundle steps 8–16) **applied on Railway
+> 2026-07-10** ✅. Remaining: token rotation (1), deploy/env (2–3), drain
+> (5), Twilio webhook repoint (6), HTML publish (7), smoke (8).
+
 Everything from both improvement rounds is on `master` and locally proven.
 This list converts it into a running 24/7 system. Steps marked 🧑 are yours
 (console/dashboard actions); the rest is copy-paste.

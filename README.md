@@ -306,6 +306,13 @@ open complaints or overdue balances? Is this a duplicate request? The verdict
 decision email, and the morning briefing. The critic never decides; it makes
 sure the human deciding sees what the proposer might have missed.
 
+When the critic objects to a drafted artifact, the conversation doesn't end
+there. The drafting agent gets the findings back for **one bounded
+revision**, the critic re-reviews, and the human sees the final state with
+the revision honestly annotated — including when the fix didn't work.
+Proposer, critic, reviser, human: a real multi-agent deliberation with a
+hard iteration cap instead of an endless debate.
+
 Where appropriate, actions can be reversed within configurable time windows,
 approval requests automatically expire, confidence thresholds determine when
 human review is required, and continuous health monitoring ensures every
@@ -337,6 +344,30 @@ bounds the system can never propose beyond.
 
 Self-improvement without self-mutation: the system proposes, people ratify.
 Nothing changes without oversight.
+
+And the AI accounts for its own costs. Every model call in the platform is
+**metered** — which agent, how many tokens, what it cost, how long it took —
+with optional per-agent daily budgets that degrade gracefully to the
+deterministic fallbacks rather than ever breaking a flow, and a cheaper
+model tier for high-volume wording. The morning briefing reports what the
+automation earned *and* what it burned.
+
+## A Platform That Audits Itself
+
+Two standing agents keep the platform honest about its own weaknesses.
+
+Every night, a **behavior evaluation harness** runs golden scenarios through
+the real customer-facing AI — does the SDR still qualify properly, does a
+prompt-injection attempt leak anything, does the auto-reply still answer
+from approved knowledge, does the planner stay inside its rails? Any drift —
+from a model update, a prompt change, a data regression — raises an alert
+before a customer ever sees it.
+
+And a **data-quality agent** patrols the foundation everything else stands
+on: duplicate contacts, malformed phone numbers, unreachable records,
+ownerless accounts. The safe fixes arrive as governed, fully **reversible**
+proposals — every change records its before-state — while anything that
+moves money or history stays a human decision. Garbage in, governed out.
 
 ## Governance Before Autonomy
 
@@ -481,6 +512,11 @@ _Listed in the same order as the launcher page on [agentorc.ca](https://agentorc
 - **Predictive lead scoring v2** — a dependency-free logistic model trained on settled leads (transparent coefficients, per-feature contributions on every prediction), held to a Brier-vs-base-rate bar on holdout data, refusing to train on thin or one-sided history; activation is a governed `scoring.activate` action with undo restoring the previous version, and consumers fall back to the band-history heuristic when no model is active.
 - **PII minimization** — customer-authored text and injected context blocks are deterministically masked (emails → `j***@domain`, phones/cards → last-4; dates, money and invoice numbers stay readable) before reaching the LLM; operational agent commands are deliberately exempt so actions still work, and masking is idempotent with an instant kill switch.
 - **SMS + voice as governed channels** — agents send SMS and place spoken calls through Twilio under the same draft-first autosend gates, every touch logged as a CRM activity; inbound texts are signature-verified, matched to their customer, bridged onto the timeline as bus events, and answered with a KB-grounded, PII-masked reply sized for SMS.
+- **LLM cost metering, budgets, and tiering** — every model call across ~20 call sites is metered through the shared factory (caller inferred automatically, exact provider token counts with estimation fallback, latency, success); optional per-agent daily budgets block over-budget calls *before* spending and degrade to the deterministic fallbacks; a lite model tier serves high-volume wording; `GET /llm/usage` and the briefing's AI-spend line report cost per agent.
+- **Critic→revise loop** — an objection from the critic triggers ONE bounded revision by the drafting side (LLM rewrite for KB articles guided by the exact findings; deterministic slot-drop for conflicting meetings), then a re-review; the approval carries the final verdict with the revision annotated, including honest `improved: false` outcomes.
+- **Nightly behavior evals ("CI for prompts")** — five golden scenarios run through the real LLM flows with deterministic assertions (SDR qualification pursuit, prompt-injection leak check, KB-grounded auto-reply with a self-provisioning canary article, planner bounds, a no-LLM retrieval canary); failures raise a supervisor alert naming the drifted evals.
+- **A data-quality agent** — six nightly detectors (duplicate contacts, unnormalized phones, unreachable records, ownerless accounts, duplicate account names); the two safe fixes ship as governed, capped, fully undoable approvals (before-state recorded: undo restores exact phone values, resurrects merged contacts and returns their activities), while account merges stay report-only. The critic re-checks the problem still exists at review time, so stale fixes draw an objection.
+- **Parallel agent fan-out** — planner read steps and composite capabilities execute their independent peer calls concurrently.
 - **An autonomous SDR at the front door** — one brain, two faces: a public web-chat widget (per-IP rate-limited, kill-switched) and a turn-based conversational phone agent (Twilio speech gathering, signature-verified). A deterministic state machine — never the LLM — captures name/company/need/email, creates the lead idempotently, and books the intro meeting through the booking engine once the prospect says yes to an actual offer; the LLM writes only the conversational wording, grounded in the approved KB, with no tools and no CRM access.
 - **Persistent customer intelligence** — a nightly deterministic scorer writes a living profile per customer (churn risk vs their own median order gap, RFM/LTV, preferred channel + engagement hour, interests from ordered categories, inbound-email sentiment) that feeds the AI 360s, the supervisor's churn detector, and campaign segmentation — with the full component breakdown persisted for explainability.
 - **Marketing campaigns on the CASL stack** — segment the customer base by churn band / LTV / industry / channel, LLM-draft the content (deterministic template fallback, placeholders enforced), optionally A/B two subjects (50/50 split, per-variant reply attribution + leading verdict), and launch through the existing consent infrastructure (suppression list, verified-address gate, unsubscribe footer); draft-only unless autosend is explicitly enabled *and* the launch is confirmed. A supervisor-detected churn spike can *propose* a win-back campaign through the governance queue — agents initiating commercial action within policy.
@@ -536,7 +572,10 @@ crm_agent/
     │   ├── scoring.py             ← Predictive lead scoring (governed activation)
     │   ├── privacy.py             ← PII masking before any LLM prompt
     │   ├── telephony.py           ← SMS + voice channel (Twilio, governed)
-    │   └── sdr.py                 ← Autonomous SDR (public chat + voice loop)
+    │   ├── sdr.py                 ← Autonomous SDR (public chat + voice loop)
+    │   ├── llm_meter.py           ← LLM usage metering, budgets, model tiering
+    │   ├── evals.py               ← Nightly behavior evals (CI for prompts)
+    │   └── data_quality.py        ← Data hygiene detectors + undoable fixes
     └── agents/
         │  ── 10 conversational AI agents (LangGraph + pre-router + LLM) ──
         ├── accounts/         prompt | pre_router | sql_builder | formatter | graph | router
