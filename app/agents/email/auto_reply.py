@@ -279,6 +279,13 @@ def process_inbound_email(email: Dict[str, Any], own_address: str) -> bool:
     from app.core.database import get_connection
     import json as _json
 
+    # A message with no parseable sender is not a customer touch (malformed
+    # mail, or an error entry that leaked through) — never classify, bridge,
+    # or reply to it.
+    if not _extract_email_addr(email.get('from', '')):
+        logger.debug("Inbound skipped: no parseable sender address")
+        return False
+
     skip_reason = should_skip(email, own_address)
     # Rate-limited senders are still REAL customer touches — only own-address /
     # noreply-pattern mail bypasses the CRM bridge entirely.

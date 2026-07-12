@@ -16,6 +16,7 @@ import imaplib
 import logging
 import os
 import smtplib
+import socket
 import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -194,6 +195,11 @@ def fetch_inbox(limit: int = 20, unseen_only: bool = False) -> List[Dict[str, An
         logger.info(f"IMAP fetched {len(emails)} emails (limit={limit})")
         return emails
 
+    except (socket.gaierror, TimeoutError, ConnectionError, OSError) as e:
+        # Transient network/DNS trouble — the next poll will retry; one calm
+        # line, no traceback spam.
+        logger.warning(f"IMAP fetch skipped (transient network/DNS): {e}")
+        return [{'error': str(e)}]
     except Exception as e:
         logger.error(f"IMAP fetch error: {e}", exc_info=True)
         return [{'error': str(e)}]

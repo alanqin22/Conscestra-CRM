@@ -56,6 +56,10 @@ class ImapPoller:
             logger.warning(f"ImapPoller fetch_inbox failed: {exc}")
             return
 
+        # fetch_inbox signals failure as [{'error': …}] (kept that way for the
+        # inbox UI) — those are NOT messages; processing one would feed a junk
+        # dict into the auto-reply pipeline.
+        emails = [e for e in emails if not e.get("error")]
         if not emails:
             return
 
