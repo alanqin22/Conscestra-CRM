@@ -423,13 +423,12 @@ def _gather(prompt_inner: str) -> str:
 
 
 async def _voice_params(request: Request) -> Optional[Dict[str, str]]:
-    """Validated Twilio POST params (None = bad signature)."""
+    """Validated voice-webhook params (None = bad signature). Provider-aware:
+    Twilio HMAC or Telnyx Ed25519. Both TeXML voice webhooks are form-encoded
+    and Twilio-compatible (CallSid, From, SpeechResult), so the loop below is
+    unchanged across carriers — only the signature check differs."""
     from app.core import telephony
-    form = {k: str(v) for k, v in (await request.form()).items()}
-    sig = request.headers.get("X-Twilio-Signature", "")
-    if not telephony._valid_signature(str(request.url), form, sig):
-        return None
-    return form
+    return await telephony.verified_form(request)
 
 
 @public_router.post("/sdr/voice/inbound")
