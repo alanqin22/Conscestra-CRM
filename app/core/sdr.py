@@ -402,7 +402,7 @@ async def sdr_chat(request: Request):
 
 
 # ============================================================================
-# CONVERSATIONAL VOICE — Twilio <Gather input="speech"> loop
+# CONVERSATIONAL VOICE — <Gather input="speech"> loop (Twilio + Telnyx TeXML)
 # ============================================================================
 
 def _twiml(inner: str) -> Response:
@@ -415,11 +415,34 @@ def _say(text: str) -> str:
     return f'<Say voice="alice">{_twiml_escape(text)}</Say>'
 
 
+# End-of-speech wait (seconds) — the dead air after the caller stops talking
+# before the transcript is sent. Lower = snappier replies, but too low risks
+# cutting off a caller who pauses mid-sentence. Telnyx needs a NUMERIC value
+# (rejects "auto"); Twilio's "auto" is adaptive. Tune via SDR_SPEECH_TIMEOUT.
+SPEECH_TIMEOUT = os.getenv("SDR_SPEECH_TIMEOUT", "1").strip() or "1"
+
+
 def _gather(prompt_inner: str) -> str:
+    """Speech-gathering Gather, provider-aware. Telnyx requires a numeric
+    speechTimeout (auto → the gather never completes, empty transcript)."""
+    from app.core import telephony
+    stimeout = SPEECH_TIMEOUT if telephony._provider() == "telnyx" else "auto"
     return (f'<Gather input="speech" action="/sdr/voice/turn" method="POST" '
-            f'speechTimeout="auto" language="en-US">{prompt_inner}</Gather>'
+            f'speechTimeout="{stimeout}" language="en-US">{prompt_inner}</Gather>'
             + _say("Are you still there?")
             + '<Redirect method="POST">/sdr/voice/turn</Redirect>')
+
+
+def _heard(params: Dict[str, str]) -> str:
+    """The recognized speech from a Gather callback. TeXML aims to be
+    Twilio-compatible (SpeechResult), but tolerate provider variants so a
+    naming difference never silently drops the caller's words."""
+    for k in ("SpeechResult", "speech_result", "Transcript",
+              "TranscriptionText", "Digits"):
+        v = (params.get(k) or "").strip()
+        if v:
+            return v
+    return ""
 
 
 async def _voice_params(request: Request) -> Optional[Dict[str, str]]:
@@ -455,8 +478,12 @@ async def sdr_voice_turn(request: Request):
         return _twiml(_say("The voice assistant is offline. Goodbye.")
                       + "<Hangup/>")
     call_sid = params.get("CallSid") or str(_uuid.uuid4())
-    heard = (params.get("SpeechResult") or "").strip()
+    heard = _heard(params)
     if not heard:
+        # Log the callback keys so a provider param mismatch is diagnosable
+        # from the server log rather than a silent "didn't catch that" loop.
+        logger.info(f"[sdr] voice turn: no speech; callback keys="
+                    f"{sorted(params.keys())}")
         return _twiml(_gather(_say("Sorry, I didn't catch that. "
                                    "Could you say it again?")))
     res = converse(f"voice-{call_sid}", heard, "voice")
