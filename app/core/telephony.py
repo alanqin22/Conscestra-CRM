@@ -27,10 +27,21 @@ TRIAL NOTES: a Twilio trial only reaches VERIFIED numbers and prefixes
 messages with "Sent from your Twilio trial account". A funded Telnyx account
 reaches any number. Rotate secrets after sharing them anywhere.
 
+TIERED INBOUND REPLIES: inbound SMS is a PUBLIC channel — the carrier
+signature proves the request came from the carrier, NOT who texted, and
+caller ID is spoofable. So live CRM data is released only to the explicit
+`SMS_OPERATOR_NUMBERS` allowlist (staff), which routes through the
+in-process orchestrator (accounts, contacts, leads, opportunities, orders,
+products, activities, accounting, analytics). Every other sender keeps the
+KB-grounded, PII-masked customer reply that never touches the database.
+Empty allowlist (the default) = nobody gets CRM data — KB for all.
+
 CONFIG (env)
   TELEPHONY_PROVIDER   twilio   twilio | telnyx (which carrier is live)
   SMS_AUTOSEND    0   1 = really send SMS/calls; else draft as owner tasks
   SMS_AUTOREPLY   1   inbound webhook replies with the LLM/KB answer
+  SMS_OPERATOR_NUMBERS  ''  comma-separated E.164 staff numbers that may
+                            query the LIVE CRM over SMS (blank = none)
   -- Twilio --  TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_NUMBER
   -- Telnyx --  TELNYX_API_KEY / TELNYX_FROM_NUMBER
                 TELNYX_PUBLIC_KEY    account Ed25519 public key (webhook auth)
@@ -41,6 +52,7 @@ CONFIG (env)
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac as _hmac
@@ -403,17 +415,137 @@ def _match_sender(phone_e164: str) -> Optional[Dict[str, Any]]:
         conn.close()
 
 
-def _compose_sms_reply(sender_display: str, body: str) -> str:
-    """KB-grounded, PII-safe, SMS-sized auto-reply (fallback: plain ack)."""
+def _operator_numbers() -> set:
+    """E.164 numbers allowed to query the LIVE CRM over SMS.
+
+    Read per call (not cached at import) so the allowlist can be corrected
+    with a restart-free env reload, and so an empty/blank value can never
+    silently widen to 'everyone'."""
+    out = set()
+    for part in os.getenv("SMS_OPERATOR_NUMBERS", "").split(","):
+        n = normalize_phone(part.strip())
+        if n:
+            out.add(n)
+    return out
+
+
+def _is_operator(sender_e164: Optional[str]) -> bool:
+    """Fail-closed: unknown/blank sender is never an operator."""
+    return bool(sender_e164) and sender_e164 in _operator_numbers()
+
+
+# Bare acknowledgements carry no routable keyword, so the orchestrator's
+# keyword router would drop them on its catch-all agent (activities) — which
+# then invents a write from the session's leftover context. Follow-ups stay
+# with whichever agent the sender was last talking to instead.
+_SMS_FOLLOWUP_RE = re.compile(
+    r"^\s*(y|yes|yep|yeah|yup|ok|okay|sure|please|thanks|thank\s+you|"
+    r"do\s+it|go\s+ahead|confirm|correct|right)\b[\s,.!]*(please|thanks)?"
+    r"[\s,.!?]*$", re.IGNORECASE)
+
+# sender E.164 → agent endpoint last used, so a follow-up has somewhere to go.
+_LAST_AGENT: Dict[str, str] = {}
+
+
+def _route_sms(sender_e164: str, body: str) -> str:
+    """Keyword-route, but keep bare follow-ups on the sender's last agent."""
+    from app.agents.orchestrator.router import _route_single
+    if _SMS_FOLLOWUP_RE.match(body or "") and sender_e164 in _LAST_AGENT:
+        return _LAST_AGENT[sender_e164]
+    path = _route_single((body or "").lower())
+    _LAST_AGENT[sender_e164] = path
+    return path
+
+
+async def _compose_operator_reply(sender_e164: str, body: str) -> str:
+    """OPERATOR TIER — answer from the live CRM, READ-ONLY.
+
+    Routes the question through the orchestrator's keyword router to the
+    owning agent in-process (ASGI, no network hop, no admin token needed),
+    then condenses that agent's markdown answer down to SMS size. Internal
+    data is intentionally NOT masked here — this tier is staff-only.
+
+    Writes are refused: caller ID is spoofable and a misrouted word ("yes")
+    is enough for an agent's NL router to resolve a create, so the session is
+    marked a read-only channel. That runs every SP the agent reaches inside a
+    PostgreSQL read-only transaction — enforcement the agent cannot talk its
+    way past, and which does not rely on the write-mode blocklist."""
+    from app.agents.orchestrator.router import _call_agent
+    from app.core.write_guard import WritePermissionError, set_readonly_channel
+
+    set_readonly_channel("sms")
+    path = _route_sms(sender_e164, body)
+    logger.info(f"[telephony] operator SMS from {sender_e164} → {path}")
+    try:
+        data = await _call_agent(path, body, f"sms-{sender_e164}")
+    except WritePermissionError:
+        return ("I can look things up by text, but I can't create, edit or "
+                "delete records here — use the web app for changes.")
+
+    # A write blocked deeper in the stack comes back as the router's 403 body
+    # rather than an exception, and UI-form modes ('show_lead_form') are a
+    # browser affordance — over SMS there is no form to open. Both mean the
+    # same thing to a texter: this channel reads, it doesn't write.
+    mode = str(data.get("mode") or (data.get("rawParams") or {}).get("mode") or "")
+    if mode.startswith("show_") and mode.endswith("_form"):
+        return ("I can look things up by text, but creating or editing records "
+                "needs the web app.")
+
+    raw = str(data.get("output") or "").strip()
+    if not raw:
+        detail = str(data.get("detail") or "").strip()
+        if "read-only" in detail.lower():
+            return ("I can look things up by text, but I can't create, edit or "
+                    "delete records here — use the web app for changes.")
+        return "No answer came back from the CRM for that — try rephrasing?"
+    # Never text a raw stored-procedure stack trace.
+    if raw.lstrip().startswith("### ERROR") or "Validation failed for sp_" in raw:
+        logger.warning(f"[telephony] agent error for {sender_e164}: {raw[:200]}")
+        return ("That didn't come back cleanly — try asking with a name, e.g. "
+                "'show the latest order for David Chen'.")
+    try:
+        from app.core.graph_utils import _get_llm
+        resp = await asyncio.to_thread(_get_llm(tier="lite").invoke, [
+            {"role": "system", "content":
+                "Condense this CRM answer into ONE SMS for an authorized "
+                "internal operator. Under 300 characters, plain text — no "
+                "markdown, tables or links. Keep names, amounts, dates and "
+                "statuses EXACT; never invent a detail that isn't there. "
+                "Lead with the answer itself."},
+            {"role": "user", "content": f"Question: {body[:200]}\n\n"
+                                        f"CRM answer:\n{raw[:3000]}\n\nSMS:"},
+        ])
+        text = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+        return text[:300] if text else raw[:300]
+    except Exception as exc:
+        # The data is already in hand — degrade to a truncated raw answer
+        # rather than losing the reply to a wording failure.
+        logger.warning(f"[telephony] operator condense failed: {exc}")
+        return raw[:300]
+
+
+async def _compose_sms_reply(sender_display: str, body: str,
+                             sender_e164: Optional[str] = None) -> str:
+    """KB-grounded, PII-safe, SMS-sized auto-reply (fallback: plain ack).
+
+    Staff numbers on the SMS_OPERATOR_NUMBERS allowlist get the live-CRM
+    tier instead; every other sender stays on the KB-only path below."""
     ack = ("Thanks for your message — the Conscestra CRM team has it and "
            "will follow up shortly.")
     if not AUTOREPLY:
         return ack
+    if _is_operator(sender_e164):
+        try:
+            return await _compose_operator_reply(sender_e164, body)
+        except Exception as exc:
+            logger.warning(f"[telephony] operator reply failed: {exc}")
+            return ("I couldn't reach the CRM just now — please try again "
+                    "in a moment.")
     try:
         from app.core import knowledge, privacy
         from app.core.graph_utils import _get_llm
-        kb = knowledge.rag_block("sms inquiry", body)
-        resp = _get_llm(tier="lite").invoke([
+        kb = await asyncio.to_thread(knowledge.rag_block, "sms inquiry", body)
+        resp = await asyncio.to_thread(_get_llm(tier="lite").invoke, [
             {"role": "system", "content":
                 "You write SMS replies for Conscestra CRM. ONE short paragraph, "
                 "under 300 characters, plain text, no links unless given one, "
@@ -430,8 +562,8 @@ def _compose_sms_reply(sender_display: str, body: str) -> str:
         return ack
 
 
-def _bridge_inbound_sms(sender: str, body: str,
-                        via: str = "provider") -> Optional[str]:
+async def _bridge_inbound_sms(sender: str, body: str,
+                              via: str = "provider") -> Optional[str]:
     """Provider-agnostic core: match the sender, log the inbound activity,
     emit sms.received, and compose the auto-reply text. Returns the reply."""
     sender = normalize_phone(sender) or sender
@@ -461,19 +593,20 @@ def _bridge_inbound_sms(sender: str, body: str,
         except Exception as exc:
             logger.warning(f"[telephony] sms.received emit skipped: {exc}")
     logger.info(f"[telephony] inbound SMS from {sender} via {via} "
-                f"({(who or {}).get('kind') or 'unmatched'})")
-    return _compose_sms_reply(display, body)
+                f"({(who or {}).get('kind') or 'unmatched'}"
+                f"{', operator' if _is_operator(sender) else ''})")
+    return await _compose_sms_reply(display, body, sender_e164=sender)
 
 
-def handle_inbound_sms(url: str, params: Dict[str, str],
-                       signature: str) -> Optional[str]:
+async def handle_inbound_sms(url: str, params: Dict[str, str],
+                             signature: str) -> Optional[str]:
     """Twilio inbound SMS: validate HMAC then bridge. Returns the reply text
     (None = invalid signature). Telnyx inbound is handled in the endpoint
     (JSON body + Ed25519 + separate-message reply)."""
     if not _valid_signature(url, params, signature):
         return None
-    return _bridge_inbound_sms(params.get("From", ""),
-                               params.get("Body", ""), via="Twilio")
+    return await _bridge_inbound_sms(params.get("From", ""),
+                                     params.get("Body", ""), via="Twilio")
 
 
 # ============================================================================
@@ -527,8 +660,8 @@ async def telephony_inbound(request: Request):
         if payload.get("direction") != "inbound":
             return Response("", status_code=200)
         sender = (payload.get("from") or {}).get("phone_number", "")
-        reply = _bridge_inbound_sms(sender, payload.get("text", ""),
-                                    via="Telnyx")
+        reply = await _bridge_inbound_sms(sender, payload.get("text", ""),
+                                          via="Telnyx")
         # Telnyx has no inline reply — send the auto-reply as a separate msg.
         if reply and AUTOSEND:
             try:
@@ -539,9 +672,9 @@ async def telephony_inbound(request: Request):
 
     # Twilio: form-encoded + HMAC, reply inline as TwiML.
     form = dict(await request.form())
-    reply = handle_inbound_sms(str(request.url),
-                               {k: str(v) for k, v in form.items()},
-                               request.headers.get("X-Twilio-Signature", ""))
+    reply = await handle_inbound_sms(str(request.url),
+                                     {k: str(v) for k, v in form.items()},
+                                     request.headers.get("X-Twilio-Signature", ""))
     if reply is None:
         return Response("invalid signature", status_code=403)
     return Response(f'<?xml version="1.0" encoding="UTF-8"?><Response>'

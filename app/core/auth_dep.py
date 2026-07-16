@@ -95,8 +95,16 @@ def _bearer(request: Request) -> Optional[str]:
 # delete forms). Default-deny by listing writes; unknown/absent modes (NL reads,
 # list/get/report/forecast) are allowed.
 # ⚠ When adding a NEW write mode to any agent, add it here too — otherwise both
-# the HTTP gate and the deep write guard treat it as a read.
-# Coverage test: scratch/test_write_modes.py.
+# the HTTP gate and the deep write guard treat it as a read, and an ANONYMOUS
+# caller can run it from the NL bar. Two traps this list has fallen into before:
+#   • WRAPPER MODES — sp_activities rewrites log_call/add_note/create_task/
+#     schedule_meeting/log_email → create and reopen → update INSIDE the
+#     function. The guard only ever sees the pre-rewrite name, so the wrapper
+#     must be listed BY NAME; matching 'create' is not enough.
+#   • p_action VERBS — sp_orders branches on p_action (add_item, soft_delete,
+#     update_header, …), which the guard reads alongside p_mode.
+# Coverage test: `python scratch/test_write_modes.py` re-derives the write modes
+# from sp/*.sql and fails on anything missing here. Run it after touching an SP.
 WRITE_MODES = {
     "create", "update", "delete", "edit", "save", "remove", "add",
     "change_stage", "close_won", "close_lost", "convert", "qualify", "disqualify",
@@ -104,6 +112,27 @@ WRITE_MODES = {
     "cancel", "approve", "reject", "send",
     "add_product", "update_product", "remove_product", "update_stock", "adjust",
     "show_lead_form", "show_lead_update_form",  # forms that lead to writes
+    # Forms for the other entities — same reason as the lead forms above: the
+    # form is the entry to a write, so a read-only caller is sent to sign in
+    # rather than shown a form whose save would fail. (show_low_stock_form and
+    # show_price_history_form are NOT here — those open read-only reports.)
+    "show_account_form", "show_account_update_form",
+    "show_contact_form", "show_contact_update_form",
+    "show_opportunity_form", "show_opportunity_update_form",
+    "show_opportunity_add_product_form", "show_opportunity_update_product_form",
+    "show_order_form", "show_product_form", "show_bulk_stock_form",
+    # WRAPPER MODES — sp_activities rewrites each of these into create/update
+    # INSIDE the function ("WRAPPER MODES → CREATE / UPDATE"). The guard only
+    # sees the pre-rewrite name in the SQL text, so they must be listed by name
+    # or they read as harmless. 'complete' was already here; these were missed.
+    "log_call", "log_email", "schedule_meeting", "create_task", "add_note",
+    "reopen",
+    # p_action verbs on sp_orders (the guard reads p_action as well as p_mode);
+    # each writes orders / order_items / audit_log. 'restore' was already here.
+    "add_item", "batch_update", "change_status", "hard_delete", "remove_item",
+    "soft_delete", "update_header",
+    # Direct writes: sp_store INSERTs order_items; sp_products UPDATEs products.
+    "checkout_add_items", "bulk_adjust_stock",
     # Module-specific write modes (same names in the request body and in the
     # SQL's p_mode, so both the HTTP gate and the deep write guard catch them):
     "generate_invoice", "record_payment", "void_invoice",      # accounting

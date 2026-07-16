@@ -447,26 +447,49 @@ def _match_nl(message: str) -> Optional[dict]:
                 params['search'] = name
         return params
 
+    # Connective lead-ins between "opportunity" and the name the user means:
+    # "…opportunity WITH ACCOUNT agentorc.ca", "…opportunities FOR Sophia".
+    # Applied repeatedly (with → account → …) so stacked prepositions peel off.
+    _SEARCH_LEADIN_RE = re.compile(
+        r'^(?:(?:with|for|from|by|of|at|on|in|to)\s+|'
+        r'(?:the|a|an)\s+|'
+        r'(?:account|customer|client|company|contact|owner|named?|called?)\s+)+',
+        re.IGNORECASE)
+
     # Search / find opportunities
     if re.search(r'\b(search|find)\b.*\bopportunit', msg):
         params = {'mode': 'list', 'page_size': 50, 'page_number': 1}
-        # "named X" / "called X"
-        nm = re.search(r"(?:named?|called?)\s+[\"']?([^\"']+?)[\"']?(?:\s|$)", msg, re.IGNORECASE)
+
+        # "named X" / "called X" — take the WHOLE name. A quoted name wins;
+        # otherwise it runs to the end, minus a trailing time/place qualifier
+        # ("… in Q3"). The name is non-greedy up to that qualifier, so
+        # "named Big Deal" yields "big deal" rather than the first word alone.
+        term = ''
+        nm = re.search(
+            r"(?:named?|called?)\s+(?:[\"']([^\"']+)[\"']|(.+?))"
+            r"(?:\s+(?:in|at|on|during|this|last)\b.*)?$",
+            msg, re.IGNORECASE)
         if nm:
-            params['search'] = nm.group(1).strip()
-        else:
-            # "find opportunities: David" or "find opportunities David" or "find opps for Sophia"
+            term = nm.group(1) or nm.group(2) or ''
+
+        if not term.strip():
+            # "find opportunities: David" / "find opportunities David" /
+            # "find the opportunity with account agentorc.ca?"
             colon = re.search(r'opportunit\w*[:\s]+(.+)', msg, re.IGNORECASE)
             if colon:
-                term = colon.group(1).strip().strip('"\'')
-                if term:
-                    params['search'] = term
-            else:
-                # "find opportunities for Sophia Pat"
-                for_m = re.search(r'\bopportunit\w*\s+(?:for|from|by)\s+(.+?)(?:\s+(?:in|at|this|last)\b.*)?$',
-                                   raw, re.IGNORECASE)
-                if for_m:
-                    params['search'] = for_m.group(1).strip().rstrip('?.,;')
+                # The capture is greedy, so conversational phrasing lands here
+                # whole: "opportunity with account agentorc.ca?" yields
+                # "with account agentorc.ca?", which is then searched verbatim
+                # and matches nothing. Peel the connective lead-in back to the
+                # actual name.
+                term = _SEARCH_LEADIN_RE.sub('', colon.group(1).strip().strip('"\''))
+
+        # NB: no "for/from/by" fallback here. There used to be one, but the
+        # greedy colon pattern above matches every phrasing it could have
+        # caught (it ran first), so it was unreachable and is gone.
+        term = term.strip().strip('"\'').rstrip('?.,;!').strip()
+        if term:
+            params['search'] = term
         return params
 
     return None

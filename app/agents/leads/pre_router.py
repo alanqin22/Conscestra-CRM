@@ -598,8 +598,17 @@ def route_request(body: dict, chat_input: dict, session_id: str) -> dict:
     # UUID (so the SP/AI can act directly).
     _has_uuid = bool(_extract_uuid(raw))
 
+    # A question ABOUT a new lead ("find the information for new lead, Aria
+    # Zhang") is a lookup, not a create — 'new' is an adjective there, which
+    # the \bnew\b.*\blead pattern below cannot tell apart. Asking for the form
+    # by name still wins, so "show me the create lead form" keeps working.
+    _lookup_intent = bool(
+        re.search(r'\b(find|look\s*up|search|information|info|details|'
+                  r'who\s+is|tell\s+me\s+about|status\s+of)\b', msg)
+        and not re.search(r'\bform\b', msg))
+
     # Create lead (no UUID).
-    if not _has_uuid and (
+    if not _has_uuid and not _lookup_intent and (
         re.search(r'\b(create|new|add|make)\b.*\blead', msg)
         or re.search(r'\bcreate\s+or\s+update\s+lead', msg)
         or re.match(r'^\s*(create|new|add)\s+lead', msg)

@@ -272,6 +272,30 @@ you choose.
 Chat to qualified lead to booked meeting — **before a human ever says
 hello.**
 
+## The Whole CRM, From a Text Message
+
+The number a prospect calls is also a command line for the people who run the
+business. Text it a question — *"the latest order for David Chen?"*, *"find
+the opportunity with account agentorc.ca"* — and the orchestrator routes it to
+the owning agent, reads the live CRM, and texts back the answer condensed to a
+sentence. Accounts, contacts, leads, opportunities, orders, products,
+activities, accounting: what the fleet answers in the browser, it answers on a
+phone, with nothing installed.
+
+Which makes authorization the entire problem. Inbound SMS is a public channel —
+the carrier signature proves a message came from the carrier, not who sent it,
+and caller ID is spoofable. So the CRM answers only the numbers on an explicit
+operator allowlist; every other sender gets the knowledge-grounded reply that
+never touches the database. An empty allowlist, the default, means nobody.
+
+And the channel is **read-only, enforced by PostgreSQL** rather than by good
+intentions. An operator session runs inside a read-only transaction, so a
+misrouted word — a bare *"yes"* is enough for a language model to resolve a
+create — is refused by the database itself, whatever the agent chose to call
+it. Questions by text; changes stay in the app.
+
+**The CRM in your pocket, with the write path closed.**
+
 ## Agents That Pursue Business Goals, Not Just Events
 
 Beyond reacting to events, Conscestra's supervisor is **goal-oriented**.
@@ -398,6 +422,21 @@ operation occurs. Whether the command is *"Generate invoice,"* *"Record
 payment,"* or *"Void invoice,"* the request is blocked unless authorization
 exists.
 
+That second check matters more than it sounds. An agent resolves intent inside
+the database — `log_call` becomes an insert, `add_note` becomes an insert —
+so a gate that reads only the words in the request sees a harmless question.
+Conscestra classifies the **resolved** operation instead, at the one choke
+point every statement passes through, and a coverage test re-derives that
+classification from the stored procedures themselves so the rule cannot drift
+away from what the SQL actually does.
+
+Public surfaces get a stronger guarantee still, because a list of forbidden
+verbs is only as good as the last person to update it. A channel declared
+read-only — inbound SMS today — runs every statement inside a
+database-enforced read-only transaction. The write is refused by PostgreSQL
+regardless of what the agent named it: authorization that does not depend on
+anyone remembering to classify tomorrow's verb.
+
 The platform supports multiple security postures ranging from open
 demonstration environments to fully locked production deployments.
 Administrative email access always requires elevated authorization
@@ -415,6 +454,8 @@ Additional protections include:
 - Immutable audit histories
 - Trusted-origin browser access
 - End-to-end permission enforcement for both interfaces and AI requests
+- Read-only channels enforced in the database, not merely by policy
+- Write classification derived from the stored procedures, and tested
 
 Sessions store only cryptographic token hashes, expire automatically after
 inactivity, and remain constrained by absolute session lifetimes.

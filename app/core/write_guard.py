@@ -22,6 +22,32 @@ from typing import Optional
 # Per-request caller role. None = no request context (system/background) → allowed.
 _role: ContextVar[Optional[str]] = ContextVar("request_role", default=None)
 
+# Channel-level read-only flag — deliberately SEPARATE from the role above.
+#
+# A caller that hands work to an agent over the in-process ASGI transport
+# cannot constrain it via _role: require_data_access re-stamps the role on
+# every request, overwriting the caller's value long before the agent reaches
+# the database. This flag is set by the channel and never touched by the
+# request path, so it survives the hop.
+#
+# It is enforced in execute_sp by opening the connection in a PostgreSQL
+# read-only transaction. That is the real guarantee: WRITE_MODES is a blocklist
+# and is known to be incomplete (log_call, add_note, create_task, checkout,
+# bulk_adjust_stock … all write but are absent), so a public channel must not
+# depend on it. The database refuses the write whatever the mode is called.
+_readonly_channel: ContextVar[Optional[str]] = ContextVar(
+    "readonly_channel", default=None)
+
+
+def set_readonly_channel(name: Optional[str]) -> None:
+    """Mark this context as a read-only channel (e.g. 'sms'). Inherited by
+    everything awaited from here, including in-process agent calls."""
+    _readonly_channel.set(name)
+
+
+def readonly_channel() -> Optional[str]:
+    return _readonly_channel.get()
+
 
 def set_request_role(role: Optional[str]) -> None:
     _role.set(role)
@@ -51,10 +77,25 @@ def guard_query(query: str) -> None:
     """Raise WritePermissionError if the current request's role may not run this
     write SP. No-op when auth is off, outside a request (role None), or for a
     write-capable role. Reads policy from auth_dep (lazy import avoids a cycle)."""
+    from app.core.auth_dep import API_AUTH_ENABLED, WRITE_MODES, WRITE_ROLES
+
+    # Read-only channel: refuse a recognised write early so the caller gets a
+    # clean message instead of a database error. This is a courtesy check, NOT
+    # the guarantee — WRITE_MODES misses several real write modes. Anything it
+    # lets past still hits the read-only transaction opened in execute_sp.
+    chan = _readonly_channel.get()
+    if chan:
+        m = _MODE_RE.search(query or "")
+        if m and m.group(1).lower() in WRITE_MODES:
+            raise WritePermissionError(
+                f"Read-only channel ({chan}): create, update and delete are "
+                "not permitted here.",
+                http_status=403,
+            )
+
     role = _role.get()
     if role is None:
         return  # system / background context — never gated
-    from app.core.auth_dep import API_AUTH_ENABLED, WRITE_MODES, WRITE_ROLES
     if not API_AUTH_ENABLED or role in WRITE_ROLES:
         return
     m = _MODE_RE.search(query or "")
