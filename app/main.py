@@ -173,16 +173,21 @@ def _run_activities_auto_sweep() -> None:
         logger.info(f"[ActivitySweep] {meta.get('message', result)}")
     except Exception as exc:
         logger.error(f"[ActivitySweep] Scheduled job failed: {exc}", exc_info=True)
-    # Playbook-task closure: the account/contact DB triggers auto-create
-    # 'Qualify new opportunity' / pricing tasks per new deal, but nothing
-    # closed them when the deal closed — they piled up 100+ deep (bottleneck
-    # scan finding, 2026-07). A task on a closed/removed deal is done or moot;
-    # completion is reversible via the activity 'reopen' mode (same rationale
-    # as the milestone auto-complete job).
+    # Moot-task closure (bottleneck scan findings, 2026-07): auto-generated
+    # playbook/courtesy tasks are born open and tied to a moment, but nothing
+    # closed them when that moment passed — they piled up by the hundreds.
+    # A task is moot when its underlying object settled (deal closed, invoice
+    # paid/cancelled, order completed) or, for the courtesy subjects only,
+    # when its window expired (30 days past due). Completion is reversible
+    # via the activity 'reopen' mode; the weekly bottleneck report still
+    # counts fresh piles, so closure keeps the queue actionable without
+    # hiding the signal.
     try:
         from app.core.database import get_connection
         conn = get_connection()
         with conn.cursor() as cur:
+            n = 0
+            # deal tasks on closed/removed opportunities
             cur.execute(
                 """UPDATE activities a
                    SET status='completed', completed_at=now(), updated_at=now()
@@ -191,14 +196,50 @@ def _run_activities_auto_sweep() -> None:
                                      WHERE o.opportunity_id = a.related_id
                                        AND o.status = 'open')
                    RETURNING 1""")
-            n = len(cur.fetchall())
+            n += len(cur.fetchall())
+            # invoice tasks (confirm receipt / reminders) on settled invoices
+            cur.execute(
+                """UPDATE activities a
+                   SET status='completed', completed_at=now(), updated_at=now()
+                   WHERE a.status='open' AND a.related_type='invoice'
+                     AND NOT EXISTS (SELECT 1 FROM invoices i
+                                     WHERE i.invoice_id = a.related_id
+                                       AND (i.is_deleted IS NULL OR i.is_deleted=false)
+                                       AND i.status NOT IN ('paid','cancelled')
+                                       AND COALESCE(i.balance_due,0) > 0)
+                   RETURNING 1""")
+            n += len(cur.fetchall())
+            # order courtesy tasks on terminal orders, or 30+ days stale
+            cur.execute(
+                """UPDATE activities a
+                   SET status='completed', completed_at=now(), updated_at=now()
+                   WHERE a.status='open' AND a.related_type='order'
+                     AND (a.subject ILIKE 'Order shipped%'
+                          OR a.subject ILIKE 'Order fulfilled%')
+                     AND (a.due_at < now() - interval '30 days'
+                          OR NOT EXISTS (SELECT 1 FROM orders o
+                                         WHERE o.order_id = a.related_id
+                                           AND o.deleted_at IS NULL
+                                           AND o.status NOT IN ('completed','cancelled')))
+                   RETURNING 1""")
+            n += len(cur.fetchall())
+            # welcome / first-contact moments that expired unworked
+            cur.execute(
+                """UPDATE activities a
+                   SET status='completed', completed_at=now(), updated_at=now()
+                   WHERE a.status='open'
+                     AND a.subject IN ('Welcome / Account created',
+                                       'First contact / Intro')
+                     AND a.due_at < now() - interval '30 days'
+                   RETURNING 1""")
+            n += len(cur.fetchall())
         conn.commit()
         conn.close()
         if n:
-            logger.info(f"[ActivitySweep] completed {n} playbook task(s) "
-                        "whose deal is closed or removed")
+            logger.info(f"[ActivitySweep] completed {n} moot task(s) "
+                        "(settled object or expired courtesy window)")
     except Exception as exc:
-        logger.error(f"[ActivitySweep] playbook closure failed: {exc}")
+        logger.error(f"[ActivitySweep] moot-task closure failed: {exc}")
 
 
 # Milestone auto-complete runs live (completion is reversible via the activity
