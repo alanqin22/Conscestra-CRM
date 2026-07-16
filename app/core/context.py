@@ -188,6 +188,23 @@ def _hydrate_lead(lead_id: str) -> Optional[Dict[str, Any]]:
     return pack
 
 
+def _attach_memory(pack: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Unified customer memory: recent cross-channel conversations + open
+    commitments join the pack, so every consumer (A2A, email auto-reply,
+    AI summaries) knows what was last said to this customer — on ANY
+    channel. Best-effort, like every other section."""
+    if pack:
+        try:
+            from app.core import customer_memory
+            mem = customer_memory.recall(pack["entity_type"],
+                                         pack["entity_id"], limit=3)
+            if mem["interactions"] or mem["open_commitments"]:
+                pack["recent_interactions"] = mem
+        except Exception as exc:
+            logger.debug(f"[context] customer memory skipped: {exc}")
+    return pack
+
+
 def hydrate(entity_type: str, entity_id: str) -> Optional[Dict[str, Any]]:
     """Compact context pack for an entity. Contacts resolve to their account.
     None when the entity doesn't exist (or the type is unsupported)."""
@@ -201,7 +218,7 @@ def hydrate(entity_type: str, entity_id: str) -> Optional[Dict[str, Any]]:
         pack = _hydrate_account(r[0]["account_id"])
         if pack:
             pack["via_contact"] = entity_id
-        return pack
+        return _attach_memory(pack)
     if et == "account":
         pack = _hydrate_account(entity_id)
     elif et == "lead":
@@ -210,7 +227,7 @@ def hydrate(entity_type: str, entity_id: str) -> Optional[Dict[str, Any]]:
         return None
     if pack:
         pack["as_of"] = datetime.now(timezone.utc).isoformat()
-    return pack
+    return _attach_memory(pack)
 
 
 # ============================================================================
@@ -292,6 +309,17 @@ def render(pack: Optional[Dict[str, Any]]) -> str:
             for d, t in lt.items()]
     if bits:
         lines.append("Last touch: " + " · ".join(bits))
+
+    mem = pack.get("recent_interactions") or {}
+    for r in (mem.get("interactions") or [])[:2]:
+        res = ("resolved" if r.get("resolved") else
+               "UNRESOLVED" if r.get("resolved") is False else "")
+        lines.append(f"Recent {r['channel']} conversation ({r['on_date']}): "
+                     f"{str(r['summary'])[:90]}" + (f" [{res}]" if res else ""))
+    if mem.get("open_commitments"):
+        lines.append("Owed to customer: " + " · ".join(
+            f"{c['what'][:60]} (since {c['since']})"
+            for c in mem["open_commitments"][:2]))
 
     return "\n".join(lines)
 

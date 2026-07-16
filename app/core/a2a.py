@@ -258,6 +258,35 @@ def _sp_sms_send(p: Dict[str, Any]) -> Any:
     return telephony.send_sms_sp(p or {})
 
 
+def _sp_quote_generate(p: Dict[str, Any]) -> Any:
+    """Email agent fill-in: build a priced quotation from LIVE retail
+    pricing (deterministic math — the LLM only writes the greeting) and
+    deliver it under the AUTOSEND + verified-address gates (else drafted
+    as an owner task). CASL-flagged commercial send."""
+    from app.core import quotes
+    return quotes.generate_quote_sp(p or {})
+
+
+def _sp_web_consult(p: Dict[str, Any]) -> Any:
+    """Internet Agent: answer from the LIVE web with cited sources (ddgs →
+    Tavily → trafilatura → LLM synthesis). Read-only and free-tier; any
+    agent can delegate to it when its answer needs fresh outside facts."""
+    from app.core.web_tools import web_answer
+    q = str(p.get("query") or p.get("message") or "").strip()
+    if not q and not p.get("url"):
+        return {"error": "query (or url) required"}
+    text = web_answer(q, url=p.get("url"))
+    return {"query": q, "url": p.get("url"), "answer": text}
+
+
+def _sp_contact_update_profile(p: Dict[str, Any]) -> Any:
+    """Voice support: apply ONE possession-verified caller's profile change
+    (phone or email, whitelisted) — executed on governance approval only;
+    the before-value comes back for undo."""
+    from app.core import voice_support
+    return voice_support.profile_update_sp(p or {})
+
+
 def _sp_scoring_activate(p: Dict[str, Any]) -> Any:
     """Predictive scoring: make a trained candidate the active model
     (executed on approval); undo restores the previous version."""
@@ -421,6 +450,31 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "unless SMS_AUTOSEND=1; trial accounts only reach verified "
                "numbers; irreversible once sent)",
                sp=_sp_sms_send),
+    Capability("quote.generate", "email", "", "write",
+               lambda p: (f"send a quotation to account "
+                          f"{p.get('account_id', '?')} for "
+                          f"{len(p.get('items') or [])} item(s)"),
+               "build + deliver a priced quotation: products matched "
+               "exactly/by prefix against the catalog, CURRENT retail "
+               "pricing, deterministic totals (LLM never touches a number), "
+               "30-day validity; emailed only under AUTOSEND to a verified "
+               "address, otherwise drafted as an owner task; CASL-compliant",
+               sp=_sp_quote_generate),
+    Capability("web.consult", "orchestrator", "", "read",
+               lambda p: f"search the web for {p.get('query', '')}",
+               "consult the live internet with cited sources (ddgs/Tavily "
+               "search + page fetch + LLM synthesis; web_answer). The "
+               "Internet Agent capability: manufacturer docs, regulations, "
+               "logistics, news — anything the CRM can't know from inside",
+               sp=_sp_web_consult),
+    Capability("contact.update_profile", "contacts", "", "write",
+               lambda p: (f"update contact {p.get('contact_id', '?')} "
+                          f"{p.get('field', '?')} to {p.get('new_value', '?')}"),
+               "change a contact's phone or email at the request of a "
+               "possession-verified support caller (voice OTP); ALWAYS "
+               "proposed — never auto-executed from a call — validated again "
+               "at execution time, undo restores the before-value",
+               sp=_sp_contact_update_profile),
     Capability("scoring.activate", "leads", "", "write",
                lambda p: f"activate lead-scoring model v{p.get('version', '?')}",
                "make a trained predictive lead-scoring candidate the active "

@@ -450,11 +450,15 @@ def _already_outreached_sync(lead_id: str) -> bool:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            # An OPEN outreach task blocks re-creation at ANY age — the old
+            # 3-day-only window let the nightly emitter mint a duplicate every
+            # few days while the original sat unworked (found stacked 9-deep).
             cur.execute(
                 """SELECT 1 FROM activities
                    WHERE related_type='lead' AND related_id=%s
                      AND subject ILIKE 'Hot lead outreach%%'
-                     AND created_at > now() - interval '3 days'
+                     AND (status = 'open'
+                          OR created_at > now() - interval '3 days')
                    LIMIT 1""",
                 (lead_id,),
             )

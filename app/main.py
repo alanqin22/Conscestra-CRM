@@ -173,6 +173,32 @@ def _run_activities_auto_sweep() -> None:
         logger.info(f"[ActivitySweep] {meta.get('message', result)}")
     except Exception as exc:
         logger.error(f"[ActivitySweep] Scheduled job failed: {exc}", exc_info=True)
+    # Playbook-task closure: the account/contact DB triggers auto-create
+    # 'Qualify new opportunity' / pricing tasks per new deal, but nothing
+    # closed them when the deal closed — they piled up 100+ deep (bottleneck
+    # scan finding, 2026-07). A task on a closed/removed deal is done or moot;
+    # completion is reversible via the activity 'reopen' mode (same rationale
+    # as the milestone auto-complete job).
+    try:
+        from app.core.database import get_connection
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE activities a
+                   SET status='completed', completed_at=now(), updated_at=now()
+                   WHERE a.status='open' AND a.related_type='opportunity'
+                     AND NOT EXISTS (SELECT 1 FROM opportunities o
+                                     WHERE o.opportunity_id = a.related_id
+                                       AND o.status = 'open')
+                   RETURNING 1""")
+            n = len(cur.fetchall())
+        conn.commit()
+        conn.close()
+        if n:
+            logger.info(f"[ActivitySweep] completed {n} playbook task(s) "
+                        "whose deal is closed or removed")
+    except Exception as exc:
+        logger.error(f"[ActivitySweep] playbook closure failed: {exc}")
 
 
 # Milestone auto-complete runs live (completion is reversible via the activity
@@ -344,6 +370,40 @@ def _run_kb_draft_pass() -> None:
                         f"from {res['threads']} resolved thread(s)")
     except Exception as exc:
         logger.error(f"[Knowledge] draft pass failed: {exc}", exc_info=True)
+
+
+def _run_kb_gap_pass() -> None:
+    """Scheduled job (nightly): the knowledge loop's demand side — take the
+    most-asked questions the KB could NOT answer (kb_gaps, logged by every
+    public channel), get the general answer from the owning module agent over
+    A2A (read-only), LLM-generalize, and PROPOSE kb.publish through
+    governance. No-op unless KB_DRAFT_ENABLED=1 — one switch for all KB
+    mining (gap_pass self-gates)."""
+    try:
+        import asyncio as _aio
+
+        from app.core.knowledge import gap_pass
+        res = _aio.run(gap_pass())
+        if res.get("proposed") or res.get("covered"):
+            logger.info(f"[Knowledge] gap pass: {len(res.get('proposed') or [])} "
+                        f"proposed, {res.get('covered', 0)} already covered")
+    except Exception as exc:
+        logger.error(f"[Knowledge] gap pass failed: {exc}", exc_info=True)
+
+
+def _run_bottleneck_pass() -> None:
+    """Scheduled job (weekly, Monday morning): the learning loop's process-
+    health scan — untouched leads, stalled deals, unchased overdue invoices,
+    aging tasks, unanswered inbound — consolidated into ONE upserted
+    Orchestrator notification. Self-gates on BOTTLENECKS_ENABLED."""
+    try:
+        from app.core.learning import bottleneck_pass
+        res = bottleneck_pass()
+        if res.get("findings"):
+            logger.info(f"[Learning] bottlenecks: {len(res['findings'])} "
+                        f"area(s) flagged")
+    except Exception as exc:
+        logger.error(f"[Learning] bottleneck pass failed: {exc}", exc_info=True)
 
 
 def _run_scoring_train() -> None:
@@ -617,6 +677,27 @@ async def lifespan(app: FastAPI):
             _run_kb_draft_pass,
             trigger=CronTrigger(hour=23, minute=0),
             id="kb_draft_pass",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        # Knowledge-gap mining — nightly 23:05 ET (right after the thread
+        # miner, so freshly-proposed articles can mark gaps covered next
+        # night). Self-gates on KB_DRAFT_ENABLED (shared with the thread
+        # and transcript miners); proposals only.
+        _scheduler.add_job(
+            _run_kb_gap_pass,
+            trigger=CronTrigger(hour=23, minute=5),
+            id="kb_gap_pass",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        # Process-bottleneck scan — weekly, Monday 08:30 ET, so the week
+        # starts with a fresh "where is work piling up" heartbeat. Reads
+        # only; self-gates on BOTTLENECKS_ENABLED.
+        _scheduler.add_job(
+            _run_bottleneck_pass,
+            trigger=CronTrigger(day_of_week="mon", hour=8, minute=30),
+            id="bottleneck_pass",
             replace_existing=True,
             misfire_grace_time=3600,
         )
@@ -994,6 +1075,43 @@ from app.core.sdr import public_router as sdr_public_router
 app.include_router(sdr_router, dependencies=_ADMIN)
 app.include_router(sdr_public_router)
 
+# -- External knowledge ingestion: upload a document / point at a URL →
+#    chunk → LLM-draft articles → the SAME governed kb.publish queue.
+#    Idempotent per (content hash, chunk), bounded per call by KB_INGEST_CAP.
+from app.core.kb_ingest import router as kb_ingest_router
+app.include_router(kb_ingest_router, dependencies=_ADMIN)
+
+# -- Intent router (Orchestrator v2): LLM intent classification with the
+#    keyword router as fallback; used by orchestrator delegation, the SMS +
+#    voice operator tiers, and the KB gap miner. Kill switch
+#    INTENT_ROUTER_ENABLED=0 → pure keyword routing, exactly v1 behavior.
+from app.core.intent_router import router as intent_router_router
+app.include_router(intent_router_router, dependencies=_ADMIN)
+
+# -- Unified customer memory ("One Customer Memory"): cross-channel
+#    conversation memory + owed commitments; written on conversation close,
+#    recalled via the context pack and the verified voice greeting.
+from app.core.customer_memory import router as customer_memory_router
+app.include_router(customer_memory_router, dependencies=_ADMIN)
+
+# -- Real-time voice (media streams): the WS endpoint is PUBLIC — carriers
+#    cannot sign a WebSocket connect, so the HMAC token minted inside the
+#    signature-verified inbound webhook IS the authorization. Status is
+#    admin-gated. Gated VOICE_STREAM_ENABLED (default off = Gather loop).
+from app.core.voice_stream import router as voice_stream_router
+from app.core.voice_stream import router_ws as voice_stream_ws_router
+app.include_router(voice_stream_router, dependencies=_ADMIN)
+app.include_router(voice_stream_ws_router)
+
+# -- Customer support voice line (tiered trust: KB for anyone, live read-only
+#    CRM for allowlisted staff, OTP-verified account-scoped answers for
+#    customers; changes become governance proposals). Webhooks are PUBLIC —
+#    the carrier signature is the authorization; gated VOICE_SUPPORT_ENABLED.
+from app.core.voice_support import router as voice_support_router
+from app.core.voice_support import public_router as voice_support_public_router
+app.include_router(voice_support_router, dependencies=_ADMIN)
+app.include_router(voice_support_public_router)
+
 # -- Real meeting booking (availability + booked meeting + signed .ics invite).
 #    The invite link is PUBLIC because the HMAC token is the authorization
 #    (same pattern as unsubscribe / governance decide links).
@@ -1053,6 +1171,7 @@ _CHAT_PAGES = [
     "executives-mgmt.html",
     "admin-users.html",
     "governance-mgmt.html",
+    "knowledge-mgmt.html",
     "index.html",
 ]
 

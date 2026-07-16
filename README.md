@@ -225,14 +225,25 @@ Your business keeps moving — even while your team sleeps.
 ## Every Resolved Case Teaches the Next One
 
 Most support knowledge evaporates the moment a ticket closes. Conscestra
-keeps it.
+keeps it — and grows it from **four inflows, all through one governed
+approval queue**.
 
-When a support conversation resolves, an agent pairs the customer's question
-with the team's answer and drafts a **knowledge-base article** — generalized,
-stripped of personal detail, and submitted through governance like any other
-agent action. Once a human approves it, the autonomous auto-reply retrieves
-it to answer the next customer with the same problem, across email and SMS
-alike. Usage counters show which knowledge actually earns its keep.
+Resolved email threads are mined into draft articles. Support-call
+transcripts are distilled the same way — the caller's words become the
+problem, the agent's answer the resolution. Every question the assistants
+*couldn't* answer is logged as a **knowledge gap**: the nightly gap pass
+takes the most-asked ones, asks the owning module agent (or, when no agent
+owns the answer, the live internet — with citations), and proposes the
+article. And an administrator can simply **upload a product manual or
+policy document** — PDF, page, or URL — on the knowledge management page:
+it is chunked, drafted into articles grounded strictly in the document, and
+queued for approval, idempotently, with one-click removal if a policy
+changes.
+
+Nothing publishes itself. A human approves every article; the critic checks
+each one first; usage counters show which knowledge actually earns its
+keep. Once approved, the same answers serve **email, SMS, web chat, and the
+phone** within the minute.
 
 Every resolved case makes the next answer better. **The help desk compounds.**
 
@@ -295,6 +306,92 @@ create — is refused by the database itself, whatever the agent chose to call
 it. Questions by text; changes stay in the app.
 
 **The CRM in your pocket, with the write path closed.**
+
+## The Phone Line Is a Digital Employee
+
+Customers can now **call** the company and reach a support agent that knows
+exactly how much to trust each caller. Anyone gets answers from the approved
+knowledge base. Staff on the operator allowlist get the live CRM, read-only.
+And a customer asking about *their own* account is verified first — not with
+security questions an AI could be talked out of, but by **possession**: a
+one-time code texted to the number on file, entered on the keypad, expiring
+in minutes, three attempts then a human follow-up.
+
+A verified caller can hear their balance and open invoices, check recent
+orders, get payment help grounded in approved policy — with a payment
+summary emailed to the address on file — and ask to change their contact
+details, which becomes a **governed proposal a human approves**, never a
+direct write. The security is structural: while a verified-customer session
+is active, the database layer refuses every general query outright — the
+caller can only reach explicitly account-scoped lookups, and the tier is
+decided by deterministic code before any language model runs.
+
+With media streams enabled, the same line stops feeling like an IVR: audio
+streams both ways over the carrier's WebSocket, speech is recognized as the
+caller finishes a sentence, replies are synthesized in a natural voice, and
+the caller can **interrupt the agent mid-sentence** and be heard. Same
+brain, same tiers, same audit trail — just a conversation.
+
+**Every call is a conversation with the whole CRM, on exactly the terms
+each caller has earned.**
+
+## One Customer Memory, Every Channel
+
+A customer who explains a problem on the phone should not start over in the
+next email. When any conversation ends — a support call, an SDR chat, an
+SMS exchange, an email auto-reply — Conscestra distills it into one compact
+memory: what they wanted, whether it was resolved, what was promised, and
+the sentiment. Every promise the agent makes becomes an **open task a human
+can see and fulfil**, not a line buried in a transcript.
+
+The next time that customer is identified on *any* channel, the same memory
+comes back: the verified caller is greeted with *"last time you contacted
+us about order 1042 — we still owe you a follow-up"*, the email reply
+acknowledges the phone call, and every agent working the account starts
+already knowing what was last said. Recall follows the trust model —
+identity before memory, so an unverified visitor can never claim someone
+else's history.
+
+**Start the conversation anywhere. Continue it everywhere.**
+
+## A Conductor That Routes by Meaning
+
+Keyword routing is fast but literal — *"what is my account balance?"*
+contains the word "account", yet the answer lives with Accounting. The
+Orchestrator now classifies each request's **intent** with a small language
+model over a catalog of what every agent owns, and trusts the answer only
+when it names a real agent with real confidence. The keyword router remains
+underneath as the always-on fallback: if the model is down, hedging, or
+hallucinating, routing degrades to exactly the old behavior rather than
+breaking. Disagreements between the two are logged — the delta is the
+tuning signal.
+
+Meaning first, keywords as the safety net — and every route annotated with
+how it was decided.
+
+## A Priced Quotation in One Command
+
+Ask for a quote and the platform builds one the way a careful salesperson
+would: products matched exactly against the catalog (an ambiguous name is
+reported, never guessed), priced from the **current retail pricing rows**,
+totals computed deterministically — the language model writes only the
+greeting, never a number. The quotation states its validity window, rides
+the same outbound gates as every send (delivered only to a verified address
+under autosend; drafted as an owner task otherwise), carries the CASL
+footer, and lands in the activity log as the audit copy.
+
+## The Platform Finds Its Own Bottlenecks
+
+Once agents create work, someone must notice when work silently piles up.
+A weekly process-health scan checks five places where momentum dies:
+new leads nobody has touched, open deals nothing has happened to, overdue
+invoices no one has chased, open tasks long past due (by owner), and
+inbound messages that never got a reply. Findings are consolidated into
+**one** upserted notification — a heartbeat, not a pile — with the worst
+examples named.
+
+The first real scan found two live code bugs and several hundred stranded
+tasks. The detector paid for itself on day one.
 
 ## Agents That Pursue Business Goals, Not Just Events
 
@@ -612,8 +709,17 @@ crm_agent/
     │   ├── planner.py             ← Bounded goal→plan orchestration
     │   ├── scoring.py             ← Predictive lead scoring (governed activation)
     │   ├── privacy.py             ← PII masking before any LLM prompt
-    │   ├── telephony.py           ← SMS + voice channel (Twilio, governed)
+    │   ├── telephony.py           ← SMS + voice channel (Twilio/Telnyx, governed)
     │   ├── sdr.py                 ← Autonomous SDR (public chat + voice loop)
+    │   ├── voice_support.py       ← Customer support line (tiered trust + OTP
+    │   │                             verification + account-scoped answers)
+    │   ├── voice_stream.py        ← Real-time voice (media streams, VAD,
+    │   │                             streaming STT/TTS, barge-in)
+    │   ├── customer_memory.py     ← One cross-channel conversation memory
+    │   ├── intent_router.py       ← LLM intent routing, keyword fallback
+    │   ├── kb_ingest.py           ← Document/URL → governed KB proposals
+    │   ├── quotes.py              ← Deterministic quotation build + delivery
+    │   ├── web_tools.py           ← Internet access (search + fetch + cite)
     │   ├── llm_meter.py           ← LLM usage metering, budgets, model tiering
     │   ├── evals.py               ← Nightly behavior evals (CI for prompts)
     │   └── data_quality.py        ← Data hygiene detectors + undoable fixes
@@ -685,6 +791,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | POST   | `/store-chat`                | Store catalogue (direct SP)                    |
 | POST   | `/auth/{signin\|signup\|signout\|...}` | Auth (direct DB, no AI)              |
 | GET    | `/voice/azure-token`         | Azure Speech short-lived token for browser STT |
+| POST   | `/sdr/chat`                  | Public SDR web chat (gated + rate-limited)     |
+| POST   | `/voice/support/{inbound\|turn\|verify}` | Support-line carrier webhooks (signature-verified) |
+| WS     | `/voice/stream/{line}`       | Real-time media stream (HMAC-token authorized) |
+| POST   | `/knowledge/ingest`          | Upload a document → governed KB proposals (admin) |
+| GET    | `/knowledge/gaps`            | Questions the KB couldn't answer (admin)       |
+| GET    | `/learning/bottlenecks`      | Live process-health scan (admin)               |
+| GET    | `/customer-memory/{type}/{id}` | Cross-channel conversation memory (admin)    |
 | GET    | `/sessions`                  | List active memory sessions                    |
 | DELETE | `/sessions/{id}`             | Clear a session's memory                       |
 

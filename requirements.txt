@@ -14,3 +14,6 @@ apscheduler>=3.10,<4
 ddgs>=9.0.0
 trafilatura>=1.12.0
 mcp>=1.0
+PyMuPDF>=1.24          # kb_ingest: PDF text extraction (import fitz)
+python-multipart>=0.0.9  # kb_ingest: FastAPI file-upload route
+audioop-lts>=0.2; python_version >= "3.13"  # voice_stream: audioop left stdlib in 3.13

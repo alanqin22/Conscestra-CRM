@@ -259,7 +259,9 @@ def _llm_reply(state: Dict[str, Any], history: List[Dict[str, str]],
     try:
         from app.core import knowledge, privacy
         from app.core.graph_utils import _get_llm
-        kb = knowledge.rag_block("prospect question", user_text)
+        # Empty subject (channel labels pollute matching); a KB miss is
+        # logged as an 'sdr_chat' gap for the nightly gap miner.
+        kb = knowledge.rag_block("", user_text, gap_channel="sdr_chat")
         missing = _missing(state)
         goal = (f"You still need their {missing} — weave ONE polite ask for it "
                 f"into your reply." if missing else
@@ -302,6 +304,7 @@ def converse(session_id: str, user_text: str, channel: str = "chat") -> Dict[str
     state["turns"] += 1
 
     if state["turns"] > _MAX_TURNS:
+        _remember_session(session_id, state, sess["history"], channel)
         return {"reply": "Thanks for the chat! A team member will follow up "
                          "by email.", "state": state, "done": True}
 
@@ -343,7 +346,29 @@ def converse(session_id: str, user_text: str, channel: str = "chat") -> Dict[str
                         {"role": "assistant", "content": reply[:300]}]
     sess["history"] = sess["history"][-12:]
     _db_save_session(session_id, sess, channel)
+    if done:
+        _remember_session(session_id, state, sess["history"], channel)
     return {"reply": reply, "state": state, "done": done}
+
+
+def _remember_session(session_id: str, state: Dict[str, Any],
+                      history: List[Dict[str, str]], channel: str) -> None:
+    """Session over → distill it into the unified customer memory (background)
+    so the prospect's next contact — any channel — starts with context. Only
+    once a LEAD exists: memory needs an identity to attach to."""
+    if not state.get("lead_id"):
+        return
+    try:
+        from app.core import customer_memory
+        text = "\n".join(f"{'prospect' if m['role'] == 'user' else 'agent'}: "
+                         f"{m['content']}" for m in history)
+        if state.get("booked"):
+            text += f"\n(meeting booked: {state['booked']})"
+        customer_memory.remember_later(
+            "lead", state["lead_id"], f"sdr_{channel}",
+            f"sdr:{session_id}", text)
+    except Exception as exc:
+        logger.debug(f"[sdr] memory write skipped: {exc}")
 
 
 # ============================================================================
@@ -463,6 +488,18 @@ async def sdr_voice_inbound(request: Request):
         return _twiml(_say("Thank you for calling Conscestra C R M. Our "
                            "voice assistant is currently offline — please "
                            "email info at agentorc dot C A.") + "<Hangup/>")
+    # Real-time transport (VOICE_STREAM_ENABLED): hand the call to the
+    # bidirectional media stream — same SDR brain, streaming audio.
+    try:
+        from app.core.telephony import normalize_phone
+        from app.core.voice_stream import stream_twiml
+        connect = stream_twiml(
+            "sdr", params.get("CallSid") or str(_uuid.uuid4()),
+            normalize_phone(params.get("From", "")) or "")
+    except Exception:
+        connect = None
+    if connect:
+        return _twiml(connect)
     return _twiml(_gather(_say(
         "Hi! You've reached the Conscestra C R M assistant. "
         "I can answer questions and book you a meeting with our team. "

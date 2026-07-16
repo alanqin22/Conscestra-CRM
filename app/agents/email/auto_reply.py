@@ -154,7 +154,10 @@ def compose_reply(email: Dict[str, Any], intent: str) -> Optional[Dict[str, str]
     kb_block = ""
     try:
         from app.core import knowledge
-        kb_block = knowledge.rag_block(orig_subject, orig_body)
+        # Real subject stays in the query (it's content, unlike the fixed
+        # channel labels); a KB miss is logged as an 'email' gap.
+        kb_block = knowledge.rag_block(orig_subject, orig_body,
+                                       gap_channel="email")
     except Exception as exc:
         logger.debug(f"knowledge retrieval skipped for auto-reply: {exc}")
 
@@ -352,6 +355,24 @@ def process_inbound_email(email: Dict[str, Any], own_address: str) -> bool:
             conn.close()
         except Exception as exc:
             logger.warning(f"audit_log insert failed: {exc}")
+
+        # Unified customer memory: a KNOWN sender's exchange is remembered
+        # (background) so their next contact on ANY channel has this context.
+        try:
+            from app.agents.email.inbound_bridge import _resolve_sender_sync
+            from app.core import customer_memory
+            who = _resolve_sender_sync(sender_addr.lower())
+            if who:
+                customer_memory.remember_later(
+                    who["kind"],
+                    who.get("account_id") or who.get("lead_id"),
+                    "email",
+                    f"email:{email.get('message_id') or sender_addr}:{int(time.time())}",
+                    f"customer (subject: {email.get('subject', '')}): "
+                    f"{str(email.get('body_text') or email.get('preview') or '')[:1500]}\n"
+                    f"agent reply: {reply['body_text'][:1000]}")
+        except Exception as exc:
+            logger.debug(f"memory write skipped for auto-reply: {exc}")
 
         return True
 

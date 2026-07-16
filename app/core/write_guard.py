@@ -38,6 +38,33 @@ _role: ContextVar[Optional[str]] = ContextVar("request_role", default=None)
 _readonly_channel: ContextVar[Optional[str]] = ContextVar(
     "readonly_channel", default=None)
 
+# Customer scope — a possession-verified CALLER (voice OTP), not a staff user.
+#
+# Deliberately harsher than the read-only channel: a verified customer may see
+# only their OWN rows, but every stored procedure is CRM-wide by construction
+# (sp_accounts lists all accounts, sp_orders all orders …). There is no way to
+# bolt a row filter onto an arbitrary SP call from out here, so the choke
+# point FAILS CLOSED instead: while this scope is set, execute_sp refuses ALL
+# SP access. The customer tier answers exclusively through explicitly
+# account-scoped parameterized queries (app/core/voice_support.py) that run in
+# a read-only transaction and inject the account_id from THIS scope — never
+# from anything the caller said. Writes are never executed on this channel;
+# they become governance proposals.
+_customer_scope: ContextVar[Optional[dict]] = ContextVar(
+    "customer_scope", default=None)
+
+
+def set_customer_scope(scope: Optional[dict]) -> None:
+    """Mark this context as a verified-customer channel. `scope` carries the
+    verified identity ({'account_id':…, 'contact_id':…}); None clears it.
+    Inherited by everything awaited from here — including any agent call a
+    routing bug might reach, which execute_sp then refuses (fail-closed)."""
+    _customer_scope.set(scope)
+
+
+def customer_scope() -> Optional[dict]:
+    return _customer_scope.get()
+
 
 def set_readonly_channel(name: Optional[str]) -> None:
     """Mark this context as a read-only channel (e.g. 'sms'). Inherited by

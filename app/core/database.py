@@ -76,8 +76,19 @@ def execute_sp(query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict
 
     # Block read-only callers from write SPs (catches NL-driven writes the HTTP
     # gate misses). No-op outside a request / when auth is off — see write_guard.
-    from app.core.write_guard import (WritePermissionError, guard_query,
-                                      readonly_channel)
+    from app.core.write_guard import (WritePermissionError, customer_scope,
+                                      guard_query, readonly_channel)
+
+    # Verified-customer channel: FAIL CLOSED. SPs are CRM-wide by construction
+    # and cannot be row-scoped from here, so a customer-scoped context gets no
+    # SP access at all — its answers come only from the explicitly
+    # account-scoped queries in voice_support (see write_guard.customer_scope).
+    if customer_scope() is not None:
+        raise WritePermissionError(
+            "Customer-verified channel: general CRM queries are not available "
+            "here — only your own account's information can be looked up.",
+            http_status=403)
+
     guard_query(query)
     _chan = readonly_channel()
 

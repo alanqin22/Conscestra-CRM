@@ -402,13 +402,16 @@ async def orchestrator_chat(req: OrchChatRequest):
             })
 
     # ── 3. Single-agent delegation — capability-routed via the A2A layer ──────
-    # _route_single still selects the agent; the call now goes through the typed
-    # A2A dispatch (correlation + capability registry), falling back to a direct
-    # _call_agent if no passthrough capability is registered for that endpoint.
-    path = _route_single(lower)
+    # Orchestrator v2: the LLM intent router selects the agent (keyword
+    # `_route_single` remains its fallback); the call then goes through the
+    # typed A2A dispatch (correlation + capability registry), falling back to
+    # a direct _call_agent if no passthrough capability is registered.
+    from app.core.intent_router import aroute
+    decision = await aroute(message)
+    path = decision.endpoint
     from app.core.a2a import dispatch, resolve, query_intent_for_endpoint, A2ARequest
     q_intent = query_intent_for_endpoint(path)
-    logger.info(f'[route] → {path} (a2a intent={q_intent})')
+    logger.info(f'[route] → {path} via {decision.label} (a2a intent={q_intent})')
     try:
         if q_intent and resolve(q_intent):
             res = await dispatch(A2ARequest(
@@ -426,4 +429,5 @@ async def orchestrator_chat(req: OrchChatRequest):
                              'output': f'Agent call failed: {e}'})
     data.setdefault('sessionId', session_id)
     data['routedTo'] = path
+    data['routedBy'] = decision.label
     return JSONResponse(data)

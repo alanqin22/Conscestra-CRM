@@ -168,8 +168,15 @@ def _log_activity(kind: str, subject: str, description: str, *,
 # ============================================================================
 
 def send_sms(to: str, body: str, *, lead_id=None, account_id=None,
-             owner_id=None, sent_by: str = "agent") -> Dict[str, Any]:
-    """Send (or draft) one SMS. Trial accounts only reach verified numbers."""
+             owner_id=None, sent_by: str = "agent",
+             transactional: bool = False) -> Dict[str, Any]:
+    """Send (or draft) one SMS. Trial accounts only reach verified numbers.
+
+    transactional=True bypasses the AUTOSEND draft gate: AUTOSEND exists to
+    hold back agent-INITIATED outreach for review, but a caller-requested
+    security code (voice OTP) is useless as a draft — the caller is on the
+    line waiting for it. Transactional bodies carry secrets, so the activity
+    log records THAT a message went out, never its content."""
     to_n = normalize_phone(to)
     if not to_n:
         return {"ok": False, "error": f"unusable phone number {to!r}"}
@@ -180,7 +187,7 @@ def send_sms(to: str, body: str, *, lead_id=None, account_id=None,
         return {"ok": False, "error": "Twilio not configured "
                                       "(TWILIO_ACCOUNT_SID/AUTH_TOKEN/FROM_NUMBER)"}
 
-    if not AUTOSEND:
+    if not AUTOSEND and not transactional:
         _log_activity("task", f"Send SMS to {to_n} (draft)",
                       f"SMS drafted by {sent_by} (SMS_AUTOSEND=0 — not sent):\n"
                       f"{body}", direction="outbound", lead_id=lead_id,
@@ -211,7 +218,9 @@ def send_sms(to: str, body: str, *, lead_id=None, account_id=None,
     sid = ((payload.get("data") or {}).get("id") if prov == "telnyx"
            else payload.get("sid"))
     _log_activity("call", f"SMS sent to {to_n}",
-                  f"Sent by {sent_by} via {prov} ({sid or ''}):\n{body}",
+                  f"Sent by {sent_by} via {prov} ({sid or ''}):\n"
+                  + ("(transactional — body withheld from the log)"
+                     if transactional else body),
                   direction="outbound", lead_id=lead_id, account_id=account_id,
                   owner_id=owner_id)
     logger.info(f"[telephony] SMS → {to_n} via {prov} ({str(sid)[:12]})")
@@ -448,11 +457,12 @@ _LAST_AGENT: Dict[str, str] = {}
 
 
 def _route_sms(sender_e164: str, body: str) -> str:
-    """Keyword-route, but keep bare follow-ups on the sender's last agent."""
-    from app.agents.orchestrator.router import _route_single
+    """Intent-route (LLM with keyword fallback — Orchestrator v2), but keep
+    bare follow-ups on the sender's last agent. Blocking; call off-loop."""
+    from app.core.intent_router import route
     if _SMS_FOLLOWUP_RE.match(body or "") and sender_e164 in _LAST_AGENT:
         return _LAST_AGENT[sender_e164]
-    path = _route_single((body or "").lower())
+    path = route(body).endpoint
     _LAST_AGENT[sender_e164] = path
     return path
 
@@ -474,7 +484,7 @@ async def _compose_operator_reply(sender_e164: str, body: str) -> str:
     from app.core.write_guard import WritePermissionError, set_readonly_channel
 
     set_readonly_channel("sms")
-    path = _route_sms(sender_e164, body)
+    path = await asyncio.to_thread(_route_sms, sender_e164, body)
     logger.info(f"[telephony] operator SMS from {sender_e164} → {path}")
     try:
         data = await _call_agent(path, body, f"sms-{sender_e164}")
@@ -544,7 +554,9 @@ async def _compose_sms_reply(sender_display: str, body: str,
     try:
         from app.core import knowledge, privacy
         from app.core.graph_utils import _get_llm
-        kb = await asyncio.to_thread(knowledge.rag_block, "sms inquiry", body)
+        # Empty subject (channel labels pollute matching); a KB miss is
+        # logged as an 'sms' gap for the nightly gap miner.
+        kb = await asyncio.to_thread(knowledge.rag_block, "", body, "sms")
         resp = await asyncio.to_thread(_get_llm(tier="lite").invoke, [
             {"role": "system", "content":
                 "You write SMS replies for Conscestra CRM. ONE short paragraph, "
@@ -595,7 +607,20 @@ async def _bridge_inbound_sms(sender: str, body: str,
     logger.info(f"[telephony] inbound SMS from {sender} via {via} "
                 f"({(who or {}).get('kind') or 'unmatched'}"
                 f"{', operator' if _is_operator(sender) else ''})")
-    return await _compose_sms_reply(display, body, sender_e164=sender)
+    reply = await _compose_sms_reply(display, body, sender_e164=sender)
+    # Unified customer memory: remember the exchange for a MATCHED sender
+    # (customers only — operator traffic is staff querying the CRM, not a
+    # customer conversation). Recall never serves unverified SMS; writing is
+    # safe because a spoofed sender gains nothing by planting a question.
+    if who and not _is_operator(sender):
+        try:
+            from app.core import customer_memory
+            customer_memory.remember_later(
+                who["kind"], who.get("account_id") or who.get("lead_id"),
+                "sms", None, f"customer: {body}\nagent: {reply}")
+        except Exception as exc:
+            logger.debug(f"[telephony] memory write skipped: {exc}")
+    return reply
 
 
 async def handle_inbound_sms(url: str, params: Dict[str, str],

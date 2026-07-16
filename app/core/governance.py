@@ -635,6 +635,11 @@ def _undo_dq_merge(ap: Dict[str, Any]) -> Dict[str, Any]:
         ((ap.get("result") or {}).get("data")) or {})
 
 
+def _undo_contact_update_profile(ap: Dict[str, Any]) -> Dict[str, Any]:
+    from app.core import voice_support
+    return voice_support.undo_profile_update(ap)
+
+
 _UNDO = {
     "campaign.winback": _undo_campaign_winback,
     "tuning.adjust": _undo_tuning_adjust,
@@ -643,6 +648,7 @@ _UNDO = {
     "scoring.activate": _undo_scoring_activate,
     "data.normalize_phones": _undo_dq_normalize,
     "data.merge_contacts": _undo_dq_merge,
+    "contact.update_profile": _undo_contact_update_profile,
 }
 
 
