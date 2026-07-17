@@ -44,6 +44,10 @@ CONFIG (env)
                             query the LIVE CRM over SMS (blank = none)
   -- Twilio --  TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_NUMBER
   -- Telnyx --  TELNYX_API_KEY / TELNYX_FROM_NUMBER
+                TELNYX_FROM_NUMBER_US  optional 2nd (US) sender; +1 US
+                                     destinations originate from it, others from
+                                     TELNYX_FROM_NUMBER. Override per send with
+                                     from='us'|'ca'|<E.164> in the A2A/admin call
                 TELNYX_PUBLIC_KEY    account Ed25519 public key (webhook auth)
                 TELNYX_TEXML_APP_ID  TeXML application id (outbound calls)
                 TELNYX_PUBLIC_BASE   public base URL for outbound-call TeXML
@@ -99,11 +103,64 @@ def _telnyx_texml_app() -> str:
     return os.getenv("TELNYX_TEXML_APP_ID", "").strip()
 
 
-def _from_number() -> str:
-    """The active sender number for the current provider."""
-    if _provider() == "telnyx":
-        return os.getenv("TELNYX_FROM_NUMBER", "").strip()
-    return os.getenv("TWILIO_FROM_NUMBER", "").strip()
+# Canadian NANP area codes. The US and Canada share country code +1, so the
+# destination country can only be told apart by its area code (NPA). Anything
+# +1 that is NOT in this set (and not toll-free) is treated as US.
+_CA_AREA_CODES = frozenset({
+    "204", "226", "236", "249", "250", "263", "289", "306", "343", "354",
+    "365", "367", "368", "382", "387", "403", "416", "418", "428", "431",
+    "437", "438", "450", "468", "474", "506", "514", "519", "548", "579",
+    "581", "584", "587", "600", "604", "613", "639", "647", "672", "683",
+    "705", "709", "742", "753", "778", "780", "782", "807", "819", "825",
+    "867", "873", "879", "902", "905",
+})
+# Toll-free NANP NPAs are shared US/Canada — never used to pick the US line.
+_TOLLFREE_AREA_CODES = frozenset({
+    "800", "833", "844", "855", "866", "877", "888",
+})
+
+
+def _npa(phone: Optional[str]) -> Optional[str]:
+    """The 3-digit NANP area code of an E.164/phone string, else None."""
+    d = re.sub(r"\D", "", phone or "")
+    if len(d) == 11 and d[0] == "1":
+        return d[1:4]
+    if len(d) == 10:
+        return d[:3]
+    return None
+
+
+def _from_number(dest: Optional[str] = None,
+                 override: Optional[str] = None) -> str:
+    """The originating sender number for the current provider.
+
+    Twilio is single-number and ignores dest/override. Telnyx supports two
+    lines — the default TELNYX_FROM_NUMBER and an optional US line
+    TELNYX_FROM_NUMBER_US — chosen (option C) as:
+      1. explicit override — a full E.164, or an alias 'us' / 'ca' / 'default';
+      2. automatic by destination country — a +1 US destination originates from
+         the US line when one is configured, Canadian/other from the default;
+      3. the default TELNYX_FROM_NUMBER.
+    Called with no args (configured()/status) it returns the default."""
+    if _provider() != "telnyx":
+        return os.getenv("TWILIO_FROM_NUMBER", "").strip()
+    default = os.getenv("TELNYX_FROM_NUMBER", "").strip()
+    us = os.getenv("TELNYX_FROM_NUMBER_US", "").strip()
+    # 1. explicit override wins
+    if override:
+        low = override.strip().lower()
+        if low in ("us", "usa"):
+            return us or default
+        if low in ("ca", "can", "canada", "default"):
+            return default
+        return normalize_phone(override) or default
+    # 2. automatic by destination country (only when a US line exists)
+    if us and dest:
+        npa = _npa(dest)
+        if npa and npa not in _CA_AREA_CODES and npa not in _TOLLFREE_AREA_CODES:
+            return us
+    # 3. default
+    return default
 
 
 AUTOSEND = _flag("SMS_AUTOSEND", "0")
@@ -169,7 +226,8 @@ def _log_activity(kind: str, subject: str, description: str, *,
 
 def send_sms(to: str, body: str, *, lead_id=None, account_id=None,
              owner_id=None, sent_by: str = "agent",
-             transactional: bool = False) -> Dict[str, Any]:
+             transactional: bool = False,
+             from_number: Optional[str] = None) -> Dict[str, Any]:
     """Send (or draft) one SMS. Trial accounts only reach verified numbers.
 
     transactional=True bypasses the AUTOSEND draft gate: AUTOSEND exists to
@@ -202,12 +260,14 @@ def send_sms(to: str, body: str, *, lead_id=None, account_id=None,
             r = requests.post(
                 f"{_TELNYX_API}/messages",
                 headers={"Authorization": f"Bearer {_telnyx_key()}"},
-                json={"from": _from_number(), "to": to_n, "text": body[:1600]},
+                json={"from": _from_number(to_n, from_number), "to": to_n,
+                      "text": body[:1600]},
                 timeout=20)
         else:
             r = requests.post(
                 f"{_API}/{_sid()}/Messages.json",
-                data={"To": to_n, "From": _from_number(), "Body": body[:1600]},
+                data={"To": to_n, "From": _from_number(to_n, from_number),
+                      "Body": body[:1600]},
                 auth=(_sid(), _token()), timeout=20)
         payload = r.json() if r.content else {}
     except Exception as exc:
@@ -258,7 +318,8 @@ def _say_url(text: str) -> str:
 
 
 def place_call(to: str, say_text: str, *, lead_id=None, account_id=None,
-               owner_id=None, called_by: str = "agent") -> Dict[str, Any]:
+               owner_id=None, called_by: str = "agent",
+               from_number: Optional[str] = None) -> Dict[str, Any]:
     """Place a call that speaks `say_text`. Twilio: inline TwiML (no public
     URL). Telnyx: a TeXML application call pointed at a signed say URL."""
     to_n = normalize_phone(to)
@@ -284,14 +345,15 @@ def place_call(to: str, say_text: str, *, lead_id=None, account_id=None,
             r = requests.post(
                 f"{_TELNYX_API}/texml/calls/{app}",
                 headers={"Authorization": f"Bearer {_telnyx_key()}"},
-                json={"To": to_n, "From": _from_number(),
+                json={"To": to_n, "From": _from_number(to_n, from_number),
                       "Url": _say_url(say_text)}, timeout=20)
         else:
             twiml = (f'<Response><Say voice="alice">'
                      f'{_twiml_escape(say_text[:800])}</Say></Response>')
             r = requests.post(
                 f"{_API}/{_sid()}/Calls.json",
-                data={"To": to_n, "From": _from_number(), "Twiml": twiml},
+                data={"To": to_n, "From": _from_number(to_n, from_number),
+                      "Twiml": twiml},
                 auth=(_sid(), _token()), timeout=20)
         payload = r.json() if r.content else {}
     except Exception as exc:
@@ -317,7 +379,8 @@ def send_sms_sp(p: Dict[str, Any]) -> Dict[str, Any]:
     """A2A structured handler for sms.send (governed write)."""
     return send_sms(str(p.get("to") or ""), str(p.get("body") or ""),
                     lead_id=p.get("lead_id"), account_id=p.get("account_id"),
-                    sent_by=str(p.get("sent_by", "a2a")))
+                    sent_by=str(p.get("sent_by", "a2a")),
+                    from_number=(p.get("from") or p.get("from_number") or None))
 
 
 # ============================================================================
@@ -660,7 +723,9 @@ def telephony_call(body: Dict[str, Any]):
     return place_call(str(body.get("to") or ""), str(body.get("say") or ""),
                       lead_id=body.get("lead_id"),
                       account_id=body.get("account_id"),
-                      called_by=str(body.get("called_by", "admin")))
+                      called_by=str(body.get("called_by", "admin")),
+                      from_number=(body.get("from") or body.get("from_number")
+                                   or None))
 
 
 # Public webhooks: the carrier can't send admin headers — the request
@@ -707,10 +772,12 @@ async def telephony_inbound(request: Request):
                     media_type="text/xml")
 
 
-@public_router.get("/telephony/texml/say")
+@public_router.api_route("/telephony/texml/say", methods=["GET", "POST"])
 def telephony_texml_say(text: str = "", t: str = ""):
     """Serve a one-shot TeXML <Say> document for outbound Telnyx calls. The
-    HMAC token authorizes it (Telnyx fetches this server-side)."""
+    HMAC token authorizes it (Telnyx fetches this server-side). Accepts both
+    GET and POST: Telnyx fetches this URL with whatever the TeXML app's Voice
+    Method is set to (POST by default), while text/t stay in the query string."""
     if not _hmac.compare_digest(_say_token(text[:800]), t):
         return Response("invalid token", status_code=403)
     return Response(_say_document(text), media_type="text/xml")
