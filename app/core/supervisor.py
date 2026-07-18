@@ -22,11 +22,12 @@ CONFIG (env)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import uuid as _uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter
 
@@ -48,6 +49,12 @@ def _int(name: str, default: int) -> int:
 
 ENABLED = _flag("SUPERVISOR_ENABLED")
 AUTOACT = _flag("SUPERVISOR_AUTOACT")
+# Phase 3.5 — planner bridge: on a breach, hand the headline to the bounded
+# planner as a GOAL. It composes a multi-agent response play; reads execute,
+# writes queue for governance approval (nothing outbound). Staged independently
+# of AUTOACT because its only "action" is queuing proposals a human approves —
+# so it can ship on well before AUTOACT. Off by default.
+PLANNER = _flag("SUPERVISOR_PLANNER")
 AR_OVERDUE_MIN = _int("SUPERVISOR_AR_OVERDUE_MIN", 10)
 SLIPPED_MIN    = _int("SUPERVISOR_SLIPPED_MIN", 10)
 UNBILLED_MIN   = _int("SUPERVISOR_UNBILLED_MIN", 3)
@@ -289,6 +296,96 @@ def _autoact(sig: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# ============================================================================
+# PLANNER BRIDGE (Phase 3.5) — a breach becomes a governed multi-agent play
+# ============================================================================
+
+def _breach_goal(sig: Dict[str, Any]) -> Optional[str]:
+    """Turn a breach signal into a plain-language GOAL for the planner. Returns
+    None for breaches with no business play (e.g. the ops bus_stall heartbeat)."""
+    headline = sig.get("headline") or ""
+    return {
+        "ar_spike":
+            f"Reduce overdue receivables ({headline}). Identify the overdue "
+            f"invoices and send payment reminders to the customers who owe.",
+        "slipped_deals":
+            f"Recover slipped pipeline ({headline}). Review the slipped "
+            f"opportunities and re-engage them to pull the deals back in.",
+        "unbilled_orders":
+            f"Close revenue leakage ({headline}). Find the shipped-but-unbilled "
+            f"orders and generate their invoices.",
+        "unworked_leads":
+            f"Improve pipeline coverage ({headline}). Identify the hot unworked "
+            f"leads and schedule outreach for them.",
+        "churn_risk":
+            f"Reduce churn ({headline}). Review the high-risk accounts and "
+            f"launch save plays for the top-value ones.",
+    }.get(sig.get("rule"))
+
+
+def _plan_already_queued(goal: str) -> bool:
+    """Idempotency: a plan for this exact goal already sits pending approval.
+    Planner writes are tagged with params->>'plan_goal' (see planner.run_plan),
+    so one active play per breach goal at a time."""
+    try:
+        rows = execute_sp(
+            "SELECT 1 AS x FROM action_approvals "
+            "WHERE status='pending' AND params->>'plan_goal' = %(g)s LIMIT 1",
+            {"g": goal})
+        return bool(rows)
+    except Exception as exc:
+        logger.debug(f"[supervisor] plan-dedupe check failed: {exc}")
+        return False
+
+
+def _run_coro(coro) -> Any:
+    """Run an async coroutine from this SYNC tick. The tick always runs off the
+    event loop (APScheduler threadpool job / asyncio.to_thread), so asyncio.run
+    is the normal path; the running-loop branch is belt-and-braces for any
+    future caller that invokes the tick from within a loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)          # no loop here — the normal case
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(lambda: asyncio.run(coro)).result()
+
+
+async def _dispatch_plan(goal: str, cid: str) -> Dict[str, Any]:
+    """Execute the plan through the typed A2A layer (crm.plan_execute) so the
+    play is audited + correlation-chained in one place — reads run, writes queue
+    for governance. Never sends anything outbound."""
+    from app.core.a2a import A2ARequest, dispatch
+    res = await dispatch(A2ARequest(
+        intent="crm.plan_execute", from_agent="supervisor",
+        params={"goal": goal}, correlation_id=cid))
+    return {"ok": res.ok, "error": res.error, "data": res.data}
+
+
+def _plan_for_breach(sig: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+    """Compose + execute a governed plan for a breach. Returns (note, queued) —
+    `queued` is the number of write proposals now pending for this breach (a
+    pre-existing plan counts as 1) — or None when the breach has no goal. The
+    caller uses queued>0 to suppress the legacy AUTOACT path so the two don't
+    double-act. Writes are proposed, never executed here — safe without AUTOACT."""
+    goal = _breach_goal(sig)
+    if not goal:
+        return None
+    if _plan_already_queued(goal):
+        return "plan already queued for approval", 1
+    cid = str(_uuid.uuid4())
+    res = _run_coro(_dispatch_plan(goal, cid))
+    if not res or not res.get("ok"):
+        return f"plan dispatch failed: {(res or {}).get('error')}", 0
+    data = res.get("data") or {}
+    steps = len(data.get("trace") or [])
+    proposed = len(data.get("proposed_approvals") or [])
+    note = (f"planned {steps} step(s), {proposed} queued for approval"
+            if proposed else f"planned {steps} step(s) (read-only, nothing to approve)")
+    return note, proposed
+
+
 def _briefing(breaches: List[Dict[str, Any]]) -> str:
     if not breaches:
         return "### 🛰️ Supervisor — all clear\nNo KPI breaches detected."
@@ -330,14 +427,26 @@ def run_supervisor_tick(force: bool = False) -> Dict[str, Any]:
         try:
             _emit_alert(sig)
             alerted.append(sig["rule"])
-            if AUTOACT and sig.get("auto"):
+            # Planner bridge FIRST (independent of AUTOACT): compose a governed
+            # multi-agent response play; writes queue for approval — safe.
+            planned_writes = 0
+            if PLANNER:
+                presult = _plan_for_breach(sig)
+                if presult:
+                    pnote, planned_writes = presult
+                    acted.append({f"{sig['rule']}/plan": pnote})
+            # AUTOACT only when the planner did NOT already queue a governed play
+            # for this breach — otherwise both paths act on it (e.g. both dun the
+            # same AR spike). The planner's composed play takes precedence.
+            if AUTOACT and sig.get("auto") and planned_writes == 0:
                 note = _autoact(sig)
                 if note:
                     acted.append({sig["rule"]: note})
         except Exception as exc:
             logger.error(f"[supervisor] act on {sig['rule']} failed: {exc}", exc_info=True)
 
-    summary = {"enabled": ENABLED, "autoact": AUTOACT, "checked": len(DETECTORS),
+    summary = {"enabled": ENABLED, "autoact": AUTOACT, "planner": PLANNER,
+               "checked": len(DETECTORS),
                "breaches": [b["rule"] for b in breaches], "alerted": alerted,
                "acted": acted, "briefing": _briefing(breaches)}
 
@@ -369,7 +478,7 @@ router = APIRouter(tags=["supervisor"])
 
 @router.get("/supervisor/status")
 def supervisor_status():
-    return {"enabled": ENABLED, "autoact": AUTOACT,
+    return {"enabled": ENABLED, "autoact": AUTOACT, "planner": PLANNER,
             "detectors": [d.__name__ for d in DETECTORS],
             "thresholds": {"ar_overdue_min": AR_OVERDUE_MIN, "slipped_min": SLIPPED_MIN,
                            "unbilled_min": UNBILLED_MIN, "unworked_min": UNWORKED_MIN,

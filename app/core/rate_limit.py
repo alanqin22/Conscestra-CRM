@@ -113,6 +113,9 @@ class SlidingWindowLimiter:
 signin_ip_attempts = SlidingWindowLimiter(MAX_ATTEMPTS_PER_IP, WINDOW_SECONDS)
 signin_user_fails = SlidingWindowLimiter(MAX_FAILS_PER_USER, WINDOW_SECONDS)
 reset_requests = SlidingWindowLimiter(5, 3600)  # password-reset: 5/identifier/hour
+# Planner EXECUTION (plan: … confirm) — runs reads + queues governance proposals,
+# so throttle per-IP to bound queue-flooding + LLM cost even for authorized callers.
+plan_exec_ip = SlidingWindowLimiter(_int_env("PLAN_EXEC_MAX_PER_HOUR", 20), 3600)
 
 
 def client_ip(request: Request) -> str:

@@ -223,6 +223,23 @@ async def require_write(request: Request) -> None:
         )
 
 
+async def caller_can_write(request: Request) -> bool:
+    """True when the caller may perform WRITE-like actions under the current
+    posture. For NL-driven write paths that carry NO structured `mode` — e.g. the
+    planner's 'plan: … confirm', which queues governance proposals — and which
+    require_data_access therefore reads as a harmless read. Open posture → always
+    True; otherwise a valid admin token OR a write-capable (admin/member) session."""
+    if not API_AUTH_ENABLED:
+        return True
+    if ADMIN_API_TOKEN:
+        provided = request.headers.get("x-admin-token") or _bearer(request) or ""
+        if secrets.compare_digest(provided, ADMIN_API_TOKEN):
+            return True
+    from app.agents.auth.router import get_session
+    sess = get_session(_bearer(request) or "")
+    return (sess or {}).get("role", "anonymous") in WRITE_ROLES
+
+
 async def require_data_access(request: Request) -> Optional[Dict[str, Any]]:
     """Unified data-endpoint gate (the demo-friendly model).
 

@@ -147,5 +147,16 @@ def _record_inbound(email: Dict[str, Any], intent: str) -> Dict[str, Any]:
 
     logger.info(f"[inbound_bridge] {sender} → {entity_type} {entity_id} "
                 f"(intent={intent}, activity={activity_id[:8]})")
+
+    # Unified Communication Layer: thread this inbound email into the sender's
+    # ONE cross-channel conversation (best-effort; placed AFTER the dedupe guard
+    # so IMAP redelivery doesn't double-thread). Never affects the poller.
+    try:
+        from app.core import channel_adapters
+        channel_adapters.capture_email(email.get("from", ""), subject, preview,
+                                       external_ref=activity_id)
+    except Exception:
+        pass
+
     return {"status": "ok", "sender": sender, "intent": intent,
             entity_type: entity_id, "activity_id": activity_id}

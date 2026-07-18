@@ -354,6 +354,32 @@ else's history.
 
 **Start the conversation anywhere. Continue it everywhere.**
 
+## Every Channel. One Conversation. One Intelligence.
+
+The channel is temporary; the relationship is permanent. Conscestra treats
+Voice, SMS, Email, WhatsApp, Slack, and Teams not as separate integrations but
+as instruments of one **Unified Communication Layer** — a common message
+envelope every channel adapter speaks, resolved to one person and threaded into
+one conversation.
+
+**Identity resolution** maps any handle — a phone number, an email address, a
+Slack or Teams user id — to a single CRM party. A WhatsApp message and a later
+email from the same person are recognized as the same relationship, so the
+thread they share moves *across* channels. External conversations
+(customer ↔ business) and internal ones (employee ↔ business intelligence) sit
+on opposite sides of a boundary the Orchestrator polices — a customer never sees
+the internal escalation their message set off.
+
+The layer is **intelligent about *how* to respond**, not merely *where*. Given
+an objective and a person, it chooses the best action: an urgent issue becomes a
+call, a formal proposal an email, a quick update a WhatsApp message, an internal
+alert a Slack post — weighing intent, relationship, urgency, the person's
+learned channel preference, and whether the matter is sensitive enough to demand
+a verified channel.
+
+**Start on WhatsApp at 9am, continue by phone at 10, receive a proposal by email
+that afternoon — one person, one conversation, one memory.**
+
 ## A Conductor That Routes by Meaning
 
 Keyword routing is fast but literal — *"what is my account balance?"*
@@ -368,6 +394,15 @@ tuning signal.
 
 Meaning first, keywords as the safety net — and every route annotated with
 how it was decided.
+
+The Orchestrator is a conductor, not just a switchboard. A single lookup goes to
+one specialist; a **multi-step goal** — *"recover our overdue receivables and
+re-engage the slipped deals this week"* — is decomposed into a coordinated plan
+across several agents, its read steps executed immediately and its every write
+queued for human approval. The same planner works unprompted: when the standing
+supervisor detects a KPI breach, it hands the situation to the planner as a goal
+and lets it compose a governed response play — sense, decide, plan, propose,
+with a human on every outbound action.
 
 ## A Priced Quotation in One Command
 
@@ -579,6 +614,16 @@ Every morning, leadership receives a personalized executive briefing.
 Every briefing combines internal business intelligence with live external
 data sources and includes citations for verification. At the same time, live
 dashboards continue tracking organizational movement throughout the day.
+
+Each executive is modeled as a leadership **role and an intelligence profile on
+top of their employee identity** — never a duplicate person record. The profile
+captures what they need to know (authority domain, strategic priorities) and how
+they want to be reached (preferred channel, briefing hour, risk threshold). When
+an action needs a decision it routes to the executive whose authority owns it,
+and arrives the way their profile prefers — email, in-app, or a Slack message —
+carrying a plain-language summary of exactly *what they are approving*, an
+independent critic's second opinion, and a one-click, signed decision that needs
+no sign-in. Same underlying intelligence, a different perspective for each leader.
 
 Business awareness becomes continuous rather than periodic.
 

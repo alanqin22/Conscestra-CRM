@@ -160,9 +160,79 @@ def eval_kb_retrieval() -> Dict[str, Any]:
             else (blk[:160] or "(no retrieval)")}
 
 
+def eval_supervisor_planner_bridge() -> Dict[str, Any]:
+    """Deterministic (no LLM, no writes): the supervisor→planner wiring is
+    intact — crm.plan_execute is a registered read/compose capability, and a
+    breach signal maps to a goal string. Guards the bridge from silent rot."""
+    from app.core import a2a, supervisor
+    cap = a2a.resolve("crm.plan_execute")
+    goal = supervisor._breach_goal(
+        {"rule": "ar_spike", "headline": "12 invoices overdue"})
+    ok = (cap is not None and cap.kind == "read" and cap.compose is not None
+          and isinstance(goal, str) and len(goal) > 20)
+    return {"ok": ok, "detail": "plan_execute cap + breach→goal wired" if ok
+            else f"cap={cap is not None} goal={bool(goal)}"}
+
+
+def eval_identity_resolution() -> Dict[str, Any]:
+    """Deterministic (no LLM): the Identity Resolution spine — external/internal
+    channel split + handle normalization. Guards the 'One Person' primitive."""
+    from app.core import identity
+    scope_ok = (identity.channel_scope("slack") == "internal"
+                and identity.channel_scope("whatsapp") == "external"
+                and identity.channel_scope("email") == "external")
+    norm_email = identity._normalize_handle("email", "  Aria.Costa@X.CA ") == "aria.costa@x.ca"
+    norm_phone = identity._normalize_handle("whatsapp", "(437) 555-7730").startswith("+")
+    ok = scope_ok and norm_email and norm_phone
+    return {"ok": ok, "detail": "channel scope + handle normalization intact" if ok
+            else f"scope={scope_ok} email={norm_email} phone={norm_phone}"}
+
+
+def eval_conversation_object() -> Dict[str, Any]:
+    """Smoke test (no DB writes): the Unified Conversation Object contract —
+    envelope + entry points intact. Guards the 'One Conversation' spine."""
+    from app.core import conversations as cv
+    msg = cv.InboundMessage(channel="whatsapp", handle="+1", body="hi")
+    ok = (msg.direction == "inbound" and cv.WINDOW_HOURS > 0
+          and all(callable(getattr(cv, f, None))
+                  for f in ("ingest", "append_outbound", "history_for_party", "close")))
+    return {"ok": ok, "detail": "conversation object contract intact" if ok
+            else "missing entry point / bad envelope"}
+
+
+def eval_channel_selection() -> Dict[str, Any]:
+    """Deterministic (no DB): the channel-selection policy is well-formed — every
+    objective's preferred channels map to a real action, and scope classification
+    (external/internal) is correct. Guards the Phase-4 decision engine."""
+    from app.core import channel_selector as cs
+    specs_ok = all(
+        all(ch in cs.CHANNEL_ACTION for ch in spec.get("prefer", []))
+        for spec in cs.OBJECTIVES.values())
+    scope_ok = (cs._scope_of("slack") == "internal"
+                and cs._scope_of("whatsapp") == "external")
+    ok = specs_ok and scope_ok and "urgent_issue" in cs.OBJECTIVES
+    return {"ok": ok, "detail": "channel policy well-formed" if ok
+            else f"specs={specs_ok} scope={scope_ok}"}
+
+
+def eval_executive_intelligence() -> Dict[str, Any]:
+    """Deterministic (no DB): the Executive Intelligence Profile defaults are
+    well-formed — every leadership role has an authority domain + priorities."""
+    from app.core import executive_intelligence as ei
+    req = ("authority_domain", "strategic_priorities", "risk_threshold",
+           "escalation_level", "briefing_hour")
+    ok = ({"CEO", "CFO", "CRO", "COO"} <= set(ei._DEFAULT_PROFILES)
+          and all(all(k in p for k in req) and p["strategic_priorities"]
+                  for p in ei._DEFAULT_PROFILES.values()))
+    return {"ok": ok, "detail": "executive profiles well-formed" if ok
+            else "missing role/field in _DEFAULT_PROFILES"}
+
+
 EVALS: List[Callable[[], Dict[str, Any]]] = [
     eval_sdr_greeting, eval_sdr_injection, eval_autoreply_grounding,
-    eval_planner_bounded, eval_kb_retrieval,
+    eval_planner_bounded, eval_kb_retrieval, eval_supervisor_planner_bridge,
+    eval_identity_resolution, eval_conversation_object, eval_channel_selection,
+    eval_executive_intelligence,
 ]
 
 

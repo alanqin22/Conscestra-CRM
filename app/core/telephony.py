@@ -643,6 +643,16 @@ async def _bridge_inbound_sms(sender: str, body: str,
     emit sms.received, and compose the auto-reply text. Returns the reply."""
     sender = normalize_phone(sender) or sender
     body = (body or "").strip()
+
+    # Unified Communication Layer: thread this inbound SMS into the sender's ONE
+    # cross-channel conversation (best-effort; the adapter swallows any failure,
+    # so this never affects the SMS reply). Threads matched AND unmatched senders.
+    try:
+        from app.core import channel_adapters
+        channel_adapters.capture_sms(sender, body)
+    except Exception:
+        pass
+
     who = _match_sender(sender) if sender else None
     display = (who or {}).get("display") or sender
 

@@ -113,8 +113,13 @@ def _draft_llm(goal: str) -> Optional[Dict[str, Any]]:
                 "list, verbatim; at most "
                 f"{MAX_STEPS} steps and {MAX_WRITES} WRITE steps; put READ "
                 "steps before WRITE steps; params must be simple JSON values "
-                "the capability description implies; if the goal cannot be "
-                'served with these capabilities, return {"error": "<why>"}.'},
+                "the capability description implies. NEVER invent entity IDs, "
+                "names, or placeholder values (no 'x', '<id>', example names) — "
+                "if you don't have a real, concrete identifier, OMIT that param "
+                "and prefer a discovery capability (a list/summary) that finds "
+                "the records itself. Only include a param you can fill with a "
+                "real value taken from the goal. If the goal cannot be served "
+                'with these capabilities, return {"error": "<why>"}.'},
             {"role": "user", "content":
                 f"GOAL: {goal}\n\nREGISTERED CAPABILITIES:\n{_manifest_lines()}\n\n"
                 'Return ONLY JSON: {"summary": "<one line>", "steps": '
@@ -127,6 +132,83 @@ def _draft_llm(goal: str) -> Optional[Dict[str, Any]]:
     except Exception as exc:
         logger.warning(f"[planner] LLM draft failed: {exc}")
         return None
+
+
+# ============================================================================
+# PARAM SANITIZATION — strip invented placeholder values before they reach an
+# agent. The draft LLM sometimes fills an ENTITY param with a value it doesn't
+# actually know ("account": "x", "<id>", an example name); that junk then
+# reaches the owning agent and errors (e.g. "Invalid UUID: x"), wasting the
+# step. We drop such values so the step runs on clean input (a discovery /
+# general answer) instead. Conservative by design: only OBVIOUS placeholders
+# are removed — real filter values (status="open", scoreMin=70) are untouched.
+# ============================================================================
+
+_PLACEHOLDER_TOKENS = {
+    "", "x", "y", "z", "xx", "xxx", "tbd", "todo", "n/a", "na", "none", "null",
+    "nil", "example", "placeholder", "string", "value", "unknown", "sample",
+    "<id>", "<uuid>", "<name>", "<account>", "?", "-", "--", "...",
+    "account name", "the account", "company name", "entity id", "id here",
+    "your account", "account_id", "entity_id", "lead_id", "contact_id",
+}
+
+_TEMPLATE_RE = re.compile(r"^\s*(?:<.*>|\{\{.*\}\}|\[.*\])\s*$")
+
+# Capabilities that are meaningless without a concrete identifier/param. A step
+# using one with none of them (after sanitization) is DROPPED, so the plan never
+# dispatches work it can't fill:
+#   • READS  — the owning agent would turn the empty request into a placeholder
+#     id and error on it (e.g. account_balance → "Invalid UUID: x").
+#   • WRITES — an under-specified write (e.g. email.send_payment_reminder with no
+#     recipient) would otherwise queue a governance proposal that CANNOT execute
+#     on approval, filling the queue with dead actions. For aggregate goals the
+#     planner should propose a bulk/segment capability (supervisor.emit_dunning,
+#     campaign.winback) that needs no per-record params — those are unaffected.
+# Discovery reads (summaries/lists) and param-free writes are untouched. intent →
+# the param aliases that satisfy the requirement (any ONE is enough).
+_REQUIRES_PARAMS: Dict[str, tuple] = {
+    # reads
+    "accounting.account_balance": ("account", "account_id", "accountId"),
+    "account.context":            ("account_id", "entity_id"),
+    "crm.context":                ("entity_id", "account_id", "lead_id", "contact_id"),
+    "leads.enrich":               ("lead_id", "leadId", "company", "domain", "email"),
+    # writes that cannot execute without their specifics
+    "email.send_payment_reminder": ("to", "invoice_number", "invoice_id"),
+    "sms.send":                    ("to",),
+    "quote.generate":              ("account_id", "items"),
+    "meeting.book":                ("entity_id", "lead_id", "contact_id"),
+    "contact.update_profile":      ("contact_id",),
+    "tuning.adjust":               ("param",),
+    "kb.publish":                  ("title",),
+    "scoring.activate":            ("version",),
+}
+
+
+def _is_placeholder_value(v: Any) -> bool:
+    """True when a param value is an obvious invented placeholder rather than a
+    real value the goal supplied. Numbers/booleans and concrete strings pass."""
+    if v is None:
+        return True
+    if isinstance(v, bool) or isinstance(v, (int, float)):
+        return False
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in _PLACEHOLDER_TOKENS or _TEMPLATE_RE.match(s):
+            return True
+        return len(s) == 1 and not s.isdigit()   # bare single letter like "x"
+    if isinstance(v, (list, dict)):
+        return len(v) == 0
+    return False
+
+
+def _sanitize_params(params: Any):
+    """Drop placeholder-valued params. Returns (clean_params, [stripped_keys])."""
+    if not isinstance(params, dict):
+        return {}, []
+    clean, stripped = {}, []
+    for k, val in params.items():
+        (stripped.append(k) if _is_placeholder_value(val) else clean.update({k: val}))
+    return clean, stripped
 
 
 def draft_plan(goal: str) -> Dict[str, Any]:
@@ -143,12 +225,27 @@ def draft_plan(goal: str) -> Dict[str, Any]:
     errs = validate_plan(plan)
     vocab = _vocabulary()
     steps = []
+    stripped_all: Dict[str, List[str]] = {}
+    dropped: List[str] = []
     for s in plan.get("steps", []):
-        if isinstance(s, dict):
-            steps.append({"intent": s.get("intent"),
-                          "kind": vocab.get(s.get("intent"), {}).get("kind"),
-                          "params": s.get("params") or {},
-                          "why": str(s.get("why") or "")[:200]})
+        if not isinstance(s, dict):
+            continue
+        intent = s.get("intent")
+        clean_params, stripped = _sanitize_params(s.get("params") or {})
+        if stripped:
+            stripped_all[str(intent)] = stripped
+        need = _REQUIRES_PARAMS.get(intent)
+        if need and not any(k in clean_params for k in need):
+            dropped.append(str(intent))
+            continue
+        steps.append({"intent": intent,
+                      "kind": vocab.get(intent, {}).get("kind"),
+                      "params": clean_params,
+                      "why": str(s.get("why") or "")[:200]})
+    if stripped_all:
+        logger.info(f"[planner] stripped placeholder params: {stripped_all}")
+    if dropped:
+        logger.info(f"[planner] dropped under-specified steps: {dropped}")
     return {"ok": not errs, "goal": goal,
             "summary": str(plan.get("summary") or "")[:300],
             "steps": steps, "errors": errs or None}

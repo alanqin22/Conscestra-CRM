@@ -27,7 +27,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -263,6 +263,74 @@ def _weave_symphony(title: str, calls: List[tuple], results: List[Any]) -> str:
     return '\n'.join(out)
 
 
+def _format_plan(result: Dict[str, Any], executed: bool) -> str:
+    """Render a planner draft (preview) or an executed plan (reads run, writes
+    queued for approval) as chat markdown. Sibling of _weave_symphony /
+    _format_pulse. Handles three shapes: failed draft (ok False, no trace),
+    draft preview (steps), and executed plan (trace + proposed_approvals)."""
+    goal = result.get('goal') or ''
+
+    # Failed draft / planner declined — surface the reasons.
+    if not result.get('ok') and not result.get('trace'):
+        errs = result.get('errors') or ['the planner could not draft a plan']
+        lines = ['### 🧭 Plan — could not build', '']
+        if goal:
+            lines += [f'**Goal:** {goal}', '']
+        lines += [f'- ⚠️ {e}' for e in errs]
+        return '\n'.join(lines)
+
+    kind_icon = {'read': '📖', 'write': '✍️'}
+
+    # Draft preview — nothing has run.
+    if not executed:
+        lines = [f'### 🧭 Plan — {goal}']
+        if result.get('summary'):
+            lines += [f'_{result["summary"]}_', '']
+        lines += ['| # | capability | kind | why |', '| --- | --- | --- | --- |']
+        steps = result.get('steps') or []
+        for i, s in enumerate(steps, 1):
+            lines.append(
+                f"| {i} | `{s.get('intent')}` | "
+                f"{kind_icon.get(s.get('kind'), '')} {s.get('kind') or ''} | "
+                f"{s.get('why') or ''} |")
+        writes = sum(1 for s in steps if s.get('kind') == 'write')
+        lines += ['', (
+            '_Preview only — reply with the same goal plus **confirm** to '
+            f'execute: reads run immediately, {writes} write step(s) queue for '
+            'approval._' if writes else
+            '_Preview only — reply with the same goal plus **confirm** to '
+            'execute (read-only plan)._')]
+        return '\n'.join(lines)
+
+    # Executed plan — reads ran, writes were proposed to governance.
+    lines = [f'### 🧭 Plan executed — {goal}']
+    if result.get('summary'):
+        lines += [f'_{result["summary"]}_', '']
+    trace = sorted(result.get('trace') or [], key=lambda t: t.get('step', 0))
+    reads = [t for t in trace if t.get('kind') == 'read']
+    writes = [t for t in trace if t.get('kind') == 'write']
+    if reads:
+        lines.append('**📖 Reads — executed**')
+        for t in reads:
+            status = '✓' if t.get('ok') else '✕'
+            body = (t.get('output') or t.get('error') or '').strip() or '(no output)'
+            lines.append(f"- {status} `{t.get('intent')}` — {body[:200]}")
+        lines.append('')
+    if writes:
+        lines.append('**✍️ Writes — queued for approval**')
+        by_step = {p.get('step'): p for p in (result.get('proposed_approvals') or [])}
+        for t in writes:
+            p = by_step.get(t.get('step'), {})
+            aid = t.get('queued_approval') or p.get('approval_uuid') or ''
+            why = p.get('why') or ''
+            lines.append(f"- `{t.get('intent')}` — approval "
+                         f"`{str(aid)[:8]}`{(' — ' + why) if why else ''}")
+        lines.append('')
+    if result.get('note'):
+        lines.append(f"_{result['note']}_")
+    return '\n'.join(lines)
+
+
 # ============================================================================
 # ROUTE
 # ============================================================================
@@ -273,7 +341,7 @@ async def orchestrator_health():
 
 
 @router.post('/orchestrator-chat')
-async def orchestrator_chat(req: OrchChatRequest):
+async def orchestrator_chat(req: OrchChatRequest, request: Request):
     session_id = (req.sessionId or 'orch-session').strip()
     message = ((req.chatInput.message if req.chatInput else None)
                or req.message or '').strip()
@@ -340,6 +408,58 @@ async def orchestrator_chat(req: OrchChatRequest):
         tag = ' (dry-run — add "confirm" to execute)' if dry else ''
         return JSONResponse({'sessionId': session_id, 'success': True, 'mode': 'a2a',
                              'output': f"### 🔗 A2A → {intent} (via {res.agent}){tag}\n{body}"})
+
+    # ── 0c. Bounded planner — "plan: <goal>" decomposes a novel multi-step ───
+    # goal into a coordinated multi-agent plan (app/core/planner.py). Preview by
+    # default (draft only); add a trailing "confirm" to execute — reads run
+    # immediately, writes queue for governance approval (nothing outbound). This
+    # is the conductor on the conversational path: the same registered-capability
+    # rails the /planner/plan endpoint uses, opt-in by the "plan:" token so it
+    # can never shadow ordinary single-agent routing.
+    _plan_m = re.match(r'^(?:plan|goal)\s*[:=]\s*(.*)$', message.strip(),
+                       re.IGNORECASE | re.DOTALL)
+    if _plan_m:
+        from app.core import planner
+        goal = _plan_m.group(1).strip()
+        confirm = False
+        _cm = re.search(r'\s+confirm\s*$', goal, re.IGNORECASE)
+        if _cm:
+            confirm, goal = True, goal[:_cm.start()].strip()
+        logger.info(f'[planner] goal={goal[:80]!r} confirm={confirm}')
+
+        # G3: executing (confirm) queues governance proposals + spends LLM, so
+        # gate it behind write-auth and a per-IP rate limit. The draft PREVIEW
+        # stays open to anyone; an unauthorized "confirm" degrades to a preview
+        # (not a 403) so the plan is still shown, just not queued.
+        if confirm:
+            from app.core.auth_dep import caller_can_write
+            if not await caller_can_write(request):
+                draft = await asyncio.to_thread(planner.draft_plan, goal)
+                out = _format_plan(draft, executed=False)
+                if draft.get('ok'):
+                    out += ('\n\n_Sign in (or send an admin token) to execute — '
+                            'execution queues actions for approval._')
+                return JSONResponse({'sessionId': session_id,
+                                     'success': bool(draft.get('ok')),
+                                     'mode': 'plan', 'workflow': 'plan', 'output': out})
+            from app.core.rate_limit import plan_exec_ip, client_ip
+            if plan_exec_ip.record(client_ip(request)) > plan_exec_ip.max_events:
+                return JSONResponse({'sessionId': session_id, 'success': False,
+                                     'mode': 'plan', 'workflow': 'plan',
+                                     'output': '### 🧭 Plan — rate limited\n\nToo many '
+                                     'plan executions this hour. Please try again later.'})
+        try:
+            result = (await planner.run_plan(goal) if confirm
+                      else await asyncio.to_thread(planner.draft_plan, goal))
+        except Exception as e:
+            logger.error(f'planner failed: {e}', exc_info=True)
+            return JSONResponse({'sessionId': session_id, 'success': False,
+                                 'mode': 'error', 'output': f'Planner failed: {e}'})
+        return JSONResponse({
+            'sessionId': session_id, 'success': bool(result.get('ok')),
+            'mode': 'plan', 'workflow': 'plan',
+            'output': _format_plan(result, executed=confirm),
+        })
 
     # ── 1. Company pulse — sp_orchestrator overview ──────────────────────────
     if _PULSE_RE.search(lower):
@@ -408,6 +528,24 @@ async def orchestrator_chat(req: OrchChatRequest):
     # a direct _call_agent if no passthrough capability is registered.
     from app.core.intent_router import aroute
     decision = await aroute(message)
+
+    # Step 4: automatic plan routing — when the intent router labels the message
+    # a confident MULTI-STEP GOAL (only when INTENT_PLAN_ROUTING is on), decompose
+    # it with the bounded planner and return a PREVIEW. Never auto-executed: the
+    # user runs it via the explicit "plan: … confirm" handle (section 0c above).
+    if getattr(decision, 'kind', 'single_agent') == 'plan':
+        from app.core import planner
+        logger.info(f'[route] → planner preview (auto) for {message[:60]!r}')
+        result = await asyncio.to_thread(planner.draft_plan, message)
+        out = _format_plan(result, executed=False)
+        if result.get('ok'):
+            out += ('\n\n_Auto-detected a multi-step goal. To run it, reply:_ '
+                    f'`plan: {message} confirm`')
+        return JSONResponse({'sessionId': session_id,
+                             'success': bool(result.get('ok')),
+                             'mode': 'plan', 'workflow': 'plan-auto',
+                             'output': out, 'routedBy': decision.label})
+
     path = decision.endpoint
     from app.core.a2a import dispatch, resolve, query_intent_for_endpoint, A2ARequest
     q_intent = query_intent_for_endpoint(path)

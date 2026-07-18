@@ -313,6 +313,17 @@ def _sp_crm_plan(p: Dict[str, Any]) -> Any:
     return planner.draft_plan(str(p.get("goal") or ""))
 
 
+def _sp_select_channel(p: Dict[str, Any]) -> Any:
+    """Intelligent channel selection: best communication ACTION for an objective
+    + party (Unified Communication Layer, Phase 4). Read-only — decides, never sends."""
+    from app.core import channel_selector
+    return channel_selector.select(
+        str(p.get("objective") or "quick_update"),
+        str(p.get("party_type") or "contact"),
+        str(p.get("party_id") or p.get("entity_id") or ""),
+        urgency=p.get("urgency"), sensitive=p.get("sensitive"))
+
+
 # ---- peer handoff / negotiation -------------------------------------------
 async def delegate(parent: "A2ARequest", sub_intent: str,
                    params: Optional[Dict[str, Any]] = None,
@@ -341,6 +352,22 @@ async def _compose_pipeline_snapshot(req: "A2ARequest"):
     }
     hops = [fin.intent, hot.intent]   # intents are already agent-namespaced
     return data, hops
+
+
+async def _compose_crm_plan_execute(req: "A2ARequest"):
+    """Composite: EXECUTE a bounded plan for a goal — run the READ steps and
+    QUEUE every WRITE step for governance approval (nothing outbound). The
+    executing counterpart of `crm.plan` (which only drafts). Registered as a
+    compose (not sp) so planner.run_plan is awaited on the caller's loop — no
+    nested event loop — and returns (result, hops) like the other composites.
+    Read-kind by design: its only side effect is running reads + creating
+    governance PROPOSALS, so it is not itself gated (the planner gates each
+    write internally). Correlation lineage flows through run_plan → dispatch."""
+    from app.core import planner
+    goal = str((req.params or {}).get("goal") or "")
+    res = await planner.run_plan(goal)
+    hops = [str(t.get("intent")) for t in (res.get("trace") or []) if t.get("intent")]
+    return res, hops
 
 
 def _suggest(intent: str) -> List[str]:
@@ -501,10 +528,27 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "draft only; execution runs reads and queues writes for "
                "governance approval",
                sp=_sp_crm_plan),
+    # Intelligent channel selection (Unified Communication Layer, Phase 4):
+    # the best communication ACTION for an objective + party. Read-only.
+    Capability("comms.select_channel", "orchestrator", "", "read",
+               lambda p: (f"select channel for {p.get('objective','?')} to "
+                          f"{p.get('party_type','contact')} {p.get('party_id','')}"),
+               "pick the best channel/action for an objective + party (intent + "
+               "identity + urgency + learned preference + authorization) — decides, "
+               "never sends; the vision's 'what's the best way to accomplish this?'",
+               sp=_sp_select_channel),
     # Composite (peer handoff): fans out to Accounting + Leads and composes.
     Capability("crm.pipeline_snapshot", "orchestrator", "", "read",
                lambda p: "", "financial + hot-lead snapshot composed from peers",
                compose=_compose_pipeline_snapshot),
+    # Executing counterpart of crm.plan: runs a bounded plan for a goal —
+    # reads execute, writes queue for governance approval (nothing outbound).
+    Capability("crm.plan_execute", "orchestrator", "", "read",
+               lambda p: f"execute plan: {p.get('goal', '')}",
+               "execute a bounded goal→plan: run the READ steps and QUEUE every "
+               "WRITE step for governance approval (nothing outbound) — the "
+               "executing counterpart of crm.plan (draft-only)",
+               compose=_compose_crm_plan_execute),
 )
 
 # Generic NL-passthrough capability per agent — lets the orchestrator route ANY

@@ -1042,6 +1042,26 @@ app.include_router(executives_router)  # router already require_admin on every r
 from app.core.pipeline_hygiene import router as pipeline_hygiene_router
 app.include_router(pipeline_hygiene_router, dependencies=_ADMIN)
 
+# -- Identity Resolution (Unified Communication Layer, Phase 1a) — (channel,
+#    handle) → one CRM party (external contact / internal employee).
+from app.core.identity import router as identity_router
+app.include_router(identity_router, dependencies=_ADMIN)
+
+# -- Unified Conversation Object (Unified Communication Layer, Phase 1b) — one
+#    cross-channel thread per person; ingest() resolves identity + threads.
+from app.core.conversations import router as conversations_router
+app.include_router(conversations_router, dependencies=_ADMIN)
+
+# -- Intelligent channel selection (Unified Communication Layer, Phase 4) — best
+#    communication action for an objective + party (also A2A comms.select_channel).
+from app.core.channel_selector import router as channel_selector_router
+app.include_router(channel_selector_router, dependencies=_ADMIN)
+
+# -- Executive Intelligence — executive = role + intelligence profile on the
+#    Person/Employee (owners) identity; links execs to employees + per-exec profile.
+from app.core.executive_intelligence import router as exec_intel_router
+app.include_router(exec_intel_router, dependencies=_ADMIN)
+
 # -- Blackboard (Phase 4 — shared agent memory)
 from app.core.blackboard import router as blackboard_router
 app.include_router(blackboard_router, dependencies=_ADMIN)
@@ -1107,6 +1127,12 @@ from app.core.telephony import router as telephony_router
 from app.core.telephony import public_router as telephony_public_router
 app.include_router(telephony_router, dependencies=_ADMIN)
 app.include_router(telephony_public_router)
+
+# -- Channel transports (Unified Communication Layer, Phase 3) — provider
+#    webhooks: WhatsApp (external), Slack + Teams (internal). PUBLIC by nature;
+#    signature-verified when the provider secret is set (dev-permissive otherwise).
+from app.core.transports import router as transports_router
+app.include_router(transports_router)
 
 # -- Autonomous SDR (prospect-facing web chat + conversational voice).
 #    PUBLIC by nature: chat is gated SDR_CHAT_ENABLED + per-IP rate-limited;

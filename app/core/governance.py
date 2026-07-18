@@ -252,6 +252,205 @@ def _critic_line(critique: Optional[Dict[str, Any]]) -> str:
             f"{critique.get('summary', '')}")
 
 
+# Internal/bookkeeping params not worth showing the approver.
+_HIDE_PARAMS = {"_revised", "plan_correlation_id", "plan_goal", "govern_bypass",
+                "confidence"}
+
+# Plain-language description of what each action DOES — shown when the params
+# alone don't convey it (e.g. planner-proposed batch actions carry only a goal).
+_ACTION_DESC = {
+    "supervisor.emit_dunning": "Start the overdue-invoice dunning loop — drafts "
+        "payment reminders for materially overdue invoices.",
+    "supervisor.emit_hot_leads": "Start hot-lead outreach — auto-schedules calls "
+        "for high-scoring leads.",
+    "email.send_payment_reminder": "Send an overdue-invoice payment reminder email.",
+    "data.normalize_phones": "Normalize contact/lead phone numbers to E.164 "
+        "(capped batch, undoable).",
+    "data.merge_contacts": "Merge exact-duplicate contacts into the oldest (undoable).",
+    "campaign.winback": "Create and launch a win-back marketing campaign.",
+    "kb.publish": "Publish a knowledge-base article.",
+    "tuning.adjust": "Change a governed model tuning parameter.",
+    "scoring.activate": "Activate a trained lead-scoring model version.",
+    "meeting.book": "Book a meeting on the owner's calendar.",
+    "quote.generate": "Build and send a priced quotation.",
+    "contact.update_profile": "Update a contact's profile field.",
+}
+
+
+def _summary_rows(action_type: str, params: Optional[Dict[str, Any]]):
+    """The '(label, value)' rows describing WHAT an action does — the single
+    source of truth shared by the email, the in-app notification, AND the
+    governance queue UI. Never empty: falls back to an action description, then
+    the goal it serves, then the action name."""
+    p = params or {}
+
+    def g(*keys, default=""):
+        for k in keys:
+            v = p.get(k)
+            if v not in (None, "", []):
+                return v
+        return default
+
+    at = (action_type or "").lower()
+    rows: List = []
+    if at == "kb.publish":
+        rows = [("Title", str(g("title"))),
+                ("Question", str(g("problem"))[:400]),
+                ("Answer", str(g("answer"))[:600])]
+        if p.get("keywords"):
+            rows.append(("Keywords", ", ".join(map(str, p["keywords"]))[:200]))
+    elif at == "email.send_payment_reminder":
+        rows = [("To", str(g("to"))),
+                ("Invoice", str(g("invoice_number", "invoice_id"))),
+                ("Amount", str(g("amount"))),
+                ("Days overdue", str(g("days_overdue")))]
+    elif at == "campaign.winback":
+        rows = [("Goal", str(g("goal")))]
+        seg = g("segment")
+        if seg:
+            rows.append(("Segment", seg if isinstance(seg, str)
+                         else json.dumps(seg, default=str)[:200]))
+    elif at == "tuning.adjust":
+        rows = [("Parameter", str(g("param"))), ("New value", str(g("value"))),
+                ("Why", str(g("why", "reason")))]
+    elif at == "contact.update_profile":
+        rows = [("Contact", str(g("contact_id"))), ("Field", str(g("field"))),
+                ("New value", str(g("new_value")))]
+    elif at == "meeting.book":
+        rows = [("With", f"{g('entity_type', 'lead')} "
+                         f"{g('entity_id', 'lead_id', 'contact_id')}".strip()),
+                ("When", str(g("start", "when", default="first available slot")))]
+    elif at == "quote.generate":
+        rows = [("Account", str(g("account_id"))),
+                ("Line items", str(len(p.get("items") or [])))]
+    elif at == "scoring.activate":
+        rows = [("Model version", str(g("version")))]
+
+    rows = [(k, v) for k, v in rows if v not in ("", "None")]
+    # No specific fields (e.g. a planner-proposed batch action) → describe WHAT
+    # the action does, then list any other visible params.
+    if not rows:
+        desc = _ACTION_DESC.get(at)
+        if desc:
+            rows.append(("Action", desc))
+        for k, v in p.items():
+            if k in _HIDE_PARAMS or str(k).startswith("_"):
+                continue
+            sv = json.dumps(v, default=str) if isinstance(v, (dict, list)) else str(v)
+            rows.append((str(k).replace("_", " ").capitalize(), sv[:200]))
+    # Planner-proposed actions carry the goal they serve — real approver context.
+    goal = p.get("plan_goal")
+    if goal:
+        rows.append(("Proposed to accomplish", str(goal)[:200]))
+    rows = [(k, v) for k, v in rows if v not in ("", "None")]
+    if not rows:                    # never empty — at least name the action
+        rows = [("Action", _ACTION_DESC.get(at, action_type))]
+    return rows
+
+
+def _action_summary(action_type: str, params: Optional[Dict[str, Any]]):
+    """Render the summary rows as a 'what you are approving' block (html, text)
+    for the email + in-app notification. Never empty (see _summary_rows)."""
+    from html import escape as _esc
+    rows = _summary_rows(action_type, params)
+    html = ('<div style="background:#f6f8fb;border:1px solid #e1e6ef;border-radius:6px;'
+            'padding:10px 14px;margin:12px 0;font-size:13px;">'
+            '<div style="font-weight:700;color:#15233f;margin-bottom:6px;">'
+            'What you are approving</div>'
+            + "".join(f'<div style="margin:3px 0;"><b>{_esc(str(k))}:</b> '
+                      f'{_esc(str(v))}</div>' for k, v in rows) + '</div>')
+    text = "What you are approving:\n" + "".join(f"  - {k}: {v}\n" for k, v in rows)
+    return html, text
+
+
+def _build_approval_email(action_type: str, params: Optional[Dict[str, Any]],
+                          amount: float, label: str, approval_uuid: str,
+                          critique: Optional[Dict[str, Any]]):
+    """Compose the routed-approval email (subject, html, text) — shared by the
+    initial routing AND re-notification, so both carry the same rich 'what you
+    are approving' context, critic opinion, and one-click decision links."""
+    links = decision_links(approval_uuid)
+    summ_html, summ_text = _action_summary(action_type, params)
+    findings = [f for f in (critique or {}).get("findings", [])
+                if f.get("verdict") in ("fail", "warn")][:4]
+    critic_html = critic_text = ""
+    if critique:
+        col = {"endorse": "#1e7c45", "caution": "#a8720a",
+               "object": "#a33a3a"}.get(critique.get("stance"), "#26304a")
+        items = "".join(f'<li style="margin:2px 0;">{f["note"]}</li>' for f in findings)
+        critic_html = (
+            f'<div style="border-left:4px solid {col};background:#f6f8fb;'
+            f'padding:10px 14px;margin:14px 0;font-size:13px;">'
+            f'<b style="color:{col};">{_critic_line(critique)}</b>'
+            + (f'<ul style="margin:6px 0 0 18px;padding:0;">{items}</ul>' if items else "")
+            + '</div>')
+        critic_text = ("\n" + _critic_line(critique) + "\n"
+                       + "".join(f"  - {f['note']}\n" for f in findings))
+    amt = f" (${amount:,.0f})" if amount else ""
+    subject = f"Approval needed: {action_type}{amt}"
+    body_html = (f"<p>A proposed action requires your decision "
+                 f"(within your authority as {label}).</p>"
+                 f"<p><b>{action_type}</b>{amt}"
+                 f"<br>Approval ID: {approval_uuid}</p>"
+                 + summ_html + critic_html +
+                 f'<p style="margin:18px 0;">'
+                 f'<a href="{links["approve"]}" style="background:#1e7c45;'
+                 f'color:#fff;padding:10px 22px;border-radius:6px;'
+                 f'text-decoration:none;font-weight:700;">✓ Approve</a>&nbsp;&nbsp;'
+                 f'<a href="{links["reject"]}" style="background:#a33a3a;'
+                 f'color:#fff;padding:10px 22px;border-radius:6px;'
+                 f'text-decoration:none;font-weight:700;">✕ Reject</a></p>'
+                 f'<p style="color:#7b8497;font-size:12px;">One-click, signed links '
+                 f'— no sign-in needed. Or review the full context in the '
+                 f'governance queue.</p>')
+    body_text = (f"Approval needed: {action_type}{amt}\n"
+                 f"Approval ID: {approval_uuid}\nAssigned to: {label}\n"
+                 + (f"\n{summ_text}" if summ_text else "") + critic_text
+                 + f"\nApprove: {links['approve']}\nReject:  {links['reject']}\n")
+    return subject, body_html, body_text
+
+
+def _deliver_approval_chat(chosen: Dict[str, Any], channel: str, approval_uuid: str,
+                           action_type: str, amount: float, summ_text: str,
+                           label: str) -> Dict[str, Any]:
+    """Deliver an approval to an executive over their preferred chat channel
+    (Slack/Teams) via the Unified Comms transports — the Executive-Intelligence →
+    comms bridge. Best-effort: falls back to the in-app notification (already
+    created) when the executive has no linked handle or the channel isn't
+    configured, so an approval is never lost."""
+    emp = chosen.get("employee_uuid")
+    handle = None
+    if emp:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT handle FROM channel_identities "
+                            "WHERE party_type='employee' AND party_id=%s::uuid "
+                            "AND channel=%s LIMIT 1", (emp, channel))
+                r = cur.fetchone()
+                handle = r[0] if r else None
+        except Exception:
+            conn.rollback()
+        finally:
+            conn.close()
+    if not handle:
+        logger.info(f"[governance] {label} prefers {channel} but has no linked "
+                    f"{channel} handle — delivered in-app instead")
+        return {"delivered": False, "reason": f"no {channel} handle (in-app fallback)"}
+    links = decision_links(approval_uuid)
+    amt = f" (${amount:,.0f})" if amount else ""
+    text = (f"🛡️ Approval needed: {action_type}{amt}\n"
+            + (summ_text + "\n" if summ_text else "")
+            + f"Approve: {links['approve']}\nReject: {links['reject']}")
+    from app.core import transports
+    if channel == "slack":
+        res = transports._slack_post(handle, text)
+    else:                                    # teams — connector-gated (drafted)
+        res = {"sent": False, "reason": "teams connector not configured (drafted)"}
+    logger.info(f"[governance] approval → {label} via {channel}: {res}")
+    return {"delivered": bool(res.get("sent")), "channel": channel, "result": res}
+
+
 def route_approval(approval_uuid: str, action_type: str,
                    params: Dict[str, Any],
                    critique: Optional[Dict[str, Any]] = None
@@ -265,6 +464,7 @@ def route_approval(approval_uuid: str, action_type: str,
     the audit event, and the one-click decision email."""
     amount = _amount_from(params)
     role = _affinity_role(action_type)
+    _, summ_text = _action_summary(action_type, params)
 
     conn = get_connection()
     try:
@@ -272,7 +472,7 @@ def route_approval(approval_uuid: str, action_type: str,
             cur.execute(
                 """SELECT executive_id::text, role_code, full_name, email,
                           approval_authority_limit, auto_email_enabled,
-                          employee_uuid::text
+                          employee_uuid::text, preferred_channel
                    FROM executives WHERE is_active""")
             execs = [dict(zip([d[0] for d in cur.description], r))
                      for r in cur.fetchall()]
@@ -291,6 +491,17 @@ def route_approval(approval_uuid: str, action_type: str,
                                            limit_of(e), e["role_code"]))[0]
             label = f"{chosen['role_code']} {chosen['full_name']}"
 
+            # Executive Intelligence → Unified Comms: deliver the way THIS
+            # executive's profile prefers. 'all' (default) = email + in-app;
+            # a single channel narrows it; slack/teams route over the comms
+            # transports with in-app kept as a reliable safety net.
+            pref = (chosen.get("preferred_channel") or "all").strip().lower()
+            want_inapp = pref in ("all", "in_app", "both", "")
+            want_email = pref in ("all", "email", "both", "")
+            want_chat = pref in ("slack", "teams")
+            if want_chat:
+                want_inapp = True
+
             cur.execute(
                 """UPDATE action_approvals
                    SET amount=%s, assigned_executive_id=%s::uuid, assigned_to=%s
@@ -307,17 +518,28 @@ def route_approval(approval_uuid: str, action_type: str,
                  None, "governance"))
             event_uuid = cur.fetchone()[0]
 
-            if chosen.get("employee_uuid"):
+            # Prefer the executive's linked employee; else resolve an owner by
+            # the executive's email so the in-app notification still reaches them
+            # when they're a CRM user under a different id (self-healing).
+            emp_uuid = chosen.get("employee_uuid")
+            if not emp_uuid and chosen.get("email"):
+                cur.execute("SELECT owner_id::text FROM owners "
+                            "WHERE lower(email)=lower(%s) AND COALESCE(is_active,true) "
+                            "LIMIT 1", (chosen["email"],))
+                _o = cur.fetchone()
+                emp_uuid = _o[0] if _o else None
+            if want_inapp and emp_uuid:
                 critic_note = _critic_line(critique)
                 cur.execute(
                     """INSERT INTO notifications
                          (employee_uuid, event_uuid, channel, status, title, body, metadata)
                        VALUES (%s::uuid, %s, 'in_app', 'pending', %s, %s, %s)""",
-                    (chosen["employee_uuid"], event_uuid,
+                    (emp_uuid, event_uuid,
                      f"🛡️ Approval needed: {action_type}" +
                      (f" (${amount:,.0f})" if amount else ""),
                      f"Proposed action awaits your decision. Review in the "
                      f"governance queue (approval {approval_uuid[:8]})."
+                     + (f"\n\n{summ_text}" if summ_text else "")
                      + (f"\n{critic_note}" if critic_note else ""),
                      json.dumps({"kind": "approval_routed",
                                  "approval_uuid": approval_uuid,
@@ -326,66 +548,82 @@ def route_approval(approval_uuid: str, action_type: str,
     finally:
         conn.close()
 
-    if GOV_ROUTE_EMAIL and chosen.get("auto_email_enabled") and chosen.get("email"):
+    if want_email and GOV_ROUTE_EMAIL and chosen.get("auto_email_enabled") \
+            and chosen.get("email"):
         try:
             from app.agents.email.smtp_imap import send_email
-            links = decision_links(approval_uuid)
-            # Critic block — the independent second opinion, right above the
-            # decision buttons where it matters.
-            findings = [f for f in (critique or {}).get("findings", [])
-                        if f.get("verdict") in ("fail", "warn")][:4]
-            critic_html = ""
-            critic_text = ""
-            if critique:
-                col = {"endorse": "#1e7c45", "caution": "#a8720a",
-                       "object": "#a33a3a"}.get(critique.get("stance"), "#26304a")
-                items = "".join(f'<li style="margin:2px 0;">{f["note"]}</li>'
-                                for f in findings)
-                critic_html = (
-                    f'<div style="border-left:4px solid {col};background:#f6f8fb;'
-                    f'padding:10px 14px;margin:14px 0;font-size:13px;">'
-                    f'<b style="color:{col};">{_critic_line(critique)}</b>'
-                    + (f'<ul style="margin:6px 0 0 18px;padding:0;">{items}</ul>'
-                       if items else "")
-                    + '</div>')
-                critic_text = ("\n" + _critic_line(critique) + "\n"
-                               + "".join(f"  - {f['note']}\n" for f in findings))
-            send_email(
-                to=chosen["email"],
-                subject=f"Approval needed: {action_type}"
-                        + (f" (${amount:,.0f})" if amount else ""),
-                body_html=(f"<p>A proposed action requires your decision "
-                           f"(within your authority as {label}).</p>"
-                           f"<p><b>{action_type}</b>"
-                           + (f" — ${amount:,.0f}" if amount else "")
-                           + f"<br>Approval ID: {approval_uuid}</p>"
-                           + critic_html +
-                           f'<p style="margin:18px 0;">'
-                           f'<a href="{links["approve"]}" style="background:#1e7c45;'
-                           f'color:#fff;padding:10px 22px;border-radius:6px;'
-                           f'text-decoration:none;font-weight:700;">✓ Approve</a>'
-                           f'&nbsp;&nbsp;'
-                           f'<a href="{links["reject"]}" style="background:#a33a3a;'
-                           f'color:#fff;padding:10px 22px;border-radius:6px;'
-                           f'text-decoration:none;font-weight:700;">✕ Reject</a></p>'
-                           f'<p style="color:#7b8497;font-size:12px;">One-click, '
-                           f'signed links — no sign-in needed. Or review the full '
-                           f'context in the governance queue.</p>'),
-                body_text=(f"Approval needed: {action_type}"
-                           + (f" (${amount:,.0f})" if amount else "")
-                           + f"\nApproval ID: {approval_uuid}\n"
-                           f"Assigned to: {label}\n"
-                           + critic_text +
-                           f"\nApprove: {links['approve']}\n"
-                           f"Reject:  {links['reject']}\n"),
-            )   # internal/administrative — transactional, not commercial
+            subject, body_html, body_text = _build_approval_email(
+                action_type, params, amount, label, approval_uuid, critique)
+            send_email(to=chosen["email"], subject=subject,
+                       body_html=body_html, body_text=body_text)
+            # internal/administrative — transactional, not commercial
         except Exception as exc:
             logger.warning(f"[governance] route email failed: {exc}")
 
+    if want_chat:
+        try:
+            _deliver_approval_chat(chosen, pref, approval_uuid, action_type,
+                                   amount, summ_text, label)
+        except Exception as exc:
+            logger.warning(f"[governance] chat delivery failed: {exc}")
+
     logger.info(f"[governance] routed {approval_uuid[:8]} → {label} "
-                f"(amount=${amount:,.0f}, affinity={role})")
+                f"(amount=${amount:,.0f}, affinity={role}, channel={pref})")
     return {"assigned_to": label, "amount": amount,
             "executive_id": chosen["executive_id"]}
+
+
+def renotify_pending(to: Optional[str] = None, limit: int = 20,
+                     action_type: Optional[str] = None) -> Dict[str, Any]:
+    """Re-send the routed-approval email for PENDING approvals using the CURRENT
+    (richer 'what you are approving') template — so items proposed before the
+    template improved get an informative email. `to` overrides the recipient (for
+    testing); otherwise each goes to its assigned executive. Read-only: re-sends
+    email only, never touches the approval or executes anything."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT a.approval_uuid::text AS approval_uuid,
+                          a.action_type AS action_type, a.params AS params,
+                          COALESCE(a.amount, 0) AS amount,
+                          a.assigned_to AS assigned_to, a.critique AS critique,
+                          e.email AS exec_email
+                   FROM action_approvals a
+                   LEFT JOIN executives e ON e.executive_id = a.assigned_executive_id
+                   WHERE a.status='pending'
+                     AND (a.expires_at IS NULL OR a.expires_at > now())
+                     AND (%(at)s IS NULL OR a.action_type = %(at)s)
+                   ORDER BY a.created_at DESC LIMIT %(lim)s""",
+                {"at": action_type, "lim": int(limit)})
+            rows = [dict(zip([d[0] for d in cur.description], r))
+                    for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    from app.agents.email.smtp_imap import send_email
+    sent, skipped = [], []
+    for r in rows:
+        dest = to or r.get("exec_email")
+        if not dest:
+            skipped.append({"approval_uuid": r["approval_uuid"], "reason": "no recipient"})
+            continue
+        try:
+            subject, body_html, body_text = _build_approval_email(
+                r["action_type"], r["params"], float(r.get("amount") or 0),
+                r.get("assigned_to") or "the approver", r["approval_uuid"],
+                r.get("critique"))
+            res = send_email(to=dest, subject=subject,
+                             body_html=body_html, body_text=body_text)
+            ok = bool((res or {}).get("success", True))
+            (sent if ok else skipped).append(
+                {"approval_uuid": r["approval_uuid"], "action_type": r["action_type"],
+                 "to": dest, "ok": ok})
+        except Exception as exc:
+            skipped.append({"approval_uuid": r["approval_uuid"], "error": str(exc)[:150]})
+    logger.info(f"[governance] renotify — sent {len(sent)}, skipped {len(skipped)}")
+    return {"pending_matched": len(rows), "sent": sent, "skipped": skipped,
+            "recipient_override": to}
 
 
 def _row(approval_uuid: str) -> Optional[Dict[str, Any]]:
@@ -442,6 +680,9 @@ def pending() -> List[Dict[str, Any]]:
                 d["confidence"] = float(d["confidence"]) if d["confidence"] is not None else None
                 for k in ("created_at", "expires_at"):
                     d[k] = d[k].isoformat() if d[k] else None
+                # 'What you are approving' — same rows the email/notification use.
+                d["summary"] = [{"label": k, "value": v} for k, v in
+                                _summary_rows(d.get("action_type"), d.get("params"))]
                 out.append(d)
             return out
     finally:
@@ -794,6 +1035,15 @@ async def governance_undo(approval_uuid: str, body: _Decision = _Decision()):
 def governance_expire():
     """Flip pending approvals past their TTL to 'expired' (also runs nightly)."""
     return expire_stale()
+
+
+@router.post("/governance/renotify")
+def governance_renotify(to: Optional[str] = None, limit: int = 20,
+                        action_type: Optional[str] = None):
+    """Re-send informative approval emails for pending items (current template).
+    ?to= overrides the recipient (testing); ?action_type= filters; ?limit= caps.
+    Re-sends email only — never executes or changes the approval."""
+    return renotify_pending(to=to, limit=limit, action_type=action_type)
 
 
 @router.post("/governance/critique/{approval_uuid}")
