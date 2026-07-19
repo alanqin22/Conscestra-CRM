@@ -17,8 +17,13 @@ CONTRACT — every capture_* is:
     changes.
 
 WIRED (Phase 2): inbound SMS (telephony._bridge_inbound_sms) and inbound email
-(email.inbound_bridge). READY for Phase 3 transports — capture_whatsapp
-(external) and capture_slack / capture_teams (internal).
+(email.inbound_bridge).
+WIRED (Phase 2b): voice — a support call threads as ONE transcript message at
+call end (voice_support._close_call); SDR calls thread per turn, both
+directions (sdr.converse, Gather + media-stream transports) — and webchat
+(sdr.converse, both directions).
+Phase 3 transports live in transports.py — capture_whatsapp (external) and
+capture_slack / capture_teams (internal), credential-gated.
 
 CONFIG (env)
   CONV_CAPTURE_ENABLED  1   master kill switch for conversation capture
@@ -88,6 +93,12 @@ def capture_webchat(handle: Optional[str], body: str,
     # A typed email identifies the visitor; otherwise thread by the session id.
     h = handle or (f"session:{session_id}" if session_id else "")
     return capture("webchat", h, body, direction, external_ref=session_id)
+
+
+def capture_voice(caller_e164: str, body: str, direction: str = "inbound",
+                  external_ref: Optional[str] = None,
+                  metadata: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    return capture("voice", caller_e164, body, direction, external_ref, metadata)
 
 
 def capture_whatsapp(sender_e164: str, body: str, direction: str = "inbound",

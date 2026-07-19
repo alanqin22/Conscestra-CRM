@@ -279,6 +279,12 @@ def _llm_reply(state: Dict[str, Any], history: List[Dict[str, str]],
         msgs.append({"role": "user", "content": privacy.mask(user_text)[:_MAX_MSG]})
         resp = _get_llm(tier="lite").invoke(msgs)
         text = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+        if text:
+            # Outbound guard: a blocked LLM reply falls back to the scripted
+            # reply — the visitor gets a safe answer either way.
+            from app.core.outbound_guard import screen
+            if not screen(text, "webchat")["ok"]:
+                return None
         return text[:600] if text else None
     except Exception as exc:
         logger.warning(f"[sdr] LLM reply failed (script fallback): {exc}")
@@ -289,7 +295,8 @@ def _llm_reply(state: Dict[str, Any], history: List[Dict[str, str]],
 # THE BRAIN — one turn, channel-agnostic
 # ============================================================================
 
-def converse(session_id: str, user_text: str, channel: str = "chat") -> Dict[str, Any]:
+def converse(session_id: str, user_text: str, channel: str = "chat",
+             handle: Optional[str] = None) -> Dict[str, Any]:
     now = time.time()
     for sid in [s for s, v in _SESSIONS.items() if now - v["at"] > _SESSION_TTL]:
         _SESSIONS.pop(sid, None)
@@ -305,8 +312,9 @@ def converse(session_id: str, user_text: str, channel: str = "chat") -> Dict[str
 
     if state["turns"] > _MAX_TURNS:
         _remember_session(session_id, state, sess["history"], channel)
-        return {"reply": "Thanks for the chat! A team member will follow up "
-                         "by email.", "state": state, "done": True}
+        reply = "Thanks for the chat! A team member will follow up by email."
+        _capture_turn(channel, state, session_id, handle, user_text, reply)
+        return {"reply": reply, "state": state, "done": True}
 
     _extract(state, user_text)
     _upsert_lead(state, channel)
@@ -345,10 +353,34 @@ def converse(session_id: str, user_text: str, channel: str = "chat") -> Dict[str
     sess["history"] += [{"role": "user", "content": user_text[:300]},
                         {"role": "assistant", "content": reply[:300]}]
     sess["history"] = sess["history"][-12:]
+    _capture_turn(channel, state, session_id, handle, user_text, reply)
     _db_save_session(session_id, sess, channel)
     if done:
         _remember_session(session_id, state, sess["history"], channel)
     return {"reply": reply, "state": state, "done": done}
+
+
+def _capture_turn(channel: str, state: Dict[str, Any], session_id: str,
+                  handle: Optional[str], user_text: str, reply: str) -> None:
+    """Unified Conversation Object: thread both sides of the exchange.
+    Voice threads by the caller's number (falls back to the session so an
+    unknown-number call still threads with itself); webchat threads by the
+    visitor's typed email once captured, else the browser session. Best-effort
+    and flag-gated inside channel_adapters — a store failure never breaks
+    the turn."""
+    try:
+        from app.core import channel_adapters as ca
+        if channel == "voice":
+            h = handle or f"session:{session_id}"
+            ca.capture_voice(h, user_text, "inbound", session_id)
+            ca.capture_voice(h, reply, "outbound", session_id)
+        else:
+            ca.capture_webchat(state.get("email"), user_text, session_id,
+                               "inbound")
+            ca.capture_webchat(state.get("email"), reply, session_id,
+                               "outbound")
+    except Exception as exc:
+        logger.debug(f"[sdr] conversation capture skipped: {exc}")
 
 
 def _remember_session(session_id: str, state: Dict[str, Any],
@@ -523,7 +555,9 @@ async def sdr_voice_turn(request: Request):
                     f"{sorted(params.keys())}")
         return _twiml(_gather(_say("Sorry, I didn't catch that. "
                                    "Could you say it again?")))
-    res = converse(f"voice-{call_sid}", heard, "voice")
+    from app.core.telephony import normalize_phone
+    res = converse(f"voice-{call_sid}", heard, "voice",
+                   handle=normalize_phone(params.get("From", "")) or None)
     if res.get("done"):
         return _twiml(_say(res["reply"]) + "<Hangup/>")
     return _twiml(_gather(_say(res["reply"])))

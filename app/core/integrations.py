@@ -1,4 +1,4 @@
-"""External integrations — calendar feed + ERP accounting exports.
+"""External integrations — calendar feed + import + ERP accounting exports.
 
 1. CALENDAR (public, token-guarded):
      GET /calendar/activities.ics[?token=…]
@@ -7,6 +7,13 @@
    can't send auth headers, so access uses the secret-address pattern: set
    CALENDAR_FEED_TOKEN in env and include ?token=<value> in the URL. When the
    env var is unset the feed follows the demo public-read posture.
+
+1b. CALENDAR IMPORT (admin-gated, zero-manual-data-entry):
+     POST /calendar/import   {"ics": "<BEGIN:VCALENDAR…>"}
+   The inbound half of the calendar bridge: paste/export an .ics from Google/
+   Outlook/Apple and each VEVENT becomes a MEETING activity. Deduped by the
+   event UID (tagged [ics:<uid>] in the description), so re-importing the same
+   calendar is a no-op — sync by re-export, not by bookkeeping.
 
 2. ERP BRIDGE (admin-gated):
      GET /erp/export/invoices.csv?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
@@ -131,6 +138,117 @@ def calendar_feed(token: Optional[str] = None):
 
     return Response("\r\n".join(lines) + "\r\n", media_type="text/calendar",
                     headers={"Content-Disposition": 'inline; filename="conscestra-activities.ics"'})
+
+
+# ============================================================================
+# Calendar import — .ics → meeting activities (deduped by event UID)
+# ============================================================================
+
+import re as _re_ics
+
+from pydantic import BaseModel
+
+
+class _IcsBody(BaseModel):
+    ics: str
+
+
+def _ics_unfold(text: str) -> str:
+    """RFC 5545 line unfolding: a line starting with space/tab continues the
+    previous line."""
+    return _re_ics.sub(r"\r?\n[ \t]", "", text or "")
+
+
+def _ics_dt(raw: str) -> Optional[str]:
+    """'20260718T140000Z' / '20260718T140000' / '20260718' → a Postgres-
+    castable timestamp string (Z = UTC; naive/date-only left local)."""
+    m = _re_ics.match(r"^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2}))?(Z?)$",
+                      (raw or "").strip())
+    if not m:
+        return None
+    y, mo, d, hh, mm, ss, z = m.groups()
+    t = f"{y}-{mo}-{d} {hh or '09'}:{mm or '00'}:{ss or '00'}"
+    return t + ("+00" if z else "")
+
+
+def _ics_events(ics: str) -> List[dict]:
+    out = []
+    for block in _re_ics.findall(r"BEGIN:VEVENT(.*?)END:VEVENT",
+                                 _ics_unfold(ics), _re_ics.DOTALL):
+        def prop(name):
+            m = _re_ics.search(rf"^{name}[^:\n]*:(.+)$", block, _re_ics.MULTILINE)
+            return m.group(1).strip() if m else None
+        ev = {"uid": prop("UID"), "summary": prop("SUMMARY") or "(no title)",
+              "start": _ics_dt(prop("DTSTART")), "end": _ics_dt(prop("DTEND")),
+              "location": prop("LOCATION"), "description": prop("DESCRIPTION"),
+              "emails": [e.lower() for e in _re_ics.findall(
+                  r"(?:ATTENDEE|ORGANIZER)[^:\n]*:mailto:([^\s\r\n]+)",
+                  block, _re_ics.IGNORECASE)]}
+        if ev["uid"] and ev["start"]:
+            out.append(ev)
+    return out
+
+
+@router_admin.post("/calendar/import")
+def calendar_import(body: _IcsBody):
+    """Import VEVENTs from pasted .ics content as MEETING activities.
+    Idempotent per event UID. An attendee/organizer email that matches a CRM
+    contact relates the meeting to that contact (+account) — the calendar
+    joins the customer record, not a side table; unmatched events anchor to a
+    neutral 'calendar' relation (deterministic id from the event UID)."""
+    import uuid as _uuid_mod
+    events = _ics_events(body.ics)
+    if not events:
+        raise HTTPException(422, "no parseable VEVENTs (need UID + DTSTART)")
+    created, skipped, matched = 0, 0, 0
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            for ev in events[:100]:
+                tag = f"[ics:{ev['uid'][:80]}]"
+                cur.execute("SELECT 1 FROM activities WHERE description LIKE %s "
+                            "LIMIT 1", (f"%{tag}%",))
+                if cur.fetchone():
+                    skipped += 1
+                    continue
+                rel_type, rel_id, account_id = "calendar", str(
+                    _uuid_mod.uuid5(_uuid_mod.NAMESPACE_URL,
+                                    f"ics:{ev['uid']}")), None
+                if ev.get("emails"):
+                    cur.execute(
+                        """SELECT c.contact_id::text, c.account_id::text
+                           FROM contacts c
+                           WHERE lower(c.email) = ANY(%s)
+                             AND COALESCE(c.is_deleted, false) = false
+                           LIMIT 1""", (ev["emails"],))
+                    hit = cur.fetchone()
+                    if hit:
+                        rel_type, rel_id, account_id = "contact", hit[0], hit[1]
+                        matched += 1
+                desc = " · ".join(x for x in (
+                    ev.get("description"),
+                    f"Location: {ev['location']}" if ev.get("location") else None,
+                ) if x)
+                cur.execute(
+                    """INSERT INTO activities
+                         (type, status, subject, description, direction,
+                          channel, related_type, related_id, account_id,
+                          due_at, created_at, updated_at)
+                       VALUES ('meeting', 'open', %s, %s, 'outbound',
+                               'calendar', %s, %s::uuid, %s::uuid,
+                               %s::timestamptz, now(), now())""",
+                    (ev["summary"][:200],
+                     (f"Imported from calendar {tag}"
+                      + (f"\n{desc}" if desc else ""))[:1500],
+                     rel_type, rel_id, account_id, ev["start"]))
+                created += 1
+        conn.commit()
+    finally:
+        conn.close()
+    logger.info(f"[calendar] import: {created} created ({matched} matched to "
+                f"contacts), {skipped} duplicate(s) of {len(events)} event(s)")
+    return {"ok": True, "events": len(events), "created": created,
+            "matched_contacts": matched, "skipped_duplicates": skipped}
 
 
 # ============================================================================

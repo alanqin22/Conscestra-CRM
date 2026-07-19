@@ -228,11 +228,100 @@ def eval_executive_intelligence() -> Dict[str, Any]:
             else "missing role/field in _DEFAULT_PROFILES"}
 
 
+# ── RAGAS-lite (KB enrichment step 4) ────────────────────────────────────────
+# The two RAG metrics that matter at this scale, run the eval-harness way:
+# context precision is DETERMINISTIC over a golden query set (expected article
+# must rank in the top 2 of the real hybrid retriever); faithfulness generates
+# a grounded reply for a few golden queries and has a lite judge verify every
+# claim is supported by the retrieved block.
+
+_KB_GOLDEN = [
+    # (query, expected source_ref)  — spread across categories + phrasings
+    ("I want to send my purchase back and get a refund", "seed:returns-refunds"),
+    ("do I have to pay for delivery on small orders", "seed:shipping-costs"),
+    ("can I undo the order I just placed", "seed:cancel-change-order"),
+    ("my package still hasn't shown up", "seed:ts-order-stuck"),
+    ("how do I put a new prospect into the system", "seed:howto-add-lead"),
+    ("what does queued for approval mean", "seed:gl-approval-queue"),
+    ("can I see my meetings in google calendar", "seed:int-calendar-feed"),
+    ("the phone robot keeps mishearing me", "seed:ts-voice-mishears"),
+    ("how much does it cost to use this", "seed:faq-pricing"),
+    ("get invoices into excel", "seed:int-erp-export"),
+]
+
+
+def eval_kb_context_precision() -> Dict[str, Any]:
+    """Deterministic (no LLM): the expected article ranks in the top 2 of the
+    real hybrid retriever for ≥70% of the golden queries."""
+    from app.core import knowledge
+    refs = {}
+    try:
+        from app.core.database import get_connection
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT article_uuid::text, source_ref "
+                        "FROM knowledge_articles WHERE status='active'")
+            refs = {u: s for u, s in cur.fetchall()}
+        conn.close()
+    except Exception as exc:
+        return {"ok": False, "detail": f"kb unavailable: {exc}"}
+    hits, misses = 0, []
+    for q, want in _KB_GOLDEN:
+        top = knowledge.retrieve("", q, audience="public")
+        got = [refs.get(h["article_uuid"]) for h in top]
+        if want in got:
+            hits += 1
+        else:
+            misses.append(f"{q[:30]}→{got}")
+    rate = hits / len(_KB_GOLDEN)
+    ok = rate >= 0.7
+    return {"ok": ok, "detail": f"top-2 precision {rate:.0%} "
+            f"({hits}/{len(_KB_GOLDEN)})"
+            + ("" if ok else f"; misses: {'; '.join(misses[:2])}")}
+
+
+def eval_kb_faithfulness() -> Dict[str, Any]:
+    """LLM (2 gens + 2 judgments, lite tier): a reply generated ONLY from the
+    retrieved block must contain no claim the block doesn't support."""
+    from app.core import knowledge
+    from app.core.graph_utils import _get_llm
+    queries = [_KB_GOLDEN[0][0], _KB_GOLDEN[6][0]]
+    try:
+        llm = _get_llm(tier="lite", caller="evals")
+        for q in queries:
+            blk = knowledge.rag_block("", q)
+            if not blk:
+                return {"ok": False, "detail": f"no retrieval for {q[:40]!r}"}
+            reply = llm.invoke([
+                {"role": "system", "content":
+                    "Answer the customer in ≤50 words using ONLY this "
+                    "approved knowledge:\n" + blk},
+                {"role": "user", "content": q}]).content
+            verdict = llm.invoke([
+                {"role": "system", "content":
+                    "You are a strict fact-checker. Does the REPLY contain any "
+                    "claim NOT supported by the KNOWLEDGE? A reply that "
+                    "declines to answer or defers to the team makes no factual "
+                    "claim — count it as grounded. Answer only 'grounded' or "
+                    "'unsupported'."},
+                {"role": "user", "content":
+                    f"KNOWLEDGE:\n{blk}\n\nREPLY:\n{reply}"}]).content
+            if "unsupported" in verdict.lower():
+                return {"ok": False,
+                        "detail": f"unfaithful reply for {q[:40]!r}: "
+                                  f"{reply[:100]}"}
+        return {"ok": True, "detail": f"{len(queries)} grounded replies, "
+                                     "0 unsupported claims"}
+    except Exception as exc:
+        return {"ok": False, "detail": f"faithfulness eval failed: {exc}"}
+
+
 EVALS: List[Callable[[], Dict[str, Any]]] = [
     eval_sdr_greeting, eval_sdr_injection, eval_autoreply_grounding,
     eval_planner_bounded, eval_kb_retrieval, eval_supervisor_planner_bridge,
     eval_identity_resolution, eval_conversation_object, eval_channel_selection,
-    eval_executive_intelligence,
+    eval_executive_intelligence, eval_kb_context_precision,
+    eval_kb_faithfulness,
 ]
 
 

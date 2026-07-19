@@ -225,7 +225,7 @@ Your business keeps moving — even while your team sleeps.
 ## Every Resolved Case Teaches the Next One
 
 Most support knowledge evaporates the moment a ticket closes. Conscestra
-keeps it — and grows it from **four inflows, all through one governed
+keeps it — and grows it from **five inflows, all through one governed
 approval queue**.
 
 Resolved email threads are mined into draft articles. Support-call
@@ -238,12 +238,27 @@ article. And an administrator can simply **upload a product manual or
 policy document** — PDF, page, or URL — on the knowledge management page:
 it is chunked, drafted into articles grounded strictly in the document, and
 queued for approval, idempotently, with one-click removal if a policy
-changes.
+changes. The fifth inflow requires no administrator at all: when a **known
+customer emails a document** — a spec sheet, a policy, a manual — the
+attachment flows through the same pipeline into governed proposals, while a
+stranger's file never reaches a model.
 
 Nothing publishes itself. A human approves every article; the critic checks
 each one first; usage counters show which knowledge actually earns its
 keep. Once approved, the same answers serve **email, SMS, web chat, and the
 phone** within the minute.
+
+And retrieval now understands **meaning, not just words**. Every article
+carries an embedding alongside full-text search, the two rankings fused —
+so *"my package still hasn't shown up"* finds the order-status answer they
+share no words with. A noisy voice transcript that misses entirely gets one
+corrective rewrite before the question is logged as a gap. The knowledge
+base itself is **tiered** — customer-facing articles on one side, agent-only
+playbook guidance on the other, enforced at retrieval so internal knowledge
+can never surface in a customer reply — and a weekly hygiene pass flags
+articles past their review date or never used, while a nightly evaluation
+measures retrieval precision and answer faithfulness against a golden query
+set.
 
 Every resolved case makes the next answer better. **The help desk compounds.**
 
@@ -262,6 +277,20 @@ has rejected the planner's own proposals when the data didn't support them —
 three autonomous layers checking each other before a human ever looks.
 
 The AI supplies judgment. Deterministic rails supply safety.
+
+## Ask *What If* Before You Act
+
+Executives can also rehearse a decision before committing to it. Ask the
+Orchestrator *"what if we cut overdue invoices by 30%?"* and the simulator
+maps the scenario onto a registered business metric, grounds it in the live
+value, and re-judges every active business objective under the new number —
+status before and after, how much of the gap to target closes, and the
+proportional ripple onto related metrics.
+
+The language model only parses the question; every projection is pure
+arithmetic over real data, and the whole exercise is **read-only by
+construction** — nothing is changed, proposed, or sent. Rehearse the move,
+then hand the winning scenario to the planner as a goal.
 
 ## An SDR That Never Sleeps
 
@@ -377,6 +406,12 @@ alert a Slack post — weighing intent, relationship, urgency, the person's
 learned channel preference, and whether the matter is sensitive enough to demand
 a verified channel.
 
+Capture is complete across the fleet: support calls thread into the
+conversation as one transcript, SDR voice calls and web chats thread turn by
+turn, and a caller's follow-up text lands in the same conversation as this
+morning's call. The per-session working memory is durable too — a server
+restart no longer costs an agent its place in the dialogue.
+
 **Start on WhatsApp at 9am, continue by phone at 10, receive a proposal by email
 that afternoon — one person, one conversation, one memory.**
 
@@ -475,6 +510,52 @@ human review is required, and continuous health monitoring ensures every
 automation remains transparent and reliable.
 
 Even the supervisors are supervised.
+
+## Four Walls Around Every Action
+
+Autonomy is only as trustworthy as its boundaries, so Conscestra builds
+**four distinct guardrail layers** around every agent action:
+
+- **A human-in-the-loop amount floor.** Confidence measures how sure an
+  agent is — not how much is at stake. Any governed action carrying an
+  amount above the configurable floor *always* pauses for human approval,
+  even at full confidence. A ninety-five-percent-confident five-thousand-
+  dollar action waits for a person; a fifty-dollar one flows.
+- **Deterministic brand boundaries.** The maximum discount any agent-built
+  quotation may carry is a hard, editable policy — requests above it are
+  clamped and flagged, never sent, whoever (or whatever) asked.
+- **An outbound guard on every message that leaves.** The last wall before
+  a customer sees anything: every email and SMS — and every SDR chat reply —
+  passes a deterministic screen for aggressive language, binding financial
+  promises, leaked internal markers, unresolved template fields, payment
+  card digits, and discounts promised in prose above the brand cap. It costs
+  microseconds, involves no model, and applies to humans and agents alike —
+  in live testing it blocked the very status report describing it, because
+  the report quoted the trigger phrases.
+- **Granular agent-level access control.** Any capability can be restricted
+  to specific calling agents — a customer-facing agent simply cannot invoke
+  an accounting capability, and the refusal is clean, explained, and traced.
+
+The input side was already walled: natural-language write attempts are
+caught at the database choke point, personal data is masked before any
+model prompt, and unverified callers can never reach account-scoped answers.
+
+## A Control Room, Not a Black Box
+
+All of this is **visible and adjustable without touching code**. The
+governance console shows every guardrail policy with its live value against
+the deployed default — thresholds move with a click and take effect
+immediately, no restart. Every agent capability appears with an
+enable/disable switch: turn one off and every dispatch of it refuses with a
+clean, explained, traced error until it is turned back on.
+
+And nothing the fleet does is opaque. Every multi-agent play shares one
+**correlation id**, and one click reconstructs its full timeline — every
+agent-to-agent call with its latency, every bus event, every approval it
+queued, including the refusals. When an approved action finally executes, it
+lands in the same trace as the proposal that spawned it.
+
+Leadership scales autonomy with a slider, not a leap of faith.
 
 ## AI That Learns From Results
 
@@ -614,6 +695,14 @@ Every morning, leadership receives a personalized executive briefing.
 Every briefing combines internal business intelligence with live external
 data sources and includes citations for verification. At the same time, live
 dashboards continue tracking organizational movement throughout the day.
+
+The briefing now carries a **Customer Health & Operations** pulse: customer
+sentiment across every channel — every distilled conversation, voice to
+email, carries a sentiment reading — a rolling satisfaction measure, and an
+inventory-risk line watching products short of their stock floor or of
+open-order demand. A negative conversation marks the account for every
+agent that touches it; a sustained sentiment slide or a stock shortfall
+becomes a supervisor breach that composes its own governed response play.
 
 Each executive is modeled as a leadership **role and an intelligence profile on
 top of their employee identity** — never a duplicate person record. The profile
@@ -761,8 +850,16 @@ crm_agent/
     │   ├── voice_stream.py        ← Real-time voice (media streams, VAD,
     │   │                             streaming STT/TTS, barge-in)
     │   ├── customer_memory.py     ← One cross-channel conversation memory
+    │   ├── identity.py            ← (channel, handle) → one CRM party
+    │   ├── conversations.py       ← Unified cross-channel Conversation Object
+    │   ├── channel_adapters.py    ← Channel inbound → one common envelope
+    │   ├── channel_selector.py    ← Best channel/action for an objective
     │   ├── intent_router.py       ← LLM intent routing, keyword fallback
-    │   ├── kb_ingest.py           ← Document/URL → governed KB proposals
+    │   ├── semantic.py            ← KB embeddings (hybrid meaning+keyword retrieval)
+    │   ├── simulator.py           ← Read-only what-if over business objectives
+    │   ├── trace.py               ← Correlation-id trace (one id → whole play)
+    │   ├── outbound_guard.py      ← Deterministic triage on every outgoing message
+    │   ├── kb_ingest.py           ← Document/URL/attachment → governed KB proposals
     │   ├── quotes.py              ← Deterministic quotation build + delivery
     │   ├── web_tools.py           ← Internet access (search + fetch + cite)
     │   ├── llm_meter.py           ← LLM usage metering, budgets, model tiering
@@ -843,6 +940,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | GET    | `/knowledge/gaps`            | Questions the KB couldn't answer (admin)       |
 | GET    | `/learning/bottlenecks`      | Live process-health scan (admin)               |
 | GET    | `/customer-memory/{type}/{id}` | Cross-channel conversation memory (admin)    |
+| GET    | `/simulate?q=…`              | Read-only what-if over live metrics + objectives (admin) |
+| GET    | `/trace/{correlation_id}`    | One play's full timeline across a2a/events/approvals (admin) |
+| GET/PUT| `/governance/policies[/{key}]` | Live guardrail policy overrides (admin)      |
+| GET/POST | `/a2a/registry[/{intent}]` | Capability enable/disable + caller ACL (admin) |
+| GET    | `/outbound-guard/test?text=…`| Dry-run the outbound message screen (admin)    |
+| POST   | `/calendar/import`           | Paste .ics → meeting activities, contact-matched (admin) |
 | GET    | `/sessions`                  | List active memory sessions                    |
 | DELETE | `/sessions/{id}`             | Clear a session's memory                       |
 

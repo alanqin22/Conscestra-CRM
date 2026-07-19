@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import random
+import time
 import uuid as _uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -313,6 +316,12 @@ def _sp_crm_plan(p: Dict[str, Any]) -> Any:
     return planner.draft_plan(str(p.get("goal") or ""))
 
 
+def _sp_crm_simulate(p: Dict[str, Any]) -> Any:
+    """Read-only what-if over the objectives math — projects, never writes."""
+    from app.core import simulator
+    return simulator.simulate(str(p.get("scenario") or p.get("q") or ""))
+
+
 def _sp_select_channel(p: Dict[str, Any]) -> Any:
     """Intelligent channel selection: best communication ACTION for an objective
     + party (Unified Communication Layer, Phase 4). Read-only — decides, never sends."""
@@ -528,6 +537,12 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "draft only; execution runs reads and queues writes for "
                "governance approval",
                sp=_sp_crm_plan),
+    Capability("crm.simulate", "orchestrator", "", "read",
+               lambda p: f"simulate: {p.get('scenario', p.get('q', ''))}",
+               "read-only what-if scenario over the registered business "
+               "metrics + active objectives (e.g. scenario='cut overdue "
+               "invoices by 30%') — projects status/gap impact, never writes",
+               sp=_sp_crm_simulate),
     # Intelligent channel selection (Unified Communication Layer, Phase 4):
     # the best communication ACTION for an objective + party. Read-only.
     Capability("comms.select_channel", "orchestrator", "", "read",
@@ -600,6 +615,92 @@ def manifest() -> Dict[str, Any]:
 
 
 # ============================================================================
+# REGISTRY-AS-DATA (audit #4) — runtime enable/disable per capability
+# ============================================================================
+# The in-code registry stays the source of WHAT exists; capability_registry
+# only overrides AVAILABILITY. No row (or no table) = enabled — the gate can
+# degrade but never lock the platform out.
+
+_REG_TTL = int(os.getenv("REGISTRY_TTL_SECS", "30"))
+_reg_cache: Dict[str, Any] = {"at": 0.0, "rows": {}}
+
+
+def _registry_rows() -> Dict[str, Dict[str, Any]]:
+    """Cached {intent: {enabled, notes, updated_by, updated_at}} from the
+    capability_registry table. {} on any failure (everything enabled)."""
+    if time.time() - _reg_cache["at"] < _REG_TTL:
+        return _reg_cache["rows"]
+    rows: Dict[str, Dict[str, Any]] = {}
+    try:
+        from app.core.database import get_connection
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute("SELECT intent, enabled, notes, updated_by, "
+                                "updated_at, allowed_callers "
+                                "FROM capability_registry")
+                except Exception:
+                    conn.rollback()   # pre-ACL schema — degrade to 5 columns
+                    cur.execute("SELECT intent, enabled, notes, updated_by, "
+                                "updated_at, NULL FROM capability_registry")
+                for r in cur.fetchall():
+                    rows[r[0]] = {"enabled": bool(r[1]), "notes": r[2],
+                                  "updated_by": r[3],
+                                  "updated_at": r[4].isoformat() if r[4] else None,
+                                  "allowed_callers": r[5]}
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug(f"[a2a] registry table skipped: {exc}")
+    _reg_cache.update(at=time.time(), rows=rows)
+    return rows
+
+
+def _invalidate_registry_cache() -> None:
+    _reg_cache["at"] = 0.0
+
+
+def capability_enabled(intent: str) -> bool:
+    row = _registry_rows().get(intent)
+    return True if row is None else bool(row.get("enabled", True))
+
+
+# ============================================================================
+# DISPATCH TRACE LOG (audit #5) — one row per real dispatch, by correlation id
+# ============================================================================
+
+_TRACE_RETENTION_DAYS = int(os.getenv("TRACE_RETENTION_DAYS", "30"))
+
+
+def _log_dispatch(req: "A2ARequest", res: "A2AResult", ms: int) -> None:
+    """Best-effort insert into a2a_dispatches — the spine of GET /trace/{cid}.
+    Never raises; a missing table just means no trace rows."""
+    try:
+        from app.core.database import get_connection
+        cap = CAPABILITIES.get(req.intent)
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO a2a_dispatches (correlation_id, intent,
+                         from_agent, agent, kind, ok, error, latency_ms)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (res.correlation_id, req.intent, req.from_agent,
+                     res.agent, cap.kind if cap else None, res.ok,
+                     (res.error or "")[:500] or None, ms))
+                if random.random() < 0.01:      # opportunistic GC
+                    cur.execute("DELETE FROM a2a_dispatches WHERE at < now() "
+                                "- make_interval(days => %s)",
+                                (_TRACE_RETENTION_DAYS,))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug(f"[a2a] dispatch log skipped: {exc}")
+
+
+# ============================================================================
 # IN-PROCESS INVOKE (ASGI — no network hop)
 # ============================================================================
 
@@ -638,6 +739,20 @@ def _summarize(intent: str, data: Any) -> str:
 
 
 async def dispatch(req: A2ARequest, dry_run: bool = False) -> A2AResult:
+    """Public entry — dispatch + best-effort trace logging (a2a_dispatches,
+    read back by GET /trace/{correlation_id}). Logging can never fail a call."""
+    t0 = time.time()
+    res = await _dispatch(req, dry_run)
+    if not dry_run:
+        try:
+            await asyncio.to_thread(_log_dispatch, req, res,
+                                    int((time.time() - t0) * 1000))
+        except Exception as exc:
+            logger.debug(f"[a2a] dispatch log skipped: {exc}")
+    return res
+
+
+async def _dispatch(req: A2ARequest, dry_run: bool = False) -> A2AResult:
     """Resolve the intent's capability and invoke the owning agent in-process."""
     cid = req.correlation_id or str(_uuid.uuid4())
     req.correlation_id = cid          # so delegated sub-calls share the lineage
@@ -649,6 +764,27 @@ async def dispatch(req: A2ARequest, dry_run: bool = False) -> A2AResult:
                          error=f"No capability registered for intent '{req.intent}'"
                                + (f". Did you mean: {', '.join(sugg)}?" if sugg else ""),
                          data={"suggestions": sugg} if sugg else None)
+
+    # Registry-as-data gate: an operator-disabled capability refuses cleanly
+    # (structured error, traced) instead of executing.
+    reg = _registry_rows().get(req.intent) or {}
+    if not reg.get("enabled", True):
+        notes = reg.get("notes")
+        return A2AResult(False, req.intent, cap.agent, cid,
+                         error=f"capability '{req.intent}' is disabled in the "
+                               f"capability registry"
+                               + (f" — {notes}" if notes else ""))
+
+    # Agent RBAC (guardrail layer 4): allowed_callers restricts WHO may
+    # dispatch this capability. Approved executions (govern_bypass) pass —
+    # the human approval is the authority.
+    allowed = reg.get("allowed_callers")
+    if (isinstance(allowed, list) and allowed
+            and req.from_agent not in allowed and not req.govern_bypass):
+        return A2AResult(False, req.intent, cap.agent, cid,
+                         error=f"caller '{req.from_agent}' is not permitted to "
+                               f"dispatch '{req.intent}' (allowed: "
+                               f"{', '.join(allowed)})")
 
     # Composite (peer handoff): the handler delegates to peer agents.
     if cap.compose is not None:
@@ -672,6 +808,46 @@ async def dispatch(req: A2ARequest, dry_run: bool = False) -> A2AResult:
                          output=f"[dry-run] would route '{req.intent}' → "
                                 f"{cap.agent} via {via}")
 
+    # Phase 5 governance: gate WRITE/outbound actions by confidence.
+    #   act → execute; propose → queue for human approval; skip → don't act.
+    # No-op unless GOV_ENABLED. govern_bypass=True is set by an approved action.
+    # 2026-07-19: this gate now sits BEFORE the structured branch — the six
+    # structured writes (sms.send, quote.generate, …) previously slipped past
+    # it, relying only on their SPs' internal safeguards.
+    if cap.kind == "write" and not req.govern_bypass:
+        from app.core import governance
+        if governance.ENABLED:
+            d = governance.decide(req.confidence)
+            # HITL amount floor (guardrail layer 1): a big-ticket action pauses
+            # for a human even at act-level confidence — confidence measures
+            # how sure the agent is, not how much is at stake.
+            if d == "act":
+                hitl = governance.hitl_amount()
+                amt = governance._amount_from(dict(req.params))
+                if hitl > 0 and amt >= hitl:
+                    d = "propose"
+                    logger.info(f"[a2a] {req.intent} ${amt:,.0f} ≥ HITL "
+                                f"${hitl:,.0f} → forced propose")
+            if d == "skip":
+                return A2AResult(False, req.intent, cap.agent, cid,
+                                 error=f"skipped by governance — confidence "
+                                       f"{req.confidence} < {governance.propose_min()}")
+            if d == "propose":
+                # _correlation_id ties the approval to this play's trace
+                # (hidden from the approval UI, dropped before execution).
+                p = dict(req.params)
+                p["_correlation_id"] = cid
+                aid = governance.propose(
+                    req.intent, req.from_agent, p,
+                    req.entity.type if req.entity else None,
+                    req.entity.id if req.entity else None, req.confidence)
+                logger.info(f"[a2a] {req.intent} gated → proposed {aid[:8]} "
+                            f"(conf={req.confidence})")
+                return A2AResult(True, req.intent, cap.agent, cid,
+                                 output=f"proposed for approval (confidence {req.confidence})",
+                                 data={"status": "pending_approval", "approval_uuid": aid})
+            # d == "act" → fall through and execute
+
     # Structured input contract: deterministic params → SP → structured data.
     # No NL parsing, no AI, no HTTP — the default for agent-to-agent calls.
     if structured:
@@ -684,29 +860,6 @@ async def dispatch(req: A2ARequest, dry_run: bool = False) -> A2AResult:
                     f"(structured) cid={cid[:8]}")
         return A2AResult(True, req.intent, cap.agent, cid, data=data,
                          output=_summarize(req.intent, data))
-
-    # Phase 5 governance: gate WRITE/outbound actions by confidence.
-    #   act → execute; propose → queue for human approval; skip → don't act.
-    # No-op unless GOV_ENABLED. govern_bypass=True is set by an approved action.
-    if cap.kind == "write" and not req.govern_bypass:
-        from app.core import governance
-        if governance.ENABLED:
-            d = governance.decide(req.confidence)
-            if d == "skip":
-                return A2AResult(False, req.intent, cap.agent, cid,
-                                 error=f"skipped by governance — confidence "
-                                       f"{req.confidence} < {governance.PROPOSE_MIN}")
-            if d == "propose":
-                aid = governance.propose(
-                    req.intent, req.from_agent, dict(req.params),
-                    req.entity.type if req.entity else None,
-                    req.entity.id if req.entity else None, req.confidence)
-                logger.info(f"[a2a] {req.intent} gated → proposed {aid[:8]} "
-                            f"(conf={req.confidence})")
-                return A2AResult(True, req.intent, cap.agent, cid,
-                                 output=f"proposed for approval (confidence {req.confidence})",
-                                 data={"status": "pending_approval", "approval_uuid": aid})
-            # d == "act" → fall through and execute
 
     try:
         message = cap.render(req.params)
@@ -752,6 +905,72 @@ router = APIRouter(tags=["a2a"])
 @router.get("/a2a/capabilities")
 def a2a_capabilities():
     return manifest()
+
+
+# ── Registry-as-data endpoints (audit #4) ────────────────────────────────────
+
+class _RegistryBody(BaseModel):
+    enabled: bool
+    notes: Optional[str] = None
+    updated_by: Optional[str] = None
+    allowed_callers: Optional[List[str]] = None   # None = leave unchanged;
+                                                  # [] = clear (anyone)
+
+
+@router.get("/a2a/registry")
+def a2a_registry():
+    """The capability manifest merged with runtime availability state."""
+    state = _registry_rows()
+    caps = []
+    for c in manifest()["capabilities"]:
+        row = state.get(c["intent"]) or {}
+        caps.append({**c, "enabled": row.get("enabled", True),
+                     "notes": row.get("notes"),
+                     "updated_by": row.get("updated_by"),
+                     "updated_at": row.get("updated_at"),
+                     "override": c["intent"] in state})
+    orphans = sorted(k for k in state if k not in CAPABILITIES)
+    disabled = sorted(c["intent"] for c in caps if not c["enabled"])
+    return {"count": len(caps), "disabled": disabled, "capabilities": caps,
+            **({"orphan_rows": orphans} if orphans else {})}
+
+
+@router.post("/a2a/registry/{intent}")
+def a2a_registry_set(intent: str, body: _RegistryBody):
+    """Enable/disable one capability at runtime. Unknown intents are refused —
+    the table overrides availability, it doesn't define capabilities."""
+    if intent not in CAPABILITIES:
+        return {"ok": False, "error": f"unknown capability '{intent}'"}
+    import json as _json
+    from app.core.database import get_connection
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO capability_registry
+                     (intent, enabled, notes, updated_by, allowed_callers)
+                   VALUES (%s,%s,%s,%s,%s::jsonb)
+                   ON CONFLICT (intent) DO UPDATE SET
+                     enabled=EXCLUDED.enabled, notes=EXCLUDED.notes,
+                     updated_by=EXCLUDED.updated_by,
+                     allowed_callers=CASE WHEN %s THEN EXCLUDED.allowed_callers
+                                          ELSE capability_registry.allowed_callers END,
+                     updated_at=now()""",
+                (intent, body.enabled, body.notes, body.updated_by or "admin",
+                 _json.dumps(body.allowed_callers)
+                 if body.allowed_callers is not None else None,
+                 body.allowed_callers is not None))
+        conn.commit()
+    finally:
+        conn.close()
+    _invalidate_registry_cache()
+    logger.info(f"[a2a] capability {intent} → "
+                f"{'ENABLED' if body.enabled else 'DISABLED'}"
+                + (f", callers={body.allowed_callers}"
+                   if body.allowed_callers is not None else "")
+                + f" (by {body.updated_by or 'admin'})")
+    return {"ok": True, "intent": intent, "enabled": body.enabled,
+            "allowed_callers": body.allowed_callers}
 
 
 class _DispatchBody(BaseModel):

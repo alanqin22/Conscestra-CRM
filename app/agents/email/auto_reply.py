@@ -273,6 +273,49 @@ def store_inbound_sentiment(email: Dict[str, Any], intent: str = None) -> None:
         logger.warning(f"email sentiment store failed: {exc}")
 
 
+def _ingest_attachments(email: Dict[str, Any]) -> None:
+    """KNOWN sender's document attachments → governed KB article proposals
+    (kb_ingest: idempotent per content hash, ≤3 proposals per document per
+    pass, human-approved before anything publishes). Unknown senders are
+    skipped entirely — their files never reach the LLM. Best-effort,
+    backgrounded; a failure never touches the reply path.
+    Kill switch: KB_ATTACH_INGEST=0."""
+    import os as _os
+    if _os.getenv("KB_ATTACH_INGEST", "1").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        return
+    atts = email.get("_attachments") or []
+    if not atts:
+        return
+    try:
+        from app.agents.email.inbound_bridge import _resolve_sender_sync
+        import re as _re
+        m = _re.search(r"<([^>]+)>", email.get("from", ""))
+        sender = (m.group(1) if m else email.get("from", "")).strip().lower()
+        if not _resolve_sender_sync(sender):
+            logger.info(f"[attach] {len(atts)} attachment(s) from unknown "
+                        f"sender {sender!r} — not ingested")
+            return
+    except Exception as exc:
+        logger.debug(f"[attach] sender check failed (skip ingest): {exc}")
+        return
+
+    def _run():
+        from app.core import kb_ingest
+        for a in atts:
+            try:
+                text = kb_ingest.extract_text(a["filename"], a["data"])
+                res = kb_ingest.ingest(a["filename"], text, cap=3)
+                logger.info(f"[attach] {a['filename']}: "
+                            f"{len(res.get('proposed') or [])} proposal(s), "
+                            f"{res.get('already_processed', 0)} already known")
+            except Exception as exc:
+                logger.info(f"[attach] {a['filename']} skipped: {exc}")
+
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def process_inbound_email(email: Dict[str, Any], own_address: str) -> bool:
     """
     Classify, compose, and send an auto-reply for a single inbound email.
@@ -311,6 +354,12 @@ def process_inbound_email(email: Dict[str, Any], own_address: str) -> bool:
     # Capture customer-voice sentiment for EVERY inbound email (feeds the
     # executive snapshot) — independent of whether we auto-reply.
     store_inbound_sentiment(email, intent)
+
+    # Zero-manual-data-entry: a KNOWN sender's document attachments flow into
+    # the governed KB pipeline (kb_ingest — idempotent by content hash, capped,
+    # every article human-approved). Strangers' files are ignored: LLM-cost and
+    # spam control. Background — never delays the reply path.
+    _ingest_attachments(email)
 
     if skip_reason:
         logger.debug(f"Auto-reply skipped: {skip_reason}")

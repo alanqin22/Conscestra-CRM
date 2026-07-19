@@ -113,7 +113,17 @@ def build_quote(account_id: str, items: List[Dict[str, Any]],
         return {"ok": False, "error": f"account {account_id} not found"}
     if not items:
         return {"ok": False, "error": "no items requested"}
-    discount_pct = max(0.0, min(float(discount_pct or 0), 50.0))
+    # Deterministic brand boundary (guardrail layer 2): the max discount is an
+    # editable governance policy, not a courtesy — requests above it are
+    # CLAMPED and flagged, whoever (or whatever) asked.
+    requested_pct = max(0.0, float(discount_pct or 0))
+    try:
+        from app.core import governance
+        cap_pct = float(governance.policy_value("brand.max_discount_pct", 15.0))
+    except Exception:
+        cap_pct = 15.0
+    discount_pct = min(requested_pct, cap_pct)
+    discount_capped = requested_pct > cap_pct
 
     lines, missing = [], []
     conn = get_connection()
@@ -139,12 +149,17 @@ def build_quote(account_id: str, items: List[Dict[str, Any]],
 
     subtotal = round(sum(l["line_total"] for l in lines), 2)
     discount = round(subtotal * discount_pct / 100, 2)
+    if discount_capped:
+        logger.info(f"[quotes] discount clamped {requested_pct}% → {cap_pct}% "
+                    f"(brand.max_discount_pct)")
     return {"ok": True, "quote": {
         "account_id": str(account_id), "account_name": who["account_name"],
         "recipient": who, "lines": lines, "unmatched": missing,
         "subtotal": subtotal, "discount_pct": discount_pct,
         "discount": discount, "total": round(subtotal - discount, 2),
         "valid_until": (date.today() + timedelta(days=VALID_DAYS)).isoformat(),
+        **({"discount_capped": True, "requested_pct": requested_pct}
+           if discount_capped else {}),
     }}
 
 

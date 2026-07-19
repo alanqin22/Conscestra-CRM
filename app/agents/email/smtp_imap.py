@@ -101,6 +101,19 @@ def send_email(
     is checked against the email_suppression opt-out list (send is skipped if
     unsubscribed) and the compliance footer (sender identification +
     unsubscribe link) is appended. Transactional callers leave the default."""
+    # Outbound guard (guardrail 3): the last deterministic wall before a
+    # customer sees the message — toxic tone, binding promises, leaked
+    # internals, over-cap discounts. Applies to EVERY path through here.
+    try:
+        from app.core.outbound_guard import screen
+        g = screen(f"{subject or ''}\n{body_text or body_html or ''}", "email")
+        if not g["ok"]:
+            return {'success': False, 'blocked': True, 'to': to,
+                    'message': "blocked by outbound guard: "
+                               + "; ".join(g["violations"])}
+    except ImportError:
+        pass
+
     if commercial:
         from app.core.consent import guard_outbound
         allowed, body_html, body_text = guard_outbound(to, body_html, body_text)
@@ -262,6 +275,9 @@ def _parse_email(msg) -> Dict[str, Any]:
 
     body_text = ''
     body_html = ''
+    attachments = []          # document attachments (pdf/txt/md/csv/html) —
+                              # consumed by the KB ingestion hook; capped so a
+                              # mailbox bomb can't balloon memory
 
     if msg.is_multipart():
         for part in msg.walk():
@@ -278,6 +294,19 @@ def _parse_email(msg) -> Dict[str, Any]:
                         part.get_content_charset() or 'utf-8', errors='replace')
                 except Exception:
                     pass
+            fn = part.get_filename()
+            if (fn and part.get_content_disposition() == 'attachment'
+                    and len(attachments) < 3):
+                low = fn.lower()
+                if low.endswith(('.pdf', '.txt', '.md', '.markdown', '.csv',
+                                 '.html', '.htm')):
+                    try:
+                        data = part.get_payload(decode=True) or b''
+                        if 0 < len(data) <= 8 * 1024 * 1024:
+                            attachments.append({'filename': _decode_header(fn),
+                                                'data': data})
+                    except Exception:
+                        pass
     else:
         ct = msg.get_content_type()
         try:
@@ -299,4 +328,5 @@ def _parse_email(msg) -> Dict[str, Any]:
         'preview':    body_text[:200].strip(),
         'body_text':  body_text,
         'body_html':  body_html,
+        '_attachments': attachments,   # internal — carries bytes, never serialize
     }

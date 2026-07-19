@@ -67,14 +67,25 @@ def _manifest_lines() -> str:
 # VALIDATE — the safety wall (mirrors playbook validation)
 # ============================================================================
 
+def _cap(key: str, default: int) -> int:
+    """Live policy cap (governance_policies row) with the code bound as
+    fallback — the bounds are tunable data, never absent."""
+    try:
+        from app.core import governance
+        return int(governance.policy_value(key, default))
+    except Exception:
+        return default
+
+
 def validate_plan(plan: Any) -> List[str]:
     """All the reasons this plan is unusable ([] = valid)."""
     errs: List[str] = []
     steps = (plan or {}).get("steps") if isinstance(plan, dict) else None
     if not isinstance(steps, list) or not steps:
         return ["plan.steps must be a non-empty list"]
-    if len(steps) > MAX_STEPS:
-        errs.append(f"{len(steps)} steps exceeds the MAX_STEPS bound ({MAX_STEPS})")
+    max_steps = _cap("planner.max_steps", MAX_STEPS)
+    if len(steps) > max_steps:
+        errs.append(f"{len(steps)} steps exceeds the MAX_STEPS bound ({max_steps})")
     vocab = _vocabulary()
     writes = 0
     for i, s in enumerate(steps, 1):
@@ -90,9 +101,10 @@ def validate_plan(plan: Any) -> List[str]:
             errs.append(f"step {i}: params must be an object")
         if vocab[intent]["kind"] == "write":
             writes += 1
-    if writes > MAX_WRITES:
+    max_writes = _cap("planner.max_writes", MAX_WRITES)
+    if writes > max_writes:
         errs.append(f"{writes} write steps exceeds the MAX_WRITES bound "
-                    f"({MAX_WRITES}) — split the goal")
+                    f"({max_writes}) — split the goal")
     return errs
 
 
@@ -111,7 +123,8 @@ def _draft_llm(goal: str) -> Optional[Dict[str, Any]]:
                 "You decompose a business goal into a SHORT plan of registered "
                 "agent capabilities. RULES: use ONLY intents from the provided "
                 "list, verbatim; at most "
-                f"{MAX_STEPS} steps and {MAX_WRITES} WRITE steps; put READ "
+                f"{_cap('planner.max_steps', MAX_STEPS)} steps and "
+                f"{_cap('planner.max_writes', MAX_WRITES)} WRITE steps; put READ "
                 "steps before WRITE steps; params must be simple JSON values "
                 "the capability description implies. NEVER invent entity IDs, "
                 "names, or placeholder values (no 'x', '<id>', example names) — "

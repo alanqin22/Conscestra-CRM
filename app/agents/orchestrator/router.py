@@ -461,6 +461,25 @@ async def orchestrator_chat(req: OrchChatRequest, request: Request):
             'output': _format_plan(result, executed=confirm),
         })
 
+    # ── 0d. Scenario simulation — "simulate: …" / "what if …" runs a READ-ONLY
+    # what-if over the objectives math (app/core/simulator.py). Nothing is
+    # written, proposed or sent — safe at any auth level, so no gate needed.
+    _sim_m = re.match(r'^(?:simulate|what\s+if)\s*[:=]?\s*(.+)$',
+                      message.strip(), re.IGNORECASE | re.DOTALL)
+    if _sim_m:
+        try:
+            from app.core import simulator
+            result = await asyncio.to_thread(simulator.simulate,
+                                             _sim_m.group(1).strip())
+            return JSONResponse({'sessionId': session_id,
+                                 'success': bool(result.get('ok')),
+                                 'mode': 'simulate', 'workflow': 'simulate',
+                                 'output': simulator.render_markdown(result)})
+        except Exception as e:
+            logger.error(f'simulator failed: {e}', exc_info=True)
+            return JSONResponse({'sessionId': session_id, 'success': False,
+                                 'mode': 'error', 'output': f'Simulation failed: {e}'})
+
     # ── 1. Company pulse — sp_orchestrator overview ──────────────────────────
     if _PULSE_RE.search(lower):
         try:

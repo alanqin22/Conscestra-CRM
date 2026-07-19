@@ -311,13 +311,14 @@ async def _brain_greet(line: str, call_sid: str, from_number: str) -> Tuple[str,
             "How can I help you today?", "speech")
 
 
-async def _brain_turn(line: str, call_sid: str, heard: str) -> Tuple[str, str]:
+async def _brain_turn(line: str, call_sid: str, heard: str,
+                      from_number: str = "") -> Tuple[str, str]:
     if line == "support":
         from app.core import voice_support as vs
         return await vs.take_turn(call_sid, heard)
     from app.core import sdr
     res = await asyncio.to_thread(sdr.converse, f"voice-{call_sid}", heard,
-                                  "voice")
+                                  "voice", from_number or None)
     return res["reply"], ("hangup" if res.get("done") else "speech")
 
 
@@ -335,9 +336,8 @@ def _brain_hangup(line: str, call_sid: str) -> None:
     try:
         from app.core import voice_support as vs
         sess = vs._CALLS.get(call_sid)
-        if sess and sess.get("transcript") and not sess.get("_closed"):
-            sess["_closed"] = True
-            vs._close_call(sess, "caller hung up")
+        if sess and sess.get("transcript"):
+            vs._close_call(sess, "caller hung up")   # idempotent — no-op if closed
     except Exception as exc:
         logger.debug(f"[stream] hangup close skipped: {exc}")
 
@@ -460,7 +460,8 @@ class _Call:
             return
         logger.info(f"[stream] {self.line} {self.call_sid[:12]} heard "
                     f"({time.time() - t0:.1f}s): {heard[:80]!r}")
-        say, nxt = await _brain_turn(self.line, self.call_sid, heard)
+        say, nxt = await _brain_turn(self.line, self.call_sid, heard,
+                                     self.from_number)
         self.mode = nxt
         await self.say(say, then_hangup=(nxt == "hangup"))
 

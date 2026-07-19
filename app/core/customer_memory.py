@@ -198,6 +198,20 @@ def remember(entity_type: str, entity_id: str, channel: str,
         owner = _owner_for(entity_type, entity_id)
         for c in d["commitments"]:
             _commitment_task(entity_type, entity_id, channel, c["what"], owner)
+    # A NEGATIVE conversation becomes a blackboard signal on the entity —
+    # the AI 360 summary and churn context pick it up automatically, and the
+    # supervisor's sentiment_drop detector watches the aggregate. Expires so
+    # a recovered relationship isn't haunted by one bad call.
+    if d.get("sentiment") == "negative":
+        try:
+            from app.core import blackboard
+            blackboard.post(entity_type, entity_id, "customer_memory",
+                            "negative_sentiment",
+                            note=f"Customer sentiment was NEGATIVE in a "
+                                 f"{channel} conversation: {d['summary'][:140]}",
+                            severity="medium", ttl_hours=14 * 24)
+        except Exception as exc:
+            logger.debug(f"[memory] sentiment signal skipped: {exc}")
     logger.info(f"[memory] remembered {channel} conversation for "
                 f"{entity_type} {entity_id[:8]} "
                 f"({len(d['commitments'])} commitment(s))")

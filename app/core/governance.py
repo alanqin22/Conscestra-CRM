@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
@@ -54,15 +55,110 @@ PROPOSE_MIN = _float("GOV_PROPOSE_MIN", 0.5)
 
 
 # ============================================================================
+# POLICY-AS-DATA (audit #4) — guardrail numbers become editable rows
+# ============================================================================
+# A governance_policies row overrides the env/code default at runtime — no
+# deploy, no restart, fully audited (updated_by/updated_at). No row (or no
+# table, or any DB failure) = the default applies: the guardrails can be
+# TUNED from data but never LOST to it. Only whitelisted keys are accepted.
+
+_KNOWN_POLICIES: Dict[str, Dict[str, Any]] = {
+    "gov.act_min": {
+        "description": "confidence at/above which a governed write auto-executes",
+        "min": 0.0, "max": 1.0, "default": lambda: ACT_MIN},
+    "gov.propose_min": {
+        "description": "confidence at/above which a governed write queues for "
+                       "approval (below = skip)",
+        "min": 0.0, "max": 1.0, "default": lambda: PROPOSE_MIN},
+    "planner.max_steps": {
+        "description": "hard cap on steps in a bounded plan",
+        "min": 1, "max": 12, "int": True, "default": lambda: 6},
+    "planner.max_writes": {
+        "description": "hard cap on WRITE steps per plan",
+        "min": 0, "max": 6, "int": True, "default": lambda: 2},
+    "gov.hitl_amount": {
+        "description": "human-in-the-loop floor: a governed write whose params "
+                       "carry an amount at/above this ALWAYS queues for "
+                       "approval, regardless of confidence (0 = off)",
+        "min": 0, "max": 10_000_000,
+        "default": lambda: _float("GOV_HITL_AMOUNT", 1000.0)},
+    "brand.max_discount_pct": {
+        "description": "deterministic brand boundary: the largest discount any "
+                       "agent-built quote may carry — requests above it are "
+                       "clamped, never sent",
+        "min": 0, "max": 100,
+        "default": lambda: _float("BRAND_MAX_DISCOUNT_PCT", 15.0)},
+}
+
+_POL_TTL = int(os.getenv("POLICY_TTL_SECS", "30"))
+_pol_cache: Dict[str, Any] = {"at": 0.0, "vals": {}}
+
+
+def _policy_rows() -> Dict[str, Any]:
+    """Cached {policy_key: value} from governance_policies ({} on failure)."""
+    if time.time() - _pol_cache["at"] < _POL_TTL:
+        return _pol_cache["vals"]
+    vals: Dict[str, Any] = {}
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT policy_key, value FROM governance_policies")
+                for k, v in cur.fetchall():
+                    vals[k] = v
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug(f"[governance] policy table skipped: {exc}")
+    _pol_cache.update(at=time.time(), vals=vals)
+    return vals
+
+
+def invalidate_policy_cache() -> None:
+    _pol_cache["at"] = 0.0
+
+
+def policy_value(key: str, default: Optional[float] = None) -> float:
+    """Effective numeric value for a policy key: DB row if present and valid,
+    else the caller's default, else the registered default."""
+    spec = _KNOWN_POLICIES.get(key) or {}
+    fallback = default if default is not None else (
+        spec["default"]() if spec.get("default") else 0.0)
+    raw = _policy_rows().get(key)
+    if raw is None:
+        return fallback
+    try:
+        v = float(raw)
+        if not (spec.get("min", v) <= v <= spec.get("max", v)):
+            return fallback
+        return int(v) if spec.get("int") else v
+    except (TypeError, ValueError):
+        return fallback
+
+
+def act_min() -> float:
+    return policy_value("gov.act_min")
+
+
+def propose_min() -> float:
+    return policy_value("gov.propose_min")
+
+
+def hitl_amount() -> float:
+    return policy_value("gov.hitl_amount")
+
+
+# ============================================================================
 # Policy
 # ============================================================================
 
 def decide(confidence: float) -> str:
-    """'act' | 'propose' | 'skip' from a confidence score."""
+    """'act' | 'propose' | 'skip' from a confidence score. Thresholds are the
+    LIVE policy values (governance_policies row overrides the env default)."""
     c = float(confidence or 0)
-    if c >= ACT_MIN:
+    if c >= act_min():
         return "act"
-    if c >= PROPOSE_MIN:
+    if c >= propose_min():
         return "propose"
     return "skip"
 
@@ -253,7 +349,8 @@ def _critic_line(critique: Optional[Dict[str, Any]]) -> str:
 
 
 # Internal/bookkeeping params not worth showing the approver.
-_HIDE_PARAMS = {"_revised", "plan_correlation_id", "plan_goal", "govern_bypass",
+_HIDE_PARAMS = {"_revised", "_correlation_id", "plan_correlation_id",
+                "plan_goal", "govern_bypass",
                 "confidence"}
 
 # Plain-language description of what each action DOES — shown when the params
@@ -742,10 +839,15 @@ def _set(approval_uuid: str, status: str, decided_by: Optional[str] = None,
 async def _execute(ap: Dict[str, Any]) -> Dict[str, Any]:
     """Run an approved action by re-dispatching it through A2A (gate bypassed)."""
     from app.core.a2a import A2ARequest, EntityRef, dispatch
+    params = ap.get("params") or {}
     req = A2ARequest(
-        intent=ap["action_type"], from_agent="governance", params=ap.get("params") or {},
+        intent=ap["action_type"], from_agent="governance", params=params,
         entity=EntityRef(ap["entity_type"], ap["entity_id"]) if ap.get("entity_type") else None,
-        confidence=1.0, govern_bypass=True)
+        confidence=1.0, govern_bypass=True,
+        # reuse the originating play's lineage so the approved execution lands
+        # in the same GET /trace/{cid} as the proposal that spawned it
+        correlation_id=(params.get("_correlation_id")
+                        or params.get("plan_correlation_id")))
     res = await dispatch(req)
     out = {"ok": res.ok, "output": res.output, "error": res.error}
     # Persist the structured result when it serializes — undo() needs it to
@@ -969,8 +1071,87 @@ router = APIRouter(tags=["governance"])
 
 @router.get("/governance/status")
 def governance_status():
-    return {"enabled": ENABLED, "act_min": ACT_MIN, "propose_min": PROPOSE_MIN,
+    return {"enabled": ENABLED, "act_min": act_min(), "propose_min": propose_min(),
+            "defaults": {"act_min": ACT_MIN, "propose_min": PROPOSE_MIN},
             "pending": len(pending())}
+
+
+# ── Policy-as-data endpoints (audit #4) ──────────────────────────────────────
+
+class _PolicyBody(BaseModel):
+    value: float
+    updated_by: Optional[str] = None
+
+
+@router.get("/governance/policies")
+def governance_policies():
+    """Every known policy: its effective value and where it comes from."""
+    rows = _policy_rows()
+    out = []
+    for key, spec in _KNOWN_POLICIES.items():
+        out.append({"key": key, "description": spec["description"],
+                    "effective": policy_value(key),
+                    "default": spec["default"](),
+                    "source": "db" if key in rows else "default",
+                    "bounds": [spec.get("min"), spec.get("max")]})
+    unknown = [k for k in rows if k not in _KNOWN_POLICIES]
+    return {"policies": out, **({"unknown_rows": unknown} if unknown else {})}
+
+
+@router.put("/governance/policies/{key}")
+def governance_policy_put(key: str, body: _PolicyBody):
+    spec = _KNOWN_POLICIES.get(key)
+    if not spec:
+        return {"ok": False, "error": f"unknown policy '{key}' — known: "
+                                      f"{sorted(_KNOWN_POLICIES)}"}
+    v = float(body.value)
+    if not (spec.get("min", v) <= v <= spec.get("max", v)):
+        return {"ok": False, "error": f"value {v} outside bounds "
+                                      f"[{spec.get('min')}, {spec.get('max')}]"}
+    if spec.get("int"):
+        v = int(v)
+    # the act/propose band must stay a band
+    if key == "gov.act_min" and v < propose_min():
+        return {"ok": False, "error": f"act_min {v} would fall below "
+                                      f"propose_min {propose_min()}"}
+    if key == "gov.propose_min" and v > act_min():
+        return {"ok": False, "error": f"propose_min {v} would exceed "
+                                      f"act_min {act_min()}"}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO governance_policies
+                     (policy_key, value, description, updated_by)
+                   VALUES (%s, %s::jsonb, %s, %s)
+                   ON CONFLICT (policy_key) DO UPDATE SET
+                     value=EXCLUDED.value, updated_by=EXCLUDED.updated_by,
+                     updated_at=now()""",
+                (key, json.dumps(v), spec["description"],
+                 body.updated_by or "admin"))
+        conn.commit()
+    finally:
+        conn.close()
+    invalidate_policy_cache()
+    logger.info(f"[governance] policy {key} → {v} (by {body.updated_by or 'admin'})")
+    return {"ok": True, "key": key, "effective": policy_value(key), "source": "db"}
+
+
+@router.delete("/governance/policies/{key}")
+def governance_policy_delete(key: str):
+    """Remove the override — the env/code default applies again."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM governance_policies WHERE policy_key=%s",
+                        (key,))
+            n = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    invalidate_policy_cache()
+    return {"ok": True, "removed": n, "key": key,
+            "effective": policy_value(key), "source": "default"}
 
 
 @router.get("/governance/queue")

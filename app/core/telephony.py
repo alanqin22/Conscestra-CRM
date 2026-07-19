@@ -241,6 +241,17 @@ def send_sms(to: str, body: str, *, lead_id=None, account_id=None,
     body = (body or "").strip()
     if not body:
         return {"ok": False, "error": "empty message body"}
+    # Outbound guard (guardrail 3) — transactional bodies (OTP codes) are
+    # code-built and screened too; the checks cost microseconds.
+    try:
+        from app.core.outbound_guard import screen
+        g = screen(body, "sms")
+        if not g["ok"]:
+            return {"ok": False, "blocked": True,
+                    "error": "blocked by outbound guard: "
+                             + "; ".join(g["violations"])}
+    except ImportError:
+        pass
     if not configured():
         return {"ok": False, "error": "Twilio not configured "
                                       "(TWILIO_ACCOUNT_SID/AUTH_TOKEN/FROM_NUMBER)"}

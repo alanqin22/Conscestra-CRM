@@ -447,6 +447,20 @@ def _run_bottleneck_pass() -> None:
         logger.error(f"[Learning] bottleneck pass failed: {exc}", exc_info=True)
 
 
+def _run_kb_hygiene_pass() -> None:
+    """Scheduled job (weekly, Monday morning): KB staleness scan — articles
+    past review_after or never used — ONE upserted Orchestrator notification.
+    Self-gates on KB_HYGIENE_ENABLED; report-only (retiring stays human)."""
+    try:
+        from app.core.knowledge import hygiene_pass
+        res = hygiene_pass()
+        if res.get("findings"):
+            logger.info(f"[Knowledge] hygiene: {len(res['findings'])} "
+                        f"finding(s) flagged")
+    except Exception as exc:
+        logger.error(f"[Knowledge] hygiene pass failed: {exc}", exc_info=True)
+
+
 def _run_scoring_train() -> None:
     """Scheduled job (weekly): predictive lead-scoring training — fit a
     candidate on settled leads and, when it beats the baseline, PROPOSE
@@ -739,6 +753,15 @@ async def lifespan(app: FastAPI):
             _run_bottleneck_pass,
             trigger=CronTrigger(day_of_week="mon", hour=8, minute=30),
             id="bottleneck_pass",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        # KB hygiene — weekly, Monday 08:45 ET (right after bottlenecks):
+        # flags stale/never-used articles into one Orchestrator notification.
+        scheduler.add_job(
+            _run_kb_hygiene_pass,
+            trigger=CronTrigger(day_of_week="mon", hour=8, minute=45),
+            id="kb_hygiene_pass",
             replace_existing=True,
             misfire_grace_time=3600,
         )
@@ -1098,6 +1121,22 @@ app.include_router(context_router, dependencies=_ADMIN)
 # -- Knowledge loop (resolved cases → governed KB articles → smarter replies)
 from app.core.knowledge import router as knowledge_router
 app.include_router(knowledge_router, dependencies=_ADMIN)
+
+# -- Semantic retrieval (embedding index over the KB; rag_block fuses FTS+meaning)
+from app.core.semantic import router as semantic_router
+app.include_router(semantic_router, dependencies=_ADMIN)
+
+# -- Correlation-id trace (one id → the whole play across a2a/events/approvals)
+from app.core.trace import router as trace_router
+app.include_router(trace_router, dependencies=_ADMIN)
+
+# -- Scenario simulation (read-only what-if over objectives math; audit #6)
+from app.core.simulator import router as simulator_router
+app.include_router(simulator_router, dependencies=_ADMIN)
+
+# -- Outbound guard (deterministic triage on every outgoing message)
+from app.core.outbound_guard import router as outbound_guard_router
+app.include_router(outbound_guard_router, dependencies=_ADMIN)
 
 # -- LLM meter (per-agent usage, budgets, tiering — the fleet's fuel gauge)
 from app.core.llm_meter import router as llm_meter_router

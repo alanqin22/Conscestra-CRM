@@ -67,6 +67,9 @@ _METRICS = [
     ("open_opps",         "Open opportunities",  "count", True,  7),
     ("won_7d",            "Won deals (7d)",      "usd",   True,  8),
     ("email_sentiment_7d","Email sentiment (7d)","score", True,  6),
+    ("csat_proxy_30d",    "Customer satisfaction (30d)","score", True, 7),
+    ("conv_neg_7d",       "Negative conversations (7d)","count", False, 6),
+    ("low_stock_count",   "Low-stock products",  "count", False, 6),
 ]
 _HIB = {k: hib for (k, _l, _u, hib, _i) in _METRICS}
 
@@ -89,6 +92,14 @@ def _metric_values(d: Dict[str, Any]) -> Dict[str, float]:
     # Only record sentiment once there's real inbound mail to score.
     if d.get("sentiment_7d") is not None:
         vals["email_sentiment_7d"] = float(d["sentiment_7d"])
+    # Cross-channel sentiment (interaction_memories) + inventory — only when
+    # there's data to stand on.
+    if d.get("csat_proxy") is not None:
+        vals["csat_proxy_30d"] = float(d["csat_proxy"])
+    if d.get("conv_n_7d"):
+        vals["conv_neg_7d"] = float(d.get("conv_neg_7d") or 0)
+    if d.get("low_stock") is not None:
+        vals["low_stock_count"] = float(d["low_stock"])
     return vals
 
 
@@ -203,6 +214,45 @@ def gather() -> Dict[str, Any]:
             sentiment_7d = float(_sent[0]) if _sent and _sent[0] is not None else None
             sentiment_n  = int(_sent[1]) if _sent else 0
 
+            # Cross-channel sentiment: every distilled conversation (voice,
+            # SMS, chat, email, whatsapp) carries a sentiment label in
+            # interaction_memories — the customer-health pulse.
+            try:
+                _x = _one(cur,
+                    "SELECT COUNT(*) FILTER (WHERE sentiment='negative'), "
+                    "       COUNT(*) FILTER (WHERE sentiment='positive'), "
+                    "       COUNT(*) FILTER (WHERE sentiment IS NOT NULL) "
+                    "FROM interaction_memories "
+                    "WHERE created_at >= now() - interval '7 days'")
+                conv_neg_7d, conv_pos_7d, conv_n_7d = (
+                    int(_x[0] or 0), int(_x[1] or 0), int(_x[2] or 0))
+                _c = _one(cur,
+                    "SELECT COUNT(*) FILTER (WHERE sentiment <> 'negative'), "
+                    "       COUNT(*) FROM interaction_memories "
+                    "WHERE sentiment IS NOT NULL "
+                    "AND created_at >= now() - interval '30 days'")
+                csat_proxy = (round(100.0 * _c[0] / _c[1], 1)
+                              if _c and _c[1] else None)
+            except Exception:
+                conv_neg_7d = conv_pos_7d = conv_n_7d = 0
+                csat_proxy = None
+
+            # Inventory risk: active products at/below the stock floor OR
+            # short of open-order demand (same rule as the supervisor's
+            # inventory_risk detector).
+            try:
+                _floor = int(os.getenv("SUPERVISOR_LOWSTOCK_FLOOR", "5"))
+                low_stock = int(_one(cur,
+                    "SELECT COUNT(*) FROM products p WHERE p.is_active "
+                    "AND (p.stock_quantity <= %s OR p.stock_quantity < "
+                    "COALESCE((SELECT SUM(oi.quantity)::int FROM order_items oi "
+                    "JOIN orders o ON o.order_id = oi.order_id "
+                    "WHERE oi.product_id = p.product_id "
+                    "AND lower(o.status) IN ('pending','processing')), 0))",
+                    (_floor,))[0] or 0)
+            except Exception:
+                low_stock = None
+
             won_amt = _one(cur,
                 "SELECT COALESCE(SUM(amount),0) FROM opportunities "
                 "WHERE status='closed_won' AND updated_at >= now() - interval '7 days'")[0]
@@ -276,6 +326,9 @@ def gather() -> Dict[str, Any]:
             "advocates": advocates, "won_amt": won_amt,
             "new_leads_7d": new_leads_7d, "overdue_acts": overdue_acts,
             "sentiment_7d": sentiment_7d, "sentiment_n": sentiment_n,
+            "conv_neg_7d": conv_neg_7d, "conv_pos_7d": conv_pos_7d,
+            "conv_n_7d": conv_n_7d, "csat_proxy": csat_proxy,
+            "low_stock": low_stock,
             "closing": closing, "biggest": biggest, "atrisk": atrisk, "big_inv": big_inv,
             "approvals": approvals, "perf": perf, "objectives": objectives,
         }
@@ -602,6 +655,29 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
         lis(d["big_inv"], lambda r: (f'Overdue invoice {r[0]} <span style="color:{MUTE}">({r[1]})</span> — '
             f'<b>{_money(r[2])}</b>, {r[3]}d overdue'
             + (f' <span style="color:{MUTE}">(large balance, 45d+)</span>' if float(r[2])>25000 and int(r[3])>=45 else '')))))
+
+    # Customer health & operations — the vision dashboard's CSAT + inventory
+    # lines, shown once there's data to stand on.
+    _health = []
+    if d.get("conv_n_7d"):
+        _health.append(("Customer sentiment (7d, all channels)",
+                        f'{d["conv_pos_7d"]} positive · {d["conv_neg_7d"]} negative '
+                        f'of {d["conv_n_7d"]} conversations'
+                        + _delta_html(deltas, "conv_neg_7d")))
+    if d.get("csat_proxy") is not None:
+        _health.append(("Customer satisfaction (30d proxy)",
+                        f'{d["csat_proxy"]:.0f}% non-negative interactions'
+                        + _delta_html(deltas, "csat_proxy_30d")))
+    if d.get("low_stock") is not None:
+        _lvl = ("Low" if d["low_stock"] == 0 else
+                "Elevated" if d["low_stock"] < 10 else "High")
+        _health.append(("Inventory risk",
+                        f'{_lvl} — {d["low_stock"]} product(s) at/below stock '
+                        f'floor or short of open-order demand'
+                        + _delta_html(deltas, "low_stock_count")))
+    if _health:
+        h.append(section("Customer Health &amp; Operations",
+                         lis(_health, lambda r: f'{r[0]}: <b>{r[1]}</b>')))
 
     if d.get("approvals"):
         h.append(section(

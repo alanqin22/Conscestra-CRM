@@ -18,6 +18,10 @@ CONFIG (env)
   SUPERVISOR_SLIPPED_MIN    10    slipped-deal count that trips a forecast alert
   SUPERVISOR_UNBILLED_MIN   3     unbilled-order count that trips a leakage alert
   SUPERVISOR_UNWORKED_MIN   25    unworked-lead count that trips a coverage alert
+  SUPERVISOR_LOWSTOCK_FLOOR 5     stock at/below this = a low-stock product
+  SUPERVISOR_LOWSTOCK_MIN   3     low-stock product count that trips inventory_risk
+  SUPERVISOR_SENT_MIN_N     5     min scored conversations (7d) before sentiment judges
+  SUPERVISOR_SENT_NEG_PCT   40    negative share (%) that trips sentiment_drop
 """
 
 from __future__ import annotations
@@ -55,6 +59,10 @@ AUTOACT = _flag("SUPERVISOR_AUTOACT")
 # of AUTOACT because its only "action" is queuing proposals a human approves —
 # so it can ship on well before AUTOACT. Off by default.
 PLANNER = _flag("SUPERVISOR_PLANNER")
+LOWSTOCK_FLOOR = _int("SUPERVISOR_LOWSTOCK_FLOOR", 5)
+LOWSTOCK_MIN   = _int("SUPERVISOR_LOWSTOCK_MIN", 3)
+SENT_MIN_N     = _int("SUPERVISOR_SENT_MIN_N", 5)
+SENT_NEG_PCT   = _int("SUPERVISOR_SENT_NEG_PCT", 40)
 AR_OVERDUE_MIN = _int("SUPERVISOR_AR_OVERDUE_MIN", 10)
 SLIPPED_MIN    = _int("SUPERVISOR_SLIPPED_MIN", 10)
 UNBILLED_MIN   = _int("SUPERVISOR_UNBILLED_MIN", 3)
@@ -125,6 +133,61 @@ def detect_unbilled_orders(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                        f"{n} shipped orders unbilled · {_money(u.get('value'))} revenue leakage",
                        "count", n, "accounting",
                        "Generate invoices for shipped-but-unbilled orders")
+    return None
+
+
+def detect_low_stock(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Inventory risk (2026-07-18): active products at/below the stock floor
+    OR short of open-order demand. Own query — the executive pack has no
+    inventory view; tolerates the tables being absent."""
+    try:
+        rows = execute_sp(
+            """SELECT count(*) AS n FROM products p WHERE p.is_active
+               AND (p.stock_quantity <= %(f)s OR p.stock_quantity <
+                    COALESCE((SELECT SUM(oi.quantity)::int FROM order_items oi
+                              JOIN orders o ON o.order_id = oi.order_id
+                              WHERE oi.product_id = p.product_id
+                              AND lower(o.status) IN ('pending','processing')), 0))""",
+            {"f": LOWSTOCK_FLOOR})
+        n = int(rows[0]["n"]) if rows else 0
+    except Exception as exc:
+        logger.debug(f"[supervisor] low-stock check skipped: {exc}")
+        return None
+    if n >= LOWSTOCK_MIN:
+        return _signal("inventory_risk",
+                       "high" if n >= LOWSTOCK_MIN * 3 else "medium",
+                       f"{n} product(s) at/below stock floor ({LOWSTOCK_FLOOR}) "
+                       f"or short of open-order demand",
+                       "low_stock", n, "products",
+                       "Review low-stock products and replenish before orders slip")
+    return None
+
+
+def detect_sentiment_drop(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Proactive revenue protection (2026-07-18): the share of NEGATIVE
+    conversations across ALL channels (interaction_memories sentiment labels)
+    over 7 days. Needs a minimum sample so one bad call can't trip it."""
+    try:
+        rows = execute_sp(
+            "SELECT count(*) FILTER (WHERE sentiment='negative') AS neg, "
+            "       count(*) AS n FROM interaction_memories "
+            "WHERE sentiment IS NOT NULL "
+            "AND created_at >= now() - interval '7 days'")
+        neg = int(rows[0]["neg"]) if rows else 0
+        n = int(rows[0]["n"]) if rows else 0
+    except Exception as exc:
+        logger.debug(f"[supervisor] sentiment check skipped: {exc}")
+        return None
+    if n >= SENT_MIN_N:
+        pct = round(100.0 * neg / n)
+        if pct >= SENT_NEG_PCT:
+            return _signal("sentiment_drop",
+                           "high" if pct >= SENT_NEG_PCT * 1.5 else "medium",
+                           f"{neg} of {n} conversations negative in 7d ({pct}%) "
+                           f"across all channels",
+                           "neg_pct", pct, "accounts",
+                           "Review the negative conversations; launch save "
+                           "plays for the accounts involved")
     return None
 
 
@@ -199,7 +262,7 @@ def detect_bus_stall(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 DETECTORS: List[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = [
     detect_ar_spike, detect_slipped_deals, detect_unbilled_orders, detect_unworked_leads,
-    detect_churn_risk, detect_bus_stall,
+    detect_churn_risk, detect_bus_stall, detect_low_stock, detect_sentiment_drop,
 ]
 
 
@@ -320,6 +383,13 @@ def _breach_goal(sig: Dict[str, Any]) -> Optional[str]:
         "churn_risk":
             f"Reduce churn ({headline}). Review the high-risk accounts and "
             f"launch save plays for the top-value ones.",
+        "inventory_risk":
+            f"Address inventory risk ({headline}). List the low-stock products "
+            f"and summarize what needs replenishing before open orders slip.",
+        "sentiment_drop":
+            f"Address declining customer sentiment ({headline}). Identify the "
+            f"accounts behind the recent negative conversations and propose "
+            f"save actions.",
     }.get(sig.get("rule"))
 
 

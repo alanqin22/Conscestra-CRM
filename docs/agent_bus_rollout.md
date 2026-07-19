@@ -18,6 +18,65 @@ Pre-flight (already verified): Railway has the base event bus
 > **Progress:** step 4 (SQL bundle steps 8–16) **applied on Railway
 > 2026-07-10** ✅. Remaining: token rotation (1), deploy/env (2–3), drain
 > (5), Twilio webhook repoint (6), HTML publish (7), smoke (8).
+> **See also the 2026-07-18 ADDENDUM below** — the migrations and flags
+> added since this list was written.
+
+---
+
+## 📦 CUTOVER ADDENDUM 2026-07-18 — everything added since the 07-10 bundle
+
+Run these **with** (or after) the original sequence. All SQL is idempotent —
+re-applying is harmless; skip anything already applied.
+
+**A. Migrations** (`psql "$RAILWAY_DB_URL" -f <file>`, in this order):
+
+| # | file | brings |
+|---|---|---|
+| 1 | `sql/customer_memory.sql` | One Customer Memory (interaction_memories) |
+| 2 | `sql/unified_comms_identity.sql` | identity resolution (channel_identities) |
+| 3 | `sql/unified_comms_conversations.sql` | cross-channel Conversation Object |
+| 4 | `sql/seed_kb_articles.sql` | 24 seed KB articles incl. the 2026-07-18 commerce-policy four (returns/shipping/cancel/damaged) |
+| 5 | `sql/session_memory.sql` | durable per-session chat memory |
+| 6 | `sql/registry_policies_trace.sql` | capability registry + governance policies + /trace spine |
+| 7 | `sql/kb_semantic.sql` | ⚠️ **ONLY after the volume resize** — embedding cache for hybrid retrieval |
+| 8 | `sql/kb_enrichment.sql` | KB audience tiers (public/internal) + category + review_after |
+| 9 | `sql/seed_kb_articles_round2.sql` | 29 articles: how-tos, troubleshooting, integrations, glossary, internal tier — **read the ⚠REVIEW note in its header first** (pricing wording) |
+| 10 | `sql/guardrails_acl.sql` | agent RBAC: allowed_callers column on capability_registry (apply with/after #6) |
+
+(`sql/kb_gaps.sql` was already applied on Railway 2026-07-16 ✅. Apply A8/A9
+after A4; retrieval degrades gracefully if A8 lags the deploy.)
+
+**B. Railway env vars** (mirrors the locally proven state):
+
+```
+# conductor — all code steps verified locally
+SUPERVISOR_PLANNER=1
+INTENT_PLAN_ROUTING=1
+INTENT_PLAN_MIN=0.70
+# unified comms (tables from A2–A3; flags default on and degrade without them)
+IDENTITY_ENABLED=1  CONVERSATIONS_ENABLED=1  CONV_CAPTURE_ENABLED=1
+# semantic retrieval — ONLY together with A7 (post-resize)
+SEMANTIC_ENABLED=1
+# AUTOACT in PROPOSE-MODE STAGING (2026-07-18, eval gate 10/10 green):
+# 0.75 sits in the propose band, so every auto-action QUEUES for approval.
+SUPERVISOR_AUTOACT=1
+SUPERVISOR_AUTOACT_CONF=0.75
+OBJECTIVES_AUTOACT=1
+```
+
+**C. Graduating AUTOACT** (after an observation window — a week of clean,
+sensible proposals in `/governance/queue`): **delete `SUPERVISOR_AUTOACT_CONF`**.
+The default 0.85 ≥ GOV_ACT_MIN 0.8 lets auto-actions execute directly (still
+event-audited, still materiality-checked). To go back, re-add the line. The
+same knob can also be tuned live post-cutover via
+`PUT /governance/policies/gov.act_min` — raising it above 0.85 re-enters
+propose mode without a restart.
+
+**D. Smoke additions** (alongside step 8's list): `GET /kb/semantic-status`
+(indexed>0), `GET /a2a/registry` (no unexpected disabled), `GET
+/governance/policies` (4 keys, source=default), `GET /trace-recent`,
+`GET /simulate?q=cut overdue invoices by 30%`, and in the orchestrator chat:
+`what if revenue grows 20%?` → a 🔮 read-only simulation.
 
 Everything from both improvement rounds is on `master` and locally proven.
 This list converts it into a running 24/7 system. Steps marked 🧑 are yours

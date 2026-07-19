@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -84,15 +85,46 @@ _STOPWORDS = {"the", "and", "for", "with", "your", "from", "this", "that",
 # RETRIEVAL — deterministic full-text search
 # ============================================================================
 
+_AUD_CACHE: Dict[str, Any] = {"at": 0.0, "has": False}
+
+
+def _has_audience() -> bool:
+    """Whether the audience/category/review_after migration (kb_enrichment.sql)
+    is applied — cached 5 min. False = filters are omitted and retrieval
+    behaves exactly as before the migration (graceful on Railway)."""
+    if time.time() - _AUD_CACHE["at"] < 300:
+        return _AUD_CACHE["has"]
+    has = False
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM information_schema.columns "
+                            "WHERE table_name='knowledge_articles' "
+                            "AND column_name='audience'")
+                has = cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    _AUD_CACHE.update(at=time.time(), has=has)
+    return has
+
+
 def search(query: str, limit: int = 3, min_rank: float = MIN_RANK,
-           any_terms: bool = False) -> List[Dict[str, Any]]:
+           any_terms: bool = False,
+           audience: Optional[str] = None) -> List[Dict[str, Any]]:
     """Ranked active articles for a query ([] on any failure).
 
     Default = AND semantics (plainto_tsquery — precise, used for API search
     and duplicate detection). any_terms=True = OR semantics over the query's
     salient words — what free-text emails need, where no article contains
     EVERY word of the message; the higher rank floor keeps single-word
-    coincidences out."""
+    coincidences out.
+
+    audience: 'public' restricts to customer-facing articles (what every
+    customer channel must pass); 'internal' = agent-only tier; None = all.
+    Ignored (all rows) until kb_enrichment.sql is applied."""
     q = (query or "").strip()
     if not q:
         return []
@@ -105,6 +137,11 @@ def search(query: str, limit: int = 3, min_rank: float = MIN_RANK,
         tsq_sql, tsq_arg = "to_tsquery('english', %s)", " | ".join(terms)
     else:
         tsq_sql, tsq_arg = "plainto_tsquery('english', %s)", q
+    aud_sql, args = "", [tsq_arg, tsq_arg]
+    if audience and _has_audience():
+        aud_sql = "AND audience=%s"
+        args.append(audience)
+    args.append(int(limit))
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -113,9 +150,9 @@ def search(query: str, limit: int = 3, min_rank: float = MIN_RANK,
                            ts_rank(search_tsv, {tsq_sql}) AS rank
                     FROM knowledge_articles
                     WHERE status='active'
-                      AND search_tsv @@ {tsq_sql}
+                      AND search_tsv @@ {tsq_sql} {aud_sql}
                     ORDER BY rank DESC LIMIT %s""",
-                (tsq_arg, tsq_arg, int(limit)))
+                tuple(args))
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
         return [r for r in rows if float(r["rank"]) >= min_rank]
@@ -163,10 +200,116 @@ def _matched_terms(terms: List[str], hit: Dict[str, Any]) -> int:
     return n
 
 
+def _semantic_hits(query: str, limit: int = 4,
+                   audience: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Articles the embedding index considers close, as full rows tagged with
+    'sim'. [] whenever semantic is off/unavailable — rag_block then behaves
+    exactly as the pure-FTS version did. The audience filter applies at the
+    row fetch, so an internal article can never surface through the vector
+    path either."""
+    try:
+        from app.core import semantic
+        sims = semantic.search(query, limit=limit)
+    except Exception as exc:
+        logger.debug(f"[knowledge] semantic skipped: {exc}")
+        return []
+    if not sims:
+        return []
+    by_uuid = {h["article_uuid"]: h["sim"] for h in sims}
+    aud_sql, args = "", [list(by_uuid)]
+    if audience and _has_audience():
+        aud_sql = "AND audience=%s"
+        args.append(audience)
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT article_uuid::text, title, problem, answer, keywords
+                   FROM knowledge_articles
+                   WHERE status='active' AND article_uuid = ANY(%s::uuid[])
+                   {aud_sql}""",
+                tuple(args))
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        for r in rows:
+            r["sim"] = by_uuid[r["article_uuid"]]
+        return sorted(rows, key=lambda r: r["sim"], reverse=True)
+    except Exception as exc:
+        logger.debug(f"[knowledge] semantic fetch skipped: {exc}")
+        return []
+    finally:
+        conn.close()
+
+
+def _fuse(fts: List[Dict[str, Any]], sem: List[Dict[str, Any]],
+          top: int = 2, k: int = 60) -> List[Dict[str, Any]]:
+    """Reciprocal-rank fusion of the two ranked lists. An article on BOTH
+    lists sums both scores, so keyword+meaning agreement outranks either
+    signal alone; k=60 is the standard damping constant."""
+    scores: Dict[str, float] = {}
+    rows: Dict[str, Dict[str, Any]] = {}
+    for ranked in (fts, sem):
+        for i, h in enumerate(ranked):
+            u = h["article_uuid"]
+            scores[u] = scores.get(u, 0.0) + 1.0 / (k + i + 1)
+            rows.setdefault(u, h)
+    order = sorted(scores, key=lambda u: scores[u], reverse=True)
+    return [rows[u] for u in order[:top]]
+
+
+def retrieve(subject: str, body: str, audience: Optional[str] = "public",
+             top: int = 2) -> List[Dict[str, Any]]:
+    """Hybrid retrieval core (FTS term-precision + embedding similarity,
+    rank-fused) — pure and side-effect free, so the evals can measure it.
+    Default audience='public': the tier every customer channel must pass;
+    audience=None lets internal callers see the agent-only tier too."""
+    query = f"{subject or ''} {str(body or '')[:200]}"
+    terms = _salient_terms(query)
+    need = 1 if len(terms) <= 2 else RAG_MIN_TERMS
+    fts = [h for h in search(query, limit=4, min_rank=RAG_MIN_RANK,
+                             any_terms=True, audience=audience)
+           if _matched_terms(terms, h) >= need]
+    # Precision order: how many of the ASKER's terms an article matches beats
+    # raw ts_rank (which rewards repeated generic words like 'call'/'text').
+    fts = sorted(fts, key=lambda h: (_matched_terms(terms, h),
+                                     float(h["rank"])), reverse=True)
+    return _fuse(fts, _semantic_hits(query, audience=audience), top=top)
+
+
+REWRITE_ENABLED = _flag("KB_REWRITE_ENABLED", "1")
+
+
+def _rewrite_query(text: str) -> Optional[str]:
+    """Corrective query rewrite — ONLY fires after a retrieval MISS on a real
+    customer channel, so it costs nothing on hits. A lite LLM condenses the
+    noisy message ('uh yeah so I was wondering about…') to its core question;
+    None on any failure (the miss then just logs a gap as before)."""
+    if not REWRITE_ENABLED:
+        return None
+    try:
+        from app.core.graph_utils import _get_llm
+        resp = _get_llm(tier="lite", caller="kb_rewrite").invoke([
+            {"role": "system", "content":
+                "Rewrite the customer's message as a short knowledge-base "
+                "search query capturing its core question — at most 10 plain "
+                "words, no punctuation. Reply with ONLY the query."},
+            {"role": "user", "content": text[:400]}])
+        q = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+        return q[:120] if q and len(q.split()) <= 14 else None
+    except Exception as exc:
+        logger.debug(f"[knowledge] query rewrite skipped: {exc}")
+        return None
+
+
 def rag_block(subject: str, body: str,
-              gap_channel: Optional[str] = None) -> str:
+              gap_channel: Optional[str] = None,
+              audience: Optional[str] = "public") -> str:
     """Prompt block with the best-matching approved answers ('' when none or
-    the kill switch is off). Counts the retrieval as a use.
+    the kill switch is off). Counts the retrieval as a use. HYBRID retrieval:
+    FTS term-precision + embedding similarity (semantic.py), rank-fused — a
+    caller's wording no longer has to share words with the article. On a miss
+    from a real channel, ONE corrective query rewrite retries before the gap
+    is logged.
 
     Pass a REAL subject only (email). Fixed channel labels ('support call',
     'sms inquiry') must be '' — their words pollute term matching, letting a
@@ -177,16 +320,11 @@ def rag_block(subject: str, body: str,
     the nightly gap_pass turns into governed article proposals."""
     if not RAG_ENABLED:
         return ""
-    query = f"{subject or ''} {str(body or '')[:200]}"
-    terms = _salient_terms(query)
-    need = 1 if len(terms) <= 2 else RAG_MIN_TERMS
-    hits = [h for h in search(query, limit=4, min_rank=RAG_MIN_RANK,
-                              any_terms=True)
-            if _matched_terms(terms, h) >= need]
-    # Precision order: how many of the ASKER's terms an article matches beats
-    # raw ts_rank (which rewards repeated generic words like 'call'/'text').
-    hits = sorted(hits, key=lambda h: (_matched_terms(terms, h),
-                                       float(h["rank"])), reverse=True)[:2]
+    hits = retrieve(subject, body, audience=audience)
+    if not hits and gap_channel:
+        rq = _rewrite_query(f"{subject or ''} {body or ''}".strip())
+        if rq:
+            hits = retrieve("", rq, audience=audience)
     if not hits:
         if gap_channel:
             log_gap(gap_channel, body)
@@ -674,7 +812,118 @@ async def gap_pass(force: bool = False) -> Dict[str, Any]:
 # Admin endpoints
 # ============================================================================
 
+# ============================================================================
+# HYGIENE — weekly staleness pass ("flags outdated content")
+# ============================================================================
+
+HYGIENE_ENABLED = _flag("KB_HYGIENE_ENABLED", "1")
+_ORCH_AGENT = "00000000-0000-0000-0000-000000000012"   # Orchestrator Agent
+UNUSED_DAYS = 90
+
+
+def hygiene_pass(force: bool = False) -> Dict[str, Any]:
+    """Weekly: find articles past review_after or never earning their keep
+    (90+ days old, unused), and upsert ONE consolidated Orchestrator
+    notification (the bottleneck-pass pattern — a heartbeat, never a pile).
+    Report-only: retiring stays a human decision via /knowledge/{id}/retire."""
+    if not HYGIENE_ENABLED and not force:
+        return {"enabled": False, "skipped": True}
+    findings: List[Dict[str, Any]] = []
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                if _has_audience():
+                    cur.execute(
+                        """SELECT title, source_ref FROM knowledge_articles
+                           WHERE status='active' AND review_after < CURRENT_DATE
+                           ORDER BY review_after LIMIT 10""")
+                    due = cur.fetchall()
+                    if due:
+                        findings.append({"kind": "review_due", "count": len(due),
+                                         "note": "article(s) past their review "
+                                                 "date",
+                                         "worst": [r[0] for r in due[:3]]})
+                cur.execute(
+                    """SELECT title, source_ref FROM knowledge_articles
+                       WHERE status='active'
+                         AND created_at < now() - interval '%s days'
+                         AND uses = 0
+                       ORDER BY created_at LIMIT 10""" % UNUSED_DAYS)
+                unused = cur.fetchall()
+                if unused:
+                    findings.append({"kind": "never_used", "count": len(unused),
+                                     "note": f"article(s) {UNUSED_DAYS}+ days "
+                                             "old that no customer question "
+                                             "ever matched",
+                                     "worst": [r[0] for r in unused[:3]]})
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(f"[knowledge] hygiene scan skipped: {exc}")
+        return {"ok": False, "error": str(exc)[:200]}
+
+    if not findings:
+        logger.info("[knowledge] hygiene pass: all fresh")
+        return {"ok": True, "findings": [], "notified": False}
+
+    title = f"📚 KB hygiene: {sum(f['count'] for f in findings)} article(s) need review"
+    lines = [f"• {f['count']} {f['note']} — e.g. "
+             + "; ".join(f["worst"]) for f in findings]
+    bodytext = ("Weekly knowledge-base staleness scan:\n" + "\n".join(lines)
+                + "\n\nReview: GET /knowledge/list · retire via "
+                  "POST /knowledge/{id}/retire · refresh by editing + "
+                  "re-publishing")
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT notification_uuid FROM notifications
+                   WHERE employee_uuid=%s::uuid
+                     AND title LIKE '📚 KB hygiene%%'
+                     AND status = ANY(%s) LIMIT 1""",
+                (_ORCH_AGENT, ["pending", "sent", "unread"]))
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    "UPDATE notifications SET title=%s, body=%s, created_at=now() "
+                    "WHERE notification_uuid=%s", (title, bodytext, row[0]))
+            else:
+                # notifications is a VIEW — anchor with an event first, and
+                # mark the row a digest so the trigger keeps our title/body
+                # (same contract as learning.bottleneck_pass).
+                cur.execute(
+                    "SELECT emit_event(%s,%s,%s,%s,%s,%s)",
+                    ("bottleneck.detected", "agent", _ORCH_AGENT,
+                     json.dumps({"context": {"areas": ["kb_stale"]}}),
+                     None, "knowledge"))
+                event_uuid = cur.fetchone()[0]
+                cur.execute(
+                    """INSERT INTO notifications
+                         (employee_uuid, event_uuid, channel, status, title,
+                          body, metadata, created_at)
+                       VALUES (%s::uuid, %s, 'in_app', 'pending', %s, %s,
+                               %s::jsonb, now())""",
+                    (_ORCH_AGENT, event_uuid, title, bodytext,
+                     json.dumps({"kind": "kb_hygiene_digest",
+                                 "areas": [f["kind"] for f in findings]})))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning(f"[knowledge] hygiene notification skipped: {exc}")
+        return {"ok": True, "findings": findings, "notified": False}
+    logger.info(f"[knowledge] hygiene pass: {len(findings)} finding(s) "
+                "→ notification upserted")
+    return {"ok": True, "findings": findings, "notified": True}
+
+
 router = APIRouter(tags=["knowledge"])
+
+
+@router.post("/knowledge/hygiene")
+def knowledge_hygiene():
+    """Run the staleness scan now (weekly job runs it automatically)."""
+    return hygiene_pass(force=True)
 
 
 @router.get("/knowledge/list")

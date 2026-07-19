@@ -210,9 +210,14 @@ def _emit_call_received(from_number: str, call_sid: str) -> None:
 
 
 def _close_call(sess: Dict[str, Any], reason: str) -> None:
-    """Log the whole conversation as one inbound voice activity (audit trail)
-    and, for an identified customer, distill it into the unified customer
-    memory (background — the goodbye never waits on an LLM)."""
+    """Log the whole conversation as one inbound voice activity (audit trail),
+    thread it into the unified Conversation Object, and, for an identified
+    customer, distill it into the unified customer memory (background — the
+    goodbye never waits on an LLM). Idempotent: a goodbye and the carrier's
+    later stop event both land here, only the first closes."""
+    if sess.get("_closed"):
+        return
+    sess["_closed"] = True
     lines = [f"{who}: {text}" for who, text in sess.get("transcript") or []]
     if not lines:
         return
@@ -220,6 +225,17 @@ def _close_call(sess: Dict[str, Any], reason: str) -> None:
         f"Support call from {sess.get('display') or sess.get('from') or '?'}",
         f"Tier: {sess['tier']} · {reason}\n\n" + "\n".join(lines),
         account_id=sess.get("account_id"), owner_id=sess.get("owner_id"))
+    # Unified Conversation Object: the whole call threads as ONE voice message
+    # keyed by the caller's number, so their follow-up SMS or email continues
+    # the same conversation. Best-effort, like every capture_*.
+    try:
+        from app.core import channel_adapters
+        channel_adapters.capture_voice(
+            sess.get("from") or f"session:{sess.get('call_sid') or id(sess)}",
+            "\n".join(lines), "inbound", sess.get("call_sid"),
+            {"tier": sess.get("tier"), "reason": reason})
+    except Exception as exc:
+        logger.debug(f"[voice] conversation capture skipped: {exc}")
     # Memory only for a VERIFIED caller — an identified-but-unverified match
     # must not write memory a spoofed caller ID could later pollute.
     if sess["tier"] == "customer" and sess.get("account_id"):
