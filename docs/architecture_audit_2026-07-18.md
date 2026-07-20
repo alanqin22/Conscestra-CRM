@@ -374,6 +374,9 @@ quality demands it.
 
 1. ⚫ **Execute the Railway cutover** (operator task; runbook in
    `agent_bus_rollout.md` ADDENDUM). Dwarfs everything else.
+   **← EXECUTED 2026-07-19** — see the EXECUTED note atop the addendum:
+   build current, migrations all applied, semantic index 56/56, backlog
+   drained 58/58, full smoke green. Production now runs the orchestra.
 2. 🟡 **Graduate AUTOACT** after a clean observation window of proposals
    (delete `SUPERVISOR_AUTOACT_CONF`).
 3. 🟡 **Anon→resolved conversation merge** — the one known Unified Comms

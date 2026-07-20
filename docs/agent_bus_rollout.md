@@ -23,6 +23,25 @@ Pre-flight (already verified): Railway has the base event bus
 
 ---
 
+> **✅ EXECUTED 2026-07-19 (remote session):** pg_dump backup taken
+> (`backups/railway_pre_cutover_2026-07-19.dump`, PG18 client via pgAdmin
+> runtime — local psql/pg_dump 17 can't dump the PG 18.4 server). Findings:
+> the master push auto-deployed, so the running build is CURRENT (verified by
+> new endpoints incl. same-day `urgent_calls` stat); **all 10 migrations A1–A10
+> were already applied** (56 active KB articles — note status values are
+> lowercase `active`); `SEMANTIC_ENABLED` already on → ran
+> `/kb/semantic-reindex` ×3 until **indexed=56, pending=0**; drained the
+> event_queue backlog **58/58 ok** (all `opportunity.stage_changed`, queue now
+> all-completed); smoke: 42 A2A capabilities, registry no disabled, policies 4
+> keys default, trace-recent live, simulator live (122 overdue invoices),
+> semantic vocabulary-miss hit @0.44, sdr/telephony(telnyx autosend)/objectives/
+> scoring/outbound-guard all green, webchat turn KB-grounded AND threaded into
+> ONE conversation on prod. Remaining 🧑: confirm `SUPERVISOR_AUTOACT_CONF=0.75`
+> + `INTENT_PLAN_ROUTING=1` + `OBJECTIVES_AUTOACT=1` in Railway env (not
+> introspectable via API), review 3 pending `/governance/queue` approvals,
+> token rotation, publish HTML. `VOICE_STREAM_ENABLED` stays OFF on Railway
+> (known live-call breakage) — the voice urgency proxy is dormant until then.
+
 ## 📦 CUTOVER ADDENDUM 2026-07-18 — everything added since the 07-10 bundle
 
 Run these **with** (or after) the original sequence. All SQL is idempotent —
