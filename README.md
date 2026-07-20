@@ -1046,3 +1046,17 @@ All 15 modules pull from `app/core/` rather than duplicating boilerplate.
 
 Domain-specific code (prompt, pre_router, sql_builder, formatter, graph
 nodes) remains **completely isolated** inside each agent's sub-package.
+
+---
+
+## Contact
+
+**Conscestra CRM — [AgentOrc.ca](https://agentorc.ca)** — Canadian AI orchestration platform.
+
+- 📞 289 800-4112 — Toronto Office
+- 📞 604 296-9885 — Vancouver Office
+- 📞 650 912-1699 — San Francisco Office
+- 📞 332 456-4869 — New York Office
+- 📞 416 889-6638 — Headquarters
+- ✉️ info@agentorc.ca
+- 📍 61 Kincaid Lane, Markham L3S 0B9, ON
