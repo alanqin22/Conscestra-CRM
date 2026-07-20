@@ -319,3 +319,110 @@ support call from the same number landed in **one** conversation.
 Known limit (deferred): a webchat thread splits when the typed email first
 appears (anonymous session key → email key) — the general anon→resolved
 conversation merge is the fix, tracked in the Unified Comms backlog.
+_(Closed 2026-07-19 — see the re-audit section below.)_
+
+---
+
+## Re-audit 2026-07-19 — updated "Ideal AI-Driven Autonomous CRM" reference
+
+_A refreshed reference description (14 pillars restated + AEA framing:
+semantic/context layer, agent registry & lifecycle, guided determinism,
+event-driven fabric, hybrid multi-agent patterns, standard protocols) was
+audited against the codebase. Claims from the 2026-07-18 audit were re-verified
+in code (`semantic.py` hybrid search, `transports.py` adapters,
+`voice_stream.py` barge-in, the 4 guardrail layers) rather than trusted._
+
+**TL;DR: ~92% of the updated vision is implemented and locally verified.**
+The updated description validates the direction rather than exposing new
+architectural work; the distance to "ideal" remains operational (the Railway
+cutover), not architectural.
+
+### Scorecard movement since 2026-07-18
+
+| # | Pillar | 07-18 | 07-19 | What moved |
+|---|---|---|---|---|
+| 2 | Unified comms | 🟠 70% | ✅ 85% | voice + webchat capture wired; all channels thread into ONE Conversation Object |
+| 7 | Knowledge & retrieval | 🟠 60% | ✅ 85% | hybrid semantic+FTS with RRF fusion (`semantic.py`) |
+| 9 | Security & governance | ✅ | ✅ **exceeds** | 4-layer guardrail model complete; structured-write governance bypass closed |
+| 11 | Multi-layer memory | 🟠 75% | ✅ 95% | durable session memory (DB write-through) |
+| 13 | Executive intelligence | ✅ 85% | ✅ 95% | what-if simulator (`simulator.py`) closes the scenario-simulation ask |
+
+All other pillars unchanged (see the 07-18 scorecard above).
+
+### True deltas the *updated* description introduces
+
+1. **Channel breadth** — WhatsApp/Slack/Teams transports exist but are
+   credential-gated (no live tenant); WeChat, MMS, social channels, and a
+   self-service portal do not exist. Webchat/voice/SMS/email/API-MCP fully live.
+2. **Multimodal voice understanding** — tone/emotion/urgency from the *audio*
+   itself. Sentiment is inferred from transcripts only; nothing reads prosody.
+   Barge-in/interruptibility is done.
+3. **Graph search** — retrieval is hybrid (semantic + keyword) but has no
+   knowledge-graph/ontology layer and no SharePoint/Drive/Notion connectors
+   (`kb_ingest` covers PDF/doc/URL/email attachments).
+4. **Standard inter-agent protocols** — internal A2A envelopes + MCP server
+   exist; the external Google-A2A / agent-mesh protocols are not implemented.
+   Low urgency until there is an external agent to talk to.
+
+Named-agent gaps (Procurement, Logistics, Project, Document, dedicated
+Forecasting/Collections) are **packaging, not capability** — dunning, inventory
+risk, churn scoring, and document ingestion all exist inside the
+supervisor/planner/KB layers. Split into dedicated agents only if routing
+quality demands it.
+
+### Ranked recommendations (2026-07-19)
+
+1. ⚫ **Execute the Railway cutover** (operator task; runbook in
+   `agent_bus_rollout.md` ADDENDUM). Dwarfs everything else.
+2. 🟡 **Graduate AUTOACT** after a clean observation window of proposals
+   (delete `SUPERVISOR_AUTOACT_CONF`).
+3. 🟡 **Anon→resolved conversation merge** — the one known Unified Comms
+   defect. **← DONE same day, see below.**
+4. 🟢 **Voice urgency/emotion proxy** — cheap prosody proxy (interruption
+   rate, speech rate) feeding the existing sentiment blackboard signal.
+   **← DONE same day, see below.**
+5. 🟢 WeChat/MMS/portal — only on demand; the `transports.py` adapter pattern
+   makes each a small additive job.
+6. ⚪ Defer: knowledge graph, external A2A protocol, dedicated ops agents —
+   revisit at larger KB/agent scale.
+
+### Appendix — items 3 & 4 implementation (2026-07-19)
+
+**Anon→resolved conversation merge** (`conversations.py`,
+`channel_adapters.py` — no migration; `status='merged'` needs no schema
+change):
+
+- `InboundMessage.prior_handle` — an adapter that KNOWS the sender previously
+  threaded anonymously under a different handle passes it; `ingest` then folds
+  that open anon conversation into the current one (`_merge_anon`): messages
+  move (keeping their original handle for audit), counts and `created_at`
+  roll up, the emptied shell becomes `status='merged'` (excluded from the
+  partial open indexes). Only `party_id IS NULL` shells are eligible — a
+  resolved person's thread is never absorbed.
+- `capture_webchat` supplies `prior_handle=session:<sid>` once the visitor's
+  email appears — the exact split scenario from the 07-18 known limit.
+- Verified live: 2 anon webchat turns + an email turn → ONE conversation with
+  all 3 messages, shell marked merged with 0 messages left; the follow-up turn
+  threads in with no re-merge; `channel_selector._learned_preference`
+  unaffected (merged shells have no party_id).
+
+**Voice urgency proxy** (`voice_stream.py` — media-stream transport only,
+where the raw audio is available; no migration):
+
+- Deterministic prosody stand-ins, zero audio-ML: per-call barge-in count
+  (the caller talking over the assistant) and sustained speech rate
+  (transcribed words ÷ PCM speech duration). Thresholds env-tunable:
+  `VOICE_URGENCY_BARGE_MIN` (2), `VOICE_URGENCY_WPM` (185),
+  `VOICE_URGENCY_MIN_WORDS` (12, gates the wpm check so one short
+  exclamation can't trip it).
+- At call end an urgent call posts a `voice_urgency` blackboard signal
+  (severity medium, 7-day TTL) on the RESOLVED caller — the same channel as
+  `negative_sentiment`, so the AI 360 summary and supervisor detectors pick
+  it up with zero extra wiring. Anonymous callers are skipped (no entity).
+  `urgent_calls` counter in `/voice-stream/status`.
+- Verified: threshold matrix (barge/wpm/calm/short-blip) + a live
+  `_post_urgency` against a resolved contact landed on `agent_blackboard`
+  and was cleaned up.
+
+Pillar 3 (voice) moves ~90% → ~95%: true tone-of-voice ML remains the only
+delta, and the reference's *behavioral* urgency ask is now covered.

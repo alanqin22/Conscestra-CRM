@@ -56,7 +56,8 @@ def _email_addr(sender: str) -> str:
 
 def capture(channel: str, handle: str, body: str, direction: str = "inbound",
             external_ref: Optional[str] = None,
-            metadata: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+            metadata: Optional[Dict[str, Any]] = None,
+            prior_handle: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Normalize + thread one message. Best-effort — returns the ingest result,
     or None when disabled or on any failure (never raises)."""
     if not ENABLED:
@@ -66,7 +67,7 @@ def capture(channel: str, handle: str, body: str, direction: str = "inbound",
         return ingest(InboundMessage(
             channel=channel, handle=handle or "", body=body or "",
             direction=direction, external_ref=external_ref,
-            metadata=metadata or {}))
+            metadata=metadata or {}, prior_handle=prior_handle))
     except Exception as exc:
         logger.debug(f"[adapter] capture {channel} failed (non-fatal): {exc}")
         return None
@@ -91,8 +92,12 @@ def capture_webchat(handle: Optional[str], body: str,
                     session_id: Optional[str] = None,
                     direction: str = "inbound") -> Optional[Dict[str, Any]]:
     # A typed email identifies the visitor; otherwise thread by the session id.
+    # Once the email appears, the session key rides along as prior_handle so
+    # the visitor's anonymous thread merges into their identified one.
     h = handle or (f"session:{session_id}" if session_id else "")
-    return capture("webchat", h, body, direction, external_ref=session_id)
+    prior = f"session:{session_id}" if (handle and session_id) else None
+    return capture("webchat", h, body, direction, external_ref=session_id,
+                   prior_handle=prior)
 
 
 def capture_voice(caller_e164: str, body: str, direction: str = "inbound",

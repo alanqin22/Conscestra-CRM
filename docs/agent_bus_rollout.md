@@ -64,6 +64,16 @@ SUPERVISOR_AUTOACT_CONF=0.75
 OBJECTIVES_AUTOACT=1
 ```
 
+**Everything else new needs NO Railway env var** — these default ON in code
+and degrade gracefully when their table is missing: durable session memory
+(`SESSION_MEMORY_DB`), KB hygiene (`KB_HYGIENE_ENABLED`), query rewrite
+(`KB_REWRITE_ENABLED`), attachment ingestion (`KB_ATTACH_INGEST`), outbound
+guard (`OUTBOUND_GUARD_ENABLED`), simulator (`SIMULATE_ENABLED`).
+Guardrail numbers (`GOV_HITL_AMOUNT` $1000, `BRAND_MAX_DISCOUNT_PCT` 15) and
+the new supervisor thresholds (`SUPERVISOR_LOWSTOCK_FLOOR/MIN`,
+`SUPERVISOR_SENT_MIN_N/NEG_PCT`) have sensible defaults and are all
+overridable LIVE via `PUT /governance/policies` or env if you prefer.
+
 **C. Graduating AUTOACT** (after an observation window — a week of clean,
 sensible proposals in `/governance/queue`): **delete `SUPERVISOR_AUTOACT_CONF`**.
 The default 0.85 ≥ GOV_ACT_MIN 0.8 lets auto-actions execute directly (still

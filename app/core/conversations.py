@@ -16,6 +16,11 @@ HOW THREADING WORKS
      themselves until identified.
   3. Append the message (tagged with the channel it arrived on) and roll the
      conversation's `channel` forward to wherever the person now is.
+  4. If the adapter knows the sender previously threaded ANONYMOUSLY under a
+     different handle (InboundMessage.prior_handle — e.g. a webchat visitor
+     keyed by browser session until they typed their email), that open anon
+     conversation is MERGED into the current one: messages move, the empty
+     shell becomes status='merged'.
 
 EXTERNAL (customer↔business) and INTERNAL (employee↔intelligence) conversations
 are separated by `scope`; the Orchestrator decides what may cross the boundary.
@@ -65,6 +70,9 @@ class InboundMessage:
     direction: str = "inbound"               # inbound | outbound
     external_ref: Optional[str] = None       # channel-native message/thread id
     metadata: Dict[str, Any] = field(default_factory=dict)
+    prior_handle: Optional[str] = None       # handle this SAME sender used on this
+                                             # channel while anonymous — triggers the
+                                             # anon→resolved conversation merge
 
 
 # ============================================================================
@@ -90,6 +98,44 @@ def _find_open(cur, scope: str, party_id: Optional[str], anon_key: Optional[str]
             (scope, anon_key, WINDOW_HOURS))
     r = cur.fetchone()
     return r[0] if r else None
+
+
+def _merge_anon(cur, scope: str, chan: str, prior_handle: str,
+                target_id: str) -> List[str]:
+    """Fold the sender's earlier ANONYMOUS conversation(s) into their current
+    one — the anon→resolved merge. Called when an adapter knows the same person
+    previously threaded under a different handle (e.g. a webchat visitor keyed
+    by browser session until they typed their email). Only party_id IS NULL
+    rows are eligible: a resolved person's thread is never absorbed. Moved
+    messages keep their original handle for audit; the emptied conversation is
+    marked status='merged' (excluded from the partial open indexes)."""
+    key = f"{chan}:{identity._normalize_handle(chan, prior_handle)}"
+    cur.execute(
+        """SELECT conversation_id::text FROM conversations
+           WHERE status='open' AND scope=%s AND anon_key=%s
+             AND party_id IS NULL AND conversation_id<>%s::uuid""",
+        (scope, key, target_id))
+    merged: List[str] = []
+    moved = 0
+    for (cid,) in cur.fetchall():
+        cur.execute(
+            """UPDATE conversation_messages SET conversation_id=%s::uuid
+               WHERE conversation_id=%s::uuid""", (target_id, cid))
+        moved += cur.rowcount
+        cur.execute(
+            """UPDATE conversations SET status='merged', updated_at=now()
+               WHERE conversation_id=%s::uuid""", (cid,))
+        merged.append(cid)
+    if merged:
+        cur.execute(
+            """UPDATE conversations c SET
+                 message_count=message_count+%s,
+                 created_at=LEAST(c.created_at,
+                   (SELECT COALESCE(MIN(created_at), c.created_at)
+                    FROM conversation_messages
+                    WHERE conversation_id=c.conversation_id))
+               WHERE conversation_id=%s::uuid""", (moved, target_id))
+    return merged
 
 
 def ingest(msg: InboundMessage) -> Dict[str, Any]:
@@ -136,6 +182,11 @@ def ingest(msg: InboundMessage) -> Dict[str, Any]:
                        WHERE conversation_id=%s::uuid""",
                     (chan, party_type, party_id, account_id, party_id, conv_id))
 
+            merged_from: List[str] = []
+            if msg.prior_handle:
+                merged_from = _merge_anon(cur, scope, chan, msg.prior_handle,
+                                          conv_id)
+
             cur.execute(
                 """INSERT INTO conversation_messages
                      (conversation_id, channel, direction, author, handle, body,
@@ -159,12 +210,17 @@ def ingest(msg: InboundMessage) -> Dict[str, Any]:
         conn.close()
 
     logger.info(f"[conversations] {chan} msg → conv {conv_id[:8]} "
-                f"({'new' if is_new else 'continued'}, party={party_type or 'anon'})")
-    return {"ok": True, "conversation_id": conv_id, "message_id": mid,
-            "is_new_conversation": is_new, "scope": scope,
-            "resolved": ident.resolved, "party_type": party_type,
-            "party_id": party_id, "account_id": account_id,
-            "verified": ident.verified, "display_name": ident.display_name}
+                f"({'new' if is_new else 'continued'}, party={party_type or 'anon'}"
+                + (f", merged {len(merged_from)} anon thread(s)" if merged_from else "")
+                + ")")
+    out = {"ok": True, "conversation_id": conv_id, "message_id": mid,
+           "is_new_conversation": is_new, "scope": scope,
+           "resolved": ident.resolved, "party_type": party_type,
+           "party_id": party_id, "account_id": account_id,
+           "verified": ident.verified, "display_name": ident.display_name}
+    if merged_from:
+        out["merged_from"] = merged_from
+    return out
 
 
 def append_outbound(conversation_id: str, channel: str, body: str,
@@ -318,7 +374,8 @@ def conversations_ingest(body: Dict[str, Any]):
     return ingest(InboundMessage(
         channel=str(b.get("channel") or ""), handle=str(b.get("handle") or ""),
         body=str(b.get("body") or ""), direction=str(b.get("direction") or "inbound"),
-        external_ref=b.get("external_ref"), metadata=b.get("metadata") or {}))
+        external_ref=b.get("external_ref"), metadata=b.get("metadata") or {},
+        prior_handle=b.get("prior_handle")))
 
 
 @router.get("/conversations/{conversation_id}")

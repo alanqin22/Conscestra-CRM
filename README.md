@@ -361,6 +361,13 @@ caller finishes a sentence, replies are synthesized in a natural voice, and
 the caller can **interrupt the agent mid-sentence** and be heard. Same
 brain, same tiers, same audit trail — just a conversation.
 
+The line also **senses how a call felt**, not just what was said: a caller
+who repeatedly talks over the agent or speaks fast and long reads as urgent,
+and that urgency lands on the customer's profile as a signal every other
+agent — the 360 summary, the standing supervisor — sees automatically. No
+audio ever leaves the call; the measures are behavioral, deterministic, and
+tunable.
+
 **Every call is a conversation with the whole CRM, on exactly the terms
 each caller has earned.**
 
@@ -411,6 +418,12 @@ conversation as one transcript, SDR voice calls and web chats thread turn by
 turn, and a caller's follow-up text lands in the same conversation as this
 morning's call. The per-session working memory is durable too — a server
 restart no longer costs an agent its place in the dialogue.
+
+Anonymity is temporary as well: a website visitor who chats first and shares
+their email three messages in doesn't leave an orphaned thread behind — the
+moment identity appears, the **anonymous conversation folds into their
+identified one**, history intact, so the relationship record begins at
+"hello", not at the email address.
 
 **Start on WhatsApp at 9am, continue by phone at 10, receive a proposal by email
 that afternoon — one person, one conversation, one memory.**
@@ -739,6 +752,16 @@ continuously responding to the changing state of the business in real time.
 
 Where traditional CRMs record the past, **Conscestra orchestrates what
 happens next.**
+
+This is the architecture the industry now calls **Autonomous Enterprise
+Architecture**: a central conductor coordinating specialized agents, one
+unified customer memory, and one governed action layer where agents never
+touch the database directly. Conscestra implements that reference model
+end-to-end — supervisor, peer-to-peer event bus, and dynamic planner
+orchestration side by side; a live capability registry and policy-as-code
+guardrails you can tune without a deploy; full correlation tracing from
+proposal to approved execution; and a learning loop that turns every
+interaction into governed improvement proposals a human reviews.
 
 ---
 

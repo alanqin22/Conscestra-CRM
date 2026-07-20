@@ -90,7 +90,14 @@ _TTS_TIMEOUT = 20.0
 _LINES = ("support", "sdr")
 
 _stats = {"calls": 0, "utterances": 0, "stt_azure": 0, "stt_whisper": 0,
-          "stt_failures": 0, "tts_azure": 0, "tts_openai": 0, "barge_ins": 0}
+          "stt_failures": 0, "tts_azure": 0, "tts_openai": 0, "barge_ins": 0,
+          "urgent_calls": 0}
+
+# Urgency proxy thresholds — deterministic prosody stand-ins (no audio ML):
+# repeated barge-ins or fast sustained speech read as elevated urgency.
+URGENCY_BARGE_MIN = int(os.getenv("VOICE_URGENCY_BARGE_MIN", "2"))
+URGENCY_WPM = int(os.getenv("VOICE_URGENCY_WPM", "185"))
+URGENCY_MIN_WORDS = int(os.getenv("VOICE_URGENCY_MIN_WORDS", "12"))
 
 
 def _public_ws_base() -> str:
@@ -329,6 +336,39 @@ async def _brain_digits(line: str, call_sid: str, digits: str) -> Tuple[str, str
     return "", "speech"        # the SDR line has no keypad flow
 
 
+def _call_urgency(n_barge: int, words: int, speech_ms: float) -> Optional[str]:
+    """Why this call reads as urgent, or None. Word count gates the wpm check
+    so a single short exclamation can't trip it."""
+    if n_barge >= URGENCY_BARGE_MIN:
+        return f"caller interrupted the assistant {n_barge} times"
+    if words >= URGENCY_MIN_WORDS and speech_ms > 0:
+        wpm = words / (speech_ms / 60000.0)
+        if wpm >= URGENCY_WPM:
+            return f"fast sustained speech (~{int(wpm)} wpm)"
+    return None
+
+
+def _post_urgency(line: str, from_number: str, reason: str) -> None:
+    """Elevated urgency → a blackboard signal on the resolved caller, the same
+    channel the negative_sentiment signal uses — so the AI 360 summary and the
+    supervisor's detectors pick it up with zero extra wiring. Anonymous callers
+    have no entity to signal on and are skipped."""
+    try:
+        from app.core import blackboard, identity
+        ident = identity.resolve("voice", from_number)
+        if not (ident.resolved and ident.scope == "external" and ident.party_id):
+            return
+        blackboard.post(ident.party_type, ident.party_id, "voice_stream",
+                        "voice_urgency",
+                        note=f"Elevated urgency on a {line} call: {reason}.",
+                        severity="medium", ttl_hours=7 * 24)
+        _stats["urgent_calls"] += 1
+        logger.info(f"[stream] voice_urgency posted for "
+                    f"{ident.party_type} {ident.party_id[:8]}: {reason}")
+    except Exception as exc:
+        logger.debug(f"[stream] urgency signal skipped: {exc}")
+
+
 def _brain_hangup(line: str, call_sid: str) -> None:
     """Caller hung up mid-conversation — close the support transcript."""
     if line != "support":
@@ -364,6 +404,9 @@ class _Call:
         self.player: Optional[asyncio.Task] = None
         self.worker: Optional[asyncio.Task] = None
         self.closing = False
+        self.n_barge = 0                    # this call's barge-in count
+        self.words = 0                      # transcribed words heard
+        self.speech_ms = 0.0                # caller speech duration
 
     # ── outbound audio ──────────────────────────────────────────────────────
     async def say(self, text: str, then_hangup: bool = False) -> None:
@@ -401,6 +444,7 @@ class _Call:
         if self.player and not self.player.done():
             self.player.cancel()
             _stats["barge_ins"] += 1
+            self.n_barge += 1
             try:
                 await self.ws.send_text(json.dumps(
                     {"event": "clear", self.sid_key: self.stream_id}))
@@ -458,6 +502,8 @@ class _Call:
         if not heard:
             await self.say("Sorry, I didn't catch that. Could you say it again?")
             return
+        self.speech_ms += len(pcm) / 16     # 16 bytes per ms at 8 kHz s16
+        self.words += len(heard.split())
         logger.info(f"[stream] {self.line} {self.call_sid[:12]} heard "
                     f"({time.time() - t0:.1f}s): {heard[:80]!r}")
         say, nxt = await _brain_turn(self.line, self.call_sid, heard,
@@ -529,6 +575,9 @@ async def voice_stream_ws(ws: WebSocket, line: str, sid: str = "",
                 task.cancel()
         if not call.closing:
             _brain_hangup(line, sid)
+        reason = _call_urgency(call.n_barge, call.words, call.speech_ms)
+        if reason:
+            await asyncio.to_thread(_post_urgency, line, frm, reason)
         logger.info(f"[stream] {line} call {sid[:12]} ended")
 
 
