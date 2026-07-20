@@ -44,10 +44,18 @@ CONFIG (env)
                             query the LIVE CRM over SMS (blank = none)
   -- Twilio --  TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_NUMBER
   -- Telnyx --  TELNYX_API_KEY / TELNYX_FROM_NUMBER
-                TELNYX_FROM_NUMBER_US  optional 2nd (US) sender; +1 US
-                                     destinations originate from it, others from
-                                     TELNYX_FROM_NUMBER. Override per send with
-                                     from='us'|'ca'|<E.164> in the A2A/admin call
+                TELNYX_FROM_POOL  optional comma-separated list of EVERY sender
+                                     number (any mix of US + Canadian lines). When
+                                     set it is the full pool the agent calls/texts
+                                     from; a destination is matched to a same-country
+                                     pool number, picked STABLY per destination so a
+                                     customer always sees one caller ID. Unset → the
+                                     pool falls back to the two legacy single vars.
+                TELNYX_FROM_NUMBER_US  legacy optional 2nd (US) sender; used only to
+                                     seed the pool when TELNYX_FROM_POOL is unset.
+                                     Override per send with from='us'|'ca'|<E.164>
+                                     in the A2A/admin call (a full E.164 must be a
+                                     pool member to be reachable inbound)
                 TELNYX_PUBLIC_KEY    account Ed25519 public key (webhook auth)
                 TELNYX_TEXML_APP_ID  TeXML application id (outbound calls)
                 TELNYX_PUBLIC_BASE   public base URL for outbound-call TeXML
@@ -130,36 +138,89 @@ def _npa(phone: Optional[str]) -> Optional[str]:
     return None
 
 
+def _is_us_number(e164: Optional[str]) -> bool:
+    """True for a +1 number whose NANP area code is US — i.e. not Canadian and
+    not toll-free (shared). Non-NANP / unrecognized numbers are treated as
+    not-US, so they group with the Canadian/default lines."""
+    npa = _npa(e164)
+    return bool(npa and npa not in _CA_AREA_CODES
+                and npa not in _TOLLFREE_AREA_CODES)
+
+
+def _from_pool() -> list:
+    """Every configured Telnyx sender number — E.164, de-duped, order preserved.
+
+    TELNYX_FROM_POOL (comma-separated) is the full pool when set; otherwise the
+    pool is seeded from the two legacy single-line vars TELNYX_FROM_NUMBER +
+    TELNYX_FROM_NUMBER_US, so pre-pool configs keep working unchanged."""
+    raw = os.getenv("TELNYX_FROM_POOL", "").strip()
+    if raw:
+        candidates = [normalize_phone(p) for p in raw.split(",")]
+    else:
+        candidates = [os.getenv("TELNYX_FROM_NUMBER", "").strip(),
+                      os.getenv("TELNYX_FROM_NUMBER_US", "").strip()]
+    out: list = []
+    for n in candidates:
+        n = (n or "").strip()
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def _pick_stable(numbers: list, dest: Optional[str]) -> str:
+    """Deterministically pick one number from `numbers` for a destination, so a
+    given customer always sees the SAME caller ID (their phone threads the calls
+    and texts together, and it reads as one consistent line) while load still
+    spreads across the pool. Sorted first so the choice is independent of how
+    the pool happens to be ordered. Empty destination → the first entry."""
+    pool = sorted(n for n in numbers if n)
+    if not pool:
+        return ""
+    key = re.sub(r"\D", "", dest or "")
+    if not key:
+        return pool[0]
+    idx = int(hashlib.sha1(key.encode()).hexdigest(), 16) % len(pool)
+    return pool[idx]
+
+
 def _from_number(dest: Optional[str] = None,
                  override: Optional[str] = None) -> str:
     """The originating sender number for the current provider.
 
-    Twilio is single-number and ignores dest/override. Telnyx supports two
-    lines — the default TELNYX_FROM_NUMBER and an optional US line
-    TELNYX_FROM_NUMBER_US — chosen (option C) as:
+    Twilio is single-number and ignores dest/override. Telnyx draws from a POOL
+    of sender numbers (TELNYX_FROM_POOL, or the two legacy single-line vars) and
+    chooses one as:
       1. explicit override — a full E.164, or an alias 'us' / 'ca' / 'default';
       2. automatic by destination country — a +1 US destination originates from
-         the US line when one is configured, Canadian/other from the default;
-      3. the default TELNYX_FROM_NUMBER.
+         a US pool number, Canadian/other/international from a non-US one, picked
+         STABLY per destination so a customer always sees the same caller ID;
+      3. the default (TELNYX_FROM_NUMBER, else the pool's first entry) when the
+         destination is unknown.
     Called with no args (configured()/status) it returns the default."""
     if _provider() != "telnyx":
         return os.getenv("TWILIO_FROM_NUMBER", "").strip()
-    default = os.getenv("TELNYX_FROM_NUMBER", "").strip()
-    us = os.getenv("TELNYX_FROM_NUMBER_US", "").strip()
+    pool = _from_pool()
+    default = (os.getenv("TELNYX_FROM_NUMBER", "").strip()
+               or (pool[0] if pool else ""))
     # 1. explicit override wins
     if override:
         low = override.strip().lower()
         if low in ("us", "usa"):
-            return us or default
+            us = [n for n in pool if _is_us_number(n)]
+            return _pick_stable(us, dest) or default
         if low in ("ca", "can", "canada", "default"):
-            return default
+            ca = [n for n in pool if not _is_us_number(n)]
+            return _pick_stable(ca, dest) or default
         return normalize_phone(override) or default
-    # 2. automatic by destination country (only when a US line exists)
-    if us and dest:
-        npa = _npa(dest)
-        if npa and npa not in _CA_AREA_CODES and npa not in _TOLLFREE_AREA_CODES:
-            return us
-    # 3. default
+    if not pool:
+        return default
+    # 2. automatic by destination country — match each line's country to the
+    #    destination's, then pick stably within that country's numbers.
+    if dest:
+        want_us = _is_us_number(dest)
+        cands = [n for n in pool if _is_us_number(n) == want_us]
+        return _pick_stable(cands or pool, dest)
+    # 3. destination unknown → default
     return default
 
 
@@ -727,8 +788,12 @@ router = APIRouter(tags=["telephony"])
 
 @router.get("/telephony/status")
 def telephony_status():
+    pool = _from_pool() if _provider() == "telnyx" else []
     return {"provider": _provider(), "configured": configured(),
             "from_number": _from_number() or None,
+            "from_pool": pool,
+            "from_pool_us": [n for n in pool if _is_us_number(n)],
+            "from_pool_ca": [n for n in pool if not _is_us_number(n)],
             "autosend": AUTOSEND, "autoreply": AUTOREPLY,
             "sms_max_chars": SMS_MAX_CHARS}
 
