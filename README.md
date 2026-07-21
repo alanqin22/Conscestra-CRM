@@ -1046,3 +1046,21 @@ All 15 modules pull from `app/core/` rather than duplicating boilerplate.
 
 Domain-specific code (prompt, pre_router, sql_builder, formatter, graph
 nodes) remains **completely isolated** inside each agent's sub-package.
+
+---
+
+## Contact & Hours
+
+**Conscestra CRM — [AgentOrc.ca](https://agentorc.ca)** — Canadian AI orchestration platform.
+
+| Office | Phone | Hours |
+|--------|-------|-------|
+| 📍 Toronto | 289-800-4112 | 24/7 |
+| 📍 Vancouver | 604-296-9885 | 24/7 |
+| 📍 San Francisco | 650-912-1699 | 24/7 |
+| 📍 New York | 332-456-4869 | 24/7 |
+
+**🏢 Headquarters** — 416-477-9298 · 416-889-6638
+**Business Hours:** 9:00 a.m. to 5:00 p.m., Monday through Friday — Toronto / New York (Eastern Time)
+
+**✉️ Email:** info@agentorc.ca
