@@ -120,6 +120,7 @@ def route_request(message: str, chat_input: dict) -> Dict[str, Any]:
             "createdBy":  sd.get("created_by") or None,
             "notes":      sd.get("notes") or None,
             "items":      items,            # [{product_id, quantity}]
+            "couponCode": (sd.get("coupon_code") or "").strip() or None,
         })
 
     if context == "get_order_detail":

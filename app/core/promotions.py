@@ -1,0 +1,302 @@
+"""Promotions & coupons — the read/validate layer the Store agent uses to
+answer discount questions HONESTLY from real data (never an invented offer).
+
+Data model: sql/promotions_coupons.sql (coupons, coupon_redemptions,
+price_match_requests). Design + authority tiers: docs/promotions_coupons_design.md.
+
+Everything here degrades gracefully: if the tables aren't deployed yet, reads
+return "nothing" and validation returns a clean "no such coupon" — the agent
+then falls back to the honest promo/price-match/specialist handoff. Nothing
+raises into a customer turn.
+
+Authority (enforced by callers, documented here):
+  AUTOMATIC  active published Promo price (product_pricing) + a VALID coupon
+             within its window/limits and under the brand discount cap.
+  APPROVAL   competitor price-match, or a coupon flagged requires_approval /
+             above brand.max_discount_pct → governance.propose(), never auto.
+  NEVER      arbitrarily changing a listed price.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from app.core.database import get_connection
+
+logger = logging.getLogger("promotions")
+
+
+# ============================================================================
+# READ — advertisable coupons
+# ============================================================================
+
+def active_public_coupons(product: Optional[Dict[str, Any]] = None,
+                          limit: int = 5) -> List[Dict[str, Any]]:
+    """Live, advertisable coupons the agent may mention unprompted. Filters to
+    the viewed product's scope when a product is given (all / its category /
+    itself). Never raises — returns [] when the table is missing or empty."""
+    category_id = (product or {}).get("category_id")
+    product_id = (product or {}).get("product_id")
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT code, description, discount_type, discount_value,
+                              min_subtotal, max_discount, applies_to, ends_at
+                         FROM coupons
+                        WHERE is_active = true AND is_public = true
+                          AND starts_at <= now()
+                          AND (ends_at IS NULL OR ends_at > now())
+                          AND (usage_limit IS NULL OR times_redeemed < usage_limit)
+                          AND (applies_to = 'all'
+                               OR (applies_to = 'category' AND category_id = %(cat)s::uuid)
+                               OR (applies_to = 'product'  AND product_id  = %(pid)s::uuid))
+                        ORDER BY discount_value DESC
+                        LIMIT %(lim)s""",
+                    {"cat": category_id, "pid": product_id, "lim": limit})
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug(f"[promotions] active_public_coupons skipped: {exc}")
+        return []
+
+
+def _coupon_line(c: Dict[str, Any]) -> str:
+    if c["discount_type"] == "percent":
+        amt = f"{float(c['discount_value']):g}% off"
+        if c.get("max_discount"):
+            amt += f" (up to ${float(c['max_discount']):,.0f})"
+    else:
+        amt = f"${float(c['discount_value']):,.2f} off"
+    cond = (f" on orders over ${float(c['min_subtotal']):,.0f}"
+            if c.get("min_subtotal") else "")
+    return f"code {c['code']} — {amt}{cond}"
+
+
+def summarize_for_agent(product: Optional[Dict[str, Any]] = None) -> str:
+    """One short block of REAL advertisable coupons for the agent prompt, or ''
+    when there are none (agent then offers price-match / specialist handoff)."""
+    coupons = active_public_coupons(product)
+    if not coupons:
+        return ""
+    return "Active coupons the shopper can use now:\n" + "\n".join(
+        f"- {_coupon_line(c)}" for c in coupons)
+
+
+# ============================================================================
+# VALIDATE — a code the customer typed (does NOT redeem; that's checkout)
+# ============================================================================
+
+def validate_coupon(code: str, subtotal: float = 0.0,
+                    product: Optional[Dict[str, Any]] = None,
+                    account_id: Optional[str] = None) -> Dict[str, Any]:
+    """Check a typed coupon code against its rules. Returns
+    {ok, reason, code, discount_amount, requires_approval}. Never raises.
+    Read-only: redemption happens at checkout, not here."""
+    code = (code or "").strip()
+    if not code:
+        return {"ok": False, "reason": "no code given"}
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT coupon_id, code, discount_type, discount_value,
+                              min_subtotal, max_discount, applies_to, category_id,
+                              product_id, ends_at, usage_limit, per_customer_limit,
+                              times_redeemed, is_active, requires_approval
+                         FROM coupons WHERE lower(code) = lower(%s)""", (code,))
+                row = cur.fetchone()
+                if not row:
+                    return {"ok": False, "reason": "no such coupon", "code": code}
+                cols = [d[0] for d in cur.description]
+                c = dict(zip(cols, row))
+
+                # Per-customer usage (only when we know the verified account).
+                used_by_customer = 0
+                if account_id and c.get("per_customer_limit") is not None:
+                    cur.execute(
+                        "SELECT count(*) FROM coupon_redemptions "
+                        "WHERE coupon_id=%s AND account_id=%s::uuid",
+                        (c["coupon_id"], account_id))
+                    used_by_customer = cur.fetchone()[0]
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug(f"[promotions] validate_coupon skipped: {exc}")
+        return {"ok": False, "reason": "no such coupon", "code": code}
+
+    # ── rule checks ──
+    from datetime import datetime, timezone
+    if not c["is_active"]:
+        return {"ok": False, "reason": "coupon inactive", "code": code}
+    if c["ends_at"] and c["ends_at"] < datetime.now(timezone.utc):
+        return {"ok": False, "reason": "coupon expired", "code": code}
+    if c["usage_limit"] is not None and c["times_redeemed"] >= c["usage_limit"]:
+        return {"ok": False, "reason": "coupon fully redeemed", "code": code}
+    if c["per_customer_limit"] is not None and used_by_customer >= c["per_customer_limit"]:
+        return {"ok": False, "reason": "you've already used this coupon", "code": code}
+    if c["applies_to"] == "category" and str((product or {}).get("category_id")) != str(c["category_id"]):
+        return {"ok": False, "reason": "coupon doesn't apply to this item", "code": code}
+    if c["applies_to"] == "product" and str((product or {}).get("product_id")) != str(c["product_id"]):
+        return {"ok": False, "reason": "coupon doesn't apply to this item", "code": code}
+    if float(subtotal or 0) < float(c["min_subtotal"] or 0):
+        return {"ok": False, "code": code,
+                "reason": f"needs a minimum subtotal of ${float(c['min_subtotal']):,.2f}"}
+
+    # ── compute discount ──
+    if c["discount_type"] == "percent":
+        disc = float(subtotal or 0) * float(c["discount_value"]) / 100.0
+        if c["max_discount"]:
+            disc = min(disc, float(c["max_discount"]))
+    else:
+        disc = min(float(c["discount_value"]), float(subtotal or 0)) if subtotal else float(c["discount_value"])
+
+    # Over the brand discount cap → still valid, but needs approval.
+    requires_approval = bool(c["requires_approval"])
+    try:
+        from app.core import governance
+        cap = float(governance.policy_value("brand.max_discount_pct", 15.0))
+        eff_pct = (disc / float(subtotal) * 100.0) if subtotal else float(
+            c["discount_value"] if c["discount_type"] == "percent" else 0)
+        if eff_pct > cap:
+            requires_approval = True
+    except Exception:
+        pass
+
+    return {"ok": True, "code": c["code"], "discount_amount": round(disc, 2),
+            "requires_approval": requires_approval,
+            "reason": "valid"}
+
+
+# ============================================================================
+# REDEEM — apply a coupon to an order mid-checkout (AUTOMATIC tier only)
+# ============================================================================
+
+def apply_coupon_to_order(order_id: str, code: str,
+                          account_id: Optional[str] = None,
+                          contact_id: Optional[str] = None) -> Dict[str, Any]:
+    """Apply a coupon to an order that already has its items (subtotal known)
+    but is still 'processing' — i.e. between checkout step B and step C.
+
+    Reduces orders.total_amount by the discount (the invoice trigger copies
+    total_amount into the invoice at status→pending) WITHOUT touching
+    order_items (which would refire the line trigger and overwrite the total),
+    then records the redemption and bumps usage — all in one transaction.
+
+    Only the AUTOMATIC tier is applied here: a coupon that validates and is
+    under the brand discount cap. requires_approval / invalid → not applied
+    (the order proceeds at full price; approval is a separate governed flow).
+    Returns {applied, discount_amount, code, reason, requires_approval}."""
+    code = (code or "").strip()
+    if not code:
+        return {"applied": False, "reason": "no code given"}
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT subtotal_amount::float, total_amount::float "
+                            "FROM orders WHERE order_id=%s::uuid", (order_id,))
+                row = cur.fetchone()
+            if not row:
+                return {"applied": False, "reason": "order not found"}
+            subtotal = float(row[1] if row[1] is not None else (row[0] or 0))
+
+            res = validate_coupon(code, subtotal, account_id=account_id)
+            if not res.get("ok"):
+                return {"applied": False, **res}
+            if res.get("requires_approval"):
+                # Valid but over the cap / flagged — do NOT auto-apply.
+                return {"applied": False, "requires_approval": True, **res}
+
+            disc = min(float(res["discount_amount"]), subtotal)
+            if disc <= 0:
+                return {"applied": False, "reason": "no discount", "code": res["code"]}
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE orders SET total_amount = GREATEST(total_amount - %s, 0), "
+                    "updated_at = now() WHERE order_id=%s::uuid", (disc, order_id))
+                cur.execute("SELECT coupon_id FROM coupons WHERE lower(code)=lower(%s)",
+                            (code,))
+                cid = cur.fetchone()[0]
+                cur.execute(
+                    """INSERT INTO coupon_redemptions
+                         (coupon_id, account_id, contact_id, order_id, discount_amount)
+                       VALUES (%s, %s::uuid, %s::uuid, %s::uuid, %s)""",
+                    (cid, account_id, contact_id, order_id, disc))
+                cur.execute("UPDATE coupons SET times_redeemed = times_redeemed + 1 "
+                            "WHERE coupon_id=%s", (cid,))
+            conn.commit()
+            logger.info(f"[promotions] applied {res['code']} -${disc:.2f} to order {order_id}")
+            return {"applied": True, "discount_amount": round(disc, 2),
+                    "code": res["code"]}
+        finally:
+            conn.close()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning(f"[promotions] apply_coupon_to_order failed: {exc}")
+        return {"applied": False, "reason": "could not apply coupon"}
+
+
+# ============================================================================
+# PRICE-MATCH — approval-required tier
+# ============================================================================
+
+def create_price_match_request(product: Dict[str, Any],
+                               competitor: Dict[str, Any],
+                               account_id: Optional[str] = None,
+                               contact_id: Optional[str] = None,
+                               channel: str = "store_chat") -> Dict[str, Any]:
+    """Record a competitor price-match ask and route it to human approval via
+    governance. Returns {ok, request_id, governance_ref}. Never raises."""
+    name = str(product.get("name") or product.get("product_name") or "")[:200]
+    try:
+        gov_ref = None
+        try:
+            from app.core import governance
+            gov_ref = governance.propose(
+                "price_match", proposed_by=f"store_chat:{channel}",
+                params={"product": name,
+                        "product_id": product.get("product_id"),
+                        "our_price": product.get("our_price"),
+                        "competitor_name": competitor.get("name"),
+                        "competitor_price": competitor.get("price"),
+                        "competitor_url": competitor.get("url"),
+                        "account_id": account_id},
+                entity_type="account", entity_id=account_id,
+                severity="info")
+        except Exception as exc:
+            logger.warning(f"[promotions] price-match governance propose failed: {exc}")
+
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO price_match_requests
+                         (account_id, contact_id, product_id, product_name,
+                          our_price, competitor_name, competitor_price,
+                          competitor_url, channel, governance_ref)
+                       VALUES (%(aid)s::uuid,%(cid)s::uuid,%(pid)s::uuid,%(pn)s,
+                               %(op)s,%(cn)s,%(cp)s,%(cu)s,%(ch)s,%(gr)s)
+                       RETURNING request_id::text""",
+                    {"aid": account_id, "cid": contact_id,
+                     "pid": product.get("product_id"), "pn": name,
+                     "op": product.get("our_price"),
+                     "cn": competitor.get("name"), "cp": competitor.get("price"),
+                     "cu": competitor.get("url"), "ch": channel, "gr": gov_ref})
+                rid = cur.fetchone()[0]
+            conn.commit()
+        finally:
+            conn.close()
+        return {"ok": True, "request_id": rid, "governance_ref": gov_ref}
+    except Exception as exc:
+        logger.warning(f"[promotions] create_price_match_request failed: {exc}")
+        return {"ok": False}

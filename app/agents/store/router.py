@@ -65,6 +65,7 @@ class StoreData(BaseModel):
     items:          Optional[List[StoreItem]] = None
     notes:          Optional[str]       = None
     created_by:     Optional[str]       = None
+    coupon_code:    Optional[str]       = None
 
     # Post-checkout reads
     order_id:       Optional[str]  = None
