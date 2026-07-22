@@ -758,7 +758,7 @@ async def lifespan(app: FastAPI):
         )
         # KB hygiene — weekly, Monday 08:45 ET (right after bottlenecks):
         # flags stale/never-used articles into one Orchestrator notification.
-        scheduler.add_job(
+        _scheduler.add_job(
             _run_kb_hygiene_pass,
             trigger=CronTrigger(day_of_week="mon", hour=8, minute=45),
             id="kb_hygiene_pass",

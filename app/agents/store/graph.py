@@ -257,6 +257,27 @@ def _checkout_node(state: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, A
         return {**state, "db_rows": [{"error": f"Step B: {exc}", "step": "B",
                                        "order_id": order_id, "order_number": order_number}]}
 
+    # ── Step B2: apply a coupon (optional) — BEFORE status→pending so the
+    # invoice (created by trgfn_order_create_invoice from orders.total_amount)
+    # reflects the discount. Never touches order_items (would refire the line
+    # trigger). Failure/invalid coupon is non-fatal: order proceeds full price.
+    coupon_result = None
+    coupon_code = params.get("couponCode")
+    if coupon_code:
+        try:
+            from app.core import promotions
+            coupon_result = promotions.apply_coupon_to_order(
+                order_id, coupon_code,
+                account_id=account_id, contact_id=contact_id)
+            if coupon_result.get("applied"):
+                logger.info(f"Checkout Step B2 OK — coupon {coupon_result.get('code')} "
+                            f"applied -${coupon_result.get('discount_amount')}")
+            else:
+                logger.info(f"Checkout Step B2 — coupon not applied: "
+                            f"{coupon_result.get('reason') or coupon_result}")
+        except Exception as exc:
+            logger.warning(f"Checkout Step B2 (coupon) skipped: {exc}")
+
     # ── Step C: change_status → 'pending' — fires trigger cascade ────────────
     try:
         query_c, _ = build_store_query({
@@ -318,6 +339,15 @@ def _checkout_node(state: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, A
         "total_amount":   total_amount,
         "currency":       currency,
     }
+    if coupon_result:
+        if coupon_result.get("applied"):
+            result["coupon"] = {"code": coupon_result.get("code"),
+                                "discount_amount": coupon_result.get("discount_amount")}
+        else:
+            # Surface why a supplied code didn't apply (e.g. min-subtotal, expired,
+            # needs approval) so the UI can tell the shopper.
+            result["coupon_error"] = coupon_result.get("reason") or (
+                "needs approval" if coupon_result.get("requires_approval") else "not applied")
     return {**state, "db_rows": [result]}
 
 

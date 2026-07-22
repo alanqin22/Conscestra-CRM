@@ -312,6 +312,30 @@ you choose.
 Chat to qualified lead to booked meeting — **before a human ever says
 hello.**
 
+## The Storefront Has a Salesperson
+
+The same chat bubble on the store is now a **Sales & Service agent** that
+actually knows the shop. Ask it what a shopper asks — what a product does, how
+it compares, whether it's in stock — and it answers from the live catalog, with
+the real price, the genuine sale saving, and the exact units on hand, never an
+invented number. *"What's the best computer under $2,000?"* returns real
+in-stock laptops with reasons, then asks what you'll use it for.
+
+It knows the rules, too. Shipping, returns, warranty and payment questions come
+from the approved policy base. On discounts it stays honest: it can surface a
+real, active coupon and apply it **at checkout** — reducing the order and
+recording the redemption — but it never invents an offer, and anything past the
+brand's discount cap routes to a human for approval.
+
+And it can speak to *you* about *your* account — but only once it knows you are
+you. A signed-in shopper, or one who verifies with a code emailed to the address
+on file, can ask *"where is my order?"* or *"what's my balance?"* and get an
+answer scoped to their record alone, read-only — the identity proven by the
+session or the code, never by a name typed into a box.
+
+**Every shopper question — product, price, policy, or their own order —
+answered by one agent, grounded in real data.**
+
 ## The Whole CRM, From a Text Message
 
 The number a prospect calls is also a command line for the people who run the
@@ -1056,7 +1080,7 @@ nodes) remains **completely isolated** inside each agent's sub-package.
 | Office | Phone | Hours |
 |--------|-------|-------|
 | 📍 Toronto | 289-800-4112 | 24/7 |
-| 📍 Vancouver | 604-296-9885 | 24/7 |
+| 📍 Vancouver | 778-907-0989 | 24/7 |
 | 📍 San Francisco | 650-912-1699 | 24/7 |
 | 📍 New York | 332-456-4869 | 24/7 |
 
