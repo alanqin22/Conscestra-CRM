@@ -36,11 +36,31 @@ it is FAIL-CLOSED on both authentication and authorization):
   • Abuse/cost — every inbound fires the METERED orchestrator, so each (channel,
     user) is rate-limited (TRANSPORTS_RATE_LIMIT / 10 min) BEFORE any DB/LLM work.
 
+PARTICIPATION (agents as first-class members of team channels):
+  • #6 In-thread approvals — a routed governance approval arrives with native Block
+    Kit Approve/Reject buttons; POST /slack/interactive verifies (signature +
+    linked-employee + HMAC token) and applies the decision through the SAME
+    governance flow as the one-click email links, updating the message in place.
+  • #5 Proactive posting — post_internal() / POST /comms/announce broadcast an
+    alert/briefing INTO a channel (draft-first: SLACK_PROACTIVE_ENABLED + a token).
+  • #8 Teams outbound — a 1:1 (personal) chat gets a real Bot Framework reply when
+    MICROSOFT_APP_ID/PASSWORD are set; channel/group replies stay withheld (no
+    ephemeral → audience scoping preserved).
+  • Mention-gating — in a shared channel the bot answers only when @mentioned.
+
 CONFIG (env)
   SLACK_SIGNING_SECRET   ''  verify Slack request signatures (REQUIRED in prod)
-  SLACK_BOT_TOKEN        ''  send Slack replies (chat.postMessage) when set
+  SLACK_BOT_TOKEN        ''  send Slack replies/blocks (chat.postMessage) when set
   SLACK_OPEN_CHANNELS    ''  channel ids allowed to receive in-channel CRM answers
+  SLACK_BOT_USER_ID      ''  the bot's own user id — enables @mention-gating
+  SLACK_REQUIRE_MENTION   1  in a shared channel, answer only when @mentioned
+  SLACK_PROACTIVE_ENABLED 0  allow proactive posts into channels (#5)
+  SLACK_ALERTS_CHANNEL   ''  target channel for internal_alert proactive posts
+  SLACK_BRIEFING_CHANNEL ''  target channel for internal_briefing proactive posts
+  SLACK_DEFAULT_CHANNEL  ''  fallback proactive channel when a kind has none
   TEAMS_INBOUND_SECRET   ''  shared bearer secret authenticating Teams activities
+  MICROSOFT_APP_ID       ''  Bot Framework app id — enables Teams outbound (#8)
+  MICROSOFT_APP_PASSWORD ''  Bot Framework app secret
   WHATSAPP_VERIFY_TOKEN  ''  Meta webhook GET verification challenge token
   TRANSPORTS_ENABLED      1  master kill switch for all transport webhooks
   TRANSPORTS_RATE_LIMIT  20  inbound messages per (channel, user) per 10 minutes
@@ -53,6 +73,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import time
@@ -82,6 +103,14 @@ _SLACK_MAX_SKEW = 60 * 5          # replay window for Slack timestamps (Slack's 
 # always answered in place (already 1:1). Comma-separated Slack channel ids.
 _SLACK_OPEN_CHANNELS = {c.strip() for c in
                         os.getenv("SLACK_OPEN_CHANNELS", "").split(",") if c.strip()}
+# Participation: in a SHARED channel the bot is a well-behaved participant — it
+# answers only when @mentioned (a DM is always 1:1, so always answered). Needs the
+# bot's own user id to detect the mention; if unknown, mention-gating is skipped.
+_SLACK_BOT_USER_ID = os.getenv("SLACK_BOT_USER_ID", "").strip()
+_REQUIRE_MENTION = _flag("SLACK_REQUIRE_MENTION", "1")
+# #5 Proactive posting — agents post briefings/alerts INTO channels on their own.
+# Off by default (draft-first posture); real posts also need SLACK_BOT_TOKEN.
+_PROACTIVE_ENABLED = _flag("SLACK_PROACTIVE_ENABLED", "0")
 # Abuse / cost guard — every inbound fires the METERED orchestrator, so cap the
 # rate per (channel, user). In-process sliding window (per-replica, like the embed
 # widget's limiter); staff volume doesn't warrant a shared store.
@@ -334,6 +363,93 @@ def _slack_deliver(channel_type: str, channel_id: str, user: str,
     return res
 
 
+def _slack_post_blocks(channel: str, text: str,
+                       blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Post an interactive Block Kit message (buttons etc.). `text` is the
+    notification/fallback shown where blocks can't render."""
+    token = os.getenv("SLACK_BOT_TOKEN", "")
+    if not token:
+        return {"sent": False, "reason": "no SLACK_BOT_TOKEN (drafted)"}
+    try:
+        r = httpx.post("https://slack.com/api/chat.postMessage",
+                       headers={"Authorization": f"Bearer {token}"},
+                       json={"channel": channel, "text": text[:3000],
+                             "blocks": blocks}, timeout=10)
+        j = r.json()
+        return {"sent": bool(j.get("ok")),
+                "error": None if j.get("ok") else j.get("error"),
+                "ts": j.get("ts")}
+    except Exception as exc:
+        return {"sent": False, "error": str(exc)[:120]}
+
+
+def _slack_respond(response_url: str, text: str,
+                   replace_original: bool = True) -> Dict[str, Any]:
+    """Update the originating interactive message via its (signed, temporary)
+    response_url — no bot token needed."""
+    try:
+        r = httpx.post(response_url, json={"text": text[:3000],
+                       "replace_original": replace_original}, timeout=10)
+        return {"sent": r.status_code == 200}
+    except Exception as exc:
+        return {"sent": False, "error": str(exc)[:120]}
+
+
+def approval_blocks(approval_uuid: str, action_type: str, amount: float,
+                    summary: str, approve_token: str, reject_token: str
+                    ) -> Tuple[str, List[Dict[str, Any]]]:
+    """Build the (fallback text, Block Kit blocks) for an in-thread approval. The
+    button `value` carries the HMAC-signed (approval, action) token so the
+    interactivity endpoint verifies the decision is untampered — the same token
+    the one-click email links use. Returns (text, blocks)."""
+    amt = f" (${amount:,.0f})" if amount else ""
+    text = f"🛡️ Approval needed: {action_type}{amt}"
+    ctx = (summary or "").strip()
+    blocks: List[Dict[str, Any]] = [
+        {"type": "section",
+         "text": {"type": "mrkdwn", "text": f"*🛡️ Approval needed:* {action_type}{amt}"}},
+    ]
+    if ctx:
+        blocks.append({"type": "section",
+                       "text": {"type": "mrkdwn", "text": ctx[:2900]}})
+    blocks.append({"type": "actions", "block_id": f"gov:{approval_uuid}", "elements": [
+        {"type": "button", "style": "primary", "action_id": "gov_approve",
+         "text": {"type": "plain_text", "text": "Approve"},
+         "value": f"approve:{approval_uuid}:{approve_token}"},
+        {"type": "button", "style": "danger", "action_id": "gov_reject",
+         "text": {"type": "plain_text", "text": "Reject"},
+         "value": f"reject:{approval_uuid}:{reject_token}"},
+    ]})
+    return text, blocks
+
+
+def _proactive_channel(kind: str) -> str:
+    """Resolve the target Slack channel for a proactive (#5) post by its kind."""
+    m = {"internal_alert": os.getenv("SLACK_ALERTS_CHANNEL", ""),
+         "internal_briefing": os.getenv("SLACK_BRIEFING_CHANNEL", "")}
+    return (m.get(kind) or os.getenv("SLACK_DEFAULT_CHANNEL", "")).strip()
+
+
+def post_internal(kind: str, text: str, channel: Optional[str] = None,
+                  blocks: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """#5 — proactively post an internal alert/briefing INTO a team channel.
+    Gated: SLACK_PROACTIVE_ENABLED must be on AND a channel must resolve (explicit
+    arg, or the kind's configured channel). Draft-first when disabled or when no
+    bot token is set — the composed message is returned, never silently dropped."""
+    target = (channel or _proactive_channel(kind)).strip()
+    if not _PROACTIVE_ENABLED:
+        return {"sent": False, "reason": "SLACK_PROACTIVE_ENABLED off (drafted)",
+                "channel": target, "kind": kind, "text": text}
+    if not target:
+        return {"sent": False, "reason": f"no channel configured for '{kind}' "
+                "(set SLACK_ALERTS_CHANNEL / SLACK_BRIEFING_CHANNEL / "
+                "SLACK_DEFAULT_CHANNEL)", "kind": kind, "text": text}
+    res = _slack_post_blocks(target, text, blocks) if blocks else _slack_post(target, text)
+    res.update({"channel": target, "kind": kind})
+    logger.info(f"[transports] proactive {kind} → {target}: sent={res.get('sent')}")
+    return res
+
+
 async def _slack_answer_async(text: str, user: str, channel_id: str,
                               channel_type: str, cap: Optional[Dict[str, Any]]) -> None:
     """Do the (slow) orchestrator round-trip AFTER we've already ack'd Slack, then
@@ -384,6 +500,13 @@ async def slack_events(request: Request, background: BackgroundTasks):
     text = event.get("text") or ""
     channel_id = event.get("channel", "")
     channel_type = event.get("channel_type", "")     # im | mpim | channel | group
+    # Participation: in a shared channel, only respond when @mentioned (a DM is
+    # always 1:1). Keeps the bot from answering every message in channels it's in.
+    if channel_type != "im" and _REQUIRE_MENTION and _SLACK_BOT_USER_ID:
+        mention = f"<@{_SLACK_BOT_USER_ID}>"
+        if mention not in text:
+            return JSONResponse({"ok": True, "ignored": "not-mentioned"})
+        text = text.replace(mention, "").strip()     # answer the actual ask
     # Rate-limit BEFORE any DB/LLM work. ACK with 200 (not 429) — Slack treats a
     # non-2xx as a delivery failure and retries, which would defeat the limit and
     # eventually disable the subscription.
@@ -405,9 +528,143 @@ async def slack_events(request: Request, background: BackgroundTasks):
                          "conversation_id": (cap or {}).get("conversation_id")})
 
 
+async def _slack_apply_decision(action: str, approval_uuid: str, token: str,
+                                response_url: str, decided_by: str) -> None:
+    """#6 — run an in-thread approval decision AFTER we've ACK'd Slack (3s rule),
+    then replace the buttoned message with the outcome via response_url. The HMAC
+    token is re-verified here (defense in depth alongside the Slack signature +
+    linked-employee check already done in the handler)."""
+    from app.core import governance
+    # NB: this runs on the event loop, so every blocking call (DB, outbound HTTP)
+    # is offloaded with asyncio.to_thread — a sync httpx.post here would stall the
+    # single worker (and can deadlock against a response_url on this same server).
+    async def _respond(text: str) -> None:
+        await asyncio.to_thread(_slack_respond, response_url, text)
+
+    if not governance._verify_token(approval_uuid, action, token):
+        await _respond("⚠️ This decision link is invalid or was tampered with — "
+                       "no action taken.")
+        return
+    row = await asyncio.to_thread(governance._row, approval_uuid)
+    if not row:
+        await _respond("This approval no longer exists.")
+        return
+    if row.get("status") != "pending":
+        await _respond(f"↩️ Already *{row.get('status')}* — nothing further happened.")
+        return
+    try:
+        if action == "approve":
+            res = await governance.approve(approval_uuid, decided_by=decided_by)
+            ok = res.get("ok")
+            msg = (f"✅ *Approved* by <@{decided_by}> — "
+                   + ("executed." if ok else f"execution FAILED: "
+                      f"{(res.get('result') or {}).get('error') or 'unknown error'}"))
+        else:
+            await asyncio.to_thread(governance.reject, approval_uuid, decided_by)
+            msg = f"🚫 *Rejected* by <@{decided_by}> — no action was taken."
+    except Exception as exc:
+        logger.warning(f"[transports] Slack decision apply failed: {exc}")
+        msg = "⚠️ Something went wrong applying that decision."
+    await _respond(msg)
+
+
+@router.post("/slack/interactive")
+async def slack_interactive(request: Request, background: BackgroundTasks):
+    """#6 — Slack interactivity endpoint: in-thread Approve/Reject buttons on a
+    routed governance approval. Signature-verified, then FAIL-CLOSED on identity
+    (only a linked employee may decide) AND on the HMAC decision token. ACKs within
+    3s and applies the decision in the background, updating the message in place."""
+    if not ENABLED:
+        return JSONResponse({"ok": False, "error": "transports disabled"}, status_code=503)
+    raw = await request.body()
+    if not _slack_verify(raw, request.headers):
+        return JSONResponse({"ok": False, "error": "bad signature"}, status_code=403)
+    try:
+        form = await request.form()
+        payload = json.loads(form.get("payload") or "{}")
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad payload"}, status_code=400)
+    if payload.get("type") != "block_actions":
+        return JSONResponse({"ok": True, "ignored": payload.get("type")})
+
+    slack_user = ((payload.get("user") or {}).get("id")) or ""
+    authorized, _refusal = _authorize_internal("slack", slack_user)
+    if not authorized:
+        # Ephemeral, private refusal — never acts, never leaks.
+        return JSONResponse({"text": "🔒 Only linked staff accounts can approve or "
+                             "reject. Ask an admin to link your Slack ID.",
+                             "response_type": "ephemeral"})
+    actions = payload.get("actions") or []
+    value = (actions[0].get("value") if actions else "") or ""
+    parts = value.split(":", 2)
+    if len(parts) != 3 or parts[0] not in ("approve", "reject"):
+        return JSONResponse({"ok": True, "ignored": "unknown-action"})
+    action, approval_uuid, token = parts
+    response_url = payload.get("response_url") or ""
+    # ACK now (Slack's 3s rule); apply + update the message in the background.
+    background.add_task(_slack_apply_decision, action, approval_uuid, token,
+                        response_url, slack_user)
+    return JSONResponse({"text": f"⏳ Processing your *{action}*…",
+                         "replace_original": False, "response_type": "ephemeral"})
+
+
 # ============================================================================
 # INTERNAL — Microsoft Teams (Bot Framework Activity)
 # ============================================================================
+
+_TEAMS_TOKEN: Dict[str, Any] = {"token": "", "exp": 0.0}
+
+
+def _teams_token() -> str:
+    """Bot Framework app token (client credentials), cached until ~expiry. Empty
+    when MICROSOFT_APP_ID/PASSWORD aren't set — i.e. connector not configured."""
+    app_id = os.getenv("MICROSOFT_APP_ID", "")
+    secret = os.getenv("MICROSOFT_APP_PASSWORD", "")
+    if not app_id or not secret:
+        return ""
+    now = time.time()
+    if _TEAMS_TOKEN["token"] and _TEAMS_TOKEN["exp"] > now + 30:
+        return _TEAMS_TOKEN["token"]
+    try:
+        r = httpx.post(
+            "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
+            data={"grant_type": "client_credentials", "client_id": app_id,
+                  "client_secret": secret,
+                  "scope": "https://api.botframework.com/.default"}, timeout=10)
+        j = r.json()
+        _TEAMS_TOKEN["token"] = j.get("access_token", "")
+        _TEAMS_TOKEN["exp"] = now + float(j.get("expires_in", 3600))
+        return _TEAMS_TOKEN["token"]
+    except Exception as exc:
+        logger.warning(f"[transports] Teams token fetch failed: {exc}")
+        return ""
+
+
+def _teams_post(activity: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """#8 — reply into the SAME Teams conversation as the inbound activity via the
+    Bot Framework connector. Credential-gated (MICROSOFT_APP_ID/PASSWORD); drafts
+    otherwise (draft-first, like every other outbound on the platform)."""
+    token = _teams_token()
+    if not token:
+        return {"sent": False, "reason": "no Bot Framework connector configured (drafted)"}
+    service_url = (activity.get("serviceUrl") or "").rstrip("/")
+    conv = activity.get("conversation") or {}
+    conv_id = conv.get("id") or ""
+    if not service_url or not conv_id:
+        return {"sent": False, "reason": "activity missing serviceUrl/conversation id"}
+    reply = {"type": "message", "text": text[:3500],
+             "from": activity.get("recipient") or {},
+             "recipient": activity.get("from") or {}, "conversation": conv}
+    if activity.get("id"):
+        reply["replyToId"] = activity["id"]
+    try:
+        r = httpx.post(f"{service_url}/v3/conversations/{conv_id}/activities",
+                       headers={"Authorization": f"Bearer {token}"},
+                       json=reply, timeout=10)
+        return {"sent": r.status_code in (200, 201, 202), "status": r.status_code}
+    except Exception as exc:
+        return {"sent": False, "error": str(exc)[:120]}
+
 
 @router.post("/teams/messages")
 async def teams_messages(request: Request):
@@ -438,16 +695,20 @@ async def teams_messages(request: Request):
         return JSONResponse(_thread_and_reply(cap, "teams", refusal or "", sent)
                             | {"authorized": False})
     answer = await _answer_via_orchestrator(text, f"teams-{user}")
-    # Audience scope for when the connector is wired: 'personal' (1:1) posts in
-    # place; 'channel'/'groupChat' must deliver privately (the Bot Framework
-    # equivalent of ephemeral) — mirrors the Slack posture. Recorded now, honored
-    # when real Teams outbound lands. Nothing is sent today (drafted).
+    # Audience scoping (#3), now with real outbound (#8): a 'personal' (1:1) chat is
+    # answered in place via the Bot Framework connector; a 'channel'/'groupChat' has
+    # no ephemeral equivalent, so CRM data is WITHHELD from the room (drafted) rather
+    # than broadcast — the private-by-default guarantee holds for Teams too.
     conv_type = ((act.get("conversation") or {}).get("conversationType") or "").lower()
-    scope = "personal" if conv_type == "personal" else "private"
-    sent = {"sent": False, "scope": scope,
-            "reason": "no Bot Framework connector configured (drafted)"}
+    if conv_type == "personal":
+        sent = _teams_post(act, answer)
+        sent["scope"] = "personal"
+    else:
+        sent = {"sent": False, "scope": "private",
+                "reason": "Teams channel/group reply withheld (no private delivery) — drafted"}
     logger.info(f"[transports] Teams msg from {user} → conv "
-                f"{(cap or {}).get('conversation_id', '?')[:8]} (answered, scope={scope})")
+                f"{(cap or {}).get('conversation_id', '?')[:8]} "
+                f"(answered, scope={sent.get('scope')}, sent={sent.get('sent')})")
     return JSONResponse(_thread_and_reply(cap, "teams", answer, sent))
 
 
@@ -466,9 +727,38 @@ def transports_status():
                       "bot_token": bool(os.getenv("SLACK_BOT_TOKEN")),
                       "open_channels": len(_SLACK_OPEN_CHANNELS),
                       "private_by_default": True,
+                      "require_mention": _REQUIRE_MENTION and bool(_SLACK_BOT_USER_ID),
+                      "interactive_approvals": True,
+                      "proactive_enabled": _PROACTIVE_ENABLED,
                       "fail_closed": bool(os.getenv("SLACK_SIGNING_SECRET"))
                       or not _DEV_INSECURE},
             "teams": {"inbound_secret": bool(os.getenv("TEAMS_INBOUND_SECRET")),
-                      "connector": False,
+                      "connector": bool(_teams_token()),
                       "fail_closed": bool(os.getenv("TEAMS_INBOUND_SECRET"))
                       or not _DEV_INSECURE}}
+
+
+# ============================================================================
+# Admin — proactive posting trigger (#5), mounted admin-gated in main.py
+# ============================================================================
+
+admin_router = APIRouter(tags=["transports-admin"])
+
+
+@admin_router.post("/comms/announce")
+def comms_announce(body: Dict[str, Any]):
+    """Proactively post an internal alert/briefing into a team channel (#5).
+    Dry-run by default (composes without sending); pass send=true to deliver.
+    Body: {kind?: 'internal_alert'|'internal_briefing', text: str, channel?: str,
+    send?: bool}. Real delivery also needs SLACK_PROACTIVE_ENABLED + SLACK_BOT_TOKEN."""
+    b = body or {}
+    text = str(b.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "text is required"}
+    kind = str(b.get("kind") or "internal_alert")
+    if not b.get("send"):
+        return {"ok": True, "dry_run": True, "kind": kind,
+                "channel": (b.get("channel") or _proactive_channel(kind)),
+                "preview": text[:400]}
+    res = post_internal(kind, text, channel=b.get("channel"))
+    return {"ok": bool(res.get("sent")), **res}

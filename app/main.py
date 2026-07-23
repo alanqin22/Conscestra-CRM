@@ -1170,8 +1170,11 @@ app.include_router(telephony_public_router)
 # -- Channel transports (Unified Communication Layer, Phase 3) — provider
 #    webhooks: WhatsApp (external), Slack + Teams (internal). PUBLIC by nature;
 #    signature-verified when the provider secret is set (dev-permissive otherwise).
+#    Slack /slack/interactive (in-thread approvals) is signature+identity gated.
 from app.core.transports import router as transports_router
+from app.core.transports import admin_router as transports_admin_router
 app.include_router(transports_router)
+app.include_router(transports_admin_router, dependencies=_ADMIN)   # /comms/announce (#5)
 
 # -- Autonomous SDR (prospect-facing web chat + conversational voice).
 #    PUBLIC by nature: chat is gated SDR_CHAT_ENABLED + per-IP rate-limited;
