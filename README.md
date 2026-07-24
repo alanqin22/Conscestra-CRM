@@ -452,6 +452,38 @@ identified one**, history intact, so the relationship record begins at
 **Start on WhatsApp at 9am, continue by phone at 10, receive a proposal by email
 that afternoon — one person, one conversation, one memory.**
 
+## Your Team Chat Is a Command Surface
+
+The unified layer runs *inbound* too, and the internal side turns Slack and
+Teams into a seat at the CRM. An employee messages the bot — a direct question
+in a DM, an `@mention` in a channel — and the Orchestrator answers from every
+module: *"what happened with Acme this week?"*, *"company pulse."* The reply
+threads into the same governed conversation as every other channel.
+
+Because that surface reaches the whole business, it is **fail-closed by
+construction.** Every request's signature is verified, and only a Slack or Teams
+id explicitly linked to an employee is answered at all — an unknown sender gets a
+refusal and never a row of CRM data, the same allowed-caller posture the phone
+line uses. In a shared channel the answer is **audience-scoped**: a direct
+message is already private, a channel you *designate* may post in the open, but
+anywhere else the reply is delivered **ephemerally** to the person who asked — so
+pipeline and financials are never broadcast to a room that may include people not
+entitled to them, and delivery fails closed rather than ever falling back to a
+public post. The bot is a well-behaved participant, answering only when
+addressed, and every message is rate-limited before it can spend a token.
+
+Approvals live there as well. A governed action routed to an executive can arrive
+in Slack as native **in-thread Approve / Reject buttons** — carrying the same
+HMAC-signed, single-use decision the email does — and one tap drives it through
+the identical governance flow, updating the message in place. Agents also **post
+on their own initiative**: a morning briefing or a KPI-breach alert lands in the
+team channel, draft-first until you switch it on. On Teams, a one-to-one chat
+gets a real Bot Framework reply, while channel messages stay private under the
+very same rule.
+
+**The place your team already works becomes the place they command the CRM — on
+exactly the terms each person has earned.**
+
 ## A Conductor That Routes by Meaning
 
 Keyword routing is fast but literal — *"what is my account balance?"*
@@ -831,6 +863,7 @@ _Listed in the same order as the launcher page on [agentorc.ca](https://agentorc
 - **Predictive lead scoring v2** — a dependency-free logistic model trained on settled leads (transparent coefficients, per-feature contributions on every prediction), held to a Brier-vs-base-rate bar on holdout data, refusing to train on thin or one-sided history; activation is a governed `scoring.activate` action with undo restoring the previous version, and consumers fall back to the band-history heuristic when no model is active.
 - **PII minimization** — customer-authored text and injected context blocks are deterministically masked (emails → `j***@domain`, phones/cards → last-4; dates, money and invoice numbers stay readable) before reaching the LLM; operational agent commands are deliberately exempt so actions still work, and masking is idempotent with an instant kill switch.
 - **SMS + voice as governed channels** — agents send SMS and place spoken calls through a dual-carrier adapter (Twilio **or** Telnyx behind one switch, each webhook signature-verified — Twilio HMAC / Telnyx Ed25519) under the same draft-first autosend gates, every touch logged as a CRM activity; inbound texts are matched to their customer, bridged onto the timeline as bus events, and answered with a KB-grounded, PII-masked reply sized for SMS. Outbound automatically originates from the right line — a US destination sends from the US number, Canadian and international from the default — with an explicit per-send override (`from: us|ca|<E.164>`).
+- **Slack / Teams as a governed command surface** — employees query the whole CRM from a DM or an `@mention`, answered by the Orchestrator and threaded like every other channel. Fail-closed to identity-linked staff (Slack signature verified with replay window; Teams shared-secret; unlinked senders refused with no CRM read); **audience-scoped** so a shared-channel answer is delivered ephemerally (an allow-list opens designated channels), never a public broadcast, and never a public fallback on failure; per-`(channel, user)` rate-limited before any DB/LLM work (ack < 3s, answered in the background so Slack never retries or disables the subscription). Routed approvals arrive as native in-thread **Block-Kit Approve/Reject buttons** driving the same HMAC-verified governance flow; agents post briefings/alerts into channels draft-first (`SLACK_PROACTIVE_ENABLED`); Teams 1:1 replies via the Bot Framework connector while channel replies stay withheld.
 - **LLM cost metering, budgets, and tiering** — every model call across ~20 call sites is metered through the shared factory (caller inferred automatically, exact provider token counts with estimation fallback, latency, success); optional per-agent daily budgets block over-budget calls *before* spending and degrade to the deterministic fallbacks; a lite model tier serves high-volume wording; `GET /llm/usage` and the briefing's AI-spend line report cost per agent.
 - **Critic→revise loop** — an objection from the critic triggers ONE bounded revision by the drafting side (LLM rewrite for KB articles guided by the exact findings; deterministic slot-drop for conflicting meetings), then a re-review; the approval carries the final verdict with the revision annotated, including honest `improved: false` outcomes.
 - **Nightly behavior evals ("CI for prompts")** — five golden scenarios run through the real LLM flows with deterministic assertions (SDR qualification pursuit, prompt-injection leak check, KB-grounded auto-reply with a self-provisioning canary article, planner bounds, a no-LLM retrieval canary); failures raise a supervisor alert naming the drifted evals.

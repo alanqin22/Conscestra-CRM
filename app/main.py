@@ -589,6 +589,15 @@ async def lifespan(app: FastAPI):
     db_ok = test_connection()
     logger.info(f"Database: {'OK' if db_ok else 'FAILED -- check DB_DSN in .env'}")
 
+    # HA leader election (#7): the scheduler, IMAP poller and agent-bus consumer
+    # are cluster-wide singletons — with >1 worker/replica only the LEADER may run
+    # them, or every replica would duplicate dunning, bookings and bus drains.
+    from app.core import leader
+    _run_bg = leader.begin()
+    if not _run_bg:
+        logger.info("[HA] follower — background singletons (scheduler / IMAP / agent-bus) "
+                    "run on the leader; this process serves HTTP only")
+
     # ── Daily order-status advancement scheduler (Windows-compatible) ──────────
     # Uses APScheduler so the same code runs on Windows (no pg_cron) and on
     # Railway/Linux. Wrapped in try/except so a missing package never crashes
@@ -835,9 +844,15 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             misfire_grace_time=86400,
         )
-        _scheduler.start()
-        logger.info(
-            "[Scheduler] Started (America/New_York) — "
+        if not _run_bg:
+            # Follower: the scheduler object is built but NOT started — only the
+            # leader fires the daily jobs (HA singleton, #7).
+            logger.info("[Scheduler] built but not started (HA follower)")
+            _scheduler = None
+        else:
+            _scheduler.start()
+            logger.info(
+                "[Scheduler] Started (America/New_York) — "
             "opps advance 22:00 ET | orders advance 22:05 ET | "
             "activity sweep 22:10 ET | orders seed 22:15 ET | "
             "pipeline seed 22:20 ET | overdue-invoice emit 22:25 ET | "
@@ -858,22 +873,25 @@ async def lifespan(app: FastAPI):
                 pass
         _scheduler = None
 
-    # Start autonomous inbound-email auto-reply poller
+    # Start autonomous inbound-email auto-reply poller (LEADER only — #7).
     from app.agents.email.imap_poller import start_poller, stop_poller
-    try:
-        from app.agents.email.smtp_imap import EMAIL_ADDRESS
-        start_poller(own_address=EMAIL_ADDRESS)
-        logger.info("ImapPoller started — auto-reply active for info@agentorc.ca")
-    except Exception as exc:
-        logger.warning(f"ImapPoller failed to start: {exc}")
+    if _run_bg:
+        try:
+            from app.agents.email.smtp_imap import EMAIL_ADDRESS
+            start_poller(own_address=EMAIL_ADDRESS)
+            logger.info("ImapPoller started — auto-reply active for info@agentorc.ca")
+        except Exception as exc:
+            logger.warning(f"ImapPoller failed to start: {exc}")
 
     # Start the agent-bus consumer (event-driven agent cooperation, Phase 1).
+    # LEADER only — a second consumer would double-drain the event queue (#7).
     # No-op unless AGENT_BUS_ENABLED=1 — see app/core/agent_bus.py.
-    try:
-        from app.core.agent_bus import start_agent_bus
-        start_agent_bus()
-    except Exception as exc:
-        logger.warning(f"agent_bus failed to start: {exc}")
+    if _run_bg:
+        try:
+            from app.core.agent_bus import start_agent_bus
+            start_agent_bus()
+        except Exception as exc:
+            logger.warning(f"agent_bus failed to start: {exc}")
 
     yield
 
@@ -886,6 +904,10 @@ async def lifespan(app: FastAPI):
         _scheduler.shutdown(wait=False)
     try:
         stop_poller()
+    except Exception:
+        pass
+    try:
+        leader.release()   # release the HA advisory lock (also freed on session end)
     except Exception:
         pass
     logger.info("=== CRM Agent shutting down ===")
@@ -1075,6 +1097,47 @@ app.include_router(identity_router, dependencies=_ADMIN)
 from app.core.conversations import router as conversations_router
 app.include_router(conversations_router, dependencies=_ADMIN)
 
+# -- Live Human-Agent Takeover Console (blindspot #1) — the human SEAT on the
+#    conversation spine: queue, takeover/release, AI-suggested reply, human send.
+from app.core.agent_console import router as agent_console_router
+app.include_router(agent_console_router, dependencies=_ADMIN)
+
+# -- Agent-Program Operations Analytics (blindspot #4) — the AI fleet as a
+#    service operation: containment / escalation / CSAT proxy / cost per convo.
+from app.core.agent_ops import router as agent_ops_router
+app.include_router(agent_ops_router, dependencies=_ADMIN)
+
+# -- No-Code Agent Authoring (blindspot #3) + Employee/IT internal service (#5).
+#    Data-defined agents: authoring CRUD is admin-gated; the chat endpoint
+#    self-gates (internal agents require a signed-in session, external are public
+#    + rate-limited). Runtime is grounded, tool-less and write-less (safe by
+#    default). The IT + People/HR agents are seeded rows (employee_service_seed).
+from app.core.custom_agents import (admin_router as custom_agents_admin_router,
+                                    public_router as custom_agents_public_router)
+app.include_router(custom_agents_admin_router, dependencies=_ADMIN)
+app.include_router(custom_agents_public_router)
+
+# -- Distributable Widget SDK (blindspot #6). One <script> tag embeds an
+#    EXTERNAL custom agent on any site. Key CRUD is admin-gated; the /embed/v1
+#    endpoints + /widget.js are public and origin-scoped per key (never expose
+#    an internal agent). Builds on the custom-agents runtime.
+from app.core.embed import (admin_router as embed_admin_router,
+                            public_router as embed_public_router)
+app.include_router(embed_admin_router, dependencies=_ADMIN)
+app.include_router(embed_public_router)
+
+# -- Compliance & Data-Residency Trust Center (blindspot #8). PUBLIC posture feed
+#    (no secrets — prospect/reviewer-facing control inventory), rendered by
+#    trust.html. Reflects real runtime controls; self-attested, not a cert.
+from app.core.compliance import router as compliance_router
+app.include_router(compliance_router)
+
+# -- Testing at Scale: synthetic-utterance regression suite + pre-deploy gate
+#    (blindspot #9). Admin-gated on-demand runs; also a CLI CI gate
+#    (python -m app.core.eval_suite).
+from app.core.eval_suite import router as eval_suite_router
+app.include_router(eval_suite_router, dependencies=_ADMIN)
+
 # -- Intelligent channel selection (Unified Communication Layer, Phase 4) — best
 #    communication action for an objective + party (also A2A comms.select_channel).
 from app.core.channel_selector import router as channel_selector_router
@@ -1170,8 +1233,11 @@ app.include_router(telephony_public_router)
 # -- Channel transports (Unified Communication Layer, Phase 3) — provider
 #    webhooks: WhatsApp (external), Slack + Teams (internal). PUBLIC by nature;
 #    signature-verified when the provider secret is set (dev-permissive otherwise).
+#    Slack /slack/interactive (in-thread approvals) is signature+identity gated.
 from app.core.transports import router as transports_router
+from app.core.transports import admin_router as transports_admin_router
 app.include_router(transports_router)
+app.include_router(transports_admin_router, dependencies=_ADMIN)   # /comms/announce (#5)
 
 # -- Autonomous SDR (prospect-facing web chat + conversational voice).
 #    PUBLIC by nature: chat is gated SDR_CHAT_ENABLED + per-IP rate-limited;
@@ -1278,6 +1344,11 @@ _CHAT_PAGES = [
     "admin-users.html",
     "governance-mgmt.html",
     "knowledge-mgmt.html",
+    "agent-console.html",
+    "agent-ops.html",
+    "agent-studio.html",
+    "widget-demo.html",
+    "trust.html",
     "index.html",
 ]
 
@@ -1357,9 +1428,15 @@ async def health():
     from app.agents.analytics.graph     import get_graph as gan
     from app.agents.notifications.graph import get_graph as gno
     from app.agents.store.graph         import get_graph as gstore
+    try:
+        from app.core import leader
+        _ha = {"role": leader.role(), "runs_singletons": leader.is_leader()}
+    except Exception:
+        _ha = {"role": "unknown"}
     return {
         "status":  "healthy",
         "version": "2.2.0",
+        "ha": _ha,   # leader | follower | standalone — which process runs the background singletons (#7)
         "home_index": {"endpoint": "GET /home-index", "sp": "sp_home_index"},
         "agents": {
             "accounts":      {"graph_ready": ga()     is not None},

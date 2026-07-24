@@ -930,6 +930,18 @@ def send_briefing(force: bool = False) -> Dict[str, Any]:
         results["env_fallback"] = {"role": "CEO", "sent": 1 if ok else 0, "failed": 0 if ok else 1}
         total += 1 if ok else 0
 
+    # Proactive Slack post (#5) — broadcast the CEO briefing into the team channel.
+    # Best-effort + self-gated (SLACK_PROACTIVE_ENABLED + a configured channel);
+    # a no-op draft when disabled, so this never affects email delivery.
+    try:
+        from app.core import transports
+        pr = transports.post_internal("internal_briefing",
+                                      f"*{ceo_msg['subject']}*\n\n{ceo_msg.get('text', '')}")
+        if pr.get("sent"):
+            results["slack"] = {"channel": pr.get("channel"), "sent": 1}
+    except Exception as exc:
+        logger.debug(f"[ceo_briefing] proactive Slack post skipped: {exc}")
+
     logger.info(f"[ceo_briefing] delivered total={total} by_briefing={results}")
     return {"sent_count": total, "by_briefing": results, "subject": ceo_msg["subject"]}
 

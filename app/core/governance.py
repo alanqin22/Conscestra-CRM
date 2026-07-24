@@ -541,7 +541,15 @@ def _deliver_approval_chat(chosen: Dict[str, Any], channel: str, approval_uuid: 
             + f"Approve: {links['approve']}\nReject: {links['reject']}")
     from app.core import transports
     if channel == "slack":
-        res = transports._slack_post(handle, text)
+        # Native in-thread Approve/Reject buttons (#6). The button values carry the
+        # SAME HMAC (approval, action) token as the one-click email links, so the
+        # /slack/interactive endpoint verifies the decision is untampered. The
+        # link-bearing `text` is the fallback where blocks can't render.
+        _, blocks = transports.approval_blocks(
+            approval_uuid, action_type, amount, summ_text,
+            decision_token(approval_uuid, "approve"),
+            decision_token(approval_uuid, "reject"))
+        res = transports._slack_post_blocks(handle, text, blocks)
     else:                                    # teams — connector-gated (drafted)
         res = {"sent": False, "reason": "teams connector not configured (drafted)"}
     logger.info(f"[governance] approval → {label} via {channel}: {res}")
