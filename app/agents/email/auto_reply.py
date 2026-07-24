@@ -168,6 +168,15 @@ def compose_reply(email: Dict[str, Any], intent: str) -> Optional[Dict[str, str]
         "Always sign as: The Conscestra CRM Team | info@agentorc.ca | agentorc.ca"
     )
 
+    # Multilingual (blindspot #2): reply in the language the customer wrote in
+    # (Canadian bilingual first-class). Detected from the RAW body — deterministic,
+    # no cost — grounded in the same approved knowledge; kill switch inside.
+    try:
+        from app.core import language
+        system_prompt += language.respond_in(orig_body or orig_subject)
+    except Exception as exc:
+        logger.debug(f"language directive skipped: {exc}")
+
     user_prompt = (
         f"Write an auto-reply email.\n\n"
         f"Recipient first name: {first_name}\n"
@@ -368,6 +377,17 @@ def process_inbound_email(email: Dict[str, Any], own_address: str) -> bool:
     if intent not in ('general_inquiry', 'support_request'):
         logger.info(f"Intent '{intent}' does not trigger auto-reply.")
         return False
+
+    # Live human takeover (blindspot #1): if a rep currently owns this sender's
+    # conversation in the agent console, the AI stands down — it must never talk
+    # over the human who took the wheel. Fail-open on any error.
+    try:
+        from app.core.agent_console import is_human_handled
+        if is_human_handled('email', _extract_email_addr(email.get('from', ''))):
+            logger.info("Auto-reply suppressed: conversation is human-handled.")
+            return False
+    except Exception as exc:
+        logger.debug(f"human-handled check skipped: {exc}")
 
     reply = compose_reply(email, intent)
     if not reply:
