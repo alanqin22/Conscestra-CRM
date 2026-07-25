@@ -8,8 +8,11 @@ honest scope note plus the closest CRM proxy instead of a hallucination.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import List, Optional, Tuple
+
+logger = logging.getLogger("executive")
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +90,31 @@ def _fmt_by_owner(p: dict) -> List[str]:
 
 
 def _fmt_win_rate(p: dict) -> List[str]:
+    """Win rate comes from the METRIC REGISTRY (app/core/metrics.py) — the one
+    canonical definition, so this briefing can never drift from what the Explore
+    agent, the anomaly detectors or /metrics report. The KPI pack still supplies
+    the sales-cycle figure (not a registered metric). Falls back to the pack's own
+    number if the registry is unavailable, so a briefing never breaks."""
     w = p.get('win_rate', {})
-    return ['#### 🏆 Win Rate & Sales Cycle',
-            f"Overall win rate **{w.get('overall_pct')}%** "
-            f"({w.get('won')} won / {w.get('lost')} lost) · "
-            f"average cycle **{w.get('avg_cycle_days')} days**.", '']
+    pct, definition = w.get('overall_pct'), None
+    won, lost = w.get('won'), w.get('lost')
+    try:
+        from app.core import metrics
+        m = metrics.compute("win_rate", "all_time")
+        if m.get("value") is not None:
+            pct = m["value"]
+            won = m.get("numerator", won)
+            lost = (m.get("denominator") or 0) - (m.get("numerator") or 0)
+            definition = m.get("definition")
+    except Exception as exc:
+        logger.debug(f"[executive] win_rate registry lookup failed, using pack: {exc}")
+    out = ['#### 🏆 Win Rate & Sales Cycle',
+           f"Overall win rate **{pct}%** ({won} won / {lost} lost) · "
+           f"average cycle **{w.get('avg_cycle_days')} days**."]
+    if definition:
+        out.append(f"  _{definition}_")
+    out.append('')
+    return out
 
 
 def _fmt_top_deals(p: dict) -> List[str]:

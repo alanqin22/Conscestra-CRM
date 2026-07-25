@@ -265,6 +265,17 @@ DETECTORS: List[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = [
     detect_churn_risk, detect_bus_stall, detect_low_stock, detect_sentiment_drop,
 ]
 
+# Analytics trend anomalies (blindspot A1): win-rate WoW drop, stalled deals,
+# revenue slump — the period-over-period detectors the Analytics prompt
+# promised but nothing computed. Same signal shape, so they ride this loop's
+# alert-emit + dedupe + governance + planner bridge (A5) unchanged. Loaded
+# defensively so a problem there never disarms the core detectors above.
+try:
+    from app.core import analytics_signals as _analytics_signals
+    DETECTORS += _analytics_signals.DETECTORS
+except Exception as _exc:  # pragma: no cover
+    logger.warning(f"[supervisor] analytics_signals not loaded: {_exc}")
+
 
 # ============================================================================
 # ACT (emit alert / auto-act) + idempotency
@@ -367,7 +378,16 @@ def _breach_goal(sig: Dict[str, Any]) -> Optional[str]:
     """Turn a breach signal into a plain-language GOAL for the planner. Returns
     None for breaches with no business play (e.g. the ops bus_stall heartbeat)."""
     headline = sig.get("headline") or ""
-    return {
+    # Analytics trend anomalies (A1) contribute their own goals so the planner
+    # bridge composes a governed play for them too (A5). Merged first; the
+    # explicit mapping below wins on any key collision.
+    mapping: Dict[str, str] = {}
+    try:
+        for _k, _tmpl in _analytics_signals.BREACH_GOALS.items():
+            mapping[_k] = _tmpl.format(headline=headline)
+    except Exception:
+        pass
+    mapping.update({
         "ar_spike":
             f"Reduce overdue receivables ({headline}). Identify the overdue "
             f"invoices and send payment reminders to the customers who owe.",
@@ -390,7 +410,8 @@ def _breach_goal(sig: Dict[str, Any]) -> Optional[str]:
             f"Address declining customer sentiment ({headline}). Identify the "
             f"accounts behind the recent negative conversations and propose "
             f"save actions.",
-    }.get(sig.get("rule"))
+    })
+    return mapping.get(sig.get("rule"))
 
 
 def _plan_already_queued(goal: str) -> bool:

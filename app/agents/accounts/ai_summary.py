@@ -74,8 +74,15 @@ def _gather(account_id: str) -> Dict[str, Any]:
             except Exception:
                 conn.rollback()
                 intel = ()
+        # Admin-defined custom fields (P3) — so the 360 reflects the customer's
+        # own data model, not just the fixed schema. Best-effort.
+        try:
+            from app.core import custom_fields
+            custom = custom_fields.get_values_labeled("accounts", account_id)
+        except Exception:
+            custom = []
         return {"acct": acct, "rev": rev, "opps": opps, "ar": ar,
-                "acts": acts, "contacts": contacts, "intel": intel}
+                "acts": acts, "contacts": contacts, "intel": intel, "custom": custom}
     finally:
         conn.close()
 
@@ -110,6 +117,9 @@ def _fact_sheet(d: Dict[str, Any], notes: List[Dict[str, Any]]) -> str:
         if senti_label:
             lines.append(f"Customer-voice sentiment (90d): {senti_label} "
                          f"({float(senti_score):+.2f})")
+    if d.get("custom"):
+        lines.append("Custom fields: " + ", ".join(
+            f"{f['label']}: {f['value']}" for f in d["custom"]))
     if d["opps"]:
         lines.append("Open opportunities:")
         for o in d["opps"]:

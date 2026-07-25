@@ -131,9 +131,27 @@ def agent_performance(days: int = 30) -> Dict[str, Any]:
         logger.debug(f"[learning] data-quality skipped: {exc}")
         dq = []
 
+    # ── Data READINESS: can the numbers above safely be decided on? (P1) ─────
+    # The scored view + the qualifiers an agent should say out loud. Surfacing
+    # this is the point of the readiness engine — a briefing that reports a KPI
+    # without its reliability is exactly the "untrusted context" problem.
+    try:
+        from app.core import data_readiness
+        rep = data_readiness.report()
+        dr = [f"data readiness: {rep['overall_score']}/100 ({rep['grade']})"]
+        weak = [d for d in rep.get("decisions") or []
+                if d.get("tier") in ("low", "moderate")]
+        for d in weak[:3]:
+            dr.append(f"⚠ {d['name']} reliability {d['reliability']}% "
+                      f"({d['tier']})" + (f" — {d['limiting']}" if d.get("limiting") else ""))
+        dr.extend(rep.get("caveats") or [])
+    except Exception as exc:
+        logger.debug(f"[learning] data-readiness skipped: {exc}")
+        dr = []
+
     return {"window_days": days, "cadences": cadences,
             "campaigns": campaigns, "churn_calibration": calibration,
-            "ai_spend": ai_spend + dq}
+            "ai_spend": ai_spend + dq + dr}
 
 
 # ============================================================================

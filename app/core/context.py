@@ -221,13 +221,29 @@ def hydrate(entity_type: str, entity_id: str) -> Optional[Dict[str, Any]]:
         return _attach_memory(pack)
     if et == "account":
         pack = _hydrate_account(entity_id)
+        _attach_custom_fields(pack, "accounts", entity_id)
     elif et == "lead":
         pack = _hydrate_lead(entity_id)
+        _attach_custom_fields(pack, "leads", entity_id)
     else:
         return None
     if pack:
         pack["as_of"] = datetime.now(timezone.utc).isoformat()
     return _attach_memory(pack)
+
+
+def _attach_custom_fields(pack, entity: str, entity_id: str) -> None:
+    """Agent-aware custom fields (P3): admin-defined extra fields for this record
+    so agents are 'born' knowing them. Best-effort — never breaks hydration."""
+    if not pack:
+        return
+    try:
+        from app.core import custom_fields
+        cf = custom_fields.get_values_labeled(entity, entity_id)
+        if cf:
+            pack["custom_fields"] = cf
+    except Exception as exc:
+        logger.debug(f"[context] custom fields skipped: {exc}")
 
 
 # ============================================================================
@@ -273,6 +289,11 @@ def render(pack: Optional[Dict[str, Any]]) -> str:
         bits = [b for b in bits if b]
         if bits:
             lines.append("Lead: " + " · ".join(bits))
+
+    cf = pack.get("custom_fields") or []
+    if cf:
+        lines.append("Custom: " + " · ".join(
+            f"{f['label']}: {f['value']}" for f in cf[:6]))
 
     sig = pack.get("signals") or []
     if sig:

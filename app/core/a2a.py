@@ -309,6 +309,20 @@ def _sp_dq_merge_contacts(p: Dict[str, Any]) -> Any:
     return data_quality.merge_contacts_sp(p or {})
 
 
+def _sp_identity_materialize(p: Dict[str, Any]) -> Any:
+    """Identity: materialize a CONFIRMED duplicate link — re-point the duplicate's
+    business rows to the primary and soft-delete it (executed on approval; undoable)."""
+    from app.core import identity_links
+    return identity_links.materialize_sp(p or {})
+
+
+def _sp_data_erase_record(p: Dict[str, Any]) -> Any:
+    """Lifecycle: erase a record's personal data (executed on approval).
+    IRREVERSIBLE — there is deliberately no undo handler for this action."""
+    from app.core import lifecycle
+    return lifecycle.erase_sp(p or {})
+
+
 def _sp_crm_plan(p: Dict[str, Any]) -> Any:
     """Bounded planner: draft + validate a plan for a goal — NO execution
     (run via POST /planner/plan with execute=true; writes queue for approval)."""
@@ -530,6 +544,23 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "email) into the oldest — activities reassigned, dupes "
                "soft-deleted, every move recorded, undoable",
                sp=_sp_dq_merge_contacts),
+    Capability("data.erase_record", "lifecycle", "", "write",
+               lambda p: f"erase personal data for {p.get('entity','record')} "
+                         f"{str(p.get('record_id',''))[:8]}",
+               "data lifecycle: honour an erasure request — delete the personal "
+               "satellites (custom fields, AI memories, transcripts, identity "
+               "links), de-link activity history, and redact the core record, "
+               "while RETAINING financial, suppression and audit records by "
+               "policy. IRREVERSIBLE — there is no undo",
+               sp=_sp_data_erase_record),
+    Capability("identity.materialize_link", "identity_resolution", "", "write",
+               lambda p: f"merge duplicate {p.get('entity', 'record')} into its primary",
+               "identity resolution: physically merge an ALREADY-CONFIRMED duplicate "
+               "link — the duplicate's business/history rows are re-pointed to the "
+               "primary and it is soft-deleted (logins and derived intelligence are "
+               "never moved). One transaction, every move recorded, undoable. Reads "
+               "already resolve through the link, so this is optional",
+               sp=_sp_identity_materialize),
     Capability("crm.plan", "orchestrator", "", "read",
                lambda p: f"plan: {p.get('goal', '')}",
                "bounded goal→plan orchestration: draft a validated multi-step "
