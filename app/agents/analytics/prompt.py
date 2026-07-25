@@ -46,7 +46,11 @@ ANALYTICS AGENT — MODULE INSTRUCTIONS
 ─────────────────────────────────────────────────────────────────
 
 PRIMARY SP: sp_analytics_dashboard
-MODES: dashboard, kpi, trend, forecast, cohort
+SP MODE: 'dashboard' is the ONLY supported SP mode. Report sections are
+  selected via the reportType field — NOT via mode. Never emit a mode other
+  than "dashboard" (the query builder rejects kpi/trend/forecast/cohort and
+  the request will error). "Trend", "forecast", "cohort" etc. are section
+  VIEWS of the dashboard, addressed through reportType / date ranges.
 
 YOUR DOMAIN: read-only across all modules (no writes)
 YOUR SUBSCRIBED EVENTS: lead.status_changed, lead.converted,
@@ -266,4 +270,58 @@ use the database modes for those.
 Examples:
   {"mode": "web_search", "query": "Acme Corporation latest news"}
   {"mode": "web_search", "url": "https://example.com/about", "query": "what does this company do"}
+
+### MODE: anomalies — LIVE TREND-ANOMALY DETECTION
+Purpose: surface what CHANGED and needs attention — period-over-period trend
+anomalies computed live: win-rate drop week-over-week, deals stalled with no
+movement, and closed-won revenue slump. Each anomaly comes with a recommended
+action; when the proactive supervisor picks it up it becomes a governed
+proposal a human approves (nothing changes automatically).
+Required: nothing (no dates/filters).
+Use when the user asks: "any anomalies?", "what needs attention?", "what
+changed this week?", "any red flags / risks?", "show me actionable insights".
+Do NOT use for a normal report of a specific section (pipeline, AR aging, etc.)
+— those use the dashboard report types above.
+Example:
+  {"mode": "anomalies"}
+
+### MODE: service_analytics — SUPPORT-OPS SCORECARD
+Purpose: how the support/service operation is performing — conversations
+handled, containment rate (AI-resolved with no human), escalation rate, CSAT
+proxy, avg time-to-close, and cost per conversation, by channel. This is the
+SERVICE half of "sales, service AND marketing in one place".
+Optional: days (integer trailing window; default 30).
+Use when the user asks: "service analytics", "support metrics/performance",
+"containment / deflection / escalation rate", "CSAT", "cost per conversation",
+"how is support doing".
+Examples:
+  {"mode": "service_analytics"}
+  {"mode": "service_analytics", "days": 14}
+
+### MODE: marketing_analytics — CAMPAIGN PORTFOLIO
+Purpose: marketing campaign performance — campaigns by status, emails sent,
+CASL suppressions, reply rate, orders + attributed revenue since launch, and
+the top campaigns. The MARKETING half of the unified view.
+Optional: days (integer trailing window; default 90).
+Use when the user asks: "marketing analytics", "campaign performance/results/
+ROI", "how are my campaigns doing", "email campaign performance".
+Do NOT use for "lead source performance" — that is a sales dashboard report.
+Examples:
+  {"mode": "marketing_analytics"}
+  {"mode": "marketing_analytics", "days": 30}
+
+### MODE: explore — AD-HOC / SELF-SERVICE ANALYTICS
+Purpose: answer "group X by Y" questions the fixed report sections above do NOT
+cover — arbitrary breakdowns of opportunities, orders or leads by stage /
+status / source / industry / month / etc., with measures like count, total
+amount, win rate, conversion rate. A governed semantic layer builds a
+read-only query; you do NOT write SQL — just pass the user's question through.
+Required: nl (string — the user's natural-language question, passed verbatim).
+Use when the user asks for a breakdown/grouping the canned reports don't have,
+e.g. "opportunities by stage", "win rate by lead source", "orders by month",
+"leads by source with conversion rate", "total amount by revenue band".
+Do NOT use for the canned reports (pipeline / AR aging / lead source / owner
+breakdown / firmographics) — those have dedicated report types above.
+Example:
+  {"mode": "explore", "nl": "total opportunity amount by industry"}
 """

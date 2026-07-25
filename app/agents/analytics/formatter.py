@@ -230,6 +230,151 @@ def _compute_summary(d: dict) -> dict:
 from app.core.text_clean import clean_obj
 
 
+# ---------------------------------------------------------------------------
+# Cross-domain analytics renderers (blindspot A3 — service + marketing brought
+# INTO the Analytics agent so it spans sales, service AND marketing)
+# ---------------------------------------------------------------------------
+
+def _pct_str(v) -> str:
+    return f'{float(v):.1f}%' if v is not None else 'N/A'
+
+
+def _format_service_analytics(d: Dict[str, Any]) -> str:
+    """agent_ops.metrics(days) dict → markdown support-ops scorecard."""
+    if not d or d.get('error'):
+        return ('### 🎧 Service Analytics\n\n'
+                f'Not available: {d.get("error", "no data")}.')
+    days = d.get('window_days', 30)
+    vol  = d.get('volume') or {}
+    res  = d.get('resolution') or {}
+    cost = d.get('cost') or {}
+    out: List[str] = []
+    out.append(f'### 🎧 Service Analytics — last {days} days')
+    out.append(f'**Time:** {_fmt_date(datetime.now())}')
+    out.append('')
+    out.append('**📊 Support-Ops Scorecard**')
+    out.append('')
+    out.append('| Metric | Value |')
+    out.append('| --- | --- |')
+    out.append(f'| Conversations handled | {_fmt_number(vol.get("total"))} |')
+    out.append(f'| Resolved (closed) | {_fmt_number(vol.get("closed"))} |')
+    out.append(f'| Containment rate (AI-resolved, no human) | {_pct_str(d.get("containment_rate"))} |')
+    out.append(f'| Escalation rate (ever handed to a human) | {_pct_str(d.get("escalation_rate"))} |')
+    out.append(f'| Awaiting a human now | {_fmt_number(d.get("awaiting_human"))} |')
+    out.append(f'| CSAT proxy (% non-negative) | {_pct_str(d.get("csat_proxy_pct"))} |')
+    out.append(f'| Avg messages to close | {res.get("avg_messages") if res.get("avg_messages") is not None else "N/A"} |')
+    out.append(f'| Avg hours to close | {res.get("avg_hours_to_close") if res.get("avg_hours_to_close") is not None else "N/A"} |')
+    _pcu = cost.get('per_conversation_usd')
+    out.append(f'| Cost per conversation | {_fmt_currency(_pcu) if _pcu is not None else "N/A"} |')
+    _lu = cost.get('llm_usd')
+    out.append(f'| LLM spend (window) | {_fmt_currency(_lu) if _lu is not None else "N/A"} |')
+    out.append('')
+    if vol.get('by_channel'):
+        out.append('**📡 By Channel**')
+        out.append('')
+        out.append('| Channel | Conversations |')
+        out.append('| --- | --- |')
+        for c in vol['by_channel']:
+            out.append(f'| {c.get("channel")} | {_fmt_number(c.get("count"))} |')
+        out.append('')
+    if not d.get('migration_applied'):
+        out.append('_Containment/escalation need the takeover columns '
+                   '(sql/agent_console.sql); other metrics shown regardless._')
+    out.append('---')
+    out.append('Service, sales and marketing analytics now live in one place. '
+               'Try "marketing performance" or "show pipeline summary".')
+    return '\n'.join(out)
+
+
+def _format_explore(result: Dict[str, Any]) -> str:
+    """Ad-hoc explore result → markdown table + interpreted-spec echo (trust).
+    `result` = {spec, columns, rows, note} or {error}."""
+    if not result or result.get('error'):
+        return ('### 🔎 Ad-hoc Analytics\n\n'
+                f'{result.get("error", "No result.")}\n\n'
+                '_Try grouping a known area — e.g. "opportunities by stage", '
+                '"win rate by lead source", "orders by month", "leads by source"._')
+    cols = result.get('columns') or []
+    rows = result.get('rows') or []
+    out: List[str] = []
+    out.append('### 🔎 Ad-hoc Analytics')
+    out.append(f'**Time:** {_fmt_date(datetime.now())}')
+    out.append('')
+    if result.get('note'):
+        out.append(result['note'])
+        out.append('')
+    if not cols:
+        out.append('No columns resolved.')
+        return '\n'.join(out)
+    out.append('| ' + ' | '.join(c['label'] for c in cols) + ' |')
+    out.append('| ' + ' | '.join('---' for _ in cols) + ' |')
+    if not rows:
+        out.append('| ' + ' | '.join('—' for _ in cols) + ' |')
+        out.append('')
+        out.append('_No rows matched._')
+        return '\n'.join(out)
+    for r in rows:
+        cells = []
+        for c in cols:
+            v = r.get(c['key'])
+            fmt = c.get('format')
+            if fmt in _FORMATTERS and c['kind'] == 'measure':
+                cells.append(_FORMATTERS[fmt](v))
+            else:
+                cells.append(str(v) if v is not None else 'N/A')
+        out.append('| ' + ' | '.join(cells) + ' |')
+    out.append('')
+    out.append(f'_{len(rows)} row(s). Ad-hoc query over the governed semantic '
+               'model (read-only)._')
+    return '\n'.join(out)
+
+
+def _format_marketing_analytics(d: Dict[str, Any]) -> str:
+    """marketing.marketing_analytics(days) dict → markdown campaign portfolio."""
+    if not d or d.get('error'):
+        return ('### 📣 Marketing Analytics\n\n'
+                f'Not available: {d.get("error", "no data")}.')
+    days = d.get('window_days', 90)
+    camp = d.get('campaigns') or {}
+    snd  = d.get('sends') or {}
+    eng  = d.get('engagement') or {}
+    out: List[str] = []
+    out.append(f'### 📣 Marketing Analytics — last {days} days')
+    out.append(f'**Time:** {_fmt_date(datetime.now())}')
+    out.append('')
+    out.append('**📊 Campaign Portfolio**')
+    out.append('')
+    out.append('| Metric | Value |')
+    out.append('| --- | --- |')
+    out.append(f'| Campaigns | {_fmt_number(camp.get("total"))} |')
+    _bys = camp.get('by_status') or {}
+    if _bys:
+        out.append(f'| By status | {", ".join(f"{k}: {v}" for k, v in _bys.items())} |')
+    out.append(f'| Emails sent | {_fmt_number(snd.get("sent"))} |')
+    out.append(f'| Suppressed (CASL opt-out) | {_fmt_number(snd.get("suppressed"))} |')
+    out.append(f'| Accounts replied | {_fmt_number(eng.get("accounts_replied"))} |')
+    out.append(f'| Reply rate | {_pct_str(eng.get("reply_rate_pct"))} |')
+    out.append(f'| Orders since launch | {_fmt_number(eng.get("orders"))} |')
+    out.append(f'| Attributed order value | {_fmt_currency(eng.get("order_value"))} |')
+    out.append('')
+    if d.get('top_campaigns'):
+        out.append('**🏆 Top Campaigns (by attributed order value)**')
+        out.append('')
+        out.append('| Campaign | Status | Sent | Attributed Revenue |')
+        out.append('| --- | --- | --- | --- |')
+        for c in d['top_campaigns']:
+            out.append(f'| {c.get("name")} | {c.get("status")} | '
+                       f'{_fmt_number(c.get("sent"))} | '
+                       f'{_fmt_currency(c.get("attributed_order_value"))} |')
+        out.append('')
+    if not camp.get('total'):
+        out.append('_No campaigns in this window. Lead-source performance is '
+                   'available via the sales dashboard ("lead source performance")._')
+    out.append('---')
+    out.append('Marketing, sales and service analytics now live in one place.')
+    return '\n'.join(out)
+
+
 def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Format sp_analytics_dashboard DB rows into the output dict expected by main.py.
@@ -252,6 +397,48 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
             'output': response.get('exec_markdown') or 'No executive data available.',
             'mode': 'executive_question', 'success': True,
             'dashboardData': {}, 'summaryMetrics': {}, 'params': {}, 'meta': {}
+        }
+
+    # ── Anomalies — pre-formatted by app/core/analytics_signals.py ───────────
+    # dashboardData carries the STRUCTURED signals so the UI can render a per-
+    # anomaly "Act on this" button (A5); the markdown output is the text fallback.
+    if str(params.get('mode') or '') == 'anomalies':
+        return {
+            'output': response.get('anomalies_markdown') or 'No anomalies detected.',
+            'mode': 'anomalies', 'success': True,
+            'dashboardData': {'anomalies': response.get('anomalies_data') or []},
+            'summaryMetrics': {}, 'params': {}, 'meta': {}
+        }
+
+    # ── Service analytics (support-ops scorecard) — blindspot A3 ─────────────
+    if str(params.get('mode') or '') == 'service_analytics':
+        data = response.get('service_data') or {}
+        return {
+            'output': _format_service_analytics(data),
+            'mode': 'service_analytics', 'success': not data.get('error'),
+            'dashboardData': {'service_metrics': data}, 'summaryMetrics': {},
+            'params': {}, 'meta': {}
+        }
+
+    # ── Ad-hoc exploration (semantic layer) — blindspot A2 ───────────────────
+    if str(params.get('mode') or '') == 'explore':
+        result = response.get('explore_result') or {}
+        return {
+            'output': _format_explore(result),
+            'mode': 'explore', 'success': not result.get('error'),
+            'dashboardData': ({'explore': result.get('rows') or []}
+                              if not result.get('error') else {}),
+            'summaryMetrics': {}, 'params': {}, 'meta': {'spec': result.get('spec')}
+        }
+
+    # ── Marketing analytics (campaign portfolio) — blindspot A3 ──────────────
+    if str(params.get('mode') or '') == 'marketing_analytics':
+        data = response.get('marketing_data') or {}
+        return {
+            'output': _format_marketing_analytics(data),
+            'mode': 'marketing_analytics', 'success': not data.get('error'),
+            'dashboardData': {'marketing_analytics': data}, 'summaryMetrics': {},
+            'params': {}, 'meta': {}
         }
 
     # ── Web answer — pre-formatted by app/core/web_tools.py ──────────────────

@@ -32,16 +32,26 @@ logger = logging.getLogger(__name__)
 # ── Connection factory ────────────────────────────────────────────────────────
 
 def get_connection():
-    """Return a raw psycopg2 connection using DB_DSN from settings.
+    """Return a raw psycopg2 connection for the current tenant.
 
-    Forces client_encoding=UTF8 so multi-byte characters (e.g. 'é' in
-    'Québec', en-dashes) round-trip correctly regardless of what the
-    remote PostgreSQL server negotiates by default. Without this,
-    Railway connections may return UTF-8 bytes decoded as ASCII,
-    producing '??' per byte for non-ASCII characters.
+    Tenancy (P4 Phase 0): the connection's (dsn, schema) come from
+    `tenancy.resolve()`. With MULTI_TENANT_ENABLED=0 (default, the entire product
+    today) this is ALWAYS (DB_DSN, 'public') → behaviourally identical to before.
+    In multi-tenant mode a per-tenant schema is applied via the `search_path`
+    connection option, so it is (re)established on EVERY connection (never a stale
+    or pooled search_path); the schema identifier is validated inside
+    `tenancy.resolve()` before it reaches here — never raw-interpolated.
+
+    Forces client_encoding=UTF8 so multi-byte characters (e.g. 'é' in 'Québec',
+    en-dashes) round-trip correctly regardless of what the remote PostgreSQL
+    server negotiates by default.
     """
-    settings = get_settings()
-    conn = psycopg2.connect(settings.db_dsn)
+    from app.core import tenancy
+    dsn, schema = tenancy.resolve()
+    if schema and schema != "public":
+        conn = psycopg2.connect(dsn, options=f"-c search_path={schema},public")
+    else:
+        conn = psycopg2.connect(dsn)
     conn.set_client_encoding('UTF8')
     return conn
 

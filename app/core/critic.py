@@ -444,6 +444,60 @@ def _checks_data_fix(ap: Dict[str, Any]) -> List[Dict[str, str]]:
     return out
 
 
+def _checks_data_erase(ap: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Erasure is the one action with NO undo — surface that plainly, confirm the
+    record still exists, and show what will actually be destroyed vs retained."""
+    out: List[Dict[str, str]] = []
+    p = ap.get("params") or {}
+    entity, rid = str(p.get("entity") or ""), str(p.get("record_id") or "")
+    out.append(_f("reversible", "warn",
+                  "IRREVERSIBLE — this action has no undo; approve only against a "
+                  "verified erasure request"))
+    try:
+        from app.core import lifecycle
+        pv = lifecycle.preview(entity, rid)
+    except Exception as exc:
+        out.append(_f("still_needed", "fail", f"record not resolvable: {str(exc)[:80]}"))
+        return out
+    t = pv["totals"]
+    out.append(_f("still_needed", "ok",
+                  f"{t['rows_to_delete']} row(s) will be deleted, "
+                  f"{t['rows_to_de_link']} de-linked, {t['rows_retained']} retained"))
+    out.append(_f("evidence", "ok" if p.get("reason") else "warn",
+                  p.get("reason") or "no erasure reason recorded"))
+    return out
+
+
+def _checks_identity_materialize(ap: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Sanity-check a duplicate merge: the link must STILL be confirmed and not
+    already materialized (a stale proposal must not run), and the merge must be a
+    human-confirmed one — never a bare detector guess."""
+    out: List[Dict[str, str]] = []
+    p = ap.get("params") or {}
+    link_id = p.get("link_id")
+    if not link_id:
+        return [_f("still_needed", "fail", "no link_id in the proposal")]
+    try:
+        from app.core import identity_links
+        lk = identity_links._link(str(link_id))
+    except Exception as exc:
+        return [_f("still_needed", "fail", f"link no longer resolvable: {str(exc)[:80]}")]
+    if lk["status"] != "confirmed":
+        out.append(_f("still_needed", "fail",
+                      f"link is '{lk['status']}' — only a confirmed link may merge"))
+    elif lk.get("materialized_at"):
+        out.append(_f("still_needed", "fail", "already materialized"))
+    else:
+        out.append(_f("still_needed", "ok", "link is confirmed and not yet merged"))
+    conf = float(lk.get("confidence") or 0)
+    out.append(_f("evidence", "ok" if conf >= 0.90 else "warn",
+                  f"match confidence {conf:.2f}"
+                  + ("" if conf >= 0.90 else " — below 0.90, review the pair closely")))
+    out.append(_f("reversible", "ok",
+                  "every moved row is recorded; the merge is undoable from the audit"))
+    return out
+
+
 _ACTION_CHECKS: Dict[str, Callable[[Dict[str, Any]], List[Dict[str, str]]]] = {
     "campaign.winback":          _checks_campaign_winback,
     "supervisor.emit_dunning":   _checks_emit_dunning,
@@ -455,6 +509,8 @@ _ACTION_CHECKS: Dict[str, Callable[[Dict[str, Any]], List[Dict[str, str]]]] = {
     "sms.send":                  _checks_sms_send,
     "data.normalize_phones":     _checks_data_fix,
     "data.merge_contacts":       _checks_data_fix,
+    "identity.materialize_link": _checks_identity_materialize,
+    "data.erase_record":         _checks_data_erase,
 }
 
 

@@ -364,6 +364,13 @@ _ACTION_DESC = {
     "data.normalize_phones": "Normalize contact/lead phone numbers to E.164 "
         "(capped batch, undoable).",
     "data.merge_contacts": "Merge exact-duplicate contacts into the oldest (undoable).",
+    "data.erase_record": "Erase a record's personal data — deletes custom fields, AI "
+        "memories, transcripts and identity links, de-links activity history and "
+        "redacts the core record; financial, suppression and audit records are "
+        "retained. CANNOT BE UNDONE.",
+    "identity.materialize_link": "Physically merge a confirmed duplicate record into "
+        "its primary — dependent records are re-pointed and the duplicate is "
+        "soft-deleted (undoable).",
     "campaign.winback": "Create and launch a win-back marketing campaign.",
     "kb.publish": "Publish a knowledge-base article.",
     "tuning.adjust": "Change a governed model tuning parameter.",
@@ -986,6 +993,12 @@ def _undo_dq_merge(ap: Dict[str, Any]) -> Dict[str, Any]:
         ((ap.get("result") or {}).get("data")) or {})
 
 
+def _undo_identity_materialize(ap: Dict[str, Any]) -> Dict[str, Any]:
+    from app.core import identity_links
+    return identity_links.undo_materialize(
+        ((ap.get("result") or {}).get("data")) or {})
+
+
 def _undo_contact_update_profile(ap: Dict[str, Any]) -> Dict[str, Any]:
     from app.core import voice_support
     return voice_support.undo_profile_update(ap)
@@ -999,6 +1012,7 @@ _UNDO = {
     "scoring.activate": _undo_scoring_activate,
     "data.normalize_phones": _undo_dq_normalize,
     "data.merge_contacts": _undo_dq_merge,
+    "identity.materialize_link": _undo_identity_materialize,
     "contact.update_profile": _undo_contact_update_profile,
 }
 

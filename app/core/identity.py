@@ -211,9 +211,30 @@ def _lookup_owner(by: str, value: str) -> Optional[Dict[str, Any]]:
 # Resolve
 # ============================================================================
 
+def _canonical(party_type: Optional[str], party_id: Optional[str]) -> Optional[str]:
+    """Resolve a matched party through CONFIRMED duplicate links (P1) so a handle
+    that points at a record later merged into another returns the SURVIVING one.
+
+    This is what makes the identity layer sit ABOVE the channels: whichever handle
+    someone arrives on, and whichever duplicate record that handle was originally
+    attached to, every channel threads to the same canonical party. Best-effort —
+    no identity_links table (or any error) leaves the id unchanged."""
+    if not party_id or party_type != "contact":
+        return party_id
+    try:
+        from app.core import identity_links
+        return identity_links.canonical_id("contacts", party_id) or party_id
+    except Exception as exc:
+        logger.debug(f"[identity] canonical resolution skipped: {exc}")
+        return party_id
+
+
 def resolve(channel: str, handle: str) -> Identity:
     """Map (channel, handle) → one CRM party. Never raises — an unknown handle
-    returns an unresolved Identity (the conversation still threads anonymously)."""
+    returns an unresolved Identity (the conversation still threads anonymously).
+
+    The matched party is resolved through confirmed duplicate links, so a handle
+    attached to a merged-away contact still returns the canonical record."""
     scope = channel_scope(channel)
     h = _normalize_handle(channel, handle)
     if not ENABLED or not h:
@@ -224,7 +245,8 @@ def resolve(channel: str, handle: str) -> Identity:
     if ci and ci.get("party_id"):
         return Identity(
             resolved=True, scope=ci.get("scope") or scope, channel=channel, handle=h,
-            party_type=ci["party_type"], party_id=ci["party_id"],
+            party_type=ci["party_type"],
+            party_id=_canonical(ci["party_type"], ci["party_id"]),
             account_id=ci.get("account_id"), verified=bool(ci.get("verified")),
             match_method="channel_identity", confidence=0.99)
 
@@ -240,7 +262,8 @@ def resolve(channel: str, handle: str) -> Identity:
         else:
             r = _lookup_contact_by_email(h)
             if r:
-                return Identity(True, scope, channel, h, "contact", r["party_id"],
+                return Identity(True, scope, channel, h, "contact",
+                                _canonical("contact", r["party_id"]),
                                 r.get("account_id"), bool(r.get("verified")),
                                 "email", 0.9, r.get("display_name"))
         return _unresolved(channel, h, scope)
@@ -255,7 +278,8 @@ def resolve(channel: str, handle: str) -> Identity:
         else:
             r = _lookup_contact_by_phone(h)
             if r:
-                return Identity(True, scope, channel, h, "contact", r["party_id"],
+                return Identity(True, scope, channel, h, "contact",
+                                _canonical("contact", r["party_id"]),
                                 r.get("account_id"), False, "phone", 0.75,
                                 r.get("display_name"))
         return _unresolved(channel, h, scope)

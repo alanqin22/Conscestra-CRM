@@ -35,7 +35,7 @@ context.
 - **Opportunity Agents** track pipeline momentum.
 - **Order and Product Agents** oversee commerce operations.
 - **Accounting Agents** manage invoices, payments, and financial workflows.
-- **Analytics Agents** monitor trends and performance indicators.
+- **Analytics Agents** answer open-ended questions, detect trend anomalies, and turn insights into governed actions.
 - **Notification and Email Agents** govern communication and outreach.
 - **Activity Agents** preserve organizational memory.
 
@@ -752,6 +752,92 @@ gates, so private data neither leaks into prompts nor out of them.
 Security is not a feature layered onto the platform. **Security is the
 architecture.**
 
+## One Version of the Truth, and It Can Explain Itself
+
+An AI-native CRM has a harder problem than a traditional one. When many agents
+each query the database independently, they can all be correct and still
+disagree — because a business metric is a *definition*, not a column. A
+**Trusted Semantic Core** now sits between every agent and the data.
+
+**One metric, one definition, many time windows.** Win rate used to be
+calculated separately by the exploration agent, the anomaly detectors, and the
+executive briefing. Each was defensible; together they could answer the same
+question three ways. A **metric registry** now holds the canonical definition —
+numerator, denominator, the event date it is measured by, and whether it may be
+summed at all — and every surface reads from it. The anomaly detector no longer
+redefines win rate; it asks the registry for the same metric over two windows.
+Every answer can state its own definition:
+
+> **Win Rate: 89.1%** — closed-won ÷ (closed-won + closed-lost) opportunities,
+> excluding open deals, measured by decision date.
+
+This also required a fact the schema never recorded: **when a deal was actually
+decided**. Period-over-period metrics had been measured by the record's last
+edit, so touching an old note could pull a months-old deal into "won this week."
+Deals now carry a true decision timestamp, set the moment they close and cleared
+if they reopen.
+
+**Reads are governed, not just writes.** Approving an action was always
+governed; *reading* aggregate business data was not. Cross-record analytics —
+metrics, exploration, and the analytics agent itself — now pass through one
+authorization context, so company-wide revenue and win rate cannot be read by
+asking an agent nicely. Tenant isolation stays where it belongs, at the
+connection layer; the query layer decides row-level authority.
+
+**Every value can say where it came from.** "Enterprise" typed by a person,
+imported from a spreadsheet, and inferred by an agent at 78% confidence are not
+the same fact. A **provenance envelope** — source type, source, confidence, and
+when the fact was observed — travels with custom field values, imported records
+and AI memories. Imports are stamped as a traceable batch. Where provenance is
+genuinely unknown, the system says so rather than assuming.
+
+**The AI knows whether its data can bear the weight.** Readiness used to mean
+"are there rows?" It now scores seven dimensions — completeness, validity,
+consistency, uniqueness, integrity, freshness and provenance — and maps them to
+the decisions that depend on them, so the briefing can qualify itself:
+
+> Revenue reporting is reliable. Rep accountability is not — 52% of accounts
+> have no owner.
+
+That specific finding was real, and it was fixed: ownership was recovered by
+inference from the deals people were actually working, and the create path now
+inherits an owner instead of silently leaving records unassigned.
+
+**One customer, however many records.** Exact-email matching never caught
+"Acme Inc", "Acme, Inc." and "ACME Incorporated." Identity resolution now
+combines name normalization with trigram similarity, scores each candidate, and
+sorts it into auto-link, review, or keep-separate. Crucially, confirmed
+duplicates are **links, not merges**: both records survive untouched, reads
+resolve through the link to a golden record that reports which record each field
+came from, and any link can be reversed. A physical merge is available, but it
+is a separate, governed, fully reversible action — because a wrong merge that
+cannot be undone is worse than a duplicate. Whichever channel someone arrives
+on, and whichever duplicate their handle was attached to, every conversation
+threads to the same canonical person.
+
+**Questions that cross entities.** The semantic layer spans nine business areas
+and knows how they relate — an opportunity belongs to an account and is assigned
+to a representative; a payment settles an invoice. It can answer *which
+representatives win most often* or *which industries buy the most but pay the
+slowest*. It also refuses to answer wrongly: joining one record to many
+multiplies rows, so any total across such a join is blocked with an explanation
+rather than returned as a confidently incorrect number. Period-over-period
+comparison, rolling averages and year-over-year are semantic operations
+available everywhere — and for a rate, the correct pooled figure is reported
+alongside the naive average.
+
+**Erasure understands the copies.** Deleting a person is not one delete.
+Personal data lives in custom fields, AI memories, transcripts and identity
+links, while invoices and audit trails must survive. Each store now has an
+explicit policy — delete, de-link, or retain — so an erasure request removes the
+personal data, keeps the financial and audit skeleton referentially intact, and
+deliberately preserves the record proving someone asked not to be emailed.
+
+**Scheduled intelligence knows which business it is serving.** Background work
+now runs inside an explicit tenant and system-actor context, so proactive
+intelligence can never quietly serve only the first organization — and every
+automated action remains attributable to the job that took it.
+
 ## Executive Awareness in Real Time
 
 Every morning, leadership receives a personalized executive briefing.
@@ -840,7 +926,7 @@ _Listed in the same order as the launcher page on [agentorc.ca](https://agentorc
 | 📑&nbsp;Orders | _"create order for ABC Corp"_ — line-item editor, status workflow, invoice generation |
 | 💰&nbsp;Accounting | _"Accounting Summary"_ — AR aging, cashflow, account-margin analytics, product profitability, forecast accuracy — all real-time |
 | 📝&nbsp;Activities | _"create task for Bob tomorrow"_ — typeahead Related-Name lookup across every entity |
-| 📊&nbsp;Analytics | KPI dashboards driven by Postgres stored procedures, rendered with Chart.js |
+| 📊&nbsp;Analytics | KPI dashboards (Postgres SPs + Chart.js) **plus** ad-hoc self-service exploration (_"win rate by lead source"_) over a governed semantic model, unified sales/service/marketing metrics, auto-detected trend anomalies, and a one-click "act on this" that queues a governed plan |
 | 🔔&nbsp;Notifications | Real-time activity stream with unread/read state |
 | 📧&nbsp;Email | Outbound mail + inbox + autonomous inbound auto-reply (SMTP/IMAP + LangGraph), plus event-driven order-confirmation / shipped emails to verified customers |
 | 🧭&nbsp;Orchestrator | _"daily briefing"_, _"pipeline health"_, _"company pulse"_ — symphonic workflows that fan out to multiple agents and weave the results into one report, plus a curated executive Q&A bank for CEO/CFO-style questions |
@@ -880,6 +966,13 @@ _Listed in the same order as the launcher page on [agentorc.ca](https://agentorc
 - **Hybrid routing** — common intents (search, list, update, delete) skip the LLM entirely for sub-second response; novel phrasings fall through to GPT-4o-mini.
 - **Voice everywhere** — Azure Speech SDK (Bing-style) primary, Web Speech API fallback, with BFCache-safe cleanup across navigation.
 - **Real analytics, not toys** — invoice-level cost/margin tracking, effective-dated wholesale/retail pricing, AR aging buckets, forecast attainment, data-quality badges, and a DB-level `wholesale ≤ retail` trigger.
+- **Self-service analytics without a SQL surface** — beyond the ~15 pre-built report sections, the Analytics agent answers open-ended "group X by Y" questions (_"win rate by lead source"_, _"orders by month"_, _"leads by source with conversion rate"_) through a **governed semantic layer** (`semantic_model.py` + `semantic_query.py`): the LLM emits a JSON spec referencing only curated dimension/measure keys — never SQL — which is validated against an allow-list and compiled to a **parameterized, read-only** query (filter values bound not inlined, single statement, clamped `LIMIT`, executed inside a Postgres read-only transaction with a statement timeout). Ask-Data flexibility with the safety of a stored procedure; new explores are a data edit in the registry.
+- **Analytics that spans sales, service AND marketing** — the same agent now surfaces the **service-ops scorecard** (containment / escalation / CSAT proxy / cost-per-conversation / by-channel, assembled from the conversation spine + LLM meter) and a **marketing portfolio** (campaigns, CASL-safe sends, reply rate, orders + attributed revenue) alongside pipeline and revenue — the cross-domain view surfaced in one place instead of three siloed pages.
+- **From insight to governed action** — period-over-period **anomaly detectors** (win-rate week-over-week drop, stalled deals with no movement, closed-won revenue slump) ride the standing supervisor loop (alerting + 12h dedupe) and answer on demand (_"any anomalies?"_) with a recommended action. They're pushed proactively into the **daily executive briefing** (email + its Slack broadcast), and every surfaced anomaly carries an **"act on this"** control (`POST /analytics/anomalies/act`) that composes a bounded multi-agent plan via the same planner bridge the supervisor uses — reads run, writes queue for governance approval, idempotent, nothing sent or changed automatically.
+- **A Customer Activation Layer — value fast for any size** — the hardest distance in a CRM is empty-database → "this understands my business"; three surfaces (one `setup.html` Get-Started page) close it: **(1) Governed CSV import** (`data_import.py`) brings a customer's book of business in through the *same* entity create-path, SPs and audit as a hand-typed record — alias-mapped headers, a read-only dry-run **preview** (create / duplicate / error) then an idempotent **commit** (re-checks dedupe). **(2) A Readiness Center** (`readiness.py` → `GET /setup/readiness`) replaces a wall of zeros with a prioritized next-step checklist (DB / LLM / core-records / KB / email / executives + posture flags), every probe defensive. **(3) A one-command demo** (`demo.py` → `POST /demo/seed`) seeds a realistic sample business (reusing the importer) + shaped opportunities and returns the intelligence **headline** — _"$595k open pipeline · 5 stalled · 3 slipped · 60% win rate · 12 leads"_ — then `clear()` removes it.
+- **Custom fields that aren't decorative** — an admin declares extra fields on accounts/contacts/leads/opportunities (`customer_tier`, `renewal_date`, RCM level, MLS #) with **no schema change** — a sidecar defs+values store (`custom_fields.py`) that touches zero existing tables or SPs. They're **DB-, UI-, Agent- and Analytics-aware**: injected into `context.hydrate()` and the AI 360 (an agent answering "show me Enterprise accounts" *sees* the field), and surfaced as dimensions/filters in the semantic layer (_"total pipeline by customer tier"_) with filter values kept as bound params.
+- **Industry starter packs** — apply a vertical (SaaS / Real Estate / Music School) in one click (`industry_packs.py`): pure data that reuses every existing writer to seed the right **custom fields + knowledge base + goals + a grounded Q&A assistant**. The CRM is unchanged; only the content fits the industry. Idempotent and fully removable.
+- **Multi-tenant-ready (single-org today)** — a focused single-organization product now, with a deliberate **tenant-routing seam** (`tenancy.py` + a `tenants` registry): because all ~360 data-access sites funnel through one `get_connection` chokepoint, tenancy attaches in **one place** (schema-per-tenant via `search_path`, database-per-tenant for residency) with **no stored-procedure or table changes** — so a future SaaS deployment is a configuration path, not a rewrite (`docs/multi_tenancy.md`). Off by default; behaviour is byte-for-byte today's.
 - **Self-correcting financial data** — invoice ↔ payment triggers recalc balance and status with a rounding-tolerant settlement rule (near-paid invoices settle instead of lingering as "overdue"), the accounts→events trigger is idempotent (no duplicate auto-created deals), and the AR executive view reports outstanding / past-due on a materiality basis — so the receivables figures stay honest.
 - **Deterministic lead scoring** — a transparent Fit + Intent model (`fn_score_lead`, `rule_based_v1`) replaces random scores with explainable, audited Cold/Warm/Hot ratings; the scoring function is a single swappable API, ready to drop in a predictive model later.
 - **Executive Q&A bank** — every agent answers interrogative "executive questions" through a shared decision-grade layer (headline, confidence, drivers, recommended action + owner, drill-down link), with each capability chip routed to a distinct section set.
@@ -930,7 +1023,14 @@ crm_agent/
     │   ├── voice_stream.py        ← Real-time voice (media streams, VAD,
     │   │                             streaming STT/TTS, barge-in)
     │   ├── customer_memory.py     ← One cross-channel conversation memory
-    │   ├── identity.py            ← (channel, handle) → one CRM party
+    │   ├── identity.py            ← (channel, handle) → one CRM party (canonical-aware)
+    │   ├── identity_resolution.py ← fuzzy duplicate candidates (normalize + trigram)
+    │   ├── identity_links.py      ← reversible duplicate links + golden-record view
+    │   ├── metrics.py             ← Metric Registry: one canonical definition per metric
+    │   ├── access.py              ← DataAccessContext — governed reads (authorization)
+    │   ├── provenance.py          ← source/confidence envelope for stored values
+    │   ├── data_readiness.py      ← 7-dimension readiness scoring + decision reliability
+    │   ├── lifecycle.py           ← erasure policy per store (delete/de-link/retain)
     │   ├── conversations.py       ← Unified cross-channel Conversation Object
     │   ├── channel_adapters.py    ← Channel inbound → one common envelope
     │   ├── channel_selector.py    ← Best channel/action for an objective
@@ -1007,7 +1107,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | POST   | `/activity-chat`             | Activities agent                               |
 | POST   | `/notifications-chat`        | Notifications agent                            |
 | POST   | `/accounting-chat`           | Accounting agent                               |
-| POST   | `/analytics-chat`            | Analytics agent                                |
+| POST   | `/analytics-chat`            | Analytics agent (reports + ad-hoc explore + anomalies + service/marketing) |
+| POST   | `/analytics/explore`         | Ad-hoc self-service query over the governed semantic model (read-only) |
+| GET    | `/analytics/explore/catalog` | The semantic model — explores + dimension/measure keys |
+| GET    | `/analytics/anomalies`       | Live trend anomalies + thresholds (admin)      |
+| POST   | `/analytics/anomalies/act`   | Compose a governed plan for an anomaly (writes queue for approval) |
 | POST   | `/orchestrator-chat`         | Orchestrator agent (symphony workflows + executive Q&A) |
 | POST   | `/email-chat`                | Email agent (SMTP/IMAP + LangGraph)            |
 | POST   | `/store-chat`                | Store catalogue (direct SP)                    |
@@ -1026,6 +1130,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | GET/POST | `/a2a/registry[/{intent}]` | Capability enable/disable + caller ACL (admin) |
 | GET    | `/outbound-guard/test?text=…`| Dry-run the outbound message screen (admin)    |
 | POST   | `/calendar/import`           | Paste .ics → meeting activities, contact-matched (admin) |
+| GET    | `/setup/readiness`           | New-org readiness — configured/populated + next step (admin) |
+| POST   | `/import/{preview\|commit}`  | Governed CSV import of accounts/contacts/leads (admin) |
+| POST   | `/demo/{seed\|clear}`        | Seed / remove a sample business + intelligence headline (admin) |
+| GET/POST/DELETE | `/custom-fields/defs` · `/custom-fields/values/{entity}/{id}` | Custom-field definitions + record values (admin) |
+| GET/POST | `/industry/packs[/{id}/apply\|remove]` | Apply/remove an industry starter pack (admin) |
 | GET    | `/sessions`                  | List active memory sessions                    |
 | DELETE | `/sessions/{id}`             | Clear a session's memory                       |
 

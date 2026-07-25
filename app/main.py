@@ -512,13 +512,22 @@ def _run_objectives_pass() -> None:
 def _run_supervisor_tick() -> None:
     """Scheduled job: proactive supervisor tick (Phase 3) — read the executive
     KPI pack, detect breaches, emit supervisor.alert events. No-op unless
-    SUPERVISOR_ENABLED=1 (run_supervisor_tick self-gates)."""
+    SUPERVISOR_ENABLED=1 (run_supervisor_tick self-gates).
+
+    Runs ONCE PER ACTIVE TENANT inside an explicit tenant + SYSTEM actor context
+    (blind spot #9). Single-org today → exactly one iteration on the default
+    tenant, i.e. unchanged behaviour; in multi-tenant mode no tenant is silently
+    skipped, and one tenant failing never blocks the rest."""
     try:
         from app.core.supervisor import run_supervisor_tick
-        res = run_supervisor_tick()
-        if res.get('breaches'):
-            logger.info(f"[Supervisor] breaches={res['breaches']} "
-                        f"alerted={res.get('alerted')} acted={res.get('acted')}")
+        from app.core import tenancy
+        out = tenancy.for_each_tenant(run_supervisor_tick, job="supervisor_tick")
+        for tid, res in (out.get("results") or {}).items():
+            if isinstance(res, dict) and res.get('breaches'):
+                logger.info(f"[Supervisor][{tid}] breaches={res['breaches']} "
+                            f"alerted={res.get('alerted')} acted={res.get('acted')}")
+        for tid, err in (out.get("errors") or {}).items():
+            logger.error(f"[Supervisor][{tid}] tick failed: {err}")
     except Exception as exc:
         logger.error(f"[Supervisor] tick failed: {exc}", exc_info=True)
 
@@ -555,12 +564,19 @@ def _run_pipeline_hygiene() -> None:
 def _run_ceo_briefing() -> None:
     """Scheduled job: email the CEO the morning strategic briefing (08:00 ET).
     No-op unless CEO_BRIEFING_ENABLED=1 and CEO_BRIEFING_EMAIL is set. Internal
-    admin email — the CEO recipient lives in env config, not accounts/contacts."""
+    admin email — the CEO recipient lives in env config, not accounts/contacts.
+
+    Runs once per active tenant in a tenant + SYSTEM actor context (blind spot
+    #9) — single-org today means one iteration, unchanged."""
     try:
         from app.core.ceo_briefing import send_briefing
-        res = send_briefing()
-        if not res.get("skipped"):
-            logger.info(f"[CEOBriefing] {res}")
+        from app.core import tenancy
+        out = tenancy.for_each_tenant(send_briefing, job="ceo_briefing")
+        for tid, res in (out.get("results") or {}).items():
+            if isinstance(res, dict) and not res.get("skipped"):
+                logger.info(f"[CEOBriefing][{tid}] {res}")
+        for tid, err in (out.get("errors") or {}).items():
+            logger.error(f"[CEOBriefing][{tid}] send failed: {err}")
     except Exception as exc:
         logger.error(f"[CEOBriefing] send failed: {exc}", exc_info=True)
 
@@ -1076,6 +1092,71 @@ app.include_router(a2a_router, dependencies=_ADMIN)
 from app.core.supervisor import router as supervisor_router
 app.include_router(supervisor_router, dependencies=_ADMIN)
 
+# -- Analytics trend anomalies (blindspot A1 — win-rate WoW / stalled / slump)
+from app.core.analytics_signals import router as analytics_signals_router, act_router as analytics_act_router
+app.include_router(analytics_signals_router, dependencies=_ADMIN)
+# The on-demand "act on this" (A5) is _DATA-gated so the analytics page can call
+# it; the proposal it creates still needs admin approval in the governance queue.
+app.include_router(analytics_act_router, dependencies=_DATA)
+
+# -- Governed READ authorization (P0 Trusted Semantic Core, step 3). Cross-record
+# aggregate reads (metrics / explore) are gated to authorized roles ON TOP of the
+# _DATA read gate: _DATA runs first (stamps request.state.session), then
+# require_analytics_access denies non-admin/anonymous callers. Individual-record
+# CRUD is unaffected — it stays governed by its own SPs. Row-level scoping (rep /
+# customer) is deferred but config-ready in access.DataAccessContext.
+from fastapi import Depends as _Depends
+from app.core.access import require_analytics_access
+_ANALYTICS = _DATA + [_Depends(require_analytics_access)]
+
+# -- Ad-hoc / semantic-layer analytics (blindspot A2 — governed explore)
+from app.core.semantic_query import router as analytics_explore_router
+app.include_router(analytics_explore_router, dependencies=_ANALYTICS)
+
+# -- Metric Registry (P0 Trusted Semantic Core, step 2) — one canonical
+# definition per metric, self-describing.
+from app.core.metrics import router as metrics_router
+app.include_router(metrics_router, dependencies=_ANALYTICS)
+
+# -- Governed CSV data onboarding (platform blindspot P1 — value-fast import)
+from app.core.data_import import router as data_import_router
+app.include_router(data_import_router, dependencies=_ADMIN)
+
+# -- New-org readiness / empty-state guidance (platform blindspot P2)
+from app.core.readiness import router as readiness_router
+app.include_router(readiness_router, dependencies=_ADMIN)
+
+# -- Data readiness / quality scoring (P1) — is the data good ENOUGH to decide on?
+from app.core.data_readiness import router as data_readiness_router
+app.include_router(data_readiness_router, dependencies=_ADMIN)
+
+# -- Identity resolution (P1) — fuzzy duplicate candidates (accounts/contacts/leads)
+from app.core.identity_resolution import router as identity_resolution_router
+app.include_router(identity_resolution_router, dependencies=_ADMIN)
+
+# -- Reversible identity links + resolved "golden record" view (P1). Links only —
+# records are never rewritten, so every decision is reversible.
+from app.core.identity_links import router as identity_links_router
+app.include_router(identity_links_router, dependencies=_ADMIN)
+
+# -- Data lifecycle / erasure (#8) — explicit delete/anonymize/retain policy across
+# the distributed copies (custom fields, memories, transcripts, identity links);
+# erasure itself is governed and irreversible.
+from app.core.lifecycle import router as lifecycle_router
+app.include_router(lifecycle_router, dependencies=_ADMIN)
+
+# -- Demo / sample-data seed (platform blindspot P6 — time-to-value)
+from app.core.demo import router as demo_router
+app.include_router(demo_router, dependencies=_ADMIN)
+
+# -- Custom Fields (platform blindspot P3 — data-model extensibility)
+from app.core.custom_fields import router as custom_fields_router
+app.include_router(custom_fields_router, dependencies=_ADMIN)
+
+# -- Industry Starter Packs (platform blindspot P5 — verticalization)
+from app.core.industry_packs import router as industry_packs_router
+app.include_router(industry_packs_router, dependencies=_ADMIN)
+
 from app.core.notification_triage import router as notif_triage_router
 app.include_router(notif_triage_router, dependencies=_ADMIN)
 from app.core.ceo_briefing import router as ceo_briefing_router
@@ -1349,6 +1430,7 @@ _CHAT_PAGES = [
     "agent-studio.html",
     "widget-demo.html",
     "trust.html",
+    "setup.html",
     "index.html",
 ]
 

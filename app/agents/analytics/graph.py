@@ -146,6 +146,53 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "exec_markdown": text,
             }}]}
 
+        # ── anomalies — live trend-anomaly detection (blindspot A1) ──────────
+        # The Analytics agent's prompt long advertised anomaly detection; this
+        # is where it actually runs. Read-only; the recommended actions become
+        # governed proposals when the proactive supervisor picks them up (A5).
+        if parsed_json.get("mode") == "anomalies":
+            from app.core import analytics_signals
+            sigs = analytics_signals.detect_all()
+            text = analytics_signals.format_briefing(sigs)
+            return {**state, "db_rows": [{"result": {
+                "metadata": {"status": "success", "code": 0, "mode": "anomalies"},
+                "anomalies_markdown": text,
+                "anomalies_data": sigs,   # structured — powers the UI "act" buttons (A5)
+            }}]}
+
+        # ── service_analytics — support-ops scorecard (blindspot A3) ─────────
+        # Surfaces the agent-ops service metrics (containment / escalation /
+        # CSAT / cost-per-conversation) INTO the Analytics agent.
+        if parsed_json.get("mode") == "service_analytics":
+            from app.core import agent_ops
+            data = agent_ops.metrics(int(parsed_json.get("days") or 30))
+            return {**state, "db_rows": [{"result": {
+                "metadata": {"status": "success", "code": 0, "mode": "service_analytics"},
+                "service_data": data,
+            }}]}
+
+        # ── marketing_analytics — campaign portfolio (blindspot A3) ──────────
+        if parsed_json.get("mode") == "marketing_analytics":
+            from app.core import marketing
+            data = marketing.marketing_analytics(int(parsed_json.get("days") or 90))
+            return {**state, "db_rows": [{"result": {
+                "metadata": {"status": "success", "code": 0, "mode": "marketing_analytics"},
+                "marketing_data": data,
+            }}]}
+
+        # ── explore — ad-hoc semantic-layer query (blindspot A2) ─────────────
+        # NL → governed JSON spec → parameterized, read-only SQL over the
+        # curated semantic model. The agent never writes SQL; see
+        # app/core/semantic_query.py for the safety model.
+        if parsed_json.get("mode") == "explore":
+            from app.core import semantic_query
+            nl = parsed_json.get("nl") or state.get("user_input", "")
+            result = semantic_query.plan_and_run(nl)
+            return {**state, "db_rows": [{"result": {
+                "metadata": {"status": "success", "code": 0, "mode": "explore"},
+                "explore_result": result,
+            }}]}
+
         # ── web_search — live internet lookup (ddgs free → Tavily fallback) ──
         if parsed_json.get("mode") == "web_search":
             from app.core.web_tools import web_answer

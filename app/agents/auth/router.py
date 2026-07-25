@@ -218,6 +218,10 @@ def get_session(token: str) -> Optional[Dict[str, Any]]:
                 cur.execute("UPDATE auth_sessions SET last_seen_at = now() WHERE token_hash = %s",
                             (_token_hash(token),))
                 conn.commit()
+            # Tenancy (P4 Phase 0): every session carries a tenant_id. Single-org
+            # today → 'default'. `setdefault` is future-proof: once auth_sessions
+            # gains a real tenant_id column, SELECT * fills it and this is a no-op.
+            sess.setdefault("tenant_id", "default")
             return sess
     finally:
         conn.close()

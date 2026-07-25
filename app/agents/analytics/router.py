@@ -15,10 +15,11 @@ Unique characteristics:
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from .graph import get_graph
+from app.core.access import require_analytics_access
 from app.core.write_guard import WritePermissionError
 
 logger = logging.getLogger(__name__)
@@ -77,11 +78,18 @@ async def analytics_health():
     }
 
 
-@router.post("/analytics-chat", response_model=AnalyticsChatResponse)
+@router.post("/analytics-chat", response_model=AnalyticsChatResponse,
+             dependencies=[Depends(require_analytics_access)])
 async def analytics_chat(req: AnalyticsChatRequest):
     """
     Main analytics endpoint — drop-in replacement for the standalone
     analytics_agent /analytics-chat webhook.
+
+    GOVERNED READ (P0 step 3): this agent answers cross-record aggregate
+    questions and runs the semantic explore SERVER-SIDE, so it is gated to the
+    same authorized roles as /metrics and /analytics/explore — otherwise a
+    non-admin (or anonymous under API_PUBLIC_READ) could read company-wide win
+    rate and revenue simply by asking the agent. /analytics-health stays open.
     """
     logger.info("=== New Analytics Chat Request ===")
     session_id = (req.sessionId or "default-session").strip()

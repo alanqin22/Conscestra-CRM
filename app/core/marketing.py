@@ -438,10 +438,119 @@ def winback_campaign_sp(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================================
+# Marketing analytics rollup (blindspot A3 — surface marketing INTO the
+# Analytics agent alongside sales + service). Aggregates the per-campaign data
+# `campaign_results` computes into a portfolio view. Read-only; degrades
+# cleanly when the marketing tables are absent.
+# ============================================================================
+
+def marketing_analytics(days: int = 90) -> Dict[str, Any]:
+    days = max(1, min(days, 365))
+    out: Dict[str, Any] = {"window_days": days}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.marketing_campaigns') IS NOT NULL")
+            if not cur.fetchone()[0]:
+                return {**out, "error": "marketing tables not found "
+                        "(apply sql/marketing.sql)"}
+
+            # Campaigns created in the window, by status.
+            cur.execute(
+                "SELECT status, count(*) FROM marketing_campaigns "
+                "WHERE created_at > now() - make_interval(days => %s) GROUP BY 1",
+                (days,))
+            camp_by_status = {s: int(n) for s, n in cur.fetchall()}
+            total_campaigns = sum(camp_by_status.values())
+
+            # Sends by status for those campaigns (drafted / sent / suppressed / …).
+            sends_by_status: Dict[str, int] = {}
+            cur.execute("SELECT to_regclass('public.marketing_sends') IS NOT NULL")
+            if cur.fetchone()[0]:
+                cur.execute(
+                    "SELECT ms.status, count(*) FROM marketing_sends ms "
+                    "JOIN marketing_campaigns c ON c.campaign_uuid = ms.campaign_uuid "
+                    "WHERE c.created_at > now() - make_interval(days => %s) "
+                    "GROUP BY 1", (days,))
+                sends_by_status = {s: int(n) for s, n in cur.fetchall()}
+            total_sends = sum(sends_by_status.values())
+
+            # Engagement attributed to campaign accounts since each launch:
+            # inbound replies + orders/value (same attribution as campaign_results).
+            accounts_replied = 0
+            n_orders, order_value = 0, 0.0
+            if total_campaigns:
+                cur.execute(
+                    "SELECT count(DISTINCT ms.account_id) FROM marketing_sends ms "
+                    "JOIN marketing_campaigns c ON c.campaign_uuid = ms.campaign_uuid "
+                    "JOIN activities ac ON ac.account_id = ms.account_id "
+                    "  AND ac.direction='inbound' "
+                    "  AND ac.created_at > COALESCE(c.launched_at, c.created_at) "
+                    "WHERE c.created_at > now() - make_interval(days => %s)", (days,))
+                accounts_replied = int(cur.fetchone()[0] or 0)
+                cur.execute(
+                    "SELECT count(*), COALESCE(SUM(o.total_amount),0) FROM orders o "
+                    "WHERE o.deleted_at IS NULL "
+                    "  AND o.created_at > now() - make_interval(days => %s) "
+                    "  AND o.account_id IN (SELECT ms.account_id FROM marketing_sends ms "
+                    "     JOIN marketing_campaigns c ON c.campaign_uuid = ms.campaign_uuid "
+                    "     WHERE c.created_at > now() - make_interval(days => %s))",
+                    (days, days))
+                n_orders, order_value = cur.fetchone()
+
+            # Top campaigns by attributed order value (portfolio leaderboard).
+            top = []
+            if total_campaigns:
+                cur.execute(
+                    "SELECT c.name, c.status, "
+                    "  COALESCE((SELECT count(*) FROM marketing_sends ms "
+                    "            WHERE ms.campaign_uuid=c.campaign_uuid AND ms.status='sent'),0), "
+                    "  COALESCE((SELECT SUM(o.total_amount) FROM orders o "
+                    "            WHERE o.deleted_at IS NULL "
+                    "              AND o.created_at > COALESCE(c.launched_at, c.created_at) "
+                    "              AND o.account_id IN (SELECT account_id FROM marketing_sends "
+                    "                                   WHERE campaign_uuid=c.campaign_uuid)),0) "
+                    "FROM marketing_campaigns c "
+                    "WHERE c.created_at > now() - make_interval(days => %s) "
+                    "ORDER BY 4 DESC NULLS LAST LIMIT 5", (days,))
+                top = [{"name": nm, "status": st, "sent": int(sn or 0),
+                        "attributed_order_value": float(ov or 0)}
+                       for nm, st, sn, ov in cur.fetchall()]
+    except Exception as exc:
+        conn.rollback()
+        logger.warning(f"[marketing] analytics failed: {exc}")
+        return {**out, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+
+    sent = sends_by_status.get("sent", 0)
+    out.update({
+        "campaigns": {"total": total_campaigns, "by_status": camp_by_status},
+        "sends": {"total": total_sends, "by_status": sends_by_status,
+                  "sent": sent, "suppressed": sends_by_status.get("suppressed", 0)},
+        "engagement": {
+            "accounts_replied": accounts_replied,
+            "reply_rate_pct": (round(100.0 * accounts_replied / total_sends, 1)
+                               if total_sends else None),
+            "orders": int(n_orders or 0),
+            "order_value": float(order_value or 0),
+        },
+        "top_campaigns": top,
+    })
+    return out
+
+
+# ============================================================================
 # Admin endpoints
 # ============================================================================
 
 router = APIRouter(tags=["marketing"])
+
+
+@router.get("/marketing/analytics")
+def marketing_analytics_endpoint(days: int = 90):
+    """Portfolio-level marketing analytics — campaigns, sends, engagement."""
+    return marketing_analytics(days)
 
 
 @router.get("/marketing/campaigns")

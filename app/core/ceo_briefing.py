@@ -317,6 +317,15 @@ def gather() -> Dict[str, Any]:
         except Exception as exc:
             logger.warning(f"[ceo_briefing] objectives skipped: {exc}")
             objectives = []
+        # Analytics trend anomalies (A4) — the proactive push of A1's detectors
+        # into this daily briefing (win-rate WoW drop, stalled deals, revenue
+        # slump). Best-effort: a failure here never breaks the briefing.
+        try:
+            from app.core import analytics_signals
+            anomalies = analytics_signals.detect_all()
+        except Exception as exc:
+            logger.warning(f"[ceo_briefing] anomalies skipped: {exc}")
+            anomalies = []
         return {
             "rev_yest": rev_yest, "rev_7d": rev_7d,
             "rev_recent_date": rev_recent_date, "rev_recent_amt": rev_recent_amt,
@@ -331,6 +340,7 @@ def gather() -> Dict[str, Any]:
             "low_stock": low_stock,
             "closing": closing, "biggest": biggest, "atrisk": atrisk, "big_inv": big_inv,
             "approvals": approvals, "perf": perf, "objectives": objectives,
+            "anomalies": anomalies,
         }
     finally:
         conn.close()
@@ -477,6 +487,20 @@ def _objective_lines(objs: List[Any]) -> List[str]:
     return out
 
 
+def _anomaly_lines(anoms: List[Dict[str, Any]]) -> List[str]:
+    """Analytics trend anomalies → compact human lines (shared by text + HTML).
+    A4: the proactive push of A1's detectors (win-rate WoW drop, stalled deals,
+    revenue slump) into the daily executive briefing — insight at the point of
+    decision, with the recommended action attached."""
+    icon = {"high": "🔴", "medium": "🟠", "low": "🟡"}
+    order = {"high": 0, "medium": 1, "low": 2}
+    out: List[str] = []
+    for s in sorted(anoms or [], key=lambda x: order.get(x.get("severity"), 3)):
+        out.append(f"{icon.get(s.get('severity'), '•')} {s.get('headline')} "
+                   f"→ {s.get('recommended_action')}")
+    return out
+
+
 def _perf_lines(perf: Dict[str, Any]) -> List[str]:
     """Agent report card → compact human lines (shared by text + HTML)."""
     if not perf:
@@ -529,6 +553,12 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
     t.append(f"  4. New advocates (won, 7d)   : {d['advocates']} accounts ({_money(d['won_amt'])}){_delta_text(deltas,'advocates_7d')}")
     t.append(f"  5. #1 decision today         : {decision}")
     t.append("")
+    anom_lines = _anomaly_lines(d.get("anomalies"))
+    if anom_lines:
+        t.append("⚠ WHAT CHANGED — TREND ANOMALIES (auto-detected)")
+        for ln in anom_lines:
+            t.append(f"   - {ln}")
+        t.append("")
     t.append("1. REVENUE SNAPSHOT")
     t.append(f"   Active pipeline      : {_money(d['pipeline'])} ({d['open_cnt']} open)")
     t.append(f"   Weighted forecast    : {_money(d['weighted'])}")
@@ -632,6 +662,20 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
              f'<div style="font-size:15px;font-weight:600;color:#ffffff;margin-top:6px;line-height:1.45;">{decision.replace("**","")}</div>'
              '</td></tr></table>')
     h.append('</td></tr>')
+
+    # What Changed — trend anomalies (A4), high in the layout since "what
+    # changed / needs attention" is decision-grade.
+    if d.get("anomalies"):
+        _acol = {"high": "#b91c1c", "medium": "#b45309", "low": "#a16207"}
+        _adot = {"high": "🔴", "medium": "🟠", "low": "🟡"}
+        h.append(section(
+            'What Changed — Trend Anomalies '
+            '<span style="background:#fdecec;color:#b91c1c;font-size:9px;font-weight:700;'
+            'letter-spacing:.05em;padding:2px 7px;border-radius:999px;vertical-align:middle;">AUTO-DETECTED</span>',
+            lis(sorted(d["anomalies"], key=lambda s: {"high": 0, "medium": 1, "low": 2}.get(s.get("severity"), 3)),
+                lambda s: (f'<b style="color:{_acol.get(s.get("severity"), INK)};">'
+                           f'{_adot.get(s.get("severity"), "•")} {s["headline"]}</b>'
+                           f'<br><span style="color:{MUTE};">→ {s["recommended_action"]}</span>'))))
 
     h.append(section("1 &middot; Revenue Snapshot", lis([
         ("Active pipeline",       f'{_money(d["pipeline"])} ({d["open_cnt"]} open)' + _delta_html(deltas, "pipeline")),
@@ -788,6 +832,18 @@ def render_role(d: Dict[str, Any], deltas: Dict[str, Any], role: str) -> Dict[st
     for i, key in enumerate(kpi_keys, 1):
         h.append(kpi(i, key))
     h.append('</tr></table></td></tr>')
+    # What Changed — trend anomalies (A4), shared with the flagship briefing.
+    if d.get("anomalies"):
+        _acol = {"high": "#b91c1c", "medium": "#b45309", "low": "#a16207"}
+        _adot = {"high": "🔴", "medium": "🟠", "low": "🟡"}
+        h.append(section(
+            'What Changed — Trend Anomalies '
+            '<span style="background:#fdecec;color:#b91c1c;font-size:9px;font-weight:700;'
+            'letter-spacing:.05em;padding:2px 7px;border-radius:999px;vertical-align:middle;">AUTO-DETECTED</span>',
+            lis(sorted(d["anomalies"], key=lambda s: {"high": 0, "medium": 1, "low": 2}.get(s.get("severity"), 3)),
+                lambda s: (f'<b style="color:{_acol.get(s.get("severity"), INK)};">'
+                           f'{_adot.get(s.get("severity"), "•")} {s["headline"]}</b>'
+                           f'<br><span style="color:{MUTE};">→ {s["recommended_action"]}</span>'))))
     for s in sections:
         title, inner = sec_html[s]
         h.append(section(title, inner))
@@ -814,6 +870,9 @@ def render_role(d: Dict[str, Any], deltas: Dict[str, Any], role: str) -> Dict[st
 
     text = (f"{role} MORNING BRIEFING — {today}  ({subtitle})\n\n"
             + "\n".join(f"  {_META.get(k,(k,))[0]}: {_fmt_metric(k, vals.get(k))}{_delta_text(deltas,k)}" for k in kpi_keys))
+    _anom = _anomaly_lines(d.get("anomalies"))
+    if _anom:
+        text += "\n\nWHAT CHANGED — TREND ANOMALIES\n" + "\n".join(f"  - {ln}" for ln in _anom)
     if web:
         text += ("\n\n" + web["title"].replace("&amp;", "&").upper() + " (LIVE WEB)\n"
                  + "\n".join(_web_intel_text(web))).replace("**", "")

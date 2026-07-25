@@ -262,6 +262,11 @@ async def require_data_access(request: Request) -> Optional[Dict[str, Any]]:
     sess = get_session(_bearer(request) or "")
     role = (sess or {}).get("role", "anonymous")
     set_request_role(role)
+    # Tenancy (P4 Phase 0): stamp the caller's tenant into the request context so
+    # get_connection routes to the right schema. No-op today (MULTI_TENANT_ENABLED=0
+    # → resolve() ignores context and returns the default DSN + public schema).
+    from app.core import tenancy
+    tenancy.set_tenant((sess or {}).get("tenant_id") or tenancy.DEFAULT_TENANT_ID)
     if sess:
         request.state.session = sess
 

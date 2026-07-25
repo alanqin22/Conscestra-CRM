@@ -110,6 +110,21 @@ def _extract_uuid(s: Any) -> Optional[str]:
     return m.group(0) if m else None
 
 
+def _win_days(msg: str, default: int) -> int:
+    """Parse an optional trailing-window ("last 14 days", "past 3 months") for
+    the service/marketing analytics modes. Falls back to `default`."""
+    m = re.search(r'\b(?:last|past|trailing)\s+(\d+)\s+days?\b', msg)
+    if m:
+        return max(1, min(int(m.group(1)), 365))
+    m = re.search(r'\b(?:last|past|trailing)\s+(\d+)\s+months?\b', msg)
+    if m:
+        return max(1, min(int(m.group(1)) * 30, 365))
+    if re.search(r'\bthis\s+(?:week|month|quarter)\b|\blast\s+week\b', msg):
+        return {'week': 7, 'month': 30, 'quarter': 90}.get(
+            re.search(r'week|month|quarter', msg).group(0), default)
+    return default
+
+
 def _routed(params: dict) -> dict:
     logger.info(
         f"→ ROUTED: reportType={params.get('reportType', 'full_dashboard')} "
@@ -153,6 +168,50 @@ def route_request(body: dict, chat_input: dict, session_id: str) -> dict:
         _q = (_web_m.group(1) or '').strip().rstrip('?.!') or raw
         logger.info(f'-> ROUTED: web_search (deterministic) query={_q[:80]!r}')
         return {'router_action': True, 'params': {'mode': 'web_search', 'query': _q}}
+
+    # ── Deterministic anomaly route (blindspot A1) ───────────────────────────
+    # "any anomalies?", "what needs attention?", "what changed this week?",
+    # "any red flags / risks?" → live trend-anomaly detection (win-rate WoW
+    # drop, stalled deals, revenue slump) with recommended actions. Routed here
+    # so it never depends on the AI agent's JSON discipline. Kept tight so
+    # normal report requests (which carry a report keyword) don't get stolen.
+    if re.search(
+        r'\banomal\w*\b|\bwhat\s+needs\s+attention\b|\bneeds?\s+(?:my\s+)?attention\b'
+        r'|\bwhat(?:\'s|\s+is)?\s+(?:wrong|off|going\s+on)\b|\bred\s+flags?\b'
+        r'|\b(?:any|some)thing\s+(?:wrong|off|amiss|concerning)\b'
+        r'|\bwhat\s+changed\b|\bany\s+(?:risks?|issues?|concerns?|alerts?)\b'
+        r'|\bactionable\s+insights?\b|\bwhat\s+should\s+i\s+(?:worry|know)\b',
+        msg, re.IGNORECASE):
+        logger.info('-> ROUTED: anomalies (deterministic)')
+        return {'router_action': True, 'params': {'mode': 'anomalies'}}
+
+    # ── Service (support-ops) analytics route (blindspot A3) ─────────────────
+    # Unifies the agent-ops service scorecard (containment / deflection /
+    # escalation / CSAT / cost-per-conversation) INTO the Analytics agent, so
+    # "sales, service AND marketing" is one place. Optional "last N days/months"
+    # window; defaults handled downstream.
+    if re.search(
+        r'\bservice\s+(?:analytics|metrics|performance|report)\b|\bsupport\s+(?:analytics|metrics|performance|ops|report)\b'
+        r'|\bcontainment\b|\bdeflection\b|\bescalation\s+rate\b|\bcsat\b'
+        r'|\bcost\s+per\s+(?:resolution|resolved|conversation|ticket)\b'
+        r'|\bagent[\s-]ops\b|\bresolution\s+(?:rate|time)\b|\bhow\s+is\s+support\b',
+        msg, re.IGNORECASE):
+        logger.info('-> ROUTED: service_analytics (deterministic)')
+        return {'router_action': True,
+                'params': {'mode': 'service_analytics', 'days': _win_days(msg, 30)}}
+
+    # ── Marketing analytics route (blindspot A3) ─────────────────────────────
+    # Campaign portfolio performance. Does NOT steal 'lead source' (a sales
+    # report type) — matches campaign/marketing phrasings only.
+    if re.search(
+        r'\bmarketing\s+(?:analytics|metrics|performance|report|roi)\b'
+        r'|\bcampaign\s+(?:analytics|performance|results?|roi|report)\b'
+        r'|\bcampaigns?\s+(?:performance|doing|results?)\b|\bemail\s+campaigns?\b'
+        r'|\bhow\s+are\s+(?:my\s+)?campaigns\b',
+        msg, re.IGNORECASE):
+        logger.info('-> ROUTED: marketing_analytics (deterministic)')
+        return {'router_action': True,
+                'params': {'mode': 'marketing_analytics', 'days': _win_days(msg, 90)}}
     logger.info(f'Message: {raw[:120]}')
 
     # ── routerAction short-circuit (v3.1) ───────────────────────────────────
@@ -242,6 +301,19 @@ def route_request(body: dict, chat_input: dict, session_id: str) -> dict:
             params['reportType'] = _rt
         logger.info(f'[NL-report] type={_rt} range={params.get("startDate")}..{params.get("endDate")}')
         return _routed(params)
+
+    # ── Ad-hoc exploration (blindspot A2) ────────────────────────────────────
+    # Last resort before the AI agent: "group-by" style questions the ~15
+    # canned report types above don't cover (e.g. "opportunities by stage",
+    # "leads by source", "win rate by lead source", "orders by month"). Runs
+    # only AFTER the canned detectors, so pipeline/owner_breakdown/firmographics
+    # etc. keep winning; the semantic-layer explore handles the long tail.
+    _dim = (r'stage|status|lead\s*source|source|month|quarter|year|province|'
+            r'rating|channel|employee\s*band|revenue\s*band|industry|owner|region')
+    if re.search(rf'\b(?:by|per)\s+(?:{_dim})\b', msg) or re.search(
+            r'\b(?:group(?:ed)?\s+by|broken?\s+down\s+by|breakdown|split\s+by)\b', msg):
+        logger.info('-> ROUTED: explore (deterministic, semantic layer)')
+        return {'router_action': True, 'params': {'mode': 'explore', 'nl': raw}}
 
     # ── Fallback: AI Agent ───────────────────────────────────────────────────
     return _passthru(raw)

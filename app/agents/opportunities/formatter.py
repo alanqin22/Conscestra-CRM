@@ -163,6 +163,9 @@ def _render_opportunity_detail(out: list, opp: dict, products: list, stage_histo
     out.append(_md_row(['Weighted Value',  _fmt_currency(weighted)]))
     out.append(_md_row(['Status',          opp.get('status') or 'N/A']))
     out.append(_md_row(['Close Date',      _fmt_date(opp.get('close_date'))]))
+    # decided_at is stamped by the SP only when a deal is won/lost (NULL while open)
+    if opp.get('decided_at'):
+        out.append(_md_row(['Decided At',      _fmt_dt(opp.get('decided_at'))]))
 
     if opp.get('account_name'): out.append(_md_row(['Account',      opp['account_name']]))
     if opp.get('contact_name'): out.append(_md_row(['Contact',      opp['contact_name']]))
