@@ -1183,6 +1183,12 @@ app.include_router(conversations_router, dependencies=_ADMIN)
 from app.core.agent_console import router as agent_console_router
 app.include_router(agent_console_router, dependencies=_ADMIN)
 
+# -- Universal Escalation Object (U1) — the durable obligation created when an
+#    agent promises a human will follow up: owner, priority, SLA deadline. Wires
+#    the no-code/embedded agents (#3/#6) into the takeover console (#1).
+from app.core.escalation import router as escalation_router
+app.include_router(escalation_router, dependencies=_ADMIN)
+
 # -- Agent-Program Operations Analytics (blindspot #4) — the AI fleet as a
 #    service operation: containment / escalation / CSAT proxy / cost per convo.
 from app.core.agent_ops import router as agent_ops_router
@@ -1197,6 +1203,42 @@ from app.core.custom_agents import (admin_router as custom_agents_admin_router,
                                     public_router as custom_agents_public_router)
 app.include_router(custom_agents_admin_router, dependencies=_ADMIN)
 app.include_router(custom_agents_public_router)
+
+# -- Agent Versioning & Publish Gate (U2). Data-defined agents are a DEPLOYMENT
+#    system, so they get a deployment lifecycle: draft → evaluate → publish →
+#    live, with version history and one-click rollback. Closes the hole where #3
+#    (no-code authoring) bypassed #9 (the pre-deploy eval gate).
+from app.core.agent_versions import router as agent_versions_router
+app.include_router(agent_versions_router, dependencies=_ADMIN)
+
+# -- Platform Self-Observability (U3). agent_ops measures what the AI workforce
+#    ACHIEVES; this measures whether the workforce is FUNCTIONING, keeping the
+#    promises it made (U1 escalation SLAs) and respecting its own controls
+#    (U2 gate overrides). The 12k event backlog was found by accident — this is
+#    how the platform notices its own failures instead.
+from app.core.platform_health import router as platform_health_router
+app.include_router(platform_health_router, dependencies=_ADMIN)
+
+# -- LLM Provider Failover (U5). Policy-aware provider graph at the ONE LLM
+#    chokepoint. Ships DISABLED (LLM_FAILOVER_ENABLED=0) because the Google key
+#    is free-tier, where content may be used to train; the policy gate refuses
+#    customer/internal data to a free-tier provider independently of the flag.
+from app.core.llm_router import router as llm_router_router
+app.include_router(llm_router_router, dependencies=_ADMIN)
+
+# -- Action Authorization Layer (U4). Authored agents can be granted a curated
+#    subset of EXISTING capabilities: reads execute scoped, writes become
+#    governed proposals in the same approval queue an executive already
+#    ratifies. An agent can neither invent a capability nor widen its own grant.
+from app.core.agent_capabilities import router as agent_caps_router
+app.include_router(agent_caps_router, dependencies=_ADMIN)
+
+# -- MCP Client (U6). We already SERVE MCP (app/mcp_server.py); this lets our
+#    agents CONSUME external MCP servers. Deliberately governed by U4's grants
+#    rather than a second permission model, plus one extra rule: calling a third
+#    party is egress, so internal-tier content is refused (U5's rule).
+from app.core.mcp_client import router as mcp_client_router
+app.include_router(mcp_client_router, dependencies=_ADMIN)
 
 # -- Distributable Widget SDK (blindspot #6). One <script> tag embeds an
 #    EXTERNAL custom agent on any site. Key CRUD is admin-gated; the /embed/v1
@@ -1428,6 +1470,7 @@ _CHAT_PAGES = [
     "agent-console.html",
     "agent-ops.html",
     "agent-studio.html",
+    "platform-health.html",
     "widget-demo.html",
     "trust.html",
     "setup.html",

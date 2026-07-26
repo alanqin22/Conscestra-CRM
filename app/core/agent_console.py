@@ -61,6 +61,41 @@ def _sentiment(text: str):
 # Queue — the work list
 # ============================================================================
 
+def _live_escalations(conversation_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """conversation_id → its live escalation (U1), for the queue badges. Empty
+    dict if the table is absent — the console predates it and must still run."""
+    ids = [c for c in conversation_ids if c]
+    if not ids:
+        return {}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT conversation_id::text, escalation_id::text, reason,
+                          priority, contact_known, sla_due_at,
+                          (sla_due_at < now()) AS breached
+                   FROM escalations
+                   WHERE status IN ('open','assigned')
+                     AND conversation_id = ANY(%s::uuid[])""",
+                (ids,))
+            cols = [d[0] for d in cur.description]
+            out: Dict[str, Dict[str, Any]] = {}
+            for row in cur.fetchall():
+                d = dict(zip(cols, row))
+                cid = d.pop("conversation_id")
+                if d.get("sla_due_at"):
+                    d["sla_due_at"] = d["sla_due_at"].isoformat()
+                out[cid] = d
+            return out
+    except Exception as exc:
+        conn.rollback()
+        logger.debug(f"[console] escalation badges skipped "
+                     f"(apply sql/escalations.sql?): {exc}")
+        return {}
+    finally:
+        conn.close()
+
+
 def queue(limit: int = 50, needs_human_only: bool = False) -> Dict[str, Any]:
     """Open EXTERNAL conversations as a rep work list. Priority: a customer
     already handed to a human, then customers whose last message is inbound
@@ -97,18 +132,28 @@ def queue(limit: int = 50, needs_human_only: bool = False) -> Dict[str, Any]:
     finally:
         conn.close()
 
+    # Live escalations (U1) — a promise someone made to these customers. Read
+    # separately and merged in Python so a missing sql/escalations.sql degrades
+    # to "no escalation badges" instead of breaking the whole queue.
+    live_esc = _live_escalations([r["conversation_id"] for r in rows])
+
     out: List[Dict[str, Any]] = []
     for r in rows:
         body = (r.get("body") or "").strip()
         awaiting = (r.get("direction") == "inbound")   # customer spoke last
         score, label = _sentiment(body) if awaiting else (0.0, "neutral")
-        # Priority: human-held (someone's mid-handoff) > awaiting reply > idle;
+        esc = live_esc.get(r["conversation_id"])
+        # Priority: an unmet PROMISE outranks everything — that is the whole
+        # point of U1 — then human-held (mid-handoff), then awaiting reply;
         # a negative last message jumps the awaiting bucket.
         prio = 0
         if r.get("handling") == "human":
             prio = 30
         elif awaiting:
             prio = 20 + (5 if label == "negative" else 0)
+        if esc:
+            prio = max(prio, 40 if esc.get("breached") else 35)
+            r["escalation"] = esc
         r["awaiting_reply"] = awaiting
         r["last_preview"] = body[:160]
         r["last_sentiment"] = label
@@ -122,7 +167,10 @@ def queue(limit: int = 50, needs_human_only: bool = False) -> Dict[str, Any]:
     # Highest priority first, then most recent first.
     out.sort(key=lambda x: (x["priority"], x["last_message_at"] or ""),
              reverse=True)
-    return {"ok": True, "count": len(out), "conversations": out}
+    return {"ok": True, "count": len(out), "conversations": out,
+            "escalations_open": len(live_esc),
+            "escalations_breached": sum(1 for e in live_esc.values()
+                                        if e.get("breached"))}
 
 
 # ============================================================================
@@ -153,6 +201,9 @@ def transcript(conversation_id: str) -> Dict[str, Any]:
         "assigned_at": (r[2].isoformat() if r and r[2] else None),
         "escalated": (bool(r[3]) if r else False),
     }
+    # The live promise (U1), so the rep opening the thread sees WHAT was
+    # committed to this customer and by when — not just that "it was escalated".
+    base["escalation"] = _live_escalations([conversation_id]).get(conversation_id)
     return base
 
 
@@ -196,6 +247,15 @@ def takeover(conversation_id: str, agent: str) -> Dict[str, Any]:
     if res.get("ok"):
         _system_note(conversation_id,
                      f"— {agent} (human agent) joined the conversation —")
+        # Picking up the work discharges the promise (U1) — no second click.
+        try:
+            from app.core import escalation
+            done = escalation.resolve_for_conversation(
+                conversation_id, agent, "picked up in the live console")
+            if done.get("resolved"):
+                res["escalations_resolved"] = done["resolved"]
+        except Exception as exc:
+            logger.debug(f"[console] escalation discharge skipped: {exc}")
     return res
 
 

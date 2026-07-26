@@ -7,6 +7,9 @@ psycopg2-binary>=2.9.9
 langchain>=0.2.0
 langchain-openai>=0.1.0
 langchain-ollama>=0.1.0
+# U5 provider failover — alternate provider client. Only imported when
+# LLM_FAILOVER_ENABLED=1 and the primary actually fails.
+langchain-google-genai>=2.0.0
 langchain-community>=0.2.0
 langgraph>=0.1.0
 httpx>=0.27.0

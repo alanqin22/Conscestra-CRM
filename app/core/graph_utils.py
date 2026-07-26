@@ -53,14 +53,20 @@ class AgentState(TypedDict):
 # LLM FACTORY
 # ============================================================================
 
-def _get_llm(tier: str = "standard", caller: str = None):
+def _get_llm(tier: str = "standard", caller: str = None,
+             data_internal: bool = False):
     """Return the configured LLM (OpenAI or Ollama ChatModel), wrapped in the
     usage meter (app/core/llm_meter): every invoke is budget-checked and
     recorded per caller — the fleet's fuel gauge.
 
     tier="lite" uses LLM_MODEL_LITE when set — for high-volume, low-stakes
     wording (SDR replies, auto-replies, SMS) that doesn't need the flagship
-    model. caller defaults to the calling module's name (sdr, planner, …)."""
+    model. caller defaults to the calling module's name (sdr, planner, …).
+
+    data_internal=True marks a request as carrying INTERNAL-tier knowledge
+    (the employee IT/HR agents). It drives U5's provider policy — internal
+    content must not reach an external provider merely because the primary had
+    an outage, which is the LLM-layer analogue of U2's reach_invariant."""
     import os as _os
     import sys as _sys
     settings = get_settings()
@@ -89,10 +95,47 @@ def _get_llm(tier: str = "standard", caller: str = None):
         )
     try:
         from app.core.llm_meter import MeteredLLM
-        return MeteredLLM(inner, caller=caller, model=model, tier=tier)
+        return MeteredLLM(inner, caller=caller, model=model, tier=tier,
+                          provider=settings.llm_provider,
+                          alt_factory=_alt_client_factory(tier),
+                          data_internal=data_internal)
     except Exception as exc:                  # the meter must never break the fleet
         logger.warning(f"LLM meter unavailable — returning unmetered model: {exc}")
         return inner
+
+
+def _alt_client_factory(tier: str):
+    """Build the LAZY constructor for an alternate provider (U5).
+
+    Returns None when failover is off or unconfigured, which makes MeteredLLM
+    behave exactly as it did before U5. The alternate client is only ever
+    constructed if the primary actually fails — a healthy request pays nothing
+    for the existence of a failover path."""
+    try:
+        from app.core import llm_router
+        if not llm_router.ENABLED:
+            return None
+    except Exception:
+        return None
+
+    def _build(provider: str, model: str, timeout: float):
+        if provider == "gemini":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            import os as _o
+            return ChatGoogleGenerativeAI(
+                model=model, google_api_key=_o.getenv("GOOGLE_API_KEY", ""),
+                temperature=0.1, timeout=timeout, max_retries=0)
+        if provider == "ollama":
+            s = get_settings()
+            return ChatOllama(base_url=s.ollama_base_url, model=model,
+                              temperature=0.1)
+        if provider == "openai":
+            s = get_settings()
+            return ChatOpenAI(api_key=s.openai_api_key, model=model,
+                              temperature=0.1, timeout=timeout, max_retries=0)
+        raise RuntimeError(f"no client builder for provider '{provider}'")
+
+    return _build
 
 
 def _call_ollama_direct(system_prompt: str, messages: list) -> str:

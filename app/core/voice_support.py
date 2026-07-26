@@ -257,19 +257,159 @@ def _twiml(inner: str) -> Response:
                     f"<Response>{inner}</Response>", media_type="text/xml")
 
 
-def _say(text: str) -> str:
+# ── Voice i18n ──────────────────────────────────────────────────────────────
+# Blindspot #2 shipped multilingual for TEXT and deliberately left voice in
+# English, because a French reply spoken by an English TTS voice sounds broken.
+# Real voice i18n needs BOTH halves switched together: the carrier's <Gather>
+# speech-recognition language AND the <Say> voice. Switching only one is worse
+# than switching neither — English STT on French speech produces garbage the
+# agent then answers confidently.
+# TTS side is CONFIRMED for our carrier: Telnyx TeXML <Say> accepts Amazon
+# Polly voices as `Polly.VoiceId` (and `alice`), the same spelling as Twilio.
+#
+# STT side is NOT confirmed per language: Telnyx documents <Gather language>
+# as "see the RESTful API docs for supported values" and does not publish the
+# list. Rather than hardcode a guess and discover it at 2am on a real call —
+# the same "configured is not the same as working" trap as the missing Ollama
+# model and the listed-but-404 Gemini models — every recognition code is
+# OVERRIDABLE BY ENV, so a mismatch is a config fix, not a deploy.
+#
+#   VOICE_STT_ZH=cmn-CN   (etc. per language)
+_VOICE_BY_LANG_DEFAULTS = {
+    # lang: (recognition language for <Gather>, TTS voice for <Say>)
+    "en": ("en-US", "alice"),
+    "fr": ("fr-CA", "Polly.Chantal"),      # fr-CA first-class: Canadian market
+    "es": ("es-US", "Polly.Penelope"),
+    "de": ("de-DE", "Polly.Marlene"),
+    # Mandarin specifically. Cantonese is a DIFFERENT language (zh-HK), not a
+    # dialect toggle, and is deliberately not claimed here.
+    "zh": ("zh-CN", "Polly.Zhiyu"),
+}
+
+# Which language each TTS voice we ship actually speaks. Used to REFUSE a
+# half-switched override: the env hooks above make it possible to change the
+# TTS voice without the recognition language (or vice versa), which produces
+# exactly the failure voice i18n exists to prevent — e.g. English speech
+# recognition on Mandarin audio, yielding garbage the agent then answers
+# confidently. A mismatched pair is rejected and the safe default pair for that
+# language is used instead.
+_TTS_LANG = {
+    "alice": "en", "man": "en", "woman": "en",
+    "Polly.Chantal": "fr", "Polly.Penelope": "es",
+    "Polly.Marlene": "de", "Polly.Zhiyu": "zh",
+}
+
+# Legitimate alternative codes for the SAME language. Without these the guard
+# below would reject the very overrides it exists to enable: `cmn-CN` is the
+# ISO 639-3 code for Mandarin — the one Amazon Polly itself uses for Zhiyu —
+# so refusing it would block the fix for an unverified carrier code.
+# Note yue (Cantonese) is deliberately NOT a synonym for zh: it is a different
+# language, and accepting it here would silently answer Mandarin callers in
+# Cantonese.
+_LANG_SYNONYMS = {
+    "zh": {"zh", "cmn"},
+    "en": {"en"}, "fr": {"fr"}, "es": {"es"}, "de": {"de"},
+}
+
+
+def _validated_pair(code: str, stt: str, tts: str) -> tuple:
+    """Accept an override only if BOTH halves still describe the same language.
+
+    Unknown voices (a custom or ElevenLabs voice we have no mapping for) cannot
+    be validated, so they are allowed with a warning — refusing them would make
+    the override hook useless for the very cases it exists to serve."""
+    default_stt, default_tts = _VOICE_BY_LANG_DEFAULTS[code]
+    accepted = _LANG_SYNONYMS.get(code, {code})
+    stt_family = (stt or "").split("-")[0].lower()
+    tts_family = _TTS_LANG.get(tts)
+
+    if stt_family and stt_family not in accepted:
+        logger.error(
+            "[voice] VOICE_STT_%s=%r is a %r code but the language is %r — "
+            "refusing the override and using %r. Recognition language and TTS "
+            "voice must describe the SAME language.",
+            code.upper(), stt, stt_family, code, default_stt)
+        stt = default_stt
+    if tts_family is not None and tts_family not in accepted:
+        logger.error(
+            "[voice] VOICE_TTS_%s=%r speaks %r but the language is %r — "
+            "refusing the override and using %r.",
+            code.upper(), tts, tts_family, code, default_tts)
+        tts = default_tts
+    elif tts_family is None and tts != default_tts:
+        logger.warning("[voice] VOICE_TTS_%s=%r is not a voice we can validate "
+                       "— accepted, but confirm it speaks %s.",
+                       code.upper(), tts, code)
+    return stt, tts
+
+
+_VOICE_BY_LANG = {
+    code: _validated_pair(
+        code,
+        os.getenv(f"VOICE_STT_{code.upper()}", "").strip() or stt,
+        os.getenv(f"VOICE_TTS_{code.upper()}", "").strip() or tts)
+    for code, (stt, tts) in _VOICE_BY_LANG_DEFAULTS.items()
+}
+VOICE_MULTILINGUAL = _flag("VOICE_MULTILINGUAL", "1")
+
+
+def _lang_of(sess: Optional[Dict[str, Any]]) -> str:
+    """The caller's language for THIS call. Sticky per session: re-detecting on
+    every turn would let one ambiguous utterance flip the voice mid-call, which
+    is far more jarring than being wrong once."""
+    if not VOICE_MULTILINGUAL:
+        return "en"
+    return ((sess or {}).get("lang") or "en")
+
+
+def _note_lang(sess: Dict[str, Any], heard: str) -> str:
+    """Detect once, from the caller's own words, then stick to it."""
+    if not VOICE_MULTILINGUAL or not heard:
+        return _lang_of(sess)
+    if sess.get("lang"):
+        return sess["lang"]
+    try:
+        from app.core import language
+        code = language.detect(heard)
+    except Exception:
+        code = "en"
+    if code not in _VOICE_BY_LANG:
+        code = "en"
+    sess["lang"] = code
+    if code != "en":
+        logger.info(f"[voice] caller language detected: {code} — switching "
+                    f"recognition + TTS voice")
+    return code
+
+
+def _say(text: str, lang: str = "en") -> str:
     from app.core.telephony import _twiml_escape
-    return f'<Say voice="alice">{_twiml_escape(text[:800])}</Say>'
+    voice = _VOICE_BY_LANG.get(lang, _VOICE_BY_LANG["en"])[1]
+    return f'<Say voice="{voice}">{_twiml_escape(text[:800])}</Say>'
 
 
-def _gather_speech(prompt_inner: str) -> str:
+def _gather_speech(prompt_inner: str, lang: str = "en") -> str:
     from app.core import telephony
     from app.core.sdr import SPEECH_TIMEOUT
     stimeout = SPEECH_TIMEOUT if telephony._provider() == "telnyx" else "auto"
+    recog = _VOICE_BY_LANG.get(lang, _VOICE_BY_LANG["en"])[0]
+    still_there = {"en": "Are you still there?",
+                   "fr": "Êtes-vous toujours là ?",
+                   "es": "¿Sigue ahí?",
+                   "de": "Sind Sie noch da?",
+                   "zh": "请问您还在吗？"}.get(lang, "Are you still there?")
     return (f'<Gather input="speech" action="/voice/support/turn" method="POST" '
-            f'speechTimeout="{stimeout}" language="en-US">{prompt_inner}</Gather>'
-            + _say("Are you still there?")
+            f'speechTimeout="{stimeout}" language="{recog}">{prompt_inner}</Gather>'
+            + _say(still_there, lang)
             + '<Redirect method="POST">/voice/support/turn</Redirect>')
+
+
+def _hold_music() -> str:
+    """Keep the line open while a human joins. A <Redirect> alone would hand
+    the turn straight back to the AI, which is exactly what standing down is
+    supposed to stop."""
+    return ('<Pause length="20"/>'
+            '<Redirect method="POST">/voice/support/turn</Redirect>')
 
 
 def _gather_digits(prompt_inner: str) -> str:
@@ -1013,13 +1153,15 @@ async def _verified(request: Request) -> Optional[Dict[str, str]]:
     return await telephony.verified_form(request)
 
 
-def _next_twiml(say: str, nxt: str) -> Response:
-    """Map a brain decision to Gather-transport TwiML."""
+def _next_twiml(say: str, nxt: str, lang: str = "en") -> Response:
+    """Map a brain decision to Gather-transport TwiML, in the caller's
+    language. Recognition language and TTS voice are switched TOGETHER —
+    switching one without the other is worse than switching neither."""
     if nxt == "hangup":
-        return _twiml(_say(say) + "<Hangup/>")
+        return _twiml(_say(say, lang) + "<Hangup/>")
     if nxt == "digits":
-        return _twiml(_gather_digits(_say(say)))
-    return _twiml(_gather_speech(_say(say)))
+        return _twiml(_gather_digits(_say(say, lang)))
+    return _twiml(_gather_speech(_say(say, lang), lang))
 
 
 @public_router.post("/voice/support/inbound")
@@ -1060,13 +1202,47 @@ async def voice_support_turn(request: Request):
     from app.core.sdr import _heard
     call_sid = params.get("CallSid") or f"anon-{secrets.token_hex(8)}"
     heard = _heard(params)[:_MAX_MSG]
+    sess = _CALLS.get(call_sid) or {}
+    lang = _lang_of(sess)
     if not heard:
         logger.info(f"[voice] turn: no speech; callback keys="
                     f"{sorted(params.keys())}")
-        return _twiml(_gather_speech(_say(
-            "Sorry, I didn't catch that. Could you say it again?")))
+        retry = {"en": "Sorry, I didn't catch that. Could you say it again?",
+                 "fr": "Désolé, je n'ai pas bien entendu. Pouvez-vous répéter ?",
+                 "es": "Perdón, no le entendí. ¿Puede repetirlo?",
+                 "de": "Entschuldigung, das habe ich nicht verstanden. "
+                       "Können Sie das wiederholen?",
+                 "zh": "抱歉，我没有听清楚。您可以再说一遍吗？"}.get(lang)
+        return _twiml(_gather_speech(_say(retry, lang), lang))
+
+    # ── U1/#1 on the voice channel: stand the AI down for a live human ──────
+    # A rep who takes the conversation over in the console must actually take
+    # it over. Without this the AI keeps answering the caller while a person
+    # is also working the thread — the failure the takeover console exists to
+    # prevent, previously closed only for email.
+    try:
+        from app.core import agent_console
+        if agent_console.is_human_handled("voice", (sess or {}).get("from", "")):
+            hold = {"en": "One moment — a member of our team is joining the call.",
+                    "fr": "Un instant — un membre de notre équipe se joint à "
+                          "l'appel.",
+                    "es": "Un momento — un miembro de nuestro equipo se une a "
+                          "la llamada.",
+                    "de": "Einen Moment — ein Mitglied unseres Teams kommt "
+                          "dazu.",
+                    "zh": "请稍等，我们团队的同事马上加入通话。"}.get(
+                        lang, "One moment — a member of our team is joining "
+                              "the call.")
+            logger.info(f"[voice] call {call_sid[:8]} is human-handled — AI "
+                        f"standing down")
+            return _twiml(_say(hold, lang) + _hold_music())
+    except Exception as exc:
+        logger.debug(f"[voice] takeover check skipped: {exc}")
+
     say, nxt = await take_turn(call_sid, heard)
-    return _next_twiml(say, nxt)
+    # Language is decided from the caller's own words on the first real turn.
+    lang = _note_lang(_CALLS.get(call_sid) or {}, heard)
+    return _next_twiml(say, nxt, lang)
 
 
 @public_router.post("/voice/support/verify")
