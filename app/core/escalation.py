@@ -1,0 +1,541 @@
+"""Universal Escalation Object — U1 (round-2 Agentforce blindspots, 2026-07-25).
+
+THE BUG THIS CLOSES
+    `custom_agents.run()` instructed the model to say "a human teammate will
+    follow up" when it had no approved answer. Nothing else happened. No queue
+    item, no owner, no deadline, no notification, no entry in the takeover
+    console we built for exactly this moment. On an embedded widget — running
+    on someone ELSE's website — a visitor could ask for a human and the
+    organization would never learn of it. The takeover console (#1) and the
+    no-code/embedded agents (#3/#6) were two shipped features with no wire
+    between them.
+
+THE RULE
+    Never let an agent promise an action that does not create a durable system
+    record. `open()` IS that record.
+
+        agent → escalation intent → escalations row
+                                  → conversations.escalated (console queue)
+                                  → in-app notification (SSE)
+                                  → SLA deadline the supervisor can breach-check
+
+DESIGN NOTES
+  • Own table, not a conversation flag. An escalation has an owner, a priority
+    and a DEADLINE, and it must exist even when the conversation could not be
+    threaded (an anonymous visitor on a third-party site).
+  • Idempotent per conversation: a partial unique index means asking three
+    times in one thread yields ONE obligation. A re-ask escalates PRIORITY
+    instead of creating a duplicate.
+  • Honest about reachability. If we hold no email/phone, `contact_known` is
+    false and the caller is told to ask the visitor for one — a promise we
+    cannot deliver on is the failure mode we are fixing, not reproducing.
+  • Never raises into a customer conversation. Every DB path is defensive; a
+    missing migration degrades to a logged warning and `{"ok": False}` — the
+    visitor still gets their answer.
+
+Requires sql/escalations.sql. See also [agent_console] (the human seat),
+[custom_agents] (the agents that raise these), [supervisor] (SLA breach).
+
+CONFIG (env)
+  ESCALATION_ENABLED        1    kill switch
+  ESCALATION_SLA_MINUTES    240  default deadline for a normal escalation
+  ESCALATION_NOTIFY         1    also raise an in-app notification (high/urgent)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter
+
+from app.core.database import get_connection
+
+logger = logging.getLogger("escalation")
+
+
+def _flag(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+ENABLED = _flag("ESCALATION_ENABLED", "1")
+NOTIFY = _flag("ESCALATION_NOTIFY", "1")
+DEFAULT_SLA_MINUTES = int(os.getenv("ESCALATION_SLA_MINUTES", "240"))
+
+# Machine reasons — the WHY, kept small and stable so the queue can group them.
+REASONS = {
+    "customer_requested_human": "The customer explicitly asked for a person.",
+    "no_approved_answer": "The agent had no approved knowledge and deferred.",
+    "high_value_intent": "A purchase / contract intent above the self-serve bar.",
+    "complaint": "The customer expressed frustration or threatened to leave.",
+    "agent_promised_followup": "The agent's reply promised a human follow-up.",
+    "manual": "Raised by a human.",
+}
+
+# Priority → SLA multiplier. Urgent work gets a tighter deadline, not just a
+# louder label — a priority that doesn't change a deadline is decoration.
+_SLA_BY_PRIORITY = {"urgent": 0.25, "high": 0.5, "normal": 1.0, "low": 2.0}
+_PRIORITY_RANK = {"low": 0, "normal": 1, "high": 2, "urgent": 3}
+
+
+# ============================================================================
+# Detection — did this turn earn an escalation?
+# ============================================================================
+
+# Deliberately deterministic (no LLM, no cost, no latency) and deliberately
+# NARROW: a false positive costs a human a wasted glance at the queue, which is
+# far cheaper than the failure we are fixing (a silent broken promise).
+_HUMAN_RE = re.compile(
+    r"\b(speak|talk|chat|connect|put me through)\s+(to|with)\s+(a|an|the|some)?\s*"
+    r"(human|person|people|agent|rep|representative|advisor|someone|somebody|"
+    r"manager|supervisor|sales\s*rep|account\s*manager)\b"
+    r"|\b(real|actual|live)\s+(human|person|agent)\b"
+    r"|\bhuman\s+(agent|being|support|help)\b"
+    r"|\b(get|give)\s+me\s+(a|an)\s+(human|person|manager|rep)\b"
+    r"|\b(parler|parlez)\s+(à|a|avec)\s+(un|une)\s+(humain|personne|conseiller|agent)\b",
+    re.I,
+)
+_COMPLAINT_RE = re.compile(
+    r"\b(unacceptable|ridiculous|furious|outrageous|disgusted|appalled)\b"
+    r"|\b(cancel|canceling|cancelling|terminate|close)\s+(my|our|the)\s+"
+    r"(account|subscription|contract|service)\b"
+    r"|\b(speak\s+to|escalate\s+to)\s+(your|a)\s+(manager|supervisor)\b"
+    r"|\b(lawyer|legal action|sue|refund)\b"
+    r"|\b(third|3rd)\s+time\s+(i|we)('ve|\s+have)?\s+(asked|contacted|emailed)\b",
+    re.I,
+)
+_HIGH_VALUE_RE = re.compile(
+    r"\b(enterprise|bulk|volume|wholesale)\s+(purchase|order|pricing|deal|plan|licen[cs]e)\b"
+    r"|\b(quote|proposal|rfp|rfq|contract|procurement|invoice)\b"
+    r"|\$\s?\d{1,3}(,\d{3})+(\.\d+)?\b"                    # $50,000
+    r"|\b\d+\s?(k|K)\s+(budget|deal|contract|purchase)\b",
+    re.I,
+)
+
+
+def detect(text: str) -> Optional[str]:
+    """Return an escalation REASON for this customer message, or None.
+
+    Order matters: an explicit ask for a person outranks inference about what
+    they might want."""
+    t = (text or "").strip()
+    if len(t) < 3:
+        return None
+    if _HUMAN_RE.search(t):
+        return "customer_requested_human"
+    if _COMPLAINT_RE.search(t):
+        return "complaint"
+    if _HIGH_VALUE_RE.search(t):
+        return "high_value_intent"
+    return None
+
+
+# The literal enforcement of the rule: did the AGENT's own reply promise that a
+# person would follow up? If it did, that promise must become a row. This is
+# checked on the outgoing text, so it catches the promise however the model
+# chose to phrase it — including the module's own canned fallback.
+_PROMISE_RE = re.compile(
+    r"\b(a\s+)?(human|team\s?mate|teammate|colleague|team\s+member|specialist|"
+    r"representative|rep|advisor|someone\s+from\s+(our|the)\s+team)\b[^.!?]{0,60}"
+    r"\b(will|'ll|can|shall)\b[^.!?]{0,40}\b(follow\s?up|get\s+back|reach\s+out|"
+    r"contact|be\s+in\s+touch|assist|help)\b"
+    r"|\b(i'?ll|i\s+will|we'?ll|we\s+will)\b[^.!?]{0,40}\b(have|ask|get)\b"
+    r"[^.!?]{0,40}\b(teammate|colleague|human|someone|specialist)\b"
+    r"|\b(pass|escalate|forward)\s+(this|it|you)\b[^.!?]{0,30}"
+    r"\b(to|on\s+to)\b[^.!?]{0,30}\b(a\s+)?(human|person|colleague|teammate|team)\b"
+    r"|\b(un|une)\s+(coll[èe]gue|humain|conseiller)\b[^.!?]{0,40}"
+    r"\b(vous\s+)?(contactera|recontactera|reviendra)\b",
+    re.I,
+)
+
+
+def promised_followup(reply: str) -> bool:
+    """True when an agent's outgoing reply commits a human to follow up."""
+    return bool(_PROMISE_RE.search(reply or ""))
+
+
+def priority_for(reason: str, text: str = "") -> str:
+    """Priority reads the WHOLE message, not just the reason that won detection.
+
+    "I need to speak with someone about a $50,000 enterprise purchase" is
+    detected as customer_requested_human (an explicit ask outranks inference),
+    but it is still a high-value conversation — so the money and the anger are
+    scored independently of which pattern matched first."""
+    if reason == "complaint" or _COMPLAINT_RE.search(text or ""):
+        return "high"
+    if reason == "high_value_intent" or _HIGH_VALUE_RE.search(text or ""):
+        return "high"
+    return "normal"
+
+
+# ============================================================================
+# The durable record
+# ============================================================================
+
+def _reachable(channel: Optional[str], handle: Optional[str]) -> bool:
+    """True when `handle` is something a human can actually reply to. A webchat
+    session key is NOT a contact — that distinction is the whole point."""
+    h = (handle or "").strip().lower()
+    if not h or h.startswith("session:") or h.startswith("anon"):
+        return False
+    if "@" in h and "." in h.split("@")[-1]:
+        return True
+    return bool(re.fullmatch(r"\+?\d[\d\s\-().]{6,}", h))
+
+
+def open(reason: str, source: str, *,
+         summary: str = "",
+         transcript_excerpt: str = "",
+         conversation_id: Optional[str] = None,
+         channel: Optional[str] = None,
+         handle: Optional[str] = None,
+         party_type: Optional[str] = None,
+         party_id: Optional[str] = None,
+         priority: str = "normal",
+         sla_minutes: Optional[int] = None,
+         metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Create (or re-prioritize) the obligation. Idempotent per conversation.
+
+    Returns {ok, escalation_id, created, contact_known, sla_due_at}. NEVER
+    raises — a failure here must not break the customer's conversation, it must
+    only be loud in the log."""
+    if not ENABLED:
+        return {"ok": False, "error": "escalations disabled"}
+    if reason not in REASONS:
+        reason = "manual"
+    priority = priority if priority in _PRIORITY_RANK else "normal"
+    minutes = int(sla_minutes if sla_minutes is not None else
+                  max(15, DEFAULT_SLA_MINUTES * _SLA_BY_PRIORITY.get(priority, 1.0)))
+    known = _reachable(channel, handle)
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            # Idempotency: fold a repeat ask into the LIVE escalation for this
+            # conversation, raising its priority if the new ask is more urgent.
+            if conversation_id:
+                cur.execute(
+                    """SELECT escalation_id::text, priority FROM escalations
+                       WHERE conversation_id=%s::uuid
+                         AND status IN ('open','assigned')
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (conversation_id,))
+                row = cur.fetchone()
+                if row:
+                    eid, cur_prio = row[0], row[1]
+                    if _PRIORITY_RANK.get(priority, 1) > _PRIORITY_RANK.get(cur_prio, 1):
+                        cur.execute(
+                            """UPDATE escalations
+                               SET priority=%s,
+                                   sla_due_at = LEAST(sla_due_at,
+                                       now() + make_interval(mins => %s)),
+                                   updated_at = now()
+                               WHERE escalation_id=%s::uuid""",
+                            (priority, minutes, eid))
+                        conn.commit()
+                    logger.info(f"[escalation] re-ask folded into {eid[:8]} "
+                                f"({reason}, priority={priority})")
+                    return {"ok": True, "escalation_id": eid, "created": False,
+                            "contact_known": known, "reason": reason}
+
+            cur.execute(
+                """INSERT INTO escalations
+                     (source, reason, summary, transcript_excerpt, status,
+                      priority, sla_minutes, sla_due_at, conversation_id,
+                      channel, handle, contact_known, party_type, party_id,
+                      metadata)
+                   VALUES (%(src)s, %(rsn)s, %(sum)s, %(exc)s, 'open',
+                           %(pri)s, %(min)s, now() + make_interval(mins => %(min)s),
+                           %(cid)s::uuid, %(chan)s, %(hnd)s, %(known)s,
+                           %(pt)s, %(pid)s::uuid, %(meta)s::jsonb)
+                   RETURNING escalation_id::text, sla_due_at""",
+                {"src": source[:120], "rsn": reason,
+                 "sum": (summary or REASONS.get(reason, reason))[:400],
+                 "exc": (transcript_excerpt or "")[:2000],
+                 "pri": priority, "min": minutes,
+                 "cid": conversation_id, "chan": channel, "hnd": handle,
+                 "known": known, "pt": party_type, "pid": party_id,
+                 "meta": json.dumps(metadata or {})})
+            eid, due = cur.fetchone()
+
+            # Light up the EXISTING takeover console for this conversation.
+            if conversation_id:
+                try:
+                    cur.execute(
+                        """UPDATE conversations SET escalated=true, updated_at=now()
+                           WHERE conversation_id=%s::uuid""", (conversation_id,))
+                except Exception as exc:      # migration not applied — non-fatal
+                    logger.debug(f"[escalation] console flag skipped: {exc}")
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        logger.warning(f"[escalation] open failed (apply sql/escalations.sql?): {exc}")
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+
+    logger.info(f"[escalation] OPEN {eid[:8]} {reason} via {source} "
+                f"priority={priority} reachable={known}")
+    if NOTIFY and priority in ("high", "urgent"):
+        _notify(eid, reason, priority, summary, channel, handle, known)
+    return {"ok": True, "escalation_id": eid, "created": True,
+            "contact_known": known, "reason": reason,
+            "sla_due_at": due.isoformat() if due else None}
+
+
+def _notify(escalation_id: str, reason: str, priority: str, summary: str,
+            channel: Optional[str], handle: Optional[str],
+            contact_known: bool) -> None:
+    """In-app notification to the linked executives (the audience that already
+    receives approval notifications, and the only owner-linked audience that
+    exists today). Best-effort: the escalation is durable with or without it."""
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT employee_uuid::text FROM executives
+                               WHERE is_active AND employee_uuid IS NOT NULL""")
+                owners = [r[0] for r in cur.fetchall()]
+                if not owners:
+                    logger.debug("[escalation] no linked executives to notify")
+                    return
+                who = handle if contact_known else "an unidentified visitor"
+                title = f"🙋 {priority.title()} escalation: a customer asked for a human"
+                body = (f"{summary or REASONS.get(reason, reason)}\n\n"
+                        f"Channel: {channel or 'unknown'} · Contact: {who}\n"
+                        + ("" if contact_known else
+                           "⚠ We have no way to reach this person — the agent has "
+                           "asked them for an email.\n")
+                        + "Open the Live Agent Console to pick it up.")
+                for owner in owners:
+                    cur.execute(
+                        """INSERT INTO notifications
+                             (employee_uuid, channel, status, title, body,
+                              metadata, created_at)
+                           VALUES (%(o)s::uuid, 'in_app', 'pending', %(t)s, %(b)s,
+                                   %(m)s::jsonb, now())""",
+                        {"o": owner, "t": title, "b": body,
+                         "m": json.dumps({"kind": "escalation",
+                                          "source": "escalation",
+                                          "escalation_id": escalation_id,
+                                          "priority": priority,
+                                          "reason": reason})})
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        # notifications.event_uuid is NOT NULL in some deployments — the
+        # escalation still stands, the console still shows it.
+        logger.info(f"[escalation] notification skipped (non-fatal): "
+                    f"{str(exc)[:160]}")
+
+
+# ============================================================================
+# Work list + close-out
+# ============================================================================
+
+def list_open(limit: int = 100, include_resolved: bool = False) -> Dict[str, Any]:
+    """The escalation work list: soonest deadline first, breaches flagged."""
+    if not ENABLED:
+        return {"ok": False, "error": "escalations disabled"}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT escalation_id::text, source, reason, summary,
+                           transcript_excerpt, status, priority, assigned_to,
+                           conversation_id::text, channel, handle, contact_known,
+                           sla_due_at, created_at, resolved_at, resolution_note,
+                           (status IN ('open','assigned') AND sla_due_at < now())
+                             AS breached
+                    FROM escalations
+                    {"" if include_resolved else "WHERE status IN ('open','assigned')"}
+                    ORDER BY (status IN ('open','assigned')) DESC,
+                             sla_due_at ASC
+                    LIMIT %s""",
+                (max(1, min(limit, 500)),))
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as exc:
+        conn.rollback()
+        logger.warning(f"[escalation] list failed: {exc}")
+        return {"ok": False, "error": f"{str(exc)[:180]} (apply sql/escalations.sql?)"}
+    finally:
+        conn.close()
+
+    for r in rows:
+        for k in ("sla_due_at", "created_at", "resolved_at"):
+            if r.get(k):
+                r[k] = r[k].isoformat()
+    breached = sum(1 for r in rows if r.get("breached"))
+    return {"ok": True, "count": len(rows), "breached": breached,
+            "escalations": rows}
+
+
+def assign(escalation_id: str, agent: str) -> Dict[str, Any]:
+    return _update(escalation_id,
+                   """SET status='assigned', assigned_to=%(who)s,
+                          assigned_at=now(), updated_at=now()""",
+                   {"who": (agent or "agent")[:120]})
+
+
+def resolve(escalation_id: str, agent: str = "agent",
+            note: str = "") -> Dict[str, Any]:
+    return _update(escalation_id,
+                   """SET status='resolved', resolved_by=%(who)s,
+                          resolved_at=now(), resolution_note=%(note)s,
+                          updated_at=now()""",
+                   {"who": (agent or "agent")[:120], "note": (note or "")[:1000]})
+
+
+def _update(escalation_id: str, set_clause: str,
+            params: Dict[str, Any]) -> Dict[str, Any]:
+    if not ENABLED:
+        return {"ok": False, "error": "escalations disabled"}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""UPDATE escalations {set_clause}
+                    WHERE escalation_id=%(id)s::uuid
+                    RETURNING escalation_id::text, status""",
+                {**params, "id": escalation_id})
+            row = cur.fetchone()
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        logger.warning(f"[escalation] update failed: {exc}")
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+    if not row:
+        return {"ok": False, "error": "escalation not found"}
+    return {"ok": True, "escalation_id": row[0], "status": row[1]}
+
+
+def resolve_for_conversation(conversation_id: str, agent: str,
+                             note: str = "") -> Dict[str, Any]:
+    """Close the live escalation on a conversation — called when a rep takes
+    the conversation over or closes it, so picking up the work discharges the
+    obligation without a second click."""
+    if not (ENABLED and conversation_id):
+        return {"ok": False}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE escalations
+                   SET status='resolved', resolved_by=%s, resolved_at=now(),
+                       resolution_note=%s, updated_at=now()
+                   WHERE conversation_id=%s::uuid AND status IN ('open','assigned')
+                   RETURNING escalation_id::text""",
+                ((agent or "agent")[:120], (note or "handled in console")[:1000],
+                 conversation_id))
+            ids = [r[0] for r in cur.fetchall()]
+        conn.commit()
+        return {"ok": True, "resolved": ids}
+    except Exception as exc:
+        conn.rollback()
+        logger.debug(f"[escalation] conversation resolve skipped: {exc}")
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# SLA breach — what makes the deadline real (supervisor detector, U3-adjacent)
+# ============================================================================
+
+def sla_breaches() -> List[Dict[str, Any]]:
+    """Signal in the supervisor's exact shape: live escalations past their
+    deadline. An SLA nobody checks is a comment, not a commitment."""
+    if not ENABLED:
+        return []
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT count(*),
+                          count(*) FILTER (WHERE NOT contact_known),
+                          min(sla_due_at)
+                   FROM escalations
+                   WHERE status IN ('open','assigned') AND sla_due_at < now()""")
+            n, unreachable, oldest = cur.fetchone()
+    except Exception as exc:
+        conn.rollback()
+        logger.debug(f"[escalation] breach check skipped: {exc}")
+        return []
+    finally:
+        conn.close()
+
+    if not n:
+        return []
+    return [{
+        "rule": "escalation_sla_breach",
+        "severity": "critical" if n >= 5 else "warning",
+        "headline": (f"{n} escalation(s) past their promised follow-up time"
+                     + (f" — {unreachable} with no way to reach the customer"
+                        if unreachable else "")),
+        "metric": "escalations_breached",
+        "value": int(n),
+        "owner_agent": "orchestrator",
+        "recommended_action": ("Open the Live Agent Console and clear the "
+                               "escalation queue; oldest deadline was "
+                               f"{oldest.isoformat() if oldest else 'unknown'}."),
+    }]
+
+
+# ============================================================================
+# Router (admin — the console's escalation surface)
+# ============================================================================
+
+router = APIRouter(tags=["escalations"])
+
+
+@router.get("/escalations")
+def api_list(limit: int = 100, include_resolved: bool = False):
+    return list_open(limit, include_resolved)
+
+
+@router.post("/escalations")
+def api_open(body: Dict[str, Any]):
+    b = body or {}
+    return open(str(b.get("reason") or "manual"),
+                str(b.get("source") or "manual"),
+                summary=str(b.get("summary") or ""),
+                transcript_excerpt=str(b.get("transcript_excerpt") or ""),
+                conversation_id=b.get("conversation_id"),
+                channel=b.get("channel"), handle=b.get("handle"),
+                priority=str(b.get("priority") or "normal"),
+                metadata=b.get("metadata") if isinstance(b.get("metadata"), dict) else None)
+
+
+@router.post("/escalations/{escalation_id}/assign")
+def api_assign(escalation_id: str, body: Dict[str, Any]):
+    return assign(escalation_id, str((body or {}).get("agent") or "agent"))
+
+
+@router.post("/escalations/{escalation_id}/resolve")
+def api_resolve(escalation_id: str, body: Dict[str, Any]):
+    b = body or {}
+    return resolve(escalation_id, str(b.get("agent") or "agent"),
+                   str(b.get("note") or ""))
+
+
+@router.get("/escalations-status")
+def api_status():
+    has = False
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.escalations') IS NOT NULL")
+            has = bool(cur.fetchone()[0])
+    except Exception:
+        conn.rollback()
+    finally:
+        conn.close()
+    return {"enabled": ENABLED, "table": has,
+            "default_sla_minutes": DEFAULT_SLA_MINUTES, "reasons": REASONS}

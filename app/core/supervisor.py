@@ -277,6 +277,30 @@ except Exception as _exc:  # pragma: no cover
     logger.warning(f"[supervisor] analytics_signals not loaded: {_exc}")
 
 
+def detect_escalation_sla(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """U1: an agent promised a human would follow up and the deadline passed.
+    The SLA on an escalation is only a commitment if something checks it."""
+    try:
+        from app.core import escalation
+        sigs = escalation.sla_breaches()
+        return sigs[0] if sigs else None
+    except Exception as exc:
+        logger.debug(f"[supervisor] escalation SLA check skipped: {exc}")
+        return None
+
+
+DETECTORS.append(detect_escalation_sla)
+
+# U3: the platform watching ITSELF (machinery degraded, governance drift) —
+# loaded defensively so an observability fault never disarms the detectors that
+# watch the business.
+try:
+    from app.core import platform_health as _platform_health
+    DETECTORS += _platform_health.DETECTORS
+except Exception as _exc:  # pragma: no cover
+    logger.warning(f"[supervisor] platform_health not loaded: {_exc}")
+
+
 # ============================================================================
 # ACT (emit alert / auto-act) + idempotency
 # ============================================================================

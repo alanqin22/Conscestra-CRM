@@ -1200,9 +1200,110 @@ def _twiml(inner: str) -> Response:
                     f"<Response>{inner}</Response>", media_type="text/xml")
 
 
-def _say(text: str) -> str:
+# Voice i18n — the SDR line is the one most callers actually reach, so it gets
+# the same treatment as the support line. The language table lives in
+# voice_support so there is ONE source of truth (including its guard that
+# refuses a half-switched STT/TTS pair); this module just asks for it.
+_VOICE_LANG: Dict[str, str] = {}          # call_sid -> language, sticky per call
+
+
+def _voice_pair(lang: str) -> tuple:
+    try:
+        from app.core.voice_support import _VOICE_BY_LANG
+        return _VOICE_BY_LANG.get(lang) or _VOICE_BY_LANG["en"]
+    except Exception:
+        return ("en-US", "alice")
+
+
+# ── Why voice needs a MENU and text does not ────────────────────────────────
+# On a text channel the customer's own characters arrive intact, so detection
+# is trivial and reliable. On a call it is a chicken-and-egg problem: <Gather>
+# commits to ONE recognition language, so Mandarin spoken into an `en-US`
+# recogniser comes back as English-ish gibberish — and running a detector over
+# THAT can never yield `zh`, no matter how good the detector is. You cannot
+# detect a language from a transcript produced by the wrong recogniser.
+#
+# So the caller declares it, by keypad, which works regardless of what the
+# recogniser thinks it heard. English callers are unaffected: they simply speak,
+# exactly as before, because the gather accepts speech AND digits.
+_LANG_MENU = {"1": "en", "2": "fr", "3": "zh", "4": "es"}
+
+# Each option's prompt, in its own language. ORDER IS EXPLICIT (not dict order)
+# so the spoken menu and the routing can never drift apart — the failure mode
+# where a caller presses what they heard and gets a different language.
+_LANG_MENU_ORDER = ["1", "2", "3", "4"]
+_LANG_MENU_TEXT = {
+    "1": ("en", "For English, press 1."),
+    "2": ("fr", "Pour le français, appuyez sur 2."),
+    "3": ("zh", "中文服务，请按 3。"),
+    "4": ("es", "Para español, marque 4."),
+}
+
+
+def lang_menu_twiml() -> str:
+    """The language menu as ONE <Say> PER OPTION, each with that language's own
+    voice.
+
+    A single English <Say> containing "中文服务，请按 3" is read by an English
+    TTS engine and comes out unintelligible — the caller who most needs the
+    option is the one who cannot understand it. TwiML allows multiple <Say>
+    elements inside a <Gather>, so each option is voiced by its own speaker."""
+    out = []
+    for digit in _LANG_MENU_ORDER:
+        code, text = _LANG_MENU_TEXT[digit]
+        # Sanity: the spoken option must route where it says it routes.
+        assert _LANG_MENU[digit] == code, (
+            f"menu says {digit}->{code} but routing says "
+            f"{digit}->{_LANG_MENU[digit]}")
+        out.append(_say(text, code))
+    return "".join(out)
+
+
+def set_call_lang(call_sid: str, code: str) -> str:
+    """Pin a call's language (from the keypad menu or a stored preference)."""
+    from app.core.voice_support import _VOICE_BY_LANG
+    if code not in _VOICE_BY_LANG:
+        code = "en"
+    _VOICE_LANG[call_sid] = code
+    if code != "en":
+        logger.info(f"[sdr] voice language set to {code} — switching "
+                    f"recognition + TTS voice")
+    return code
+
+
+def _call_lang(call_sid: str, heard: str = "") -> str:
+    """The language for this call. Sticky once decided.
+
+    Text detection is still attempted as a BONUS — if the recogniser happens to
+    return Han characters (some engines do transliterate), we take the hint —
+    but the keypad menu is the reliable path and the one callers are offered."""
+    try:
+        from app.core.voice_support import VOICE_MULTILINGUAL
+        if not VOICE_MULTILINGUAL:
+            return "en"
+    except Exception:
+        return "en"
+    if call_sid in _VOICE_LANG:
+        return _VOICE_LANG[call_sid]
+    if not heard:
+        return "en"
+    try:
+        from app.core import language
+        code = language.detect(heard)
+    except Exception:
+        code = "en"
+    # Only PIN a non-English detection. An 'en' result from an en-US recogniser
+    # is not evidence of anything — it is the only thing that recogniser can
+    # produce — so it must not lock the call into English.
+    if code != "en":
+        return set_call_lang(call_sid, code)
+    return "en"
+
+
+def _say(text: str, lang: str = "en") -> str:
     from app.core.telephony import _twiml_escape
-    return f'<Say voice="alice">{_twiml_escape(text)}</Say>'
+    voice = _voice_pair(lang)[1]
+    return f'<Say voice="{voice}">{_twiml_escape(text)}</Say>'
 
 
 # End-of-speech wait (seconds) — the dead air after the caller stops talking
@@ -1212,14 +1313,27 @@ def _say(text: str) -> str:
 SPEECH_TIMEOUT = os.getenv("SDR_SPEECH_TIMEOUT", "1").strip() or "1"
 
 
-def _gather(prompt_inner: str) -> str:
+def _gather(prompt_inner: str, lang: str = "en") -> str:
     """Speech-gathering Gather, provider-aware. Telnyx requires a numeric
-    speechTimeout (auto → the gather never completes, empty transcript)."""
+    speechTimeout (auto → the gather never completes, empty transcript).
+
+    Recognition language and TTS voice always move together — switching one
+    without the other means (e.g.) English recognition on Mandarin audio,
+    producing garbage the agent then answers confidently."""
     from app.core import telephony
     stimeout = SPEECH_TIMEOUT if telephony._provider() == "telnyx" else "auto"
-    return (f'<Gather input="speech" action="/sdr/voice/turn" method="POST" '
-            f'speechTimeout="{stimeout}" language="en-US">{prompt_inner}</Gather>'
-            + _say("Are you still there?")
+    recog = _voice_pair(lang)[0]
+    still = {"en": "Are you still there?", "fr": "Êtes-vous toujours là ?",
+             "es": "¿Sigue ahí?", "de": "Sind Sie noch da?",
+             "zh": "请问您还在吗？"}.get(lang, "Are you still there?")
+    # `speech dtmf` accepts EITHER: an English caller just talks (unchanged
+    # behaviour), a non-English caller presses a digit to declare their
+    # language — which works even though the recogniser is still on the wrong
+    # language, because a keypad tone carries no accent.
+    return (f'<Gather input="speech dtmf" numDigits="1" '
+            f'action="/sdr/voice/turn" method="POST" '
+            f'speechTimeout="{stimeout}" language="{recog}">{prompt_inner}</Gather>'
+            + _say(still, lang)
             + '<Redirect method="POST">/sdr/voice/turn</Redirect>')
 
 
@@ -1265,10 +1379,18 @@ async def sdr_voice_inbound(request: Request):
         connect = None
     if connect:
         return _twiml(connect)
-    return _twiml(_gather(_say(
-        "Hi! You've reached the Conscestra C R M assistant. "
-        "I can answer questions and book you a meeting with our team. "
-        "How can I help you today?")))
+    greeting = ("Hi! You've reached the Conscestra C R M assistant. "
+                "I can answer questions and book you a meeting with our team. "
+                "How can I help you today?")
+    inner = _say(greeting)
+    try:
+        from app.core.voice_support import VOICE_MULTILINGUAL
+        if VOICE_MULTILINGUAL:
+            # Each option in its own voice — see lang_menu_twiml().
+            inner += lang_menu_twiml()
+    except Exception:
+        pass
+    return _twiml(_gather(inner))
 
 
 @public_router.post("/sdr/voice/turn")
@@ -1281,19 +1403,62 @@ async def sdr_voice_turn(request: Request):
                       + "<Hangup/>")
     call_sid = params.get("CallSid") or str(_uuid.uuid4())
     heard = _heard(params)
+
+    # ── Keypad language choice ──────────────────────────────────────────────
+    # Handled FIRST, and before `heard` is consulted: a digit is an unambiguous
+    # declaration that survives the wrong recogniser, whereas the transcript at
+    # this point was produced by whatever language the last Gather committed to.
+    digits = (params.get("Digits") or params.get("digits") or "").strip()
+    if digits and digits in _LANG_MENU:
+        lang = set_call_lang(call_sid, _LANG_MENU[digits])
+        prompt = {"en": "Great — how can I help you today?",
+                  "zh": "好的，请问有什么可以帮您？",
+                  "fr": "Parfait — comment puis-je vous aider ?",
+                  "es": "Perfecto — ¿en qué puedo ayudarle?"}.get(
+                      lang, "Great — how can I help you today?")
+        return _twiml(_gather(_say(prompt, lang), lang))
+
+    lang = _call_lang(call_sid)
     if not heard:
         # Log the callback keys so a provider param mismatch is diagnosable
         # from the server log rather than a silent "didn't catch that" loop.
         logger.info(f"[sdr] voice turn: no speech; callback keys="
                     f"{sorted(params.keys())}")
-        return _twiml(_gather(_say("Sorry, I didn't catch that. "
-                                   "Could you say it again?")))
+        retry = {"en": "Sorry, I didn't catch that. Could you say it again?",
+                 "fr": "Désolé, je n'ai pas bien entendu. Pouvez-vous répéter ?",
+                 "es": "Perdón, no le entendí. ¿Puede repetirlo?",
+                 "de": "Entschuldigung, das habe ich nicht verstanden.",
+                 "zh": "抱歉，我没有听清楚。您可以再说一遍吗？"}.get(lang)
+        return _twiml(_gather(_say(retry, lang), lang))
+
     from app.core.telephony import normalize_phone
-    res = converse(f"voice-{call_sid}", heard, "voice",
-                   handle=normalize_phone(params.get("From", "")) or None)
+    frm = normalize_phone(params.get("From", "")) or None
+
+    # A rep who takes the conversation over in the console must actually take
+    # it over — the AI has to stand down on this line too, not just support.
+    try:
+        from app.core import agent_console
+        if frm and agent_console.is_human_handled("voice", frm):
+            hold = {"en": "One moment — a member of our team is joining the call.",
+                    "fr": "Un instant — un membre de notre équipe se joint à l'appel.",
+                    "es": "Un momento — alguien de nuestro equipo se une a la llamada.",
+                    "de": "Einen Moment — ein Mitglied unseres Teams kommt dazu.",
+                    "zh": "请稍等，我们团队的同事马上加入通话。"}.get(
+                        lang, "One moment — a member of our team is joining.")
+            logger.info(f"[sdr] voice call {call_sid[:8]} is human-handled — "
+                        f"AI standing down")
+            return _twiml(_say(hold, lang)
+                          + '<Pause length="20"/>'
+                          + '<Redirect method="POST">/sdr/voice/turn</Redirect>')
+    except Exception as exc:
+        logger.debug(f"[sdr] takeover check skipped: {exc}")
+
+    res = converse(f"voice-{call_sid}", heard, "voice", handle=frm)
+    lang = _call_lang(call_sid, heard)      # decided from the caller's own words
     if res.get("done"):
-        return _twiml(_say(res["reply"]) + "<Hangup/>")
-    return _twiml(_gather(_say(res["reply"])))
+        _VOICE_LANG.pop(call_sid, None)
+        return _twiml(_say(res["reply"], lang) + "<Hangup/>")
+    return _twiml(_gather(_say(res["reply"], lang), lang))
 
 
 # ============================================================================

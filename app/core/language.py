@@ -74,11 +74,62 @@ _NAMES = {
     "fr": "French (Canadian French / français canadien)",
     "es": "Spanish (español)",
     "de": "German (Deutsch)",
+    # Written Chinese: the model must be told WHICH script to answer in, because
+    # Simplified and Traditional are not interchangeable to a reader. Simplified
+    # is the safer default for a general audience; a Traditional-writing customer
+    # is handled by the mirroring instruction in directive().
+    "zh": "Mandarin Chinese (中文, Simplified characters)",
     "en": "English",
 }
-_SHORT = {"fr": "French", "es": "Spanish", "de": "German", "en": "English"}
+_SHORT = {"fr": "French", "es": "Spanish", "de": "German",
+          "zh": "Chinese", "en": "English"}
+
+# Languages we can actually SERVE end to end (reply + voice). A script we can
+# detect but not serve must fall back to English rather than promise support we
+# don't have — ja/ko are detected precisely so they DON'T get mislabelled as
+# Chinese, not because we support them.
+_SUPPORTED = {"fr", "es", "de", "zh", "en"}
 
 _WORD_RE = re.compile(r"[a-zà-ÿœæ']+", re.IGNORECASE)
+
+# ── Non-Latin scripts ────────────────────────────────────────────────────────
+# The stopword+diacritic scorer above is structurally blind to any language that
+# doesn't use spaced Latin words: Chinese text scored ZERO on every set and fell
+# through to the English default, so a Chinese customer silently got an English
+# reply on every channel. Script detection fixes that far more reliably than
+# stopwords ever could — a Han character IS the signal, with no ambiguity and no
+# word segmentation needed (Chinese doesn't put spaces between words, which is
+# precisely why the word-based scorer could never see it).
+_HAN = re.compile(r"[一-鿿㐀-䶿豈-﫿]")
+# Japanese uses Han characters TOO, so "has Han" alone is not "is Chinese".
+# Kana is the disambiguator: any kana means Japanese, not Chinese.
+_KANA = re.compile(r"[぀-ゟ゠-ヿ]")
+_HANGUL = re.compile(r"[가-힯ᄀ-ᇿ]")
+
+# How much non-Latin script is needed before we switch languages. A single Han
+# character inside an English sentence (a product name, a pasted brand) must not
+# flip the whole conversation — the same conservatism the Latin scorer uses.
+_SCRIPT_MIN_CHARS = 2
+
+
+def _script_language(text: str) -> str | None:
+    """Detect a non-Latin script language, or None to fall through to the
+    word-based scorer. Deterministic, no dependency, no cost.
+
+    Kana and Hangul are checked BEFORE the Han threshold, because Korean is
+    usually written with no Han characters at all and Japanese can be — so
+    gating on a Han count first would make this function silently blind to the
+    very scripts it exists to tell apart from Chinese. Each script carries the
+    same minimum-character conservatism, so one stray glyph in an English
+    sentence never flips the conversation."""
+    if len(_KANA.findall(text)) >= _SCRIPT_MIN_CHARS:
+        return "ja"          # kana → Japanese (detected so it is NOT read as zh)
+    if len(_HANGUL.findall(text)) >= _SCRIPT_MIN_CHARS:
+        return "ko"          # Hangul → Korean (same reason)
+    if len(_HAN.findall(text)) >= _SCRIPT_MIN_CHARS:
+        # Han with no kana and no Hangul: Chinese.
+        return "zh"
+    return None
 
 
 def _flag(name: str, default: str = "1") -> bool:
@@ -94,6 +145,11 @@ def detect(text: str) -> str:
     raises; deterministic; no cost."""
     if not ENABLED or not text:
         return "en"
+    # Script check FIRST: a non-Latin script is unambiguous evidence, and the
+    # word scorer below cannot see it at all (no spaced Latin words to score).
+    script = _script_language(text)
+    if script:
+        return script if script in _SUPPORTED else "en"
     low = text.lower()
     words = _WORD_RE.findall(low)
     if not words:
@@ -126,13 +182,21 @@ def directive(code: str) -> str:
     if not ENABLED or code == "en" or code not in _NAMES:
         return ""
     name = _NAMES[code]
+    extra = ""
+    if code == "zh":
+        # Simplified vs Traditional is not a style choice — mixing them, or
+        # answering a Traditional writer in Simplified, reads as wrong to the
+        # customer. Mirror what they used.
+        extra = (" Match the customer's character set: reply in Traditional "
+                 "characters (繁體) if they wrote in Traditional, otherwise "
+                 "Simplified (简体). Do not mix the two in one reply.")
     return (
         f"\n\nLANGUAGE: The customer wrote in {name}. Reply ENTIRELY in {name}, "
         f"naturally and fluently, as a native speaker would. Any approved "
         f"knowledge or facts provided to you may be in English — translate their "
         f"SUBSTANCE into {name}; keep product names, prices, numbers, dates and "
         f"URLs exactly as given. Do not mention translation or that you switched "
-        f"languages."
+        f"languages." + extra
     )
 
 

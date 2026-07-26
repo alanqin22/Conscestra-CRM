@@ -111,9 +111,11 @@ The result is a formal Web Intelligence Briefing containing clickable
 citations and source attribution.
 
 The platform also integrates directly with calendars, accounting systems, and
-external AI ecosystems through the Model Context Protocol (MCP). This allows
-assistants such as Claude and other MCP-capable systems to connect directly to
-Conscestra's agents, organizational memory, and capability registry.
+external AI ecosystems through the Model Context Protocol (MCP) — **in both
+directions**. Assistants such as Claude and other MCP-capable systems connect
+directly to Conscestra's agents, organizational memory, and capability
+registry; and Conscestra's own agents can call tools hosted on external MCP
+servers, under the same grants and guardrails as every native action.
 
 ## AI That Understands Business Context
 
@@ -262,6 +264,33 @@ set.
 
 Every resolved case makes the next answer better. **The help desk compounds.**
 
+## A Promise Made Is a Promise Owed
+
+The worst failure of a customer-facing AI is not a wrong answer. It is a
+**dropped one** — the conversation where the customer asked for a manager,
+or the agent said *"someone will get back to you,"* and then nothing
+happened. A transcript records that moment; it does not oblige anyone to
+act on it.
+
+Conscestra turns those moments into **first-class escalation objects** with
+an owner and a clock. Two very different triggers create them. The first is
+what the *customer* asks for — a request for a human, a complaint, a legal
+or safety word, a refund demand, repeated failed attempts at the same
+question. The second is subtler and easier to miss: **the agent's own
+promise.** When the AI says it will follow up, that sentence is scanned as
+it goes out, and the commitment is opened as an obligation before the
+customer ever sees the reply. An AI that can make promises must be a system
+that can be held to them.
+
+Each escalation carries a **service-level deadline** appropriate to its
+reason — a legal or safety flag is not given the same runway as a general
+question — and one is opened per conversation, so a frustrated customer who
+asks three times gets one owner rather than three tickets. Breaches surface
+on the platform's own health view, and resolving the conversation resolves
+the obligation.
+
+**The conversation can end. The obligation cannot, until someone closes it.**
+
 ## Give It a Goal, Get a Governed Plan
 
 For everything the playbooks don't already cover, executives can hand the
@@ -379,11 +408,14 @@ is active, the database layer refuses every general query outright — the
 caller can only reach explicitly account-scoped lookups, and the tier is
 decided by deterministic code before any language model runs.
 
-With media streams enabled, the same line stops feeling like an IVR: audio
-streams both ways over the carrier's WebSocket, speech is recognized as the
-caller finishes a sentence, replies are synthesized in a natural voice, and
-the caller can **interrupt the agent mid-sentence** and be heard. Same
-brain, same tiers, same audit trail — just a conversation.
+An optional real-time mode (off by default) takes the same line further:
+audio streams both ways over the carrier's WebSocket, speech is recognized
+as the caller finishes a sentence, replies are synthesized in a natural
+voice, and the caller can **interrupt the agent mid-sentence** and be heard.
+Same brain, same tiers, same audit trail. It is a deliberate switch rather
+than the default, because the streaming path and the turn-based path are
+genuinely different call flows — the multilingual and takeover behavior
+below belongs to the turn-based one.
 
 The line also **senses how a call felt**, not just what was said: a caller
 who repeatedly talks over the agent or speaks fast and long reads as urgent,
@@ -392,8 +424,30 @@ agent — the 360 summary, the standing supervisor — sees automatically. No
 audio ever leaves the call; the measures are behavioral, deterministic, and
 tunable.
 
-**Every call is a conversation with the whole CRM, on exactly the terms
-each caller has earned.**
+And the line **answers in the caller's own language** — English, French,
+Mandarin Chinese, or Spanish. The caller chooses from a menu where **each
+option is spoken by a native voice**, because an option offered in a voice
+you cannot understand is not an option at all. Choosing switches both halves
+together: the speech recognizer *and* the synthesized voice. That pairing is
+not a detail — recognizing Mandarin with an English recognizer returns
+nonsense the agent would then answer confidently, so the system refuses to
+switch one without the other.
+
+Language is declared, not guessed, and the reason is worth stating plainly:
+a phone line must commit to one recognizer before the caller speaks, so
+detecting the language from the transcript is circular — the words come back
+already filtered through the wrong language. Text channels can detect
+silently because the customer's own characters arrive intact. Voice cannot,
+so it asks. Once chosen, the choice holds for the whole call; an unclear
+"okay" never flips the accent mid-sentence.
+
+When a human takes the call over from the console, the AI **stands down** —
+it stops answering, plays a hold message in the caller's language, and keeps
+the line open for the person joining. The customer is never talking to two
+agents at once.
+
+**Every call is a conversation with the whole CRM, in the caller's own
+language, on exactly the terms each caller has earned.**
 
 ## One Customer Memory, Every Channel
 
@@ -658,6 +712,60 @@ deterministic fallbacks rather than ever breaking a flow, and a cheaper
 model tier for high-volume wording. The morning briefing reports what the
 automation earned *and* what it burned.
 
+## The Agents You Author Can Also Act
+
+An agent that can only explain things is a search box with better manners.
+Conscestra's no-code Studio lets a business user describe an agent in plain
+language — who it serves, what it knows, how it should sound — and that
+agent can then **do the work**, not just narrate it: log an activity, create
+a task, open a case, update a contact's own details.
+
+What makes that safe is that **the agent never gets a power; it gets a
+grant.** Every action lives in a capability catalogue, and an authored agent
+holds an explicit, revocable grant to each one. Three independent checks
+decide any call, and any single one of them refuses: is this capability
+granted to this agent, is the caller allowed to trigger it, and does the
+data involved permit it. Nothing is implied by the fact that a capability
+exists — **appearing in a catalogue is not permission.**
+
+The reason this matters is that anything an agent can do, a *customer
+talking to that agent* can attempt to make it do. So authored agents get the
+narrow, low-blast-radius actions by default, and anything that moves money,
+history, or another person's record does not execute — it becomes a
+**governed proposal** in the same approval queue as every other consequential
+action, with the same critic, the same audit trail, the same human.
+
+**The agent proposes in the customer's words. The platform decides in yours.**
+
+## Publishing an Agent Is a Release, Not a Save
+
+The moment a business user can create a customer-facing agent without an
+engineer, editing that agent becomes a **deployment** — and deployments need
+the discipline deployments get.
+
+Every edit in the Studio is a **draft version**. Publishing runs a gate
+first: does the agent have a real instruction set, is its knowledge audience
+consistent with who can reach it, does it pass its evaluation scenarios.
+Only a version that clears the gate can go live, and the previously live
+version is kept intact, so **rollback is a single action** rather than a
+frantic attempt to remember what the prompt used to say.
+
+One rule cannot be waived by anyone, and it is the one that caught a real
+bug here. An agent reachable by the public may read only the **public**
+knowledge tier. It is enforced when the draft is written, when it is
+evaluated, and again when it is published — not once, three times — because
+this exact misconfiguration once let an externally reachable agent answer
+from internal documentation. A gate you can talk your way past is a
+suggestion.
+
+An urgent fix can still override the gate, but never invisibly: an override
+demands a **written reason**, and the version history shows the override,
+the reason, and **the checks that were failing when it was forced** — for as
+long as that version exists. Publishing under pressure is allowed.
+Publishing without a record is not.
+
+**Anyone can build an agent. No one can quietly ship a broken one.**
+
 ## A Platform That Audits Itself
 
 Two standing agents keep the platform honest about its own weaknesses.
@@ -674,6 +782,34 @@ on: duplicate contacts, malformed phone numbers, unreachable records,
 ownerless accounts. The safe fixes arrive as governed, fully **reversible**
 proposals — every change records its before-state — while anything that
 moves money or history stays a human decision. Garbage in, governed out.
+
+## Is the Platform Itself Healthy Right Now?
+
+Every module in Conscestra reports on the *business*. None of them answered
+a different question: **is the machinery under all of it actually working?**
+
+A platform health view answers it in three parts. **Platform** — is the
+event backbone draining or backing up, are events stranded with no handler
+to claim them, is any work retrying without ever succeeding, is there a
+second model provider standing by. **Obligations** — how many escalations
+are open, and how many have blown their deadline. **Governance** — how long
+approvals have been sitting, and whether any agent version was published by
+overriding its gate.
+
+Two of those deserve emphasis because they are the failures that hide.
+A **stranded event** is worse than a failed one: nothing errored, nothing
+alerted, the work simply had no owner and sat silently — which is exactly
+what happened here when a restart's cutoff logic orphaned everything emitted
+while the platform was down. And a **retry that never succeeds** looks
+healthy from every angle except the one that counts.
+
+The view is also honest about its own failure. "Not signed in as an
+administrator," "the server is unreachable," and "the query failed" are
+three different situations with three different responses, and a dashboard
+that collapses them into *Failed to load* has told you nothing. Each one
+says which it is.
+
+**A platform that can act on its own must be able to tell you when it can't.**
 
 ## Governance Before Autonomy
 
@@ -751,6 +887,67 @@ gates, so private data neither leaks into prompts nor out of them.
 
 Security is not a feature layered onto the platform. **Security is the
 architecture.**
+
+## One Model Provider Should Not Be a Single Point of Failure
+
+A CRM whose phone line, storefront, and help desk all think through one
+vendor's API has quietly made that vendor's worst day its own. Conscestra
+can **fail over to a second model provider** mid-request — but the
+interesting part is everything it refuses to fail over.
+
+Retrying blindly is not resilience; it is an amplifier. So failures are
+sorted first. A timeout, a rate limit, an overloaded upstream — those are
+**transient**, and worth a second provider. An invalid API key, a malformed
+request, a refusal on safety grounds, a budget stop — those are **decisions
+or defects**, and re-asking a different vendor either changes nothing or
+launders an answer the first one deliberately declined. Only the first class
+ever moves.
+
+Two boundaries hold regardless of how urgent the request is. Failing over
+sends your data to a **different company**, so anything classified as
+internally sensitive stays on the primary path or falls back to the local
+model — it does not get shipped elsewhere because the first API was slow.
+And the **budget is checked once, before any provider is tried**, so a
+failover can never spend past a ceiling by taking the second route.
+
+Telemetry records both layers: the **logical request** the business made and
+each **provider attempt** underneath it, so cost, latency, and reliability
+per vendor are answerable questions rather than an averaged blur. Failover
+ships **off by default** and every provider is health-checked by actually
+calling it — because a model being listed in a vendor's catalogue is not the
+same as that model responding, and we learned that the direct way.
+
+**Resilience is knowing which failures deserve a second chance.**
+
+## Tools From Anywhere, Governed the Same Way
+
+Conscestra already **serves** the Model Context Protocol, so assistants like
+Claude can work with the CRM directly. It now **consumes** MCP as well: the
+platform's own agents can call tools that live on external MCP servers,
+extending what they can do without waiting on a release here.
+
+That is an enormous door, so it opens onto the governance that already
+exists rather than beside it. An external tool is projected into **the same
+capability catalogue** as every native action and is granted the same way.
+Building a second permission model for third-party tools would have
+guaranteed the two drifted — and the weaker one is the one attackers use.
+
+Three gates apply, each sufficient on its own to refuse. The server must be
+**explicitly registered and enabled** — an allowlist, never whatever
+discovery happens to return. The individual tool must be enabled, because
+**a server listing a tool is not permission to call it.** And calling a
+third party is **egress**, so the same data-class rule from failover
+applies: internally sensitive data does not leave without an explicit
+opt-in.
+
+External tools default to **requiring approval**, for a simple reason —
+their code cannot be reviewed here. Credentials are referenced by
+environment-variable name and never stored or returned. Disabling a server
+**revokes** its tools and the grants to them in the same motion, so turning
+something off means it is off.
+
+**New capabilities arrive as fast as the ecosystem builds them, under rules
+that never move.**
 
 ## One Version of the Truth, and It Can Explain Itself
 
@@ -976,6 +1173,13 @@ _Listed in the same order as the launcher page on [agentorc.ca](https://agentorc
 - **Self-correcting financial data** — invoice ↔ payment triggers recalc balance and status with a rounding-tolerant settlement rule (near-paid invoices settle instead of lingering as "overdue"), the accounts→events trigger is idempotent (no duplicate auto-created deals), and the AR executive view reports outstanding / past-due on a materiality basis — so the receivables figures stay honest.
 - **Deterministic lead scoring** — a transparent Fit + Intent model (`fn_score_lead`, `rule_based_v1`) replaces random scores with explainable, audited Cold/Warm/Hot ratings; the scoring function is a single swappable API, ready to drop in a predictive model later.
 - **Executive Q&A bank** — every agent answers interrogative "executive questions" through a shared decision-grade layer (headline, confidence, drivers, recommended action + owner, drill-down link), with each capability chip routed to a distinct section set.
+- **Escalations as objects, not sentiment** — a customer asking for a human, a complaint, a legal/safety word, a refund demand or a repeated failed question opens a first-class **escalation with an owner and an SLA clock** (`escalation.py`) — and so does *the agent's own promise*: outgoing text is scanned for "someone will follow up" and the commitment is opened before the customer sees the reply. One per conversation (partial unique index), SLA tiered by reason, breaches surfaced on platform health, resolved when the conversation is.
+- **Authored agents that act, under grants** — the no-code Studio's agents can log activities, create tasks, open cases and update a contact's own details through a **capability catalogue + revocable per-agent grants** (`agent_capabilities.py`). Three independent checks each sufficient to refuse (granted · caller allowed · data class), *listing is never permission*, and anything consequential becomes a **governed proposal** in the existing approval queue rather than executing.
+- **Publishing an agent is a release** — every Studio edit is a **draft version**; publishing runs a gate (instructions present, evaluation passed, audience consistent) and keeps the prior live version for **one-action rollback** (`agent_versions.py`). The **reach invariant** — an externally reachable agent may read only the `public` KB tier — is enforced at write, evaluate *and* publish and cannot be forced (it caught a live misconfiguration where a public agent answered from internal docs). Overrides require a written reason and the history preserves the reason **and the checks that were failing**.
+- **The platform observes itself** — `platform_health.py` + `platform-health.html` answer *is the machinery working*: event-bus drain rate, **stranded events with no handler**, retries that never succeed, failover readiness · open and **breached** escalations · approval age and gate overrides. Its own error states distinguish "not signed in as admin" from "server unreachable" from "query failed" instead of a bare *Failed to load*.
+- **LLM provider failover that refuses more than it retries** — `llm_router.py` classifies failures first: timeouts/rate-limits/overload are **transient** and worth a second provider; auth errors, malformed requests, safety refusals and budget stops are **decisions or defects** and never fail over. Egress policy holds — `INTERNAL_SENSITIVE` work never leaves for a second vendor — the **budget is checked once before any provider**, providers are health-checked by actually calling them, and telemetry separates the **logical request** from each **provider attempt**. Ships off by default (`LLM_FAILOVER_ENABLED`).
+- **MCP in both directions** — beyond serving MCP, agents can **consume** external MCP servers (`mcp_client.py`). Tools are projected into the *same* U4 capability catalogue rather than a second permission model, and three gates each refuse on their own: server registered **and** enabled (allowlist, not discovery) · tool enabled individually · **egress** data-class check. External tools default to `requires_approval`; credentials are referenced by env-var name and never stored; disabling a server revokes its tools **and** their grants.
+- **A multilingual phone line** — the support line answers in **English, French, Mandarin Chinese or Spanish**, chosen from a keypad menu where *each option is spoken in its own language*. Recognition language and TTS voice switch **together** (switching one alone yields garbage the agent answers confidently), the choice is sticky per call, and human takeover makes the AI stand down with a localized hold. Voice **declares** rather than detects because a `<Gather>` must commit to a recognizer before the caller speaks; text channels detect silently via script detection (`language.py`) that correctly separates zh from ja/ko.
 - **Nightly automation** — an APScheduler job set (pipeline progression, order-status advancement, daily seed data, activity sweep) runs at **10 PM US Eastern (DST-aware)** so the same wall-clock time fires on both the Railway and local databases.
 - **Single FastAPI + LangGraph server** — zero duplicated config, one DB connection pool, shared session memory across all 15 modules.
 
@@ -990,6 +1194,7 @@ crm_agent/
 ├── .env                           ← Single config file for all agents
 ├── sp/                            ← PostgreSQL stored procedures
 ├── *-mgmt.html                    ← One frontend per agent (incl. orchestrator-mgmt.html)
+├── platform-health.html           ← Platform / obligations / governance health
 └── app/
     ├── main.py                    ← FastAPI app — registers all routers
     ├── core/                      ← Shared utilities (zero duplication)
@@ -1043,6 +1248,15 @@ crm_agent/
     │   ├── quotes.py              ← Deterministic quotation build + delivery
     │   ├── web_tools.py           ← Internet access (search + fetch + cite)
     │   ├── llm_meter.py           ← LLM usage metering, budgets, model tiering
+    │   ├── llm_router.py          ← Provider failover (failure classes, egress
+    │   │                             policy, health checks, attempt telemetry)
+    │   ├── escalation.py          ← Escalation objects + SLAs + promised follow-ups
+    │   ├── custom_agents.py       ← No-code authored agents (reach invariant)
+    │   ├── agent_versions.py      ← Draft/publish gate, rollback, override log
+    │   ├── agent_capabilities.py  ← Capability catalogue + per-agent grants
+    │   ├── mcp_client.py          ← Consume external MCP servers (3 gates)
+    │   ├── platform_health.py     ← Platform / obligations / governance health
+    │   ├── language.py            ← Script + word language detection (zh/ja/ko safe)
     │   ├── evals.py               ← Nightly behavior evals (CI for prompts)
     │   └── data_quality.py        ← Data hygiene detectors + undoable fixes
     └── agents/
@@ -1135,6 +1349,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | POST   | `/demo/{seed\|clear}`        | Seed / remove a sample business + intelligence headline (admin) |
 | GET/POST/DELETE | `/custom-fields/defs` · `/custom-fields/values/{entity}/{id}` | Custom-field definitions + record values (admin) |
 | GET/POST | `/industry/packs[/{id}/apply\|remove]` | Apply/remove an industry starter pack (admin) |
+| GET    | `/platform/health[/section/{key}]` | Platform / obligations / governance health (admin) |
+| GET/POST | `/escalations`             | Open obligations + SLA state; assign / resolve (admin) |
+| GET/POST | `/agent-versions/{slug}[/draft\|evaluate\|publish\|rollback]` | Authored-agent draft/publish gate + history (admin) |
+| GET/POST | `/agent-capabilities[/catalog\|/{slug}]` | Capability catalogue + per-agent grants (admin) |
+| GET/POST | `/mcp/servers[/{name}/discover\|enabled]` | Register/enable external MCP servers + tools (admin) |
+| POST   | `/mcp/call`                  | Invoke an external MCP tool through the grants (admin) |
 | GET    | `/sessions`                  | List active memory sessions                    |
 | DELETE | `/sessions/{id}`             | Clear a session's memory                       |
 

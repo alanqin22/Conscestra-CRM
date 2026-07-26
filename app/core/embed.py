@@ -314,8 +314,15 @@ async def embed_chat(embed_key: str, request: Request):
     history = body.get("history") if isinstance(body.get("history"), list) else None
     # Forward to the mapped agent. custom_agents.run re-checks it exists +
     # enabled; we additionally guarantee external scope at key-creation time.
+    # The widget's per-browser session id threads the visitor's turns into ONE
+    # conversation, which is what makes an escalation (U1) followable — without
+    # it a visitor asking for a human leaves nothing a rep can pick up.
+    sid = str(body.get("session_id") or "")[:64] or None
+    handle = str(body.get("email") or "").strip()[:200] or None
     from app.core import custom_agents
-    res = custom_agents.run(key["agent_slug"], str(body.get("message") or ""), history)
+    res = custom_agents.run(key["agent_slug"], str(body.get("message") or ""),
+                            history, session_id=sid, handle=handle,
+                            source=f"embed:{embed_key}")
     return _json(res, cors)
 
 
@@ -355,6 +362,17 @@ _WIDGET_JS = r"""
       .replace(/[<>&"]/g, function (c) { return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]; }); };
   var cfg = { title: 'Chat with us', color: '#0d9488', greeting: null, examples: [] };
   var history = [], open = false, booted = false;
+  // Stable per-browser id so a visitor's turns thread into ONE conversation a
+  // human can pick up (U1). Survives reloads; falls back to memory in private
+  // mode. Not an identifier of the person — just of the chat thread.
+  var SID = (function () {
+    var k = 'cw_sid_' + KEY;
+    try { var v = localStorage.getItem(k);
+          if (!v) { v = 'w' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+                    localStorage.setItem(k, v); }
+          return v; }
+    catch (e) { return 'w' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+  })();
 
   function el(tag, css, html) { var e = document.createElement(tag); if (css) e.style.cssText = css; if (html != null) e.innerHTML = html; return e; }
 
@@ -395,7 +413,7 @@ _WIDGET_JS = r"""
     add(th, msg, 'u');
     var typing = add(th, '…', 'a');
     fetch(BASE + '/embed/v1/' + KEY + '/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: msg, history: history }) })
+        body: JSON.stringify({ message: msg, history: history, session_id: SID }) })
       .then(function (r) { return r.json(); })
       .then(function (d) { typing.innerHTML = esc(d && d.ok ? d.reply : (d && d.error) || 'Something went wrong.'); th.scrollTop = th.scrollHeight;
         if (d && d.ok) { history.push({ role: 'user', content: msg }); history.push({ role: 'assistant', content: d.reply }); } })

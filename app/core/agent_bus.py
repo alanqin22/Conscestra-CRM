@@ -66,6 +66,9 @@ BATCH        = int(os.getenv("AGENT_BUS_BATCH", "10"))
 MAX_ATTEMPTS = int(os.getenv("AGENT_BUS_MAX_ATTEMPTS", "5"))
 AUTOSEND     = _flag("AGENT_BUS_AUTOSEND")
 BACKFILL_MIN = int(os.getenv("AGENT_BUS_BACKFILL_MINUTES", "0"))
+# Blast-radius cap on the resume window (see _resume_cutoff). Bounds how far a
+# restart may reach back, so a long-dead consumer can never mass-replay history.
+MAX_CATCHUP_HOURS = int(os.getenv("AGENT_BUS_MAX_CATCHUP_HOURS", "24"))
 
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
@@ -152,6 +155,176 @@ def _claim_batch_sync(cutoff: datetime) -> List[Dict[str, Any]]:
         conn.close()
 
 
+def _last_activity_sync() -> Optional[datetime]:
+    """When this consumer last settled anything — the RESUME WATERMARK.
+
+    `event_queue.last_attempt_at` is written on every completion and failure, so
+    its maximum is a durable record of when the bus was last alive, surviving
+    restarts without a new table."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT max(last_attempt_at) FROM event_queue")
+            return cur.fetchone()[0]
+    except Exception as exc:
+        conn.rollback()
+        logger.debug(f"[agent_bus] watermark read failed: {exc}")
+        return None
+    finally:
+        conn.close()
+
+
+def _resume_cutoff() -> datetime:
+    """Eligibility floor for a starting consumer.
+
+    THE BUG THIS FIXES: the cutoff used to be `now()` at every boot, so any
+    event emitted while the process was DOWN — a deploy window, a crash, a dev
+    machine that was simply off — became permanently ineligible. It was never
+    claimed, never retried, never failed: it just sat 'pending' forever with
+    attempts=0, invisible. Found 2026-07-25 with 50 such events aged up to 13
+    days, and it recurs on EVERY restart in production.
+
+    The fix is to resume from where the consumer left off rather than from
+    'now', while keeping the protection the boot cutoff was designed for (no
+    mass replay of historical events):
+
+      • an explicit AGENT_BUS_BACKFILL_MINUTES still wins outright;
+      • otherwise resume at the last-settled watermark, so a downtime gap of N
+        minutes is caught up in full;
+      • bounded by AGENT_BUS_MAX_CATCHUP_HOURS, so a consumer that has been off
+        for a month reaches back a day, not a month;
+      • if this queue has NEVER been consumed the watermark is NULL and we keep
+        the original conservative behaviour (start at now) — a fresh install
+        with a large historical queue must not replay it by surprise. Draining
+        that is a deliberate act via drain_backlog().
+    """
+    now = datetime.now(timezone.utc)
+    if BACKFILL_MIN:
+        return now - timedelta(minutes=BACKFILL_MIN)
+    watermark = _last_activity_sync()
+    if watermark is None:
+        return now
+    return max(watermark, now - timedelta(hours=MAX_CATCHUP_HOURS))
+
+
+def orphaned_sync(cutoff: Optional[datetime] = None) -> Dict[str, Any]:
+    """Pending, dispatchable events the running cutoff will NEVER reach.
+
+    An orphan is not a backlog that is draining slowly — it is work the bus has
+    silently decided not to do. Surfaced in /agent-bus/status and Platform
+    Health (U3) so the decision to drain or discard is made by a person."""
+    cut = cutoff or _CUTOFF
+    if cut is None:
+        return {"orphaned": 0, "cutoff": None, "note": "consumer not started"}
+    types = list(HANDLERS.keys())
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT count(*), min(e.created_at), max(e.created_at)
+                   FROM event_queue q JOIN events e USING (event_uuid)
+                   WHERE q.status='pending' AND e.created_at < %(cut)s
+                     AND (%(catchall)s OR e.event_type = ANY(%(types)s))""",
+                {"cut": cut, "catchall": CATCHALL, "types": types})
+            n, oldest, newest = cur.fetchone()
+            cur.execute(
+                """SELECT e.event_type, count(*)
+                   FROM event_queue q JOIN events e USING (event_uuid)
+                   WHERE q.status='pending' AND e.created_at < %(cut)s
+                     AND (%(catchall)s OR e.event_type = ANY(%(types)s))
+                   GROUP BY 1 ORDER BY 2 DESC""",
+                {"cut": cut, "catchall": CATCHALL, "types": types})
+            by_type = {t: c for t, c in cur.fetchall()}
+        return {"orphaned": int(n or 0), "cutoff": cut.isoformat(),
+                "by_type": by_type,
+                "oldest": oldest.isoformat() if oldest else None,
+                "newest": newest.isoformat() if newest else None,
+                "note": ("these will never be processed by the running consumer; "
+                         "POST /agent-bus/drain to process them deliberately")
+                        if n else "none"}
+    except Exception as exc:
+        conn.rollback()
+        return {"orphaned": None, "error": str(exc)[:160]}
+    finally:
+        conn.close()
+
+
+def settle_inbox_sync(cur, event_uuid: str, outcome: str = "completed") -> int:
+    """Settle the agent_inbox notifications an event fanned out to.
+
+    THE ONE place that decides what a settled inbox row looks like, so a queue
+    row can never reach a terminal state while its fan-out sits 'pending'
+    forever — trading a visible backlog for an invisible one. Takes the CALLER'S
+    cursor so settlement commits atomically with the queue-row transition.
+
+      completed → 'sent'  the handler ran and the inbox item was actioned
+      cancelled → 'read'  auto-resolved without action, matching the convention
+                          notification_triage already uses for machine
+                          settlement ('sent' would claim work that never happened)
+
+    Returns the number of inbox rows settled."""
+    if outcome == "cancelled":
+        cur.execute(
+            """UPDATE notifications SET status='read', read_at=now()
+               WHERE event_uuid=%(id)s::uuid AND channel='agent_inbox'
+                 AND status='pending'""", {"id": event_uuid})
+    else:
+        cur.execute(
+            """UPDATE notifications SET status='sent', sent_at=now()
+               WHERE event_uuid=%(id)s::uuid AND channel='agent_inbox'
+                 AND status='pending'""", {"id": event_uuid})
+    return cur.rowcount
+
+
+def cancel_sync(event_uuid: str, reason: str, decided_by: str = "admin",
+                disposition: str = "stale") -> Dict[str, Any]:
+    """Retire an event WITHOUT dispatching its handler.
+
+    For events whose side effect is no longer semantically valid — a 'shipped'
+    notice for an order already delivered, a create-signal for a deleted record.
+    'completed' would falsely assert the work was done and 'failed' would
+    falsely assert an error, so the terminal state is its own value.
+
+    The disposition record is MERGED into error_context, never overwriting the
+    diagnostic history already there."""
+    import json
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT event_type, created_at FROM events "
+                        "WHERE event_uuid=%s::uuid", (event_uuid,))
+            row = cur.fetchone()
+            if not row:
+                return {"ok": False, "error": "event not found"}
+            etype, created = row
+            audit = {"disposition": disposition, "reason": reason,
+                     "decided_by": decided_by,
+                     "decided_at": datetime.now(timezone.utc).isoformat(),
+                     "original_event_type": etype,
+                     "original_created_at": created.isoformat()}
+            cur.execute(
+                """UPDATE event_queue
+                   SET status='cancelled', last_attempt_at=now(),
+                       error_context = COALESCE(error_context,'{}'::jsonb)
+                                       || %(ctx)s::jsonb,
+                       locked_by=NULL, locked_at=NULL
+                   WHERE event_uuid=%(id)s::uuid AND status='pending'
+                   RETURNING queue_uuid""",
+                {"id": event_uuid, "ctx": json.dumps(audit)})
+            if cur.fetchone() is None:
+                conn.rollback()
+                return {"ok": False, "error": "not pending (already settled?)"}
+            settled = settle_inbox_sync(cur, event_uuid, outcome="cancelled")
+        conn.commit()
+        return {"ok": True, "event_uuid": event_uuid, "event_type": etype,
+                "inbox_settled": settled}
+    except Exception as exc:
+        conn.rollback()
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+
+
 def _complete_sync(event_uuid: str, result: Dict[str, Any]) -> None:
     conn = get_connection()
     try:
@@ -160,17 +333,11 @@ def _complete_sync(event_uuid: str, result: Dict[str, Any]) -> None:
             cur.execute(
                 """UPDATE event_queue
                    SET status='completed', last_attempt_at=now(), last_error=NULL,
-                       error_context=%(ctx)s, locked_by=NULL
+                       error_context=%(ctx)s, locked_by=NULL, locked_at=NULL
                    WHERE event_uuid=%(id)s::uuid""",
                 {"id": event_uuid, "ctx": json.dumps(result)[:4000]},
             )
-            # Settle the agent_inbox items this event fanned out to.
-            cur.execute(
-                """UPDATE notifications
-                   SET status='sent', sent_at=now()
-                   WHERE event_uuid=%(id)s::uuid AND channel='agent_inbox' AND status='pending'""",
-                {"id": event_uuid},
-            )
+            settle_inbox_sync(cur, event_uuid, outcome="completed")
         conn.commit()
     finally:
         conn.close()
@@ -185,7 +352,14 @@ def _fail_sync(event_uuid: str, attempts: int, err: str) -> None:
                    SET status = CASE WHEN %(att)s >= %(max)s THEN 'failed' ELSE 'pending' END,
                        next_attempt_at = now() + (interval '30 seconds'
                                                   * power(2, LEAST(%(att)s, 6))),
-                       last_attempt_at = now(), last_error = %(err)s, locked_by = NULL
+                       last_attempt_at = now(), last_error = %(err)s,
+                       -- Release the lock COMPLETELY. Clearing locked_by while
+                       -- leaving locked_at set meant the claim query's 5-minute
+                       -- stale-lock guard, not next_attempt_at, decided when a
+                       -- retry could happen — so the configured exponential
+                       -- backoff was a fiction until it exceeded 5 minutes
+                       -- (attempt 4). next_attempt_at is the retry clock.
+                       locked_by = NULL, locked_at = NULL
                    WHERE event_uuid = %(id)s::uuid""",
                 {"id": event_uuid, "att": attempts, "max": MAX_ATTEMPTS, "err": err[:2000]},
             )
@@ -1435,7 +1609,18 @@ def start_agent_bus() -> bool:
         return False
     if _task and not _task.done():
         return True
-    _CUTOFF = datetime.now(timezone.utc) - timedelta(minutes=BACKFILL_MIN)
+    # Resume from where the consumer left off, not from 'now' — otherwise every
+    # restart orphans whatever was emitted while the process was down.
+    _CUTOFF = _resume_cutoff()
+    gap = (datetime.now(timezone.utc) - _CUTOFF).total_seconds() / 60
+    logger.info(f"[agent_bus] cutoff={_CUTOFF.isoformat()} "
+                f"(catching up {gap:.1f} min)")
+    orph = orphaned_sync(_CUTOFF)
+    if orph.get("orphaned"):
+        logger.warning(f"[agent_bus] {orph['orphaned']} pending event(s) predate "
+                       f"the cutoff and will NOT be processed "
+                       f"(oldest {orph.get('oldest')}) — {orph.get('by_type')}. "
+                       f"POST /agent-bus/drain to process them deliberately.")
     _stop.clear()
     _task = asyncio.create_task(_loop())
     return True
@@ -1464,6 +1649,9 @@ def agent_bus_status():
         "poll_secs": POLL_SECS, "batch": BATCH, "handlers": list(HANDLERS),
         "running": bool(_task and not _task.done()),
         "cutoff": _CUTOFF.isoformat() if _CUTOFF else None,
+        "max_catchup_hours": MAX_CATCHUP_HOURS,
+        "backfill_minutes": BACKFILL_MIN,
+        "orphaned": orphaned_sync(),
     }
 
 
