@@ -46,6 +46,7 @@ from app.agents.contacts.router      import router as contacts_router
 from app.agents.products.router      import router as products_router
 from app.agents.orders.router        import router as orders_router
 from app.agents.activities.router    import router as activities_router
+from app.agents.cases.router         import router as cases_router
 from app.agents.opportunities.router import router as opportunities_router
 from app.agents.accounting.router    import router as accounting_router
 from app.agents.leads.router         import router as leads_router
@@ -245,6 +246,21 @@ def _run_activities_auto_sweep() -> None:
 # Milestone auto-complete runs live (completion is reversible via the activity
 # 'reopen' mode). Flip to True to only preview the eligible count.
 MILESTONE_COMPLETE_DRY_RUN = False
+
+
+def _run_expire_quotes() -> None:
+    """Nightly: mark quotes past their validity as expired (C3.0).
+
+    Idempotent and narrow — it touches only `draft`/`sent` quotes whose
+    valid_until is strictly in the past, so accepted and declined offers are
+    left alone."""
+    try:
+        from app.core import quotes
+        res = quotes.expire_due()
+        if res.get("expired"):
+            logger.info(f"[quotes] nightly expiry closed {res['expired']} quote(s)")
+    except Exception as exc:
+        logger.error(f"[quotes] nightly expiry failed: {exc}")
 
 
 def _run_complete_settled_activities() -> None:
@@ -602,6 +618,13 @@ def _run_capture_forecast_snapshot() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("=== CRM Agent starting up (all 12 modules + home index + auth + email) ===")
+
+    # Release configuration guard — BEFORE anything binds or serves. A deployed
+    # environment missing a blocking control does not start; a laptop only gets
+    # a log line. See app/core/release_guard.py for why refusing beats warning.
+    from app.core import release_guard
+    release_guard.enforce()
+
     db_ok = test_connection()
     logger.info(f"Database: {'OK' if db_ok else 'FAILED -- check DB_DSN in .env'}")
 
@@ -673,6 +696,18 @@ async def lifespan(app: FastAPI):
             id="generate_pipeline_opportunities",
             replace_existing=True,
             misfire_grace_time=3600,
+        )
+
+        # C3.0 — close out offers whose validity has passed. An expired quote
+        # that still reads as `sent` is a commitment the business no longer
+        # has, and it inflates every open-quote figure. Safe at 22:25 because
+        # the predicate is `valid_until < current_date`: a quote valid THROUGH
+        # today survives until the date actually rolls over.
+        scheduler.add_job(
+            _run_expire_quotes,
+            trigger=CronTrigger(hour=22, minute=25), # 10:25 PM ET — expire stale quotes
+            id="expire_quotes",
+            replace_existing=True,
         )
         # Agent-bus nightly sweeps — emit events for the consumer to act on.
         # Run after the seed passes so they see the freshest data. No-op unless
@@ -1028,7 +1063,10 @@ _ADMIN = [Depends(require_admin)]
 # -- Home dashboard (registered first for fast routing).
 #    PUBLIC: the landing page / KPI summary must render for anonymous visitors
 #    (the marketing front page), so it is not session-gated.
-app.include_router(home_router)
+# /home-index returns aggregate pipeline / leads / orders / alert counts. No
+# customer records, but anonymous access lets anyone infer business scale, so it
+# carries the same data dependency as every other CRM read.
+app.include_router(home_router, dependencies=_DATA)
 
 # -- Register all 10 AI agent routers
 app.include_router(accounts_router,      dependencies=_DATA)
@@ -1036,6 +1074,7 @@ app.include_router(contacts_router,      dependencies=_DATA)
 app.include_router(products_router,      dependencies=_DATA)
 app.include_router(orders_router,        dependencies=_DATA)
 app.include_router(activities_router,    dependencies=_DATA)
+app.include_router(cases_router,          dependencies=_DATA)
 app.include_router(opportunities_router, dependencies=_DATA)
 app.include_router(accounting_router,    dependencies=_DATA)
 app.include_router(leads_router,         dependencies=_DATA)
@@ -1182,6 +1221,14 @@ app.include_router(conversations_router, dependencies=_ADMIN)
 #    conversation spine: queue, takeover/release, AI-suggested reply, human send.
 from app.core.agent_console import router as agent_console_router
 app.include_router(agent_console_router, dependencies=_ADMIN)
+
+# C5.0 — the customer portal. Registered with NO staff dependency: it is
+# customer-facing, and its authorization is the customer session resolved by
+# portal.customer_context, which opens the ONE customer scope. Adding _DATA or
+# _ADMIN here would gate customers behind a staff role and quietly make the
+# portal unreachable.
+from app.core.portal import router as portal_router
+app.include_router(portal_router)
 
 # -- Universal Escalation Object (U1) — the durable obligation created when an
 #    agent promises a human will follow up: owner, priority, SLA deadline. Wires
@@ -1455,6 +1502,8 @@ _CHAT_PAGES = [
     "accounting-mgmt.html",
     "activity-mgmt.html",
     "analytics-mgmt.html",
+    "case-mgmt.html",
+    "customer-portal.html",
     "contact-mgmt.html",
     "email-mgmt.html",
     "lead-mgmt.html",

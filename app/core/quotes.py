@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date, timedelta
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from app.core.database import get_connection
@@ -158,8 +159,13 @@ def build_quote(account_id: str, items: List[Dict[str, Any]],
         "subtotal": subtotal, "discount_pct": discount_pct,
         "discount": discount, "total": round(subtotal - discount, 2),
         "valid_until": (date.today() + timedelta(days=VALID_DAYS)).isoformat(),
-        **({"discount_capped": True, "requested_pct": requested_pct}
-           if discount_capped else {}),
+        # The cap and the request travel with EVERY quote, not only clamped
+        # ones. "The policy allowed 15% and they asked for 10%" is as much a
+        # fact about the offer as a clamp is, and recording it only on the
+        # exception makes the unexceptional case unprovable.
+        "requested_pct": requested_pct,
+        "cap_pct": cap_pct,
+        "discount_capped": discount_capped,
     }}
 
 
@@ -266,6 +272,291 @@ def _log_quote_activity(q: Dict[str, Any], email: Dict[str, str],
         logger.warning(f"[quotes] activity log skipped: {exc}")
 
 
+# ============================================================================
+# THE RECORD — C3.0
+# ============================================================================
+
+RECORD_ENABLED = os.getenv("QUOTES_RECORD", "1").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def record_quote(q: Dict[str, Any], *, emailed: bool = False,
+                 opportunity_id: Optional[str] = None,
+                 activity_id: Optional[str] = None,
+                 supersedes: Optional[str] = None,
+                 created_by: str = "quotes") -> Dict[str, Any]:
+    """Persist what was OFFERED. Never raises.
+
+    Failure isolation is deliberate: the customer's quote has already been
+    priced and possibly sent by the time this runs, so a recording failure must
+    not turn a successful offer into an error. It is loud in the log and
+    invisible to the caller's outcome.
+
+    Line prices are SNAPSHOTS — product_name and unit_price are copied, not
+    referenced. A quote that re-prices itself when the catalogue changes is not
+    a commitment.
+    """
+    if not RECORD_ENABLED:
+        return {"ok": False, "skipped": "quote recording disabled "
+                                        "(QUOTES_RECORD=0)"}
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            version = 1
+            if supersedes:
+                cur.execute("SELECT version FROM quotes WHERE quote_id=%s::uuid",
+                            (supersedes,))
+                row = cur.fetchone()
+                version = (int(row[0]) + 1) if row else 1
+
+            who = q.get("recipient") or {}
+            cur.execute(
+                """INSERT INTO quotes
+                     (account_id, contact_id, opportunity_id, version,
+                      supersedes_quote_id, status, subtotal, discount_amount,
+                      total, valid_until, discount_pct_requested,
+                      discount_pct_granted, discount_cap_pct, discount_clamped,
+                      recipient_email, recipient_verified, delivered, sent_at,
+                      activity_id, created_by)
+                   VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s::uuid, %s,
+                           %s, %s, %s, %s::date, %s, %s, %s, %s,
+                           %s, %s, %s,
+                           CASE WHEN %s THEN now() END, %s::uuid, %s)
+                   RETURNING quote_id::text""",
+                (q.get("account_id"), who.get("contact_id"), opportunity_id,
+                 version, supersedes,
+                 "sent" if emailed else "draft",
+                 q.get("subtotal") or 0, q.get("discount") or 0,
+                 q.get("total") or 0, q.get("valid_until"),
+                 q.get("requested_pct") or 0, q.get("discount_pct") or 0,
+                 q.get("cap_pct"), bool(q.get("discount_capped")),
+                 who.get("email"), bool(who.get("verified")), bool(emailed),
+                 bool(emailed), activity_id, created_by))
+            quote_id = cur.fetchone()[0]
+
+            for i, ln in enumerate(q.get("lines") or [], 1):
+                cur.execute(
+                    """INSERT INTO quote_lines
+                         (quote_id, line_no, product_id, product_name,
+                          quantity, unit_price, line_total)
+                       VALUES (%s::uuid, %s, %s::uuid, %s, %s, %s, %s)""",
+                    (quote_id, i, ln.get("product_id"),
+                     str(ln.get("name") or "")[:300],
+                     ln.get("qty") or 1, ln.get("unit_price") or 0,
+                     ln.get("line_total") or 0))
+
+            if supersedes:
+                cur.execute("""UPDATE quotes SET status='superseded',
+                                 closed_at=now(), updated_at=now()
+                               WHERE quote_id=%s::uuid
+                                 AND status IN ('draft','sent')""",
+                            (supersedes,))
+        conn.commit()
+        logger.info(f"[quotes] recorded quote {quote_id[:8]} v{version} "
+                    f"total={q.get('total')} clamped={q.get('discount_capped')}")
+        return {"ok": True, "quote_id": quote_id, "version": version}
+    except Exception as exc:
+        if conn is not None:
+            conn.rollback()
+        # LOUD, but never fatal — see the docstring.
+        logger.error(f"[quotes] could not record the quote: {exc}")
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def get_quote(quote_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT q.quote_id::text, q.quote_number, q.account_id::text,
+                          a.account_name, q.opportunity_id::text, q.version,
+                          q.supersedes_quote_id::text, q.status, q.currency,
+                          q.subtotal, q.discount_amount, q.total, q.valid_until,
+                          q.discount_pct_requested, q.discount_pct_granted,
+                          q.discount_cap_pct, q.discount_clamped,
+                          q.recipient_email, q.delivered, q.sent_at,
+                          q.accepted_at, q.closed_at, q.created_at,
+                          q.created_by
+                   FROM quotes q
+                   LEFT JOIN accounts a ON a.account_id = q.account_id
+                   WHERE q.quote_id=%s::uuid""", (quote_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            out = dict(zip([d[0] for d in cur.description], row))
+            cur.execute(
+                """SELECT line_no, product_id::text, product_name, quantity,
+                          unit_price, line_total
+                   FROM quote_lines WHERE quote_id=%s::uuid ORDER BY line_no""",
+                (quote_id,))
+            out["lines"] = [dict(zip([d[0] for d in cur.description], r))
+                            for r in cur.fetchall()]
+    finally:
+        conn.close()
+    for k, v in list(out.items()):
+        if hasattr(v, "isoformat"):
+            out[k] = v.isoformat()
+        elif isinstance(v, Decimal):
+            out[k] = float(v)
+    for ln in out["lines"]:
+        for k, v in list(ln.items()):
+            if isinstance(v, Decimal):
+                ln[k] = float(v)
+    return out
+
+
+def list_quotes(account_id: Optional[str] = None,
+                opportunity_id: Optional[str] = None,
+                status: Optional[str] = None,
+                limit: int = 50) -> List[Dict[str, Any]]:
+    where, args = ["1=1"], {}
+    if account_id:
+        where.append("q.account_id=%(acct)s::uuid")
+        args["acct"] = account_id
+    if opportunity_id:
+        where.append("q.opportunity_id=%(opp)s::uuid")
+        args["opp"] = opportunity_id
+    if status:
+        where.append("q.status=%(st)s")
+        args["st"] = status
+    args["lim"] = max(1, min(int(limit), 200))
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT q.quote_id::text, q.version, q.status, q.total,
+                           q.discount_pct_granted, q.discount_clamped,
+                           q.valid_until, q.recipient_email, q.created_at,
+                           a.account_name
+                    FROM quotes q
+                    LEFT JOIN accounts a ON a.account_id=q.account_id
+                    WHERE {' AND '.join(where)}
+                    ORDER BY q.created_at DESC LIMIT %(lim)s""", args)
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    for r in rows:
+        for k, v in list(r.items()):
+            if hasattr(v, "isoformat"):
+                r[k] = v.isoformat()
+            elif isinstance(v, Decimal):
+                r[k] = float(v)
+    return rows
+
+
+def set_status(quote_id: str, status: str, *,
+               by: str = "system") -> Dict[str, Any]:
+    """Move a quote through its lifecycle. `accepted` stamps accepted_at;
+    every terminal state stamps closed_at."""
+    if status not in ("draft", "sent", "accepted", "declined", "expired",
+                      "superseded"):
+        return {"ok": False, "error": f"unknown quote status {status!r}"}
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE quotes
+                   SET status=%s,
+                       accepted_at = CASE WHEN %s='accepted' THEN now()
+                                          ELSE accepted_at END,
+                       closed_at = CASE WHEN %s IN ('accepted','declined',
+                                                    'expired','superseded')
+                                        THEN now() ELSE closed_at END,
+                       updated_at = now()
+                   WHERE quote_id=%s::uuid""",
+                (status, status, status, quote_id))
+            n = cur.rowcount
+        conn.commit()
+        logger.info(f"[quotes] {quote_id[:8]} -> {status} by {by}")
+        return {"ok": bool(n), "updated": n}
+    except Exception as exc:
+        if conn is not None:
+            conn.rollback()
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def expire_due() -> Dict[str, Any]:
+    """Close out offers whose validity has passed. An expired quote that still
+    reads as live is a commitment the business no longer has."""
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE quotes SET status='expired', closed_at=now(),
+                             updated_at=now()
+                           WHERE status IN ('draft','sent')
+                             AND valid_until IS NOT NULL
+                             AND valid_until < current_date
+                           RETURNING quote_id::text""")
+            ids = [r[0] for r in cur.fetchall()]
+        conn.commit()
+        return {"ok": True, "expired": len(ids)}
+    except Exception as exc:
+        if conn is not None:
+            conn.rollback()
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def offered_vs_ordered(quote_id: str) -> Dict[str, Any]:
+    """What we PROMISED against what actually got ordered.
+
+    The comparison the chain could not make before this table existed. It joins
+    through the opportunity, because that is the only link an order carries
+    back — a quote has no order_id, and inventing one would assert a causal
+    claim (this order came from this quote) that the data does not support."""
+    q = get_quote(quote_id)
+    if not q:
+        return {"ok": False, "error": f"no such quote: {quote_id}"}
+    if not q.get("opportunity_id"):
+        return {"ok": True, "quote_id": quote_id, "comparable": False,
+                "reason": "this quote is not linked to an opportunity, and an "
+                          "order links back only through one — so no order can "
+                          "be attributed to it without guessing"}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT o.order_id::text, o.order_number, o.status,
+                          o.total_amount, o.order_date
+                   FROM orders o WHERE o.opportunity_id=%s::uuid
+                   ORDER BY o.order_date""", (q["opportunity_id"],))
+            orders = [dict(zip([d[0] for d in cur.description], r))
+                      for r in cur.fetchall()]
+    finally:
+        conn.close()
+    for o in orders:
+        for k, v in list(o.items()):
+            if hasattr(v, "isoformat"):
+                o[k] = v.isoformat()
+            elif isinstance(v, Decimal):
+                o[k] = float(v)
+    ordered_total = round(sum(float(o.get("total_amount") or 0)
+                              for o in orders), 2)
+    quoted = float(q.get("total") or 0)
+    return {
+        "ok": True, "comparable": True, "quote_id": quote_id,
+        "quoted_total": quoted, "ordered_total": ordered_total,
+        "variance": round(ordered_total - quoted, 2),
+        "orders": orders,
+        "discount_clamped": q.get("discount_clamped"),
+        "note": "Orders are attributed through the shared opportunity, not a "
+                "direct quote->order link. Several quotes on one opportunity "
+                "all see the same orders.",
+    }
+
+
 def generate_quote_sp(p: Dict[str, Any]) -> Dict[str, Any]:
     """A2A structured handler for quote.generate. params:
     account_id, items=[{product, qty}], discount_pct (optional)."""
@@ -291,9 +582,16 @@ def generate_quote_sp(p: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as exc:
             logger.warning(f"[quotes] send failed: {exc}")
     _log_quote_activity(q, email, emailed)
+    # C3.0: the offer becomes a RECORD, not just an email body inside an
+    # activity description truncated at 2000 characters.
+    recorded = record_quote(q, emailed=emailed,
+                            opportunity_id=(str(p.get("opportunity_id"))
+                                            if p.get("opportunity_id") else None),
+                            created_by="quote.generate")
     logger.info(f"[quotes] quote for {q['account_name']} "
                 f"{_fmt(q['total'])} — {'sent' if emailed else 'drafted as task'}")
     return {"ok": True, "emailed": emailed,
+            "quote_id": recorded.get("quote_id"),
             "drafted_as_task": not emailed,
             "to": who.get("email"), "subject": email["subject"],
             "total": q["total"], "valid_until": q["valid_until"],

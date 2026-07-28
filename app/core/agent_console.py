@@ -248,14 +248,49 @@ def takeover(conversation_id: str, agent: str) -> Dict[str, Any]:
         _system_note(conversation_id,
                      f"— {agent} (human agent) joined the conversation —")
         # Picking up the work discharges the promise (U1) — no second click.
+        # C1 Step 4: REPORT an existing case, never create one. Creating one
+        # here would make every assisted chat a case — a queue where a
+        # 30-second assist looks like a three-day investigation is a queue reps
+        # stop reading. So recording durable work stays an explicit action.
+        linked = None
+        try:
+            from app.core import cases
+            if cases.ENABLED:
+                linked = cases.case_for_conversation(conversation_id)
+                res["case"] = linked            # None when there is no case
+        except Exception as exc:
+            logger.debug(f"[console] case lookup skipped: {exc}")
+
+        # C1 Step 4b: DISCHARGE CONDITIONALLY.
+        #
+        # An obligation may only be closed when something durable carries it.
+        # A case exists -> the work is recorded, so the EVENT can close. No
+        # case -> the rep owns it but nothing records it, so the obligation
+        # stays live and ASSIGNED, clock running.
+        #
+        # Before this, takeover resolved the escalation unconditionally: the
+        # event closed, no work record existed, and the obligation survived
+        # only in someone's memory — the exact failure this axis exists to fix.
+        # A rep can still forget to record the work; they can no longer forget
+        # INVISIBLY, because an assigned escalation stays on the queue and
+        # eventually surfaces as an SLA breach.
         try:
             from app.core import escalation
-            done = escalation.resolve_for_conversation(
-                conversation_id, agent, "picked up in the live console")
-            if done.get("resolved"):
-                res["escalations_resolved"] = done["resolved"]
+            if linked:
+                done = escalation.resolve_for_conversation(
+                    conversation_id, agent,
+                    f"picked up in the live console; work recorded as case "
+                    f"{linked['case_id'][:8]}")
+                if done.get("resolved"):
+                    res["escalations_resolved"] = done["resolved"]
+            else:
+                held = escalation.assign_for_conversation(
+                    conversation_id, agent,
+                    "picked up in the live console; no case recorded yet")
+                if held.get("assigned"):
+                    res["escalations_assigned"] = held["assigned"]
         except Exception as exc:
-            logger.debug(f"[console] escalation discharge skipped: {exc}")
+            logger.debug(f"[console] escalation handling skipped: {exc}")
     return res
 
 
@@ -475,10 +510,29 @@ def send_reply(conversation_id: str, agent: str, body: str,
         conversation_id, channel, body, author="employee",
         metadata={"sent_by": agent, "via": "agent_console",
                   "delivered": delivered})
-    return {"ok": rec.get("ok", False), "delivered": delivered,
-            "delivery": delivery, "channel": channel,
-            "message_id": rec.get("message_id"),
-            "conversation_id": conversation_id}
+    out = {"ok": rec.get("ok", False), "delivered": delivered,
+           "delivery": delivery, "channel": channel,
+           "message_id": rec.get("message_id"),
+           "conversation_id": conversation_id}
+
+    # C1 Step 4: when durable work EXISTS, a human reply is its first response.
+    #
+    # Only ever for a case that already exists — replying does not create one.
+    # mark_first_response() is idempotent, so a second reply cannot overwrite
+    # the first, and a case that already had one is left alone. Entirely
+    # non-fatal: the customer's message has already been sent, and failing to
+    # annotate the case must never report that send as failed.
+    try:
+        from app.core import cases
+        if cases.ENABLED:
+            linked = cases.case_for_conversation(conversation_id)
+            if linked:
+                cases.mark_first_response(linked["case_id"])
+                cases.comment(linked["case_id"], body, internal=False)
+                out["case_id"] = linked["case_id"]
+    except Exception as exc:
+        logger.debug(f"[console] case annotation skipped: {exc}")
+    return out
 
 
 # ============================================================================
@@ -496,6 +550,23 @@ def console_queue(limit: int = 50, needs_human: bool = False):
 @router.get("/console/conversation/{conversation_id}")
 def console_conversation(conversation_id: str):
     return transcript(conversation_id)
+
+
+@router.post("/console/conversation/{conversation_id}/case")
+def console_open_case(conversation_id: str, body: Dict[str, Any]):
+    """Declare that this conversation produced durable service work.
+
+    A SEPARATE, explicit action rather than a side effect of takeover: the
+    console cannot tell an assisted chat from work that outlives the
+    interaction, so the rep says so. Idempotent — clicking twice, or a
+    conversation the escalation bridge already cased, returns the same case."""
+    from app.core import cases
+    b = body or {}
+    return cases.open_for_conversation(
+        conversation_id,
+        actor=str(b.get("agent") or "agent"),
+        subject=(b.get("subject") or None),
+        source="console")
 
 
 @router.post("/console/conversation/{conversation_id}/takeover")

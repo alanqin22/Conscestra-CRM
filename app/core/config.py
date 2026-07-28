@@ -15,7 +15,15 @@ from pydantic import model_validator
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# override=False (the default) on purpose: a REAL environment variable must
+# beat a .env file, which is both the standard dotenv semantic and the only
+# safe one for a deployed system — a .env baked into an image would otherwise
+# silently override the platform's security posture, secrets and DSN.
+#
+# It was override=True, which also made shell exports mysteriously ineffective
+# during local testing. .env remains the convenient default for development;
+# it simply no longer outranks something the operator set deliberately.
+load_dotenv()
 
 
 class Settings(BaseSettings):

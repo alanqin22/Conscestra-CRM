@@ -677,24 +677,14 @@ _SIGNIN_PROMPT = (
 
 
 def _scoped_rows(sql: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Run one read-only query for a VERIFIED customer. account_id/contact_id
-    come ONLY from the customer scope on this context — never from user text.
-    Fail-closed: raises if no verified scope is set."""
-    from app.core.write_guard import customer_scope
-    from psycopg2.extras import RealDictCursor
-    scope = customer_scope()
-    if not scope or not scope.get("account_id"):
-        raise PermissionError("no verified customer scope on this context")
-    merged = {**params, "account_id": scope["account_id"],
-              "contact_id": scope.get("contact_id")}
-    conn = get_connection()
-    try:
-        conn.set_session(readonly=True)
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, merged)
-            return [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
+    """Delegates to THE one customer-scoped read (write_guard.scoped_rows).
+
+    This module carried a character-identical copy until C5.0 found a THIRD
+    one appearing with the portal. Three copies of a security boundary means
+    the weakest copy decides what a customer can see — so voice, the SDR chat
+    and the portal now share one function."""
+    from app.core.write_guard import scoped_rows
+    return scoped_rows(sql, params)
 
 
 def _verify_viewer(auth_token: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -1337,6 +1327,30 @@ def _gather(prompt_inner: str, lang: str = "en") -> str:
             + '<Redirect method="POST">/sdr/voice/turn</Redirect>')
 
 
+# Seconds to wait for a keypress AFTER the menu finishes playing. Only the
+# silence at the end — a digit pressed DURING the menu barges in immediately.
+LANG_MENU_TIMEOUT = os.getenv("SDR_LANG_MENU_TIMEOUT", "3").strip() or "3"
+
+
+def lang_menu_gather(greeting_inner: str) -> str:
+    """DTMF-ONLY Gather for the language menu.
+
+    The menu used to share the conversational Gather's `input="speech dtmf"`,
+    which left a speech recogniser running while the options played — and a
+    digit pressed part-way through (3, while option 4 was still being read)
+    was lost to it. Nothing in a language menu needs speech: the menu exists
+    *because* the recogniser is committed to the wrong language until the
+    caller declares one, so dropping speech here costs nothing and makes the
+    keypad instant.
+
+    Falling out of this Gather with no digit continues to the next verb, which
+    is the ordinary English speech Gather — so a caller who just wants to talk
+    is not forced to choose anything."""
+    return (f'<Gather input="dtmf" numDigits="1" timeout="{LANG_MENU_TIMEOUT}" '
+            f'action="/sdr/voice/turn" method="POST">'
+            f'{greeting_inner}{lang_menu_twiml()}</Gather>')
+
+
 def _heard(params: Dict[str, str]) -> str:
     """The recognized speech from a Gather callback. TeXML aims to be
     Twilio-compatible (SpeechResult), but tolerate provider variants so a
@@ -1356,6 +1370,83 @@ async def _voice_params(request: Request) -> Optional[Dict[str, str]]:
     unchanged across carriers — only the signature check differs."""
     from app.core import telephony
     return await telephony.verified_form(request)
+
+
+# Calls that have already been offered a transfer. Without this, a caller who
+# says "person" again after an unanswered ring would be re-dialled in a loop,
+# and every loop would re-open the obligation.
+_TRANSFER_TRIED: set = set()
+
+
+def _thread_transfer(call_sid: str, handle: Optional[str], heard: str,
+                     spoken: str) -> Optional[str]:
+    """Thread this exchange onto the conversation spine and return its id.
+
+    The transfer branch returns before converse(), so the usual _capture_turn()
+    never runs — without this the escalation would reach a human with no
+    transcript, which is the one thing they need to pick the call up cold."""
+    try:
+        from app.core import channel_adapters as ca
+        h = handle or f"session:voice-{call_sid}"
+        cap = ca.capture_voice(h, heard, "inbound", call_sid)
+        ca.capture_voice(h, spoken, "outbound", call_sid)
+        return (cap or {}).get("conversation_id")
+    except Exception as exc:
+        logger.debug(f"[sdr] transfer threading skipped (non-fatal): {exc}")
+        return None
+
+
+@public_router.post("/sdr/voice/whisper")
+async def sdr_voice_whisper(request: Request):
+    """Announced to the ANSWERING phone only, before the legs are joined."""
+    params = await _voice_params(request)
+    if params is None:
+        return Response("invalid signature", status_code=403)
+    from app.core import voice_support
+    # 'From' on the whisper leg is our own DID; the customer is the party we
+    # were already talking to, so pass what the original leg reported.
+    return _twiml(voice_support.whisper_twiml(
+        (request.query_params.get("c") or "").strip()))
+
+
+@public_router.post("/sdr/voice/transfer-result")
+async def sdr_voice_transfer_result(request: Request):
+    """Where <Dial> lands when the human's phone stops ringing.
+
+    TeXML posts DialCallStatus here. 'completed' means the two of them spoke
+    and there is nothing left for us to do but hang up. Anything else — no
+    answer, busy, failed — means we offered a person and did not produce one,
+    so it degrades to exactly the same tracked callback as calling out of
+    hours. An unanswered transfer must never be a silent disconnect."""
+    params = await _voice_params(request)
+    if params is None:
+        return Response("invalid signature", status_code=403)
+    call_sid = params.get("CallSid") or str(_uuid.uuid4())
+    status = (params.get("DialCallStatus") or params.get("dial_call_status")
+              or "").strip().lower()
+    lang = _call_lang(call_sid)
+    if status in ("completed", "answered"):
+        logger.info(f"[sdr] call {call_sid[:8]} transfer {status}")
+        _VOICE_LANG.pop(call_sid, None)
+        _TRANSFER_TRIED.discard(call_sid)
+        return _twiml("<Hangup/>")
+
+    from app.core.telephony import normalize_phone
+    from app.core import voice_support
+    frm = normalize_phone(params.get("From", "")) or None
+    window = voice_support.transfer_window()
+    logger.info(f"[sdr] call {call_sid[:8]} transfer not connected "
+                f"(DialCallStatus={status!r}) — taking a message")
+    apology = voice_support.no_answer_message(lang, window)
+    voice_support.open_callback_obligation(
+        conversation_id=_thread_transfer(call_sid, frm,
+                                         "[caller asked for a person; "
+                                         "transfer not answered]", apology),
+        handle=frm, channel="voice",
+        heard=f"transfer unanswered ({status or 'unknown'})", window=window)
+    _VOICE_LANG.pop(call_sid, None)
+    _TRANSFER_TRIED.discard(call_sid)
+    return _twiml(_say(apology, lang) + "<Hangup/>")
 
 
 @public_router.post("/sdr/voice/inbound")
@@ -1380,17 +1471,19 @@ async def sdr_voice_inbound(request: Request):
     if connect:
         return _twiml(connect)
     greeting = ("Hi! You've reached the Conscestra C R M assistant. "
-                "I can answer questions and book you a meeting with our team. "
-                "How can I help you today?")
-    inner = _say(greeting)
+                "I can answer questions and book you a meeting with our team.")
     try:
         from app.core.voice_support import VOICE_MULTILINGUAL
-        if VOICE_MULTILINGUAL:
-            # Each option in its own voice — see lang_menu_twiml().
-            inner += lang_menu_twiml()
     except Exception:
-        pass
-    return _twiml(_gather(inner))
+        VOICE_MULTILINGUAL = False
+    if VOICE_MULTILINGUAL:
+        # Two Gathers in sequence, deliberately: a DTMF-only one so the keypad
+        # is instant while the menu plays (each option in its own voice — see
+        # lang_menu_twiml()), then the normal speech Gather for the caller who
+        # never presses anything and simply starts talking.
+        return _twiml(lang_menu_gather(_say(greeting))
+                      + _gather(_say("How can I help you today?")))
+    return _twiml(_gather(_say(greeting + " How can I help you today?")))
 
 
 @public_router.post("/sdr/voice/turn")
@@ -1418,7 +1511,12 @@ async def sdr_voice_turn(request: Request):
                       lang, "Great — how can I help you today?")
         return _twiml(_gather(_say(prompt, lang), lang))
 
-    lang = _call_lang(call_sid)
+    # Decide the language from what the caller just said, BEFORE any branch
+    # that speaks to them. Reading it without `heard` returns "en" on a fresh
+    # call, which sent a Mandarin caller an English "we're closed" message —
+    # the takeover hold and the transfer message are both spoken from here.
+    # Already-pinned calls (keypad choice) are unaffected: _call_lang is sticky.
+    lang = _call_lang(call_sid, heard)
     if not heard:
         # Log the callback keys so a provider param mismatch is diagnosable
         # from the server log rather than a silent "didn't catch that" loop.
@@ -1452,6 +1550,36 @@ async def sdr_voice_turn(request: Request):
                           + '<Redirect method="POST">/sdr/voice/turn</Redirect>')
     except Exception as exc:
         logger.debug(f"[sdr] takeover check skipped: {exc}")
+
+    # ── "I'd like to talk to a person" ──────────────────────────────────────
+    # Checked BEFORE converse(): once the caller has asked for a human, an LLM
+    # answer — however good — is the wrong response. Detection reuses U1's
+    # escalation.detect() rather than a second regex here, because two
+    # detectors for the same intent drift and the weaker one decides.
+    if call_sid not in _TRANSFER_TRIED:
+        try:
+            from app.core import escalation, voice_support
+            if escalation.detect(heard) == "customer_requested_human":
+                _TRANSFER_TRIED.add(call_sid)
+                window = voice_support.transfer_window()
+                logger.info(f"[sdr] call {call_sid[:8]} asked for a human — "
+                            f"window open={window['open']} "
+                            f"({window.get('reason') or window.get('local_time')})")
+                if window["open"]:
+                    return _twiml(voice_support.dial_twiml(
+                        lang, "/sdr/voice/transfer-result", caller=frm or ""))
+                # Closed, unconfigured or disabled: say when we open, and make
+                # the callback an obligation with an owner rather than a
+                # sentence that evaporates when the call ends.
+                spoken = voice_support.transfer_message(lang, window)
+                voice_support.open_callback_obligation(
+                    conversation_id=_thread_transfer(call_sid, frm, heard,
+                                                     spoken),
+                    handle=frm, channel="voice", heard=heard, window=window)
+                return _twiml(_say(spoken, lang) + "<Hangup/>")
+        except Exception as exc:
+            logger.error(f"[sdr] transfer check failed, continuing with the "
+                         f"AI: {exc}")
 
     res = converse(f"voice-{call_sid}", heard, "voice", handle=frm)
     lang = _call_lang(call_sid, heard)      # decided from the caller's own words

@@ -168,6 +168,7 @@ def gather() -> Dict[str, Any]:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            discount_pressure = _discount_pressure(cur)
             rev_yest = _one(cur, "SELECT COALESCE(SUM(amount),0) FROM payments "
                                  "WHERE payment_date::date = CURRENT_DATE - 1")[0]
             rev_7d = _one(cur, "SELECT COALESCE(SUM(amount),0) FROM payments "
@@ -340,6 +341,7 @@ def gather() -> Dict[str, Any]:
             "low_stock": low_stock,
             "closing": closing, "biggest": biggest, "atrisk": atrisk, "big_inv": big_inv,
             "approvals": approvals, "perf": perf, "objectives": objectives,
+            "discount_pressure": discount_pressure,
             "anomalies": anomalies,
         }
     finally:
@@ -487,6 +489,51 @@ def _objective_lines(objs: List[Any]) -> List[str]:
     return out
 
 
+def _discount_pressure(cur) -> Dict[str, Any]:
+    """Quotes whose requested discount was cut by the brand policy — C3.1.
+
+    Deliberately a REPORT, not a proposal. The governance queue's dominant
+    outcome is expiry (17 expired vs 5 executed at the time of writing), so
+    routing every over-ask into it would add noise to a backlog nobody
+    finishes. A sales leader who keeps seeing "we cut this one" is the signal
+    that a real exception path is warranted; until then, visibility is the
+    honest intervention.
+
+    Returns {} when the C3.0 table is absent, so a database without the
+    migration degrades to today's briefing exactly."""
+    try:
+        cur.execute("SELECT to_regclass('public.quotes')")
+        if not cur.fetchone()[0]:
+            return {}
+        cur.execute("""
+            SELECT count(*)                                   AS clamped,
+                   COALESCE(sum(total), 0)                    AS value,
+                   COALESCE(max(discount_pct_requested), 0)   AS worst_ask,
+                   COALESCE(max(discount_cap_pct), 0)         AS cap
+            FROM quotes
+            WHERE discount_clamped
+              AND created_at > now() - interval '7 days'""")
+        n, value, worst, cap = cur.fetchone()
+        if not n:
+            return {}
+        return {"clamped": int(n), "value": float(value or 0),
+                "worst_ask": float(worst or 0), "cap": float(cap or 0)}
+    except Exception as exc:
+        logger.debug(f"[briefing] discount pressure skipped: {exc}")
+        return {}
+
+
+def _discount_lines(dp: Dict[str, Any]) -> List[str]:
+    """One line, stated as a commercial fact rather than a policy violation:
+    somebody judged the deal needed more room than the brand allows."""
+    if not dp or not dp.get("clamped"):
+        return []
+    return [f"💸 {dp['clamped']} quote(s) worth {_money(dp['value'])} went out "
+            f"with the discount cut by policy (largest ask {dp['worst_ask']:.0f}% "
+            f"vs {dp['cap']:.0f}% cap) — review whether any deserved an "
+            f"exception."]
+
+
 def _anomaly_lines(anoms: List[Dict[str, Any]]) -> List[str]:
     """Analytics trend anomalies → compact human lines (shared by text + HTML).
     A4: the proactive push of A1's detectors (win-rate WoW drop, stalled deals,
@@ -557,6 +604,12 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
     if anom_lines:
         t.append("⚠ WHAT CHANGED — TREND ANOMALIES (auto-detected)")
         for ln in anom_lines:
+            t.append(f"   - {ln}")
+        t.append("")
+    disc_lines = _discount_lines(d.get("discount_pressure"))
+    if disc_lines:
+        t.append("💸 DISCOUNT PRESSURE (last 7 days)")
+        for ln in disc_lines:
             t.append(f"   - {ln}")
         t.append("")
     t.append("1. REVENUE SNAPSHOT")
@@ -873,6 +926,9 @@ def render_role(d: Dict[str, Any], deltas: Dict[str, Any], role: str) -> Dict[st
     _anom = _anomaly_lines(d.get("anomalies"))
     if _anom:
         text += "\n\nWHAT CHANGED — TREND ANOMALIES\n" + "\n".join(f"  - {ln}" for ln in _anom)
+    _disc = _discount_lines(d.get("discount_pressure"))
+    if _disc:
+        text += "\n\nDISCOUNT PRESSURE\n" + "\n".join(f"  - {ln}" for ln in _disc)
     if web:
         text += ("\n\n" + web["title"].replace("&amp;", "&").upper() + " (LIVE WEB)\n"
                  + "\n".join(_web_intel_text(web))).replace("**", "")

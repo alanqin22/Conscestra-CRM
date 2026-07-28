@@ -12,6 +12,14 @@ meter ([llm_meter]). No new capture, no new cost.
 
   metrics(days) →
     volume            conversations touched in the window, by channel
+    THE BASIS OF EVERY NUMBER HERE IS THE CONVERSATION LIFECYCLE, not the
+    case lifecycle. A closed conversation is not completed work: a chat can
+    end in four minutes while the case it created stays open for three days.
+    In particular `avg_hours` below is CONVERSATION DURATION and has never
+    been case resolution time. The case-grounded figures live in
+    app/core/case_analytics.py; these definitions are deliberately
+    UNCHANGED so existing trends stay valid.
+
     containment_rate  closed conversations the AI resolved with NO human takeover
     escalation_rate   conversations that were EVER handed to a human
     awaiting_human    open conversations sitting in a human's hands right now
