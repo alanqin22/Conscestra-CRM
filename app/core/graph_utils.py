@@ -31,6 +31,18 @@ from .config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# GPT-5 / o-series reasoning models reject any non-default temperature on the
+# Chat Completions API (only temperature=1, the default, is accepted) — so
+# for these the parameter must be omitted rather than passed as 0.1.
+_OPENAI_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def _openai_chat_kwargs(model: str) -> Dict[str, Any]:
+    m = (model or "").lower()
+    if m.startswith(_OPENAI_REASONING_PREFIXES):
+        return {}
+    return {"temperature": 0.1}
+
 
 # ============================================================================
 # SHARED STATE DEFINITION
@@ -84,7 +96,7 @@ def _get_llm(tier: str = "standard", caller: str = None,
         inner = ChatOpenAI(
             api_key=settings.openai_api_key,
             model=model,
-            temperature=0.1,
+            **_openai_chat_kwargs(model),
         )
     else:
         logger.info(f"Using Ollama LLM: {model} (caller={caller}, tier={tier})")
@@ -132,7 +144,8 @@ def _alt_client_factory(tier: str):
         if provider == "openai":
             s = get_settings()
             return ChatOpenAI(api_key=s.openai_api_key, model=model,
-                              temperature=0.1, timeout=timeout, max_retries=0)
+                              timeout=timeout, max_retries=0,
+                              **_openai_chat_kwargs(model))
         raise RuntimeError(f"no client builder for provider '{provider}'")
 
     return _build
