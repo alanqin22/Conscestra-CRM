@@ -66,6 +66,39 @@ def customer_scope() -> Optional[dict]:
     return _customer_scope.get()
 
 
+def scoped_rows(sql: str, params: Optional[dict] = None) -> list:
+    """THE customer-scoped read. One implementation, every channel.
+
+    The account_id / contact_id placeholders are filled FROM THE VERIFIED
+    SCOPE, never from caller-supplied values, and the transaction is opened
+    READ-ONLY so the database itself refuses a write regardless of what the
+    SQL says.
+
+    Extracted from voice_support when the portal became the second consumer.
+    A per-channel copy would drift, and the weakest copy would decide what a
+    customer can see — so voice, chat, the portal and anything later share
+    this exact function.
+
+    Raises PermissionError when no verified scope is present: absence of a
+    scope is never treated as permission to read everything."""
+    from app.core.database import get_connection
+    from psycopg2.extras import RealDictCursor
+
+    scope = customer_scope()
+    if not scope or not scope.get("account_id"):
+        raise PermissionError("no verified customer scope on this context")
+    merged = {**(params or {}), "account_id": scope["account_id"],
+              "contact_id": scope.get("contact_id")}
+    conn = get_connection()
+    try:
+        conn.set_session(readonly=True)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, merged)
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def set_readonly_channel(name: Optional[str]) -> None:
     """Mark this context as a read-only channel (e.g. 'sms'). Inherited by
     everything awaited from here, including in-process agent calls."""
@@ -100,11 +133,56 @@ class WritePermissionError(Exception):
 _MODE_RE = re.compile(r"p_(?:mode|action)\s*:?=\s*'([a-z_]+)'", re.IGNORECASE)
 
 
+# ============================================================================
+# FORBIDDEN PROCEDURES — legacy write paths no role may use
+# ============================================================================
+# Distinct from WRITE_MODES, which asks "may THIS ROLE write?". These procedures
+# are not a permission question at all: they are a SECOND mutation boundary that
+# bypasses the governed domain layer entirely, so no role — including admin and
+# the system context — may reach them.
+#
+# sp_cases(): authored January 2026 beside the cases table, never governed. 14
+# modes, writes `status` and `owner_id` (close/resolve/reopen/escalate/assign),
+# and has NO record_field_history awareness. Executing it would skip the case
+# state machine, owner validation and field history in a single call — the
+# governed path is app/core/cases.py and there is no legitimate second one.
+#
+# NOTE ON DEPTH: the database-privilege half of this defence is currently
+# INERT. The application connects as `postgres`, which both OWNS the function
+# and is a SUPERUSER, and PostgreSQL superusers bypass privilege checks — a
+# REVOKE empties the ACL and changes nothing (verified empirically). Until the
+# application runs as a non-superuser role, THIS GUARD IS THE ONLY EFFECTIVE
+# CONTROL. Do not weaken it on the assumption that the database is backstopping.
+FORBIDDEN_PROCEDURES = {
+    "sp_cases": ("Case mutations must go through app/core/cases.py, which "
+                 "enforces the lifecycle state machine, owner validation and "
+                 "field history. sp_cases() bypasses all three."),
+}
+
+_FORBIDDEN_RE = re.compile(
+    r"\b(" + "|".join(FORBIDDEN_PROCEDURES) + r")\s*\(", re.I)
+
+
 def guard_query(query: str) -> None:
     """Raise WritePermissionError if the current request's role may not run this
     write SP. No-op when auth is off, outside a request (role None), or for a
     write-capable role. Reads policy from auth_dep (lazy import avoids a cycle)."""
     from app.core.auth_dep import API_AUTH_ENABLED, WRITE_MODES, WRITE_ROLES
+
+    # UNCONDITIONAL, and deliberately FIRST — before the read-only-channel
+    # courtesy check and before every role early-return below, because those
+    # exempt exactly the callers most able to do damage (system context and
+    # write-capable roles). A forbidden legacy path fails VISIBLY: the query is
+    # never rewritten and never silently rerouted to the governed layer, so the
+    # caller learns their code is wrong instead of appearing to work.
+    m = _FORBIDDEN_RE.search(query or "")
+    if m:
+        proc = m.group(1).lower()
+        raise WritePermissionError(
+            f"{proc}() is a forbidden legacy write path. "
+            f"{FORBIDDEN_PROCEDURES[proc]}",
+            http_status=403,
+        )
 
     # Read-only channel: refuse a recognised write early so the caller gets a
     # clean message instead of a database error. This is a courtesy check, NOT

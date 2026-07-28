@@ -89,13 +89,24 @@ _PRIORITY_RANK = {"low": 0, "normal": 1, "high": 2, "urgent": 3}
 # NARROW: a false positive costs a human a wasted glance at the queue, which is
 # far cheaper than the failure we are fixing (a silent broken promise).
 _HUMAN_RE = re.compile(
-    r"\b(speak|talk|chat|connect|put me through)\s+(to|with)\s+(a|an|the|some)?\s*"
+    # "speak to a person", "transfer me to an agent", "put me through to sales"
+    r"\b(speak|talk|chat|connect|transfer|forward|put)\s+(me|us)?\s*(through\s+)?"
+    r"(to|with)\s+(a|an|the|some)?\s*"
     r"(human|person|people|agent|rep|representative|advisor|someone|somebody|"
-    r"manager|supervisor|sales\s*rep|account\s*manager)\b"
+    r"manager|supervisor|operator|receptionist|sales|support|customer\s+service|"
+    r"sales\s*rep|account\s*manager)\b"
     r"|\b(real|actual|live)\s+(human|person|agent)\b"
     r"|\bhuman\s+(agent|being|support|help)\b"
     r"|\b(get|give)\s+me\s+(a|an)\s+(human|person|manager|rep)\b"
-    r"|\b(parler|parlez)\s+(à|a|avec)\s+(un|une)\s+(humain|personne|conseiller|agent)\b",
+    r"|\b(parler|parlez)\s+(à|a|avec)\s+(un|une)\s+(humain|personne|conseiller|agent)\b"
+    # es — the voice line answers in Spanish, so it must hear the ask in Spanish
+    # Spanish attaches the pronoun to the infinitive — "pasarme con", not
+    # "pasar me con" — so the enclitic has to be part of the verb token.
+    r"|\b(hablar|pasar|comunicar)(me|nos)?\s+(con|a)\s+(un|una|alguien)\s*"
+    r"(persona|agente|representante|humano|asesor)?\b"
+    # zh — 人工 is "a human operator", but 人工智能 is "artificial intelligence";
+    # without this lookahead every caller ASKING ABOUT OUR AI gets transferred.
+    r"|人工(?!智能)|真人|转接|人工客服|找人工|人工服务",
     re.I,
 )
 _COMPLAINT_RE = re.compile(
@@ -281,9 +292,28 @@ def open(reason: str, source: str, *,
                 f"priority={priority} reachable={known}")
     if NOTIFY and priority in ("high", "urgent"):
         _notify(eid, reason, priority, summary, channel, handle, known)
-    return {"ok": True, "escalation_id": eid, "created": True,
-            "contact_known": known, "reason": reason,
-            "sla_due_at": due.isoformat() if due else None}
+    out = {"ok": True, "escalation_id": eid, "created": True,
+           "contact_known": known, "reason": reason,
+           "sla_due_at": due.isoformat() if due else None}
+
+    # ── C1 Step 3: the escalation → case bridge ─────────────────────────────
+    # An escalation is the EVENT; the case is the durable unit of WORK it
+    # creates. This is the ONLY automatic path between them, and it is doubly
+    # gated: CASES_ENABLED and CASES_AUTO_OPEN must BOTH be on. With
+    # CASES_AUTO_OPEN=0 (the default) this block is a no-op and escalation
+    # behaviour is byte-identical to before the case layer existed.
+    #
+    # It can never break an escalation: open() is documented to never raise,
+    # and an obligation that failed to spawn a case is still an obligation.
+    try:
+        from app.core import cases
+        if cases.ENABLED and cases.AUTO_OPEN:
+            bridged = cases.open_from_escalation(eid, actor=f"escalation:{source}"[:120])
+            if bridged.get("case_id"):
+                out["case_id"] = bridged["case_id"]
+    except Exception as exc:
+        logger.warning(f"[escalation] case bridge skipped for {eid[:8]}: {exc}")
+    return out
 
 
 def _notify(escalation_id: str, reason: str, priority: str, summary: str,
@@ -414,6 +444,43 @@ def _update(escalation_id: str, set_clause: str,
     if not row:
         return {"ok": False, "error": "escalation not found"}
     return {"ok": True, "escalation_id": row[0], "status": row[1]}
+
+
+def assign_for_conversation(conversation_id: str, agent: str,
+                            note: str = "") -> Dict[str, Any]:
+    """Own the live escalation on a conversation WITHOUT discharging it.
+
+    C1 Step 4b. An obligation may only be discharged when something durable
+    carries it — either a case now owns the work, or the work genuinely
+    finished. A rep taking the wheel proves neither, so takeover assigns rather
+    than resolves when no case exists.
+
+    Nothing downstream changes: the console queue, the escalation list,
+    sla_breaches() and platform health all already treat 'assigned' as LIVE.
+    The effect is that forgetting to record the work stops being silent — the
+    obligation stays on the queue with its clock running instead of being
+    marked handled by someone's memory."""
+    if not (ENABLED and conversation_id):
+        return {"ok": False}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE escalations
+                   SET status='assigned', assigned_to=%s, assigned_at=now(),
+                       updated_at=now()
+                   WHERE conversation_id=%s::uuid AND status='open'
+                   RETURNING escalation_id::text""",
+                ((agent or "agent")[:120], conversation_id))
+            ids = [r[0] for r in cur.fetchall()]
+        conn.commit()
+        return {"ok": True, "assigned": ids}
+    except Exception as exc:
+        conn.rollback()
+        logger.debug(f"[escalation] conversation assign skipped: {exc}")
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        conn.close()
 
 
 def resolve_for_conversation(conversation_id: str, agent: str,

@@ -58,6 +58,7 @@ import os
 import re
 import secrets
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Request, Response
@@ -412,6 +413,281 @@ def _hold_music() -> str:
             '<Redirect method="POST">/voice/support/turn</Redirect>')
 
 
+# ============================================================================
+# LIVE TRANSFER — "I want to talk to a person"
+# ============================================================================
+# Three ways this can go, and only one of them is a <Dial>:
+#
+#   in hours, number configured  → <Dial> the human. If they don't pick up,
+#                                  the action callback lands us in case 3
+#                                  rather than dropping the caller.
+#   out of hours                 → say WHEN we open, in the caller's language,
+#                                  and open the U1 obligation.
+#   unconfigured / disabled      → the U1 obligation, same as above.
+#
+# Cases 2 and 3 are not failures to be silent about: telling a caller "someone
+# will get back to you" is exactly the promise U1 exists to make binding, so
+# the escalation is opened on the SAME code path that speaks the sentence. A
+# transfer that can't happen must still leave an owner and a clock behind.
+#
+# This lives here (not in sdr.py) for the same reason _VOICE_BY_LANG does:
+# both lines transfer to the same person under the same hours, and two copies
+# of an hours table drift the moment one is edited.
+
+TRANSFER_ENABLED = _flag("VOICE_TRANSFER_ENABLED", "1")
+TRANSFER_TZ = os.getenv("VOICE_TRANSFER_TZ", "America/Toronto").strip()
+# isoweekday: 1=Mon … 7=Sun. "1-5" = weekdays.
+TRANSFER_DAYS = os.getenv("VOICE_TRANSFER_DAYS", "1-5").strip()
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        logger.warning(f"[voice] {name} is not an integer — using {default}")
+        return default
+
+
+# Seconds to ring the human before giving up and taking a message.
+TRANSFER_TIMEOUT = max(5, _int_env("VOICE_TRANSFER_TIMEOUT", 25))
+# Announce the call to the answering phone before bridging. Off by default —
+# it adds ~3s before the customer is connected.
+TRANSFER_WHISPER = _flag("VOICE_TRANSFER_WHISPER", "0")
+WHISPER_PATH = "/sdr/voice/whisper"
+
+
+def _parse_hhmm(raw: str) -> Optional[Tuple[int, int]]:
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", (raw or "").strip())
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    return (h, mi) if 0 <= h <= 23 and 0 <= mi <= 59 else None
+
+
+def _hhmm(name: str, default: str) -> Tuple[int, int]:
+    """Parse HH:MM from env, falling back to the documented default and saying
+    so. A typo must not silently become midnight — at the start bound that
+    reads as 'open since 00:00' and at the end bound as 'never open'."""
+    raw = os.getenv(name, "").strip()
+    if raw:
+        parsed = _parse_hhmm(raw)
+        if parsed:
+            return parsed
+        logger.error(f"[voice] {name}={raw!r} is not HH:MM — using {default}")
+    return _parse_hhmm(default) or (0, 0)
+
+
+def _transfer_days() -> set:
+    """'1-5' or '1,2,3,4,5' or '1-5,7' → {1,2,3,4,5}."""
+    out: set = set()
+    for part in TRANSFER_DAYS.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                a, b = part.split("-", 1)
+                out.update(range(int(a), int(b) + 1))
+            else:
+                out.add(int(part))
+        except ValueError:
+            logger.error(f"[voice] VOICE_TRANSFER_DAYS={TRANSFER_DAYS!r} "
+                         f"unparseable at {part!r} — ignoring that part")
+    return {d for d in out if 1 <= d <= 7} or {1, 2, 3, 4, 5}
+
+
+def transfer_number() -> str:
+    """The human's number in E.164, or '' when not usable.
+
+    Read per call rather than cached at import so the number can be rotated on
+    Railway without a redeploy, and validated every time so a bad edit degrades
+    to 'take a message' instead of emitting a <Dial> the carrier rejects."""
+    raw = os.getenv("VOICE_TRANSFER_NUMBER", "").strip()
+    if not raw:
+        return ""
+    from app.core.telephony import normalize_phone
+    num = normalize_phone(raw)
+    if not num:
+        logger.error(f"[voice] VOICE_TRANSFER_NUMBER={raw!r} is not a usable "
+                     f"phone number — live transfer disabled, taking messages")
+        return ""
+    return num
+
+
+def _transfer_caller_id() -> str:
+    """What the human's phone displays. Defaults to OUR Telnyx DID, not the
+    customer's number: passing the caller's number through is spoofing that
+    carriers reject outright, and a call that looks like it came from the
+    business is also the one you know to answer."""
+    explicit = os.getenv("VOICE_TRANSFER_CALLER_ID", "").strip()
+    if explicit:
+        from app.core.telephony import normalize_phone
+        return normalize_phone(explicit) or ""
+    try:
+        from app.core.telephony import _from_number
+        return _from_number() or ""
+    except Exception:
+        return ""
+
+
+def transfer_window(now: Optional[Any] = None) -> Dict[str, Any]:
+    """Is a human reachable right now? Never raises — a clock problem must not
+    take the phone line down, so anything unexpected reports 'closed' and the
+    caller gets a tracked callback instead of a dropped call."""
+    start_h, start_m = _hhmm("VOICE_TRANSFER_START", "08:30")
+    end_h, end_m = _hhmm("VOICE_TRANSFER_END", "17:30")
+    info = {"open": False, "reason": "", "tz": TRANSFER_TZ,
+            "opens": f"{start_h:02d}:{start_m:02d}",
+            "closes": f"{end_h:02d}:{end_m:02d}",
+            "days": sorted(_transfer_days()), "number_configured": False}
+    if not TRANSFER_ENABLED:
+        info["reason"] = "transfer disabled (VOICE_TRANSFER_ENABLED=0)"
+        return info
+    info["number_configured"] = bool(transfer_number())
+    if not info["number_configured"]:
+        info["reason"] = "no VOICE_TRANSFER_NUMBER configured"
+        return info
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(TRANSFER_TZ)
+    except Exception as exc:
+        logger.error(f"[voice] VOICE_TRANSFER_TZ={TRANSFER_TZ!r} unknown "
+                     f"({exc}) — falling back to America/Toronto")
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/Toronto")
+    # DST is why this is a tz-aware local time rather than a UTC offset: the
+    # window is "8:30 as the person experiences it", which moves twice a year.
+    local = (now or datetime.now(timezone.utc)).astimezone(tz)
+    info["local_time"] = local.strftime("%a %H:%M %Z")
+    if local.isoweekday() not in _transfer_days():
+        info["reason"] = f"closed on {local.strftime('%A')}"
+        return info
+    minutes = local.hour * 60 + local.minute
+    if not (start_h * 60 + start_m <= minutes < end_h * 60 + end_m):
+        info["reason"] = (f"outside {info['opens']}–{info['closes']} "
+                          f"{local.tzname()}")
+        return info
+    info["open"] = True
+    return info
+
+
+_HOURS_SENTENCE = {
+    "en": "Our team is available weekdays between {opens} and {closes} Eastern time.",
+    "fr": "Notre équipe est disponible en semaine entre {opens} et {closes}, heure de l'Est.",
+    "es": "Nuestro equipo está disponible de lunes a viernes entre las {opens} y las {closes}, hora del Este.",
+    "zh": "我们的团队在工作日东部时间 {opens} 至 {closes} 为您服务。",
+    "de": "Unser Team ist werktags zwischen {opens} und {closes} Eastern Time erreichbar.",
+}
+_CONNECTING = {
+    "en": "Of course — let me connect you with someone now. One moment please.",
+    "fr": "Bien sûr — je vous mets en relation avec quelqu'un. Un instant je vous prie.",
+    "es": "Por supuesto — le comunico con una persona ahora. Un momento, por favor.",
+    "zh": "好的，我现在为您转接人工客服，请稍等。",
+    "de": "Selbstverständlich — ich verbinde Sie jetzt. Einen Moment bitte.",
+}
+_TAKING_MESSAGE = {
+    "en": "I've passed your request to our team and someone will call you back.",
+    "fr": "J'ai transmis votre demande à notre équipe, et quelqu'un vous rappellera.",
+    "es": "He pasado su solicitud a nuestro equipo y alguien le devolverá la llamada.",
+    "zh": "我已经把您的需求转给我们的团队，稍后会有同事回电给您。",
+    "de": "Ich habe Ihr Anliegen an unser Team weitergegeben; jemand ruft Sie zurück.",
+}
+_NO_ANSWER = {
+    "en": "Sorry — I couldn't reach anyone just now.",
+    "fr": "Désolé — je n'ai pu joindre personne à l'instant.",
+    "es": "Lo siento — no he podido localizar a nadie en este momento.",
+    "zh": "抱歉，刚才没能联系上同事。",
+    "de": "Entschuldigung — ich konnte gerade niemanden erreichen.",
+}
+
+
+def _spoken_time(hhmm: str, lang: str) -> str:
+    """'08:30' → '8:30 AM' for languages that expect it. TTS reads a bare
+    '17:30' as 'seventeen thirty' in English, which no caller says."""
+    h, m = int(hhmm[:2]), int(hhmm[3:])
+    if lang in ("zh", "fr", "de"):
+        return f"{h}:{m:02d}"
+    suffix = "AM" if h < 12 else "PM"
+    h12 = h % 12 or 12
+    return f"{h12}:{m:02d} {suffix}"
+
+
+def transfer_message(lang: str, window: Dict[str, Any]) -> str:
+    """What the caller hears when no human can be reached. Always states the
+    hours — 'someone will call you back' without a when is the vague promise
+    that made escalations necessary in the first place."""
+    hours = _HOURS_SENTENCE.get(lang, _HOURS_SENTENCE["en"]).format(
+        opens=_spoken_time(window.get("opens", "08:30"), lang),
+        closes=_spoken_time(window.get("closes", "17:30"), lang))
+    return f"{hours} {_TAKING_MESSAGE.get(lang, _TAKING_MESSAGE['en'])}"
+
+
+def no_answer_message(lang: str, window: Dict[str, Any]) -> str:
+    """After an unanswered ring. Leads with the apology — the caller just heard
+    'connecting you now', so repeating the opening hours first would sound like
+    the transfer was never attempted."""
+    return (f"{_NO_ANSWER.get(lang, _NO_ANSWER['en'])} "
+            f"{_TAKING_MESSAGE.get(lang, _TAKING_MESSAGE['en'])}")
+
+
+def dial_twiml(lang: str, action: str, caller: str = "") -> str:
+    """<Dial> the human, with an action callback so an unanswered ring comes
+    back to us. Without `action` the caller would simply be hung up on when
+    nobody picks up — the one outcome worse than never offering to transfer."""
+    from app.core.telephony import _twiml_escape
+    num, cid = transfer_number(), _transfer_caller_id()
+    cid_attr = f' callerId="{_twiml_escape(cid)}"' if cid else ""
+    # answerOnBridge: our leg is ALREADY answered (we just spoke), so without
+    # this the carrier joins the legs immediately and the caller sits in a
+    # half-open bridge while the cell rings — the window where transfer audio
+    # artifacts live. With it, the legs join only when the human actually
+    # picks up, and the caller hears real ringback until then.
+    whisper = ""
+    if TRANSFER_WHISPER:
+        # The customer's number has to ride in the URL: on the whisper leg the
+        # carrier reports From=our DID and To=the cell, so reading either there
+        # would announce the wrong party — your own number, back to you.
+        import urllib.parse
+        q = ("?c=" + urllib.parse.quote(caller, safe="")) if caller else ""
+        whisper = f' url="{_twiml_escape(WHISPER_PATH + q)}"'
+    return (_say(_CONNECTING.get(lang, _CONNECTING["en"]), lang)
+            + f'<Dial timeout="{TRANSFER_TIMEOUT}"{cid_attr} answerOnBridge="true" '
+              f'action="{action}" method="POST">'
+              f'<Number{whisper}>{_twiml_escape(num)}</Number></Dial>')
+
+
+def whisper_twiml(caller: str = "") -> str:
+    """Played to YOUR phone before the legs join, not to the customer.
+
+    A call forwarded to a personal cell arrives from the business's own number
+    with no context — you cannot tell a customer transfer from a wrong number
+    until you have already answered in the wrong tone."""
+    tail = ""
+    digits = re.sub(r"\D", "", caller or "")
+    if len(digits) >= 4:
+        tail = f", number ending {' '.join(digits[-4:])}"
+    return _say(f"Customer call from the website{tail}. Connecting now.", "en")
+
+
+def open_callback_obligation(*, conversation_id: str, handle: Optional[str],
+                             channel: str, heard: str,
+                             window: Dict[str, Any]) -> None:
+    """Record the promise we just made out loud. Never raises."""
+    try:
+        from app.core import escalation
+        escalation.open(
+            "customer_requested_human", "voice",
+            summary="Caller asked for a person on the phone line",
+            transcript_excerpt=(heard or "")[:400],
+            conversation_id=conversation_id, channel=channel, handle=handle,
+            priority="high",
+            metadata={"transfer_attempted": bool(window.get("open")),
+                      "window_reason": window.get("reason", ""),
+                      "local_time": window.get("local_time", "")})
+    except Exception as exc:
+        logger.error(f"[voice] could not record the callback obligation: {exc}")
+
+
 def _gather_digits(prompt_inner: str) -> str:
     """Keypad-only Gather for the verification code — DTMF keeps the code out
     of the speech transcript and is far more reliable than spoken digits."""
@@ -625,22 +901,13 @@ def _check_code(sess: Dict[str, Any], digits: str) -> Tuple[str, str]:
 # ============================================================================
 
 def _scoped_rows(sql: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Run one parameterized read for a VERIFIED caller. The account_id /
-    contact_id placeholders are filled from the verified customer scope —
-    never from caller-supplied values — and the transaction is read-only."""
-    scope = customer_scope()
-    if not scope or not scope.get("account_id"):
-        raise PermissionError("no verified customer scope on this context")
-    merged = {**params, "account_id": scope["account_id"],
-              "contact_id": scope.get("contact_id")}
-    conn = get_connection()
-    try:
-        conn.set_session(readonly=True)
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, merged)
-            return [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
+    """Delegates to THE one customer-scoped read (write_guard.scoped_rows).
+
+    The implementation moved out when the portal became the second consumer:
+    a per-channel copy would drift, and the weakest copy would decide what a
+    customer can see."""
+    from app.core.write_guard import scoped_rows
+    return scoped_rows(sql, params)
 
 
 def _fmt_money(v: Any) -> str:

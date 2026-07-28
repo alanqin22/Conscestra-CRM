@@ -522,6 +522,72 @@ def _resolved_threads(cap: int) -> List[Dict[str, Any]]:
         conn.close()
 
 
+def _resolved_cases(cap: int) -> List[Dict[str, Any]]:
+    """Resolved CASES as a third mining source — C1 Step 8.
+
+    A resolved case is EVIDENCE THAT WORK WAS COMPLETED. It is not, by itself,
+    verified knowledge, so this returns candidates for exactly the same
+    governance path email threads and call transcripts already take: LLM draft
+    → `governance.propose('kb.publish')` → human approval. Nothing here
+    publishes, and this function is deliberately a SOURCE rather than a second
+    pipeline — a parallel knowledge system would drift from the approval,
+    dedupe and privacy handling that already work.
+
+    DETERMINISTIC EXCLUSIONS, applied before any model sees the text:
+
+      * `resolved_at IS NULL` — closure is not completion. A case closed
+        without being resolved has no solution to teach.
+      * `is_historical` — the 120 pre-C1 rows have no resolution context and no
+        recorded history; there is nothing to mine and inventing it is exactly
+        what the historical flag exists to prevent.
+      * no substantive text — a resolution of "done" teaches nothing.
+      * already mined — the same NOT EXISTS pair the other two sources use, so
+        a case is proposed once and never re-proposed after approval OR
+        rejection is pending/decided.
+
+    Everything subtler than that — is this reusable or customer-specific, one
+    time or general — is left to `_draft_llm` returning None (the existing
+    classifier) and then to the human in the approval queue. A second
+    classification vocabulary would have to be kept in agreement with the first.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.cases')")
+            if cur.fetchone()[0] is None:
+                return []
+            cur.execute(
+                """SELECT c.case_id::text, c.subject, c.description,
+                          COALESCE(
+                            (SELECT string_agg(cm.comment, E'\\n' ORDER BY cm.created_at)
+                             FROM case_comments cm
+                             WHERE cm.case_id = c.case_id), '') AS resolution
+                   FROM cases c
+                   WHERE c.resolved_at IS NOT NULL
+                     AND c.is_historical = false
+                     AND c.resolved_at > now() - interval '30 days'
+                     AND length(coalesce(c.subject,'')) > 8
+                     AND NOT EXISTS (SELECT 1 FROM knowledge_articles k
+                                     WHERE k.source_ref = c.case_id::text)
+                     AND NOT EXISTS (SELECT 1 FROM action_approvals ap
+                                     WHERE ap.action_type = 'kb.publish'
+                                       AND ap.params->>'source_ref' = c.case_id::text
+                                       AND ap.status IN ('pending','approved','executed'))
+                   ORDER BY c.resolved_at DESC
+                   LIMIT %s""", (int(cap),))
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as exc:
+        conn.rollback()
+        logger.debug(f"[knowledge] case mining skipped: {exc}")
+        return []
+    finally:
+        conn.close()
+    # A case whose whole record is a one-line subject has no solution in it.
+    return [r for r in rows
+            if len((r.get("resolution") or "") + (r.get("description") or "")) >= 40]
+
+
 def _resolved_calls(cap: int) -> List[Dict[str, Any]]:
     """Support-call transcripts (logged by voice_support as one inbound
     'voice' activity) not yet mined. The transcript carries BOTH sides:
@@ -580,6 +646,17 @@ def draft_pass(force: bool = False) -> Dict[str, Any]:
 
     threads = _resolved_threads(DRAFT_CAP)
     calls = _resolved_calls(DRAFT_CAP - len(threads))
+    # C1 Step 8 — resolved CASES as a third source, behind its own flag so the
+    # knowledge loop's existing behaviour is byte-identical until it is turned
+    # on. Shares the same cap, so adding cases cannot increase the review load
+    # the queue already receives.
+    cases_src = []
+    try:
+        from app.core import cases as _cases
+        if _cases.ENABLED and _cases.KB_FEEDBACK:
+            cases_src = _resolved_cases(DRAFT_CAP - len(threads) - len(calls))
+    except Exception as exc:
+        logger.debug(f"[knowledge] case source skipped: {exc}")
     proposed, skipped = [], 0
 
     def _propose(art: Dict[str, Any], source_ref: str) -> None:
@@ -599,6 +676,20 @@ def draft_pass(force: bool = False) -> Dict[str, Any]:
             _propose(art, t["activity_id"])
         else:
             skipped += 1
+    for cs in cases_src:
+        # A case-derived candidate is proposed as INTERNAL. Case text is
+        # customer-specific by origin, and U2's reach_invariant means an
+        # externally reachable agent may read only the `public` tier — so the
+        # safe default keeps a fresh candidate away from customer-facing
+        # agents until a human deliberately re-tiers it on approval.
+        art = _draft_llm(cs["subject"] or "support case",
+                         cs["description"] or "", cs["resolution"] or "")
+        if art:
+            art.setdefault("audience", "internal")
+            _propose(art, cs["case_id"])
+        else:
+            skipped += 1
+
     for c in calls:
         caller_text, agent_text = _split_transcript(c["description"])
         if not (caller_text and agent_text):
@@ -610,8 +701,8 @@ def draft_pass(force: bool = False) -> Dict[str, Any]:
         else:
             skipped += 1
     return {"enabled": DRAFT_ENABLED, "threads": len(threads),
-            "calls": len(calls), "proposed": proposed,
-            "draft_failures": skipped}
+            "calls": len(calls), "cases": len(cases_src),
+            "proposed": proposed, "draft_failures": skipped}
 
 
 # ============================================================================

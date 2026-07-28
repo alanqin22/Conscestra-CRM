@@ -67,6 +67,22 @@ SECURITY_POSTURE = _POSTURE
 logger.info(f"[security] data-endpoint posture: {_POSTURE} "
             f"(API_AUTH_ENABLED={int(API_AUTH_ENABLED)}, API_PUBLIC_READ={int(API_PUBLIC_READ)})")
 
+# Two ways to express one posture, and the mode wins SILENTLY. An operator who
+# sets API_AUTH_ENABLED=1 on the platform while a stale API_SECURITY_MODE sits
+# beside it gets the mode's answer with no indication — so say which won.
+_LEGACY_SET = [n for n in ("API_AUTH_ENABLED", "API_PUBLIC_READ")
+               if os.getenv(n) is not None]
+# Public name so the release guard can report the conflict without re-reading
+# the environment — re-deriving the posture from os.environ is exactly the bug
+# that made the guard misreport it.
+POSTURE_CONFLICT = ", ".join(_LEGACY_SET) if (_MODE and _LEGACY_SET) else ""
+if POSTURE_CONFLICT:
+    logger.warning(
+        f"[security] API_SECURITY_MODE={_MODE!r} is in force; "
+        f"{POSTURE_CONFLICT} {'is' if len(_LEGACY_SET) == 1 else 'are'} "
+        f"being IGNORED. Remove the legacy flag(s), or clear "
+        f"API_SECURITY_MODE to use them.")
+
 # Surface the posture once at import (startup) rather than per request.
 if not ADMIN_API_TOKEN:
     logger.warning(
@@ -160,6 +176,7 @@ async def require_admin(request: Request) -> bool:
     # 2. human admin via session — accepted regardless of the data-endpoint
     #    posture (admin-only modules like Email must work in every mode).
     token = _bearer(request)
+    sess = None
     if token:
         from app.agents.auth.router import get_session
         sess = get_session(token)
@@ -169,6 +186,22 @@ async def require_admin(request: Request) -> bool:
     # 3. dev bypass only when nothing is configured
     if not ADMIN_API_TOKEN and not API_AUTH_ENABLED:
         return True
+
+    # A CREDENTIAL WAS PRESENTED AND IT IS NOT VALID -> 401, not 403.
+    #
+    # These are different failures and they need different fixes: 403 means
+    # "you are who you say, but you may not do this" (sign in as someone else);
+    # 401 means "re-authenticate" (sign in again). Returning 403 for an expired
+    # session told an admin their ROLE was insufficient when the role was
+    # correct and the token had simply lapsed — sending them to hunt for a
+    # permission problem that did not exist.
+    if token and not sess:
+        raise HTTPException(
+            status_code=401,
+            detail="Session expired or invalid — please sign in again.")
+
+    # No credential, or a valid session whose role is not admin: fails closed
+    # as documented.
     raise HTTPException(status_code=403, detail="Admin authorization required")
 
 

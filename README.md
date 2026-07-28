@@ -291,6 +291,73 @@ the obligation.
 
 **The conversation can end. The obligation cannot, until someone closes it.**
 
+## The Work Outlives the Conversation
+
+An escalation is an **event** — the moment something went wrong. The work that
+event creates is a different thing entirely, and it is the thing that survives.
+The customer hangs up, the chat window closes, the shift ends. A transcript
+remembers what was said. It does not remember what is still owed.
+
+Conscestra makes that work a **case**: a durable record with an owner, a
+priority, and a state machine that will not let it quietly disappear. The
+lifecycle is five states and the transitions between them are the *entire*
+grammar — `new → in_progress → waiting ⇄ in_progress → resolved`, with
+`resolved → in_progress` as the one transition meaning *this came back*, and
+`closed` genuinely terminal. There is one transition matrix, written once. An
+invalid move is refused, not logged and applied.
+
+Four distinctions are enforced because each one, collapsed, produces a
+different everyday failure:
+
+| | |
+|---|---|
+| A conversation resolved ≠ a case resolved | The customer stopped typing; nobody fixed anything |
+| A case created ≠ work accepted | It has an owner's name on it; the owner has not agreed |
+| Work accepted ≠ work completed | Someone is on it; it is not done |
+| Resolved ≠ closed | Fixed today; it can still come back, and reopening is a first-class event that increments a counter rather than pretending it never happened |
+
+Every change to status, owner, or priority is written to an **append-only
+field history** by a single writer — one row per field that actually changed,
+inside the same transaction as the change itself, guarded by a database trigger
+that refuses updates and deletes. History that can be edited is not history.
+The set of tracked fields is deliberately narrow: a log that records everything
+records nothing, because nobody reads it.
+
+Cases connect back to what created them and forward to what they teach.
+Resolution times, first-response times, reopen rates and backlog age become
+service analytics; a resolved case can be mined into a draft knowledge article
+through the same governed approval queue as every other inflow — never
+published automatically, because **a resolved case is not an approved answer.**
+
+The case layer ships behind flags (`CASES_ENABLED` on, `CASES_AUTO_OPEN` and
+`CASES_KB_FEEDBACK` off) so an organization decides when escalations start
+creating cases on their own.
+
+## Work Finds the Person Who Can Actually Do It
+
+A case with an owner is only as good as the owner being right. Assignment by
+round-robin gives a French complaint to someone who doesn't speak French and a
+hardware fault to someone who has never seen one.
+
+Conscestra routes on **recorded** attributes — language, skill, capacity — and
+the operative word is recorded. A person with no languages on file does not
+match a rule requiring French; the system reports *"no recorded languages"*
+rather than assuming. **Absent data never fabricates a match**, which is the
+difference between routing that degrades honestly and routing that is
+confidently wrong.
+
+Rules are data, not code: an administrator writes the conditions, and a
+**preview** shows who would receive the work and — more useful — *why everyone
+else was excluded*, before the rule is saved. Every rule change is versioned.
+Live workload feeds the decision, so capacity is a real constraint rather than
+an aspiration.
+
+Underneath sits a deliberate piece of plumbing: one **assignable identity**
+space. Ownership means a person who can be assigned work, which is not the
+same as a contact who happens to be in the CRM — and the system reports
+identity collisions rather than resolving them first-match-wins. Answering
+confidently with the wrong person's record is worse than declining to answer.
+
 ## Give It a Goal, Get a Governed Plan
 
 For everything the playbooks don't already cover, executives can hand the
@@ -364,6 +431,36 @@ session or the code, never by a name typed into a box.
 
 **Every shopper question — product, price, policy, or their own order —
 answered by one agent, grounded in real data.**
+
+## The Customer Can See Their Own Record
+
+For a long time the phone line did more for a verified caller than the website
+did for a signed-in one. A customer could log in and reach exactly two things:
+a health check and a sign-out button. Everything they might actually want to
+know — orders, invoices, open cases, outstanding quotes — existed, and was
+reachable by voice, and was invisible on the web.
+
+Conscestra now gives customers a **portal onto their own record**: orders and
+their line items, invoices and balances, the cases they have open with real
+status, and the quotes they have been sent with real expiry dates. The same
+assistant answers questions about it in plain language — and the AI calls the
+*same functions* the pages do, so it is incapable of returning something the
+pages would not show. There is no second data path to keep in agreement.
+
+The security model is the one the voice channel already proved, reused rather
+than reinvented — because a per-channel copy would drift, and the weakest copy
+would silently decide what every customer can see:
+
+- **One customer identity.** Voice, chat, and portal resolve to the same model.
+- **One customer scope.** A single implementation, entered over HTTP here. While a customer scope is active, stored-procedure access is refused outright — fail-closed, not filtered.
+- **Account-level boundary.** The account is the security boundary; the contact is recorded for attribution only.
+- **Read-only.** No writes, no reordering, no payments. Prove the boundary before widening it.
+
+One detail matters more than it looks. A self-registered user is a **lead**,
+not yet a customer account — and they never get an empty Orders page. An empty
+list reads as *"you have no orders"* when the truth is *"you are not linked
+yet,"* and that distinction is the whole difference between a working product
+and a broken one. They get an explicit onboarding state instead.
 
 ## The Whole CRM, From a Text Message
 
@@ -572,6 +669,22 @@ greeting, never a number. The quotation states its validity window, rides
 the same outbound gates as every send (delivered only to a verified address
 under autosend; drafted as an owner task otherwise), carries the CASL
 footer, and lands in the activity log as the audit copy.
+
+And then it **stays**. A quotation used to be composed, sent, and forgotten —
+a commercial commitment that existed only as the text of an email. Nobody
+could answer *what did we offer this customer, and is it still good?* Quotes
+are now durable records with their own lifecycle, and the prices are
+**snapshotted at the moment of the offer**: when the catalogue changes next
+week, the quote still says what was actually promised. A quote that re-prices
+itself is not a quote.
+
+Validity is enforced rather than merely printed. A nightly pass expires
+quotations whose window has closed, so *"still open"* means it. Discounts
+record what was requested, what policy allowed, and what was granted — and a
+request past the cap becomes a governed approval rather than a silent clamp,
+because a customer who asked for 30% and quietly received 15% has been
+answered without being told. Offered-versus-ordered comparison closes the
+loop between what was promised and what was bought.
 
 ## The Platform Finds Its Own Bottlenecks
 
@@ -859,6 +972,31 @@ The platform supports multiple security postures ranging from open
 demonstration environments to fully locked production deployments.
 Administrative email access always requires elevated authorization
 regardless of system posture.
+
+A posture is chosen with **one switch**, and this is not a stylistic
+preference. Two independent flags mean four combinations, two of which are
+somebody's mistake, and the failure is silent: an operator sets the flag they
+remember, the other one decides, and the deployment is not what anyone
+believes it is. One switch cannot be half-set — and when a legacy flag is
+found beside it, startup names which setting won and which is inert rather
+than resolving the conflict quietly.
+
+The posture is then **checked before the application serves anything**. A
+control that only engages when somebody remembers to set an environment
+variable is not a control; a deployed environment that is missing one refuses
+to start rather than serving unsecured data, because a failed deploy is
+recoverable in minutes and a public feed of customer names is not. Deliberate
+exceptions remain possible — an operator who genuinely wants a public feed can
+say so explicitly, which turns an accident into a decision. Local development
+is untouched: safety bought with developer friction gets switched off.
+
+That guard is also held to its own standard. An early version of it read the
+configuration from the environment instead of from what the application had
+actually resolved, and so reported the wrong posture in both directions —
+including calling an application with **no authentication at all** clean. It
+now reports what the running process is genuinely using, and the two failure
+directions are regression-tested against the old implementation. A guard that
+misreports is worse than no guard, because it manufactures confidence.
 
 Additional protections include:
 
@@ -1194,6 +1332,8 @@ crm_agent/
 ├── .env                           ← Single config file for all agents
 ├── sp/                            ← PostgreSQL stored procedures
 ├── *-mgmt.html                    ← One frontend per agent (incl. orchestrator-mgmt.html)
+├── case-mgmt.html                 ← Case queue, lifecycle actions, field history
+├── customer-portal.html           ← Customer's own record (orders/invoices/cases/quotes)
 ├── platform-health.html           ← Platform / obligations / governance health
 └── app/
     ├── main.py                    ← FastAPI app — registers all routers
@@ -1245,7 +1385,14 @@ crm_agent/
     │   ├── trace.py               ← Correlation-id trace (one id → whole play)
     │   ├── outbound_guard.py      ← Deterministic triage on every outgoing message
     │   ├── kb_ingest.py           ← Document/URL/attachment → governed KB proposals
-    │   ├── quotes.py              ← Deterministic quotation build + delivery
+    │   ├── cases.py               ← Case lifecycle — the one transition matrix
+    │   ├── history.py             ← The one append-only field-history writer
+    │   ├── case_analytics.py      ← Service metrics + knowledge signals
+    │   ├── assignable.py          ← One assignable-identity space (collision-aware)
+    │   ├── routing.py             ← Rules as data: language/skill/capacity + preview
+    │   ├── portal.py              ← Customer portal (read-only, one customer scope)
+    │   ├── release_guard.py       ← Startup posture audit (refuses an unsafe deploy)
+    │   ├── quotes.py              ← Quotation build + delivery + durable lifecycle
     │   ├── web_tools.py           ← Internet access (search + fetch + cite)
     │   ├── llm_meter.py           ← LLM usage metering, budgets, model tiering
     │   ├── llm_router.py          ← Provider failover (failure classes, egress
@@ -1271,6 +1418,7 @@ crm_agent/
         ├── notifications/
         ├── accounting/
         ├── analytics/
+        ├── cases/            ← service cases (reads allow-listed; writes go through core/cases.py)
         ├── orchestrator/     ← symphony workflows + executive Q&A bank (router | executive)
         │  ── 4 supporting modules ──
         ├── home/                   ← sp_home_index dashboard (direct SP, no AI)
@@ -1326,6 +1474,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | GET    | `/analytics/explore/catalog` | The semantic model — explores + dimension/measure keys |
 | GET    | `/analytics/anomalies`       | Live trend anomalies + thresholds (admin)      |
 | POST   | `/analytics/anomalies/act`   | Compose a governed plan for an anomaly (writes queue for approval) |
+| POST   | `/case-chat`                 | Cases agent (reads allow-listed; writes via the lifecycle) |
 | POST   | `/orchestrator-chat`         | Orchestrator agent (symphony workflows + executive Q&A) |
 | POST   | `/email-chat`                | Email agent (SMTP/IMAP + LangGraph)            |
 | POST   | `/store-chat`                | Store catalogue (direct SP)                    |
@@ -1350,6 +1499,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | GET/POST/DELETE | `/custom-fields/defs` · `/custom-fields/values/{entity}/{id}` | Custom-field definitions + record values (admin) |
 | GET/POST | `/industry/packs[/{id}/apply\|remove]` | Apply/remove an industry starter pack (admin) |
 | GET    | `/platform/health[/section/{key}]` | Platform / obligations / governance health (admin) |
+| GET    | `/cases/analytics[/semantics]` · `/cases/knowledge-signals` | Service metrics, backlog age, reopen rate, KB candidates (admin) |
+| GET/POST/DELETE | `/routing/rules[/{id}]` | Routing rules as data, versioned (admin) |
+| GET    | `/routing/recommend/{case_id}` · `/routing/preview` | Who gets this work — and why everyone else was excluded (admin) |
+| GET/POST/DELETE | `/routing/directory[/attributes\|/provision\|/{email}]` | Assignable identities + languages/skills/capacity (admin) |
+| GET    | `/portal/{me\|orders\|invoices\|cases\|quotes}` | Customer's own record — read-only, account-scoped (customer session) |
+| GET    | `/portal/ask?q=…`            | Customer assistant over the same functions the pages use |
 | GET/POST | `/escalations`             | Open obligations + SLA state; assign / resolve (admin) |
 | GET/POST | `/agent-versions/{slug}[/draft\|evaluate\|publish\|rollback]` | Authored-agent draft/publish gate + history (admin) |
 | GET/POST | `/agent-capabilities[/catalog\|/{slug}]` | Capability catalogue + per-agent grants (admin) |
