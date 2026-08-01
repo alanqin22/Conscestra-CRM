@@ -34,7 +34,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
-def main() -> int:
+def main() -> int:      # noqa: C901
     conn = psycopg2.connect(get_settings().db_dsn)
     conn.autocommit = True
     cur = conn.cursor()
@@ -102,3 +102,32 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def check_migration_overlap() -> None:
+    """No object may be defined by two migrations.
+
+    `erase_memory_verifications()` was defined in both memory_invariants.sql
+    (original, broken — its DELETE was silently discarded by a RULE) and
+    memory_audit_erasure.sql (fixed). Replaying the earlier file overwrote the
+    fix with the break. That happened for real on BOTH databases during
+    deployment, and the only reason it was caught is that a test asserted the
+    function's BEHAVIOUR rather than its existence.
+
+    Static, so it runs without a database and fails the build rather than the
+    deploy."""
+    import re
+    from app.core.deploy_state import REQUIRED_MIGRATIONS
+    sql_dir = Path(__file__).resolve().parents[1] / "sql"
+    seen: dict = {}
+    for name in REQUIRED_MIGRATIONS:
+        path = sql_dir / name
+        if not path.exists():
+            continue
+        body = path.read_text(encoding="utf-8", errors="replace")
+        for m in re.finditer(
+                r"CREATE (?:OR REPLACE )?(FUNCTION|VIEW|RULE)\s+([\w.]+)", body, re.I):
+            seen.setdefault((m.group(1).upper(), m.group(2).lower()), set()).add(name)
+    dupes = {k: v for k, v in seen.items() if len(v) > 1}
+    check("no object defined by two migrations", not dupes,
+          "; ".join(f"{k[1]} in {sorted(v)}" for k, v in dupes.items()) or "")
