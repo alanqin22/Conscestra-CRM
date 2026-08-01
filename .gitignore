@@ -120,6 +120,17 @@ deploy_winscp.log
 /sp/
 *.sql
 
+# Tests — local only, by request. They stay in the working tree and still run
+# with `python -m pytest tests/`; they are simply not published.
+#
+# CONSEQUENCE, recorded so it is not rediscovered: CI can no longer run them.
+# The pipeline is reduced to importing every app module, which still catches
+# syntax errors, broken imports and circular dependencies across the codebase —
+# but NOTHING else is verified on GitHub. All 1039 tests, and every
+# database-layer control, are now verified only on this machine and on Railway
+# via `python -m scripts.verify_invariants`.
+/tests/
+
 # Claude Code workspace (skills, local settings) — local only.
 .claude/
 

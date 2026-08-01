@@ -9,23 +9,26 @@
 # runs what is meaningful without a database, and it is named so that nobody
 # mistakes a green tick for a verified safety case.
 #
+# The tests/ directory is also outside this repository by policy, so CI cannot
+# run any test at all.
+#
 # COVERED HERE
 #   * every app module imports (222 of them) — catches syntax errors, broken
-#     imports and circular dependencies across the whole codebase
-#   * the 185 tests in the 5 test files that touch no database
+#     imports and circular dependencies across the whole codebase. That is the
+#     entire signal this pipeline provides.
 #
-# NOT COVERED HERE — verified locally against Postgres, and on Railway by
-# `python -m scripts.verify_invariants` after every deployment:
+# NOT COVERED HERE — all 1039 tests, verified locally against Postgres and on
+# Railway by `python -m scripts.verify_invariants` after every deployment:
 #   * GDPR erasure actually deleting
 #   * append-only enforcement on the verification trail
 #   * assertion-gate convergence between explain() and recall()
 #   * signature validation and key rotation
 #   * the deletion undo log
-#   * 854 further tests
 #
-# TO GET FULL COVERAGE: commit a base schema (sql/00_base_schema.sql, ~1.7 MiB,
-# 200 tables + 165 stored procedures) and the 15 declared migrations. The
-# integration job below activates on its own the moment that file exists.
+# TO GET FULL COVERAGE: publish tests/, the 15 declared migrations, and a base
+# schema (sql/00_base_schema.sql, ~1.7 MiB, 200 tables + 165 stored
+# procedures). The integration job below activates on its own once the base
+# schema is present.
 name: CI
 
 on:
@@ -34,7 +37,7 @@ on:
 
 jobs:
   checks:
-    name: import + database-free tests
+    name: import check
     runs-on: ubuntu-latest
     outputs:
       # `hashFiles()` is not available in a job-level `if:` — only inside
@@ -77,27 +80,17 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
-      # Enumerated, not pattern-matched. A test file added later is NOT picked
-      # up silently — whether it needs a database is a judgement, and the whole
-      # reason this job is scoped is that the suite quietly skipped 57% of
-      # itself when nobody was making that judgement explicitly.
-      - name: Database-free tests
-        run: |
-          python -m pytest -q \
-            tests/test_auth_expiry_reporting.py \
-            tests/test_llm_failover.py \
-            tests/test_release_guard.py \
-            tests/test_voice_and_mcp.py \
-            tests/test_voice_transfer.py
-
       - name: State what was not verified
         if: always()
         run: |
-          echo "::warning::CI covers imports + 185 database-free tests."
-          echo "::warning::854 tests and ALL database-layer safety controls are"
-          echo "::warning::NOT verified here. See the header of this workflow."
+          echo "::warning::CI verifies ONLY that all 222 app modules import."
+          echo "::warning::No test runs here: tests/ is not published. All 1039"
+          echo "::warning::tests and every database-layer control are verified"
+          echo "::warning::locally and on Railway. See this workflow's header."
 
-  # Dormant until a base schema is committed, then runs automatically.
+  # Dormant. Needs BOTH a base schema and a published tests/ directory; neither
+  # is in the repository today, so this never runs. Kept rather than deleted so
+  # the path back to real coverage stays written down.
   integration:
     name: full suite (needs base schema)
     runs-on: ubuntu-latest
