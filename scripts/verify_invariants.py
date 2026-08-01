@@ -96,12 +96,14 @@ def main() -> int:      # noqa: C901
     check("no unerasable verification rows", n == 0, f"{n} rows with no entity")
 
     conn.close()
+
+    print("\nMigration-set invariants")
+    check_migration_overlap()
+
     print(f"\n{'FAILED: ' + ', '.join(FAILURES) if FAILURES else 'all invariants hold'}")
     return 1 if FAILURES else 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
 
 
 def check_migration_overlap() -> None:
@@ -131,3 +133,7 @@ def check_migration_overlap() -> None:
     dupes = {k: v for k, v in seen.items() if len(v) > 1}
     check("no object defined by two migrations", not dupes,
           "; ".join(f"{k[1]} in {sorted(v)}" for k, v in dupes.items()) or "")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
