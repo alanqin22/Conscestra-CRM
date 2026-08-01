@@ -1,0 +1,15 @@
+# Test and tooling dependencies. NOT installed in production.
+#
+# pytest was missing from every requirements file, so the CI job did
+#     pip install -r requirements.txt
+#     python -m pytest tests/
+# and the second line could only ever fail with "No module named pytest".
+# Locally it worked because pytest had been installed by hand, months ago —
+# the same shape as the migration that referenced a column added by hand: the
+# environment carried state that no committed file described.
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest>=8.0
