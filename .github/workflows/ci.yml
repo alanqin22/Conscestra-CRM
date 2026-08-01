@@ -1,0 +1,53 @@
+# There was no CI. Not a weak pipeline — none at all. Every claim in this
+# repository was verified by one person running pytest against one mutable local
+# database, and 57% of the suite skipped silently without it.
+name: CI
+
+on:
+  push: { branches: [master, 'feat/**'] }
+  pull_request: { branches: [master] }
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: crmdb
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://postgres:ci@localhost:5432/crmdb
+      # The whole point: an environment-shaped skip becomes a failure here.
+      CRM_REQUIRE_DB: '1'
+      # Deterministic, non-production values for the safety parameters.
+      MEMORY_SIGNING_KEY: ci-signing-key-not-for-production
+      MEMORY_SIGNING_KEY_ID: ci1
+      DB_POOL_MAX: '8'
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: pip }
+
+      - run: pip install -r requirements.txt
+
+      # Ordered, checksummed, idempotent — the same runner used for production.
+      - name: Apply migrations
+        run: python -m scripts.migrate
+
+      - name: Verify schema is current
+        run: python -m scripts.migrate --check
+
+      - name: Test
+        run: python -m pytest tests/ -q --tb=short
+
+      # A green suite proved nothing about the DB-layer controls for months.
+      # These assert them from SQL, independent of the Python that uses them.
+      - name: Security invariants
+        run: python -m scripts.verify_invariants

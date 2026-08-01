@@ -48,6 +48,68 @@ def _sat(table: str, column: str, action: str, why: str,
     return {"table": table, "column": column, "action": action, "why": why, "via": via}
 
 
+# ── Derived-copy registry ────────────────────────────────────────────────────
+# Stores that hold a SECOND copy of personal text produced from somewhere else —
+# an index, a cache, a distillation. They are the ones governance forgets,
+# because nobody thinks of an index as a place where personal data lives.
+#
+# This registry exists because it already happened: `content_embeddings` shipped
+# holding a verbatim `snippet` of every indexed activity, case comment and
+# customer message — 7,051 rows across 228 contacts — and was absent from every
+# plan below. A completed erasure would have left the person's own words fully
+# retrievable. Retention (the next policy to land) would have missed it the same
+# way, for the same reason.
+#
+# Anything added here MUST also appear in the satellite list of every plan whose
+# entity it can carry — `test_lifecycle_covers_derived_stores` fails otherwise.
+# Deleting a derived copy is always safe: it regenerates from whatever survives.
+DERIVED_PII_STORES: Dict[str, Dict[str, str]] = {
+    "content_embeddings": {
+        "why": "semantic index stores indexed text verbatim in `snippet`",
+        "contacts": "contact_id",
+        "accounts": "account_id",
+        "regenerated_by": "app.core.content_index.reindex",
+    },
+    "memory_verifications": {
+        # FOURTH instance of this bug class, found by adversarial review. This
+        # table stores `statement_shown` — the exact claim ABOUT A PERSON that a
+        # human approved — and was in no erasure plan. It is deliberately
+        # append-only, which made it easier to argue it should survive; that
+        # argument does not survive an erasure request.
+        #
+        # REACHED BY ENTITY, NOT BY PARENT. It was previously erased by joining
+        # through customer_memories, so a verification whose memory row had been
+        # swept away was unreachable — and 10 of 10 rows in the live database
+        # were exactly that. The sweep deletes any memory with verified_by IS
+        # NULL, and re-derivation CLEARS verified_by whenever the evidence hash
+        # moves — so a memory that was verified, then re-derived, then lost its
+        # topic is swept while its verification rows remain. (`reject()` does
+        # set verified_by, so rejected memories are NOT swept; an earlier note
+        # here claimed otherwise.) `entity_id` is denormalised onto
+        # the row (sql/memory_audit_erasure.sql) so erasure never depends on a
+        # parent the system is expected to delete.
+        "why": "verification records quote the approved claim about the person",
+        "contacts": "entity_id",
+        "accounts": "entity_id",
+        "regenerated_by": "(not regenerated — audit history, erased with the person)",
+    },
+    "customer_memories": {
+        "why": "consolidated memories are derived assertions ABOUT the person; "
+               "their evidence points at records that are being erased",
+        "contacts": "entity_id",
+        "accounts": "entity_id",
+        "regenerated_by": "app.core.memory_consolidation.consolidate_entity",
+    },
+    "interaction_memories": {
+        "why": "AI-distilled summaries quote the person's own words",
+        "contacts": "entity_id",
+        "accounts": "entity_id",
+        "leads": "entity_id",
+        "regenerated_by": "app.core.conversations.distill_idle",
+    },
+}
+
+
 # ── Per-entity plan ──────────────────────────────────────────────────────────
 # pii: core columns to redact. `email` gets a unique placeholder (never NULL) so a
 # NOT NULL/UNIQUE constraint can't block an erasure.
@@ -61,6 +123,23 @@ PLANS: Dict[str, Dict[str, Any]] = {
                  "admin-defined field values are personal data with no independent basis"),
             _sat("interaction_memories", "entity_id", DELETE,
                  "AI memories quote the person's own words"),
+            _sat("memory_verifications", "entity_id", DELETE,
+                 "verification records quote the approved claim about the person"),
+            _sat("customer_memories", "entity_id", DELETE,
+                 "consolidated memories are derived assertions about the person"),
+            # The undo log holds full JSONB images of rows deleted BEFORE this
+            # request. Leaving them behind would mean an erasure completes while
+            # a mechanically restorable copy of the person's memories remains.
+            _sat("governed_deletions", "entity_id", DELETE,
+                 "undo-log images of this person's previously deleted rows"),
+            # The semantic index keeps a VERBATIM copy of the indexed text in
+            # `snippet`. Erasing the source rows while leaving the index intact
+            # would leave the person's own words retrievable after a completed
+            # erasure. Deleting the index rows is safe and self-healing: the
+            # next indexer pass re-indexes whatever survived erasure (e.g. an
+            # anonymized activity), so nothing legitimate is lost.
+            _sat("content_embeddings", "contact_id", DELETE,
+                 "semantic index stores the person's text verbatim in `snippet`"),
             _sat("crm_agent_memory", "entity_id", DELETE, "agent scratch memory"),
             _sat("channel_identities", "party_id", DELETE,
                  "phone/email/handle → party links ARE the identifiers"),
@@ -90,6 +169,11 @@ PLANS: Dict[str, Dict[str, Any]] = {
         "satellites": [
             _sat("custom_field_values", "entity_id", DELETE, "personal field values"),
             _sat("interaction_memories", "entity_id", DELETE, "AI memories"),
+            _sat("memory_verifications", "entity_id", DELETE,
+                 "verification records quote the approved claim"),
+            _sat("customer_memories", "entity_id", DELETE, "consolidated memories"),
+            _sat("governed_deletions", "entity_id", DELETE,
+                 "undo-log images of this person's previously deleted rows"),
             _sat("crm_agent_memory", "entity_id", DELETE, "agent scratch memory"),
             _sat("channel_identities", "party_id", DELETE, "identifier links"),
             _sat("identity_links", "duplicate_id", DELETE, "duplicate links"),
@@ -106,6 +190,13 @@ PLANS: Dict[str, Dict[str, Any]] = {
         "satellites": [
             _sat("custom_field_values", "entity_id", DELETE, "personal field values"),
             _sat("interaction_memories", "entity_id", DELETE, "AI memories"),
+            _sat("memory_verifications", "entity_id", DELETE,
+                 "verification records quote the approved claim"),
+            _sat("customer_memories", "entity_id", DELETE, "consolidated memories"),
+            _sat("governed_deletions", "entity_id", DELETE,
+                 "undo-log images of this person's previously deleted rows"),
+            _sat("content_embeddings", "account_id", DELETE,
+                 "semantic index stores indexed text verbatim in `snippet`"),
             _sat("identity_links", "duplicate_id", DELETE, "duplicate links"),
             _sat("invoices", "account_id", RETAIN, "financial record — legal retention"),
             _sat("payments", "account_id", RETAIN, "financial record — legal retention"),
@@ -238,6 +329,38 @@ def preview(entity: str, record_id: str) -> Dict[str, Any]:
 # ERASE (the governed executor — IRREVERSIBLE)
 # ============================================================================
 
+def _survivors_after_erase(cur, plan, entity: str, record_id: str) -> Dict[str, int]:
+    """Re-read every DELETE satellite and report anything still standing.
+
+    Verifies the OUTCOME rather than the statement's return value. Written
+    because a rule rewrote one erasure to NOTHING and nothing noticed: the
+    caller only checked `if cur.rowcount:`, so zero rows removed was
+    indistinguishable from zero rows present."""
+    left: Dict[str, int] = {}
+    for sat in plan["satellites"]:
+        if sat["action"] != DELETE or not _exists(cur, sat["table"]):
+            continue
+        t, col = sat["table"], sat["column"]
+        if sat["via"]:
+            parent, pkey, pmatch = sat["via"]
+            if not _exists(cur, parent):
+                continue
+            cur.execute(f"SELECT count(*) FROM {t} WHERE {col} IN "
+                        f"(SELECT {pkey} FROM {parent} WHERE {pmatch}=%s::uuid)",
+                        (record_id,))
+        elif not _has_col(cur, t, col):
+            continue
+        elif _has_col(cur, t, "entity"):
+            cur.execute(f"SELECT count(*) FROM {t} WHERE entity=%s AND {col}=%s::uuid",
+                        (entity, record_id))
+        else:
+            cur.execute(f"SELECT count(*) FROM {t} WHERE {col}=%s::uuid", (record_id,))
+        n = cur.fetchone()[0]
+        if n:
+            left[t] = n
+    return left
+
+
 def erase_sp(params: Dict[str, Any]) -> Dict[str, Any]:
     """Execute an erasure (called on governance approval). One transaction: any
     failure rolls the whole thing back. NO UNDO EXISTS — by design."""
@@ -253,6 +376,14 @@ def erase_sp(params: Dict[str, Any]) -> Dict[str, Any]:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            # memory_verifications is append-only and REFUSES a delete without
+            # this. SET LOCAL scopes it to this transaction, so the exemption
+            # cannot leak onto a pooled connection.
+            # One protocol for the whole transaction: suppresses the deletion
+            # undo log (an erasure must not stay recoverable) and unlocks the
+            # append-only verification trail. See sql/governed_mutation.sql.
+            cur.execute("SET LOCAL app.erasure = 'on'")
+            cur.execute("SET LOCAL app.memory_audit_erase = 'on'")
             cur.execute(f"SELECT 1 FROM {entity} WHERE {p['pk']}=%s::uuid", (record_id,))
             if not cur.fetchone():
                 raise LifecycleError(f"{entity} record '{record_id}' not found")
@@ -288,6 +419,17 @@ def erase_sp(params: Dict[str, Any]) -> Dict[str, Any]:
                                 (record_id,))
                     if cur.rowcount:
                         delinked[t] = delinked.get(t, 0) + cur.rowcount
+
+            # POST-CONDITION. rowcount cannot distinguish "nothing matched"
+            # from "the delete was silently discarded" — a DO INSTEAD NOTHING
+            # rule swallowed erasure of memory_verifications and every run
+            # reported success while the claims stayed on disk. Re-read instead
+            # of trusting the write.
+            survivors = _survivors_after_erase(cur, p, entity, record_id)
+            if survivors:
+                raise LifecycleError(
+                    "erasure incomplete — rows survived a DELETE satellite: "
+                    + ", ".join(f"{t}={n}" for t, n in survivors.items()))
 
             # Core record: redact the personal fields (row survives).
             sets, vals = [], []

@@ -130,17 +130,24 @@ def ensure_index(force: bool = False) -> Dict[str, Any]:
                            FROM knowledge_articles WHERE status='active'""")
             cols = [d[0] for d in cur.description]
             active = {r[0]: dict(zip(cols, r)) for r in cur.fetchall()}
-            cur.execute("SELECT article_uuid::text, content_hash, embedding "
+            cur.execute("SELECT article_uuid::text, content_hash, embedding, model "
                         "FROM kb_embeddings")
-            stored = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+            stored = {r[0]: (r[1], r[2], r[3]) for r in cur.fetchall()}
 
             stale = [u for u in stored if u not in active]
             if stale:
                 cur.execute("DELETE FROM kb_embeddings "
                             "WHERE article_uuid = ANY(%s::uuid[])", (stale,))
 
+            # Staleness is (content_hash, MODEL) — not the hash alone.
+            # The model column was written on insert and never compared, so
+            # changing EMBED_MODEL left every stored vector in the OLD model's
+            # space while queries were embedded in the NEW one. Cosine across
+            # two embedding spaces returns confident nonsense: no exception, no
+            # log, retrieval just quietly degrades (audit finding #3).
             todo = [u for u, a in active.items()
-                    if stored.get(u, ("",))[0] != _content_hash(a)]
+                    if (stored.get(u, ("", None, ""))[0],
+                        stored.get(u, ("", None, ""))[2]) != (_content_hash(a), EMBED_MODEL)]
             embedded = 0
             if todo:
                 batch = todo[:_EMBED_BATCH]
@@ -158,17 +165,28 @@ def ensure_index(force: bool = False) -> Dict[str, Any]:
                                  updated_at=now()""",
                             (u, _content_hash(active[u]), EMBED_MODEL,
                              json.dumps(v)))
-                        stored[u] = (_content_hash(active[u]), v)
+                        stored[u] = (_content_hash(active[u]), v, EMBED_MODEL)
                     embedded = len(batch)
         conn.commit()
 
         _VECTORS.clear()
-        for u, (_h, emb) in stored.items():
+        wrong_model = 0
+        for u, (_h, emb, mdl) in stored.items():
             if u not in active:
+                continue
+            # Never load a vector from a different model into the search space.
+            # Dropping it means a MISS (the caller falls back to FTS, visibly);
+            # keeping it would mean a confident wrong neighbour, invisibly. The
+            # next pass re-embeds it because model is now part of `todo`.
+            if mdl and mdl != EMBED_MODEL:
+                wrong_model += 1
                 continue
             vec = emb if isinstance(emb, list) else json.loads(emb)
             norm = math.sqrt(sum(x * x for x in vec)) or 1.0
             _VECTORS[u] = (vec, norm)
+        if wrong_model:
+            logger.info(f"[semantic] {wrong_model} article vector(s) are on a "
+                        f"previous model — excluded until re-embedded")
         _LAST_REFRESH = time.time()
         out.update(ok=True, cached=len(_VECTORS), refreshed=True,
                    embedded=embedded, pending=max(0, len(todo) - embedded))

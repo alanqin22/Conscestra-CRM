@@ -54,8 +54,15 @@ _BINDING = re.compile(
     r"risk[- ]free|no questions asked refund|lifetime warranty|"
     r"cannot be undersold)\b", re.IGNORECASE)
 
+# UNVERIFIED CUSTOMER-AUTHORED HISTORY / END UNVERIFIED HISTORY fence the
+# customer-memory block (customer_memory.UNTRUSTED_OPEN/CLOSE). If either marker
+# reaches an outgoing message, the model has echoed its retrieved context back
+# at the customer — which both looks broken and confirms to an attacker probing
+# with a planted payload that their text is being fed into the prompt.
 _LEAKS = re.compile(
-    r"(\[APPROVED KNOWLEDGE BASE\]|as an ai\b|system prompt|"
+    r"(\[APPROVED KNOWLEDGE BASE\]|\[UNVERIFIED CUSTOMER-AUTHORED HISTORY[^\]]*\]|"
+    r"\[END UNVERIFIED HISTORY\]|\[redacted-directive\]|"
+    r"as an ai\b|system prompt|"
     r"my instructions|<\|.*?\|>)", re.IGNORECASE)
 
 _PLACEHOLDER = re.compile(r"(\{\{[^}]{1,40}\}\}|\{[a-z_]{2,30}\}|"

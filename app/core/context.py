@@ -188,11 +188,24 @@ def _hydrate_lead(lead_id: str) -> Optional[Dict[str, Any]]:
     return pack
 
 
-def _attach_memory(pack: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _attach_memory(pack: Optional[Dict[str, Any]],
+                   topic: Optional[str] = None,
+                   audience: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Unified customer memory: recent cross-channel conversations + open
     commitments join the pack, so every consumer (A2A, email auto-reply,
     AI summaries) knows what was last said to this customer — on ANY
-    channel. Best-effort, like every other section."""
+    channel. Best-effort, like every other section.
+
+    RECENCY is unconditional. RELEVANCE (`related_history`, the semantic index)
+    is added only when the caller supplies BOTH a topic and an explicit
+    audience — the semantic corpus contains internal notes, so a caller that has
+    not declared which side of the staff/customer boundary it is on does not get
+    it. Omitting the audience under-serves; it never widens reach.
+
+    The relevance payload is DATA, not instruction. It is fenced by
+    customer_memory.render_related() before it can reach a prompt, and callers
+    must render it through `memory_prompt_block()` rather than interpolating
+    snippets themselves."""
     if pack:
         try:
             from app.core import customer_memory
@@ -202,10 +215,113 @@ def _attach_memory(pack: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
                 pack["recent_interactions"] = mem
         except Exception as exc:
             logger.debug(f"[context] customer memory skipped: {exc}")
+        if audience:
+            # CONSOLIDATED memory — counted, evidence-linked themes. Needs no
+            # topic: "this customer has raised billing 25 times" is context for
+            # any conversation, not an answer to a particular question. Same
+            # fail-closed audience rule as the index it derives from.
+            try:
+                from app.core import memory_consolidation as _mc
+                # hydrate('contact', id) returns an ACCOUNT pack with the contact
+                # kept in `via_contact`, so pack['entity_id'] is the account.
+                # Memories are consolidated per CONTACT — the person is who has
+                # a history — so ask about the contact when we have one.
+                mem_type, mem_id = (("contact", pack["via_contact"])
+                                    if pack.get("via_contact")
+                                    else (pack["entity_type"], pack["entity_id"]))
+                # THE TYPED BOUNDARY. A customer audience gets confirmed_facts()
+                # and is STRUCTURALLY INCAPABLE of receiving an inference — not
+                # discouraged from stating one, incapable of seeing it. An
+                # internal audience gets everything, with blockers attached.
+                if audience == _mc.CUSTOMER:
+                    facts = _mc.confirmed_facts(mem_type, mem_id, limit=5)
+                    if facts:
+                        pack["confirmed_facts"] = facts
+                else:
+                    themes = _mc.recall(mem_type, mem_id, audience, limit=5)
+                    if themes:
+                        pack["memory_themes"] = themes
+            except Exception as exc:
+                logger.debug(f"[context] consolidated memory skipped: {exc}")
+        if topic and audience:
+            try:
+                from app.core import customer_memory
+                rel = customer_memory.recall_relevant(
+                    pack["entity_type"], pack["entity_id"], topic,
+                    audience=audience,
+                    account_id=pack.get("account_id"))
+                if rel:
+                    pack["related_history"] = rel
+                    pack["related_history_trust"] = "untrusted_customer_authored"
+            except Exception as exc:
+                logger.debug(f"[context] semantic recall skipped: {exc}")
     return pack
 
 
-def hydrate(entity_type: str, entity_id: str) -> Optional[Dict[str, Any]]:
+def memory_prompt_block(pack: Optional[Dict[str, Any]]) -> str:
+    """The ONLY supported way to put a context pack's memory into a prompt.
+
+    Callers must not interpolate `related_history` snippets themselves: the text
+    is customer-authored, so it has to arrive fenced, labelled untrusted, and
+    with instruction-shaped markers defanged. Routing every consumer through one
+    renderer means the containment cannot be forgotten at a call site."""
+    if not pack:
+        return ""
+    from app.core import customer_memory
+    blocks: List[str] = []
+
+    # Consolidated themes are OURS — derived by a deterministic template over
+    # evidence we hold, not text a customer wrote — so they are stated plainly
+    # WITH their evidence count. They still are not facts to assert verbatim,
+    # which is why the count and date span travel with the claim.
+    # Customer audience: only confirmed facts ever reached the pack.
+    for f in (pack.get("confirmed_facts") or [])[:5]:
+        blocks.append(f"[CONFIRMED] {f['statement']} "
+                      f"(verified by {f.get('verified_by') or 'a colleague'})")
+
+    themes = pack.get("memory_themes") or []
+    if themes:
+        # ASSERTABLE vs INFERRED are rendered as two separate sections with
+        # different permissions. v1 printed them identically, so an agent had no
+        # way to tell an established fact from a model's inference and could
+        # state either to a customer as though both were confirmed.
+        facts = [t for t in themes if t.get("assertable")]
+        inferred = [t for t in themes if not t.get("assertable")]
+
+        if facts:
+            lines = ["[CONFIRMED ABOUT THIS CUSTOMER — human-verified, safe to state]"]
+            for t in facts[:5]:
+                who = t.get("verified_by") or "a colleague"
+                lines.append(f"- {t['statement']} (verified by {who})")
+            blocks.append("\n".join(lines))
+
+        if inferred:
+            lines = ["[INFERRED PATTERNS — NOT confirmed. Use to guide your "
+                     "approach; do NOT state these to the customer as fact, and "
+                     "never quote a count without checking a live record.]"]
+            for t in inferred[:5]:
+                flags = []
+                if t.get("truncated"):
+                    flags.append("count is a lower bound")
+                if t.get("evidence_missing"):
+                    flags.append(f"{t['evidence_missing']} source record(s) no "
+                                 f"longer exist")
+                if t.get("contradicts"):
+                    flags.append("contradicted by another memory")
+                note = f" [{'; '.join(flags)}]" if flags else ""
+                lines.append(f"- {t['statement']} "
+                             f"({t['evidence_count']} linked record(s), "
+                             f"certainty {t.get('effective_certainty')}){note}")
+            blocks.append("\n".join(lines))
+
+    if pack.get("related_history"):
+        blocks.append(customer_memory.render_related(pack["related_history"]))
+    return "\n".join(blocks)
+
+
+def hydrate(entity_type: str, entity_id: str,
+            topic: Optional[str] = None,
+            audience: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Compact context pack for an entity. Contacts resolve to their account.
     None when the entity doesn't exist (or the type is unsupported)."""
     et = (entity_type or "").lower()
@@ -218,7 +334,7 @@ def hydrate(entity_type: str, entity_id: str) -> Optional[Dict[str, Any]]:
         pack = _hydrate_account(r[0]["account_id"])
         if pack:
             pack["via_contact"] = entity_id
-        return _attach_memory(pack)
+        return _attach_memory(pack, topic, audience)
     if et == "account":
         pack = _hydrate_account(entity_id)
         _attach_custom_fields(pack, "accounts", entity_id)
@@ -229,7 +345,7 @@ def hydrate(entity_type: str, entity_id: str) -> Optional[Dict[str, Any]]:
         return None
     if pack:
         pack["as_of"] = datetime.now(timezone.utc).isoformat()
-    return _attach_memory(pack)
+    return _attach_memory(pack, topic, audience)
 
 
 def _attach_custom_fields(pack, entity: str, entity_id: str) -> None:

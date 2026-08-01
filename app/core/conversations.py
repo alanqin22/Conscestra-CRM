@@ -361,6 +361,93 @@ def close(conversation_id: str) -> Dict[str, Any]:
             "memory": remembered}
 
 
+IDLE_DISTILL_MINUTES = int(os.getenv("MEMORY_IDLE_DISTILL_MINUTES", "60"))
+IDLE_DISTILL_CAP = int(os.getenv("MEMORY_IDLE_DISTILL_CAP", "25"))
+
+
+def distill_idle(minutes: int = 0, cap: int = 0) -> Dict[str, Any]:
+    """Turn long-idle OPEN conversations into customer memory.
+
+    Distillation used to happen in exactly one place — `close()`. Real threads
+    mostly do not get closed: 61 of 62 conversations here are open, so the
+    entire One Customer Memory corpus was a single row. The memory writer was
+    never broken; it was starved, because its only trigger was an event that
+    rarely fires. Waiting for a close is also the wrong model — a customer who
+    went quiet three weeks ago has memory worth having NOW.
+
+    Idle-not-closed is the trigger, and the thread STAYS OPEN: closing it would
+    change agent-visible state to satisfy a background job. Re-distilling as a
+    thread grows is safe because `remember(refresh=True)` updates the same
+    session_ref row and commitment tasks are deduped.
+
+    Cheap by construction: only threads whose message_count changed since their
+    last distillation are re-processed, so a steady-state pass does no LLM work.
+    """
+    if not _flag("CONVERSATIONS_ENABLED"):
+        return {"ok": False, "skipped": "disabled"}
+    mins = int(minutes or IDLE_DISTILL_MINUTES)
+    lim = int(cap or IDLE_DISTILL_CAP)
+    out = {"ok": True, "examined": 0, "distilled": 0, "skipped": 0}
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            # A thread is due when it is external, resolved to a contact, has
+            # gone quiet, and has NEW words since its memory was last written.
+            # `observed_at` on the memory is set to the conversation's
+            # last_message_at, so "last_message_at > observed_at" IS the
+            # staleness test — no extra bookkeeping column, and a steady-state
+            # pass matches nothing and spends nothing.
+            cur.execute(
+                """SELECT cv.conversation_id::text, cv.party_id::text,
+                          cv.channel, cv.message_count, cv.last_message_at
+                     FROM conversations cv
+                     LEFT JOIN interaction_memories im
+                            ON im.session_ref = 'conv:' || cv.conversation_id::text
+                    WHERE cv.scope='external'
+                      AND cv.party_type='contact'
+                      AND cv.party_id IS NOT NULL
+                      AND cv.status <> 'closed'
+                      AND cv.message_count > 0
+                      AND COALESCE(cv.last_message_at, cv.updated_at)
+                            < now() - (%s || ' minutes')::interval
+                      AND (im.memory_id IS NULL
+                           OR im.observed_at IS NULL
+                           OR COALESCE(cv.last_message_at, cv.updated_at)
+                              > im.observed_at)
+                    ORDER BY COALESCE(cv.last_message_at, cv.updated_at) DESC
+                    LIMIT %s""",
+                (str(mins), lim))
+            due = cur.fetchall()
+    finally:
+        conn.close()
+
+    from app.core import customer_memory
+    for conv_id, party_id, channel, _msg_count, last_at in due:
+        out["examined"] += 1
+        try:
+            transcript = _transcript(conv_id)
+            if not (transcript or "").strip():
+                out["skipped"] += 1
+                continue
+            res = customer_memory.remember(
+                "contact", party_id, channel or "conversation",
+                f"conv:{conv_id}", transcript, refresh=True,
+                observed_at=last_at.isoformat() if last_at else None)
+            if res.get("ok"):
+                out["distilled"] += 1
+            else:
+                out["skipped"] += 1
+        except Exception as exc:
+            out["skipped"] += 1
+            logger.warning(f"[conversations] idle distill failed for "
+                           f"{conv_id[:8]}: {exc}")
+    if out["distilled"]:
+        logger.info(f"[conversations] distilled {out['distilled']} idle "
+                    f"conversation(s) into customer memory")
+    return out
+
+
 # ============================================================================
 # Admin endpoints
 # ============================================================================

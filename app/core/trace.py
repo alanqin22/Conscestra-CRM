@@ -86,6 +86,23 @@ def build(correlation_id: str) -> Dict[str, Any]:
             "label": f"{r[1]} ({r[2]}) step {r[3]} [{r[4]}]",
             "detail": {"outcome": r[5]}})
 
+    # Retrieval grounding — WHICH stored memories were placed in an agent's
+    # context during this play. Without it a bad reply is uninvestigable: the
+    # index is mutable, so re-running the search later does not reconstruct what
+    # the model actually saw.
+    try:
+        from app.core import grounding
+        for g in grounding.for_correlation(cid):
+            steps.append({
+                "at": g["at"], "source": "memory",
+                "label": (f"retrieved {g['result_count']} record(s) "
+                          f"[{g['audience']}] for "
+                          f"{g.get('entity_type') or '?'} — {(g.get('query') or '')[:60]}"),
+                "detail": {"audience": g["audience"], "sources": g["sources"],
+                           "entity_id": g.get("entity_id")}})
+    except Exception as exc:
+        logger.debug(f"[trace] grounding section skipped: {exc}")
+
     steps.sort(key=lambda s: s["at"])
     return {"correlation_id": cid, "entries": len(steps), "trace": steps}
 
