@@ -1,6 +1,31 @@
-# There was no CI. Not a weak pipeline — none at all. Every claim in this
-# repository was verified by one person running pytest against one mutable local
-# database, and 57% of the suite skipped silently without it.
+# CI — WHAT THIS DOES AND DOES NOT VERIFY
+#
+# The migration files live outside this repository by policy, so a runner
+# cannot build the schema: `scripts/migrate.py` finds 0 of 15 files. Even with
+# them present they are incremental against an existing CRM schema — a blank
+# Postgres fails with `relation "opportunities" does not exist`.
+#
+# So this pipeline deliberately claims LESS than the suite proves locally. It
+# runs what is meaningful without a database, and it is named so that nobody
+# mistakes a green tick for a verified safety case.
+#
+# COVERED HERE
+#   * every app module imports (222 of them) — catches syntax errors, broken
+#     imports and circular dependencies across the whole codebase
+#   * the 185 tests in the 5 test files that touch no database
+#
+# NOT COVERED HERE — verified locally against Postgres, and on Railway by
+# `python -m scripts.verify_invariants` after every deployment:
+#   * GDPR erasure actually deleting
+#   * append-only enforcement on the verification trail
+#   * assertion-gate convergence between explain() and recall()
+#   * signature validation and key rotation
+#   * the deletion undo log
+#   * 854 further tests
+#
+# TO GET FULL COVERAGE: commit a base schema (sql/00_base_schema.sql, ~1.7 MiB,
+# 200 tables + 165 stored procedures) and the 15 declared migrations. The
+# integration job below activates on its own the moment that file exists.
 name: CI
 
 on:
@@ -8,8 +33,76 @@ on:
   pull_request: { branches: [master] }
 
 jobs:
-  test:
+  checks:
+    name: import + database-free tests
     runs-on: ubuntu-latest
+    outputs:
+      # `hashFiles()` is not available in a job-level `if:` — only inside
+      # steps. Detecting here and exporting the answer is the supported way to
+      # gate the job below.
+      has_base_schema: ${{ steps.detect_schema.outputs.present }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: pip }
+
+      - name: Detect base schema
+        id: detect_schema
+        run: |
+          if [ -f sql/00_base_schema.sql ]; then
+            echo "present=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # Broadest signal available without a schema: if a module fails to
+      # import, everything downstream is meaningless anyway.
+      - name: Import every app module
+        run: |
+          python - <<'PY'
+          import importlib, pkgutil, sys
+          import app
+          bad = []
+          mods = [m.name for m in pkgutil.walk_packages(app.__path__, "app.")]
+          for name in mods:
+              try:
+                  importlib.import_module(name)
+              except Exception as exc:
+                  bad.append(f"{name}: {type(exc).__name__}: {exc}")
+          print(f"imported {len(mods)} modules, {len(bad)} failures")
+          for b in bad:
+              print("  FAIL", b)
+          sys.exit(1 if bad else 0)
+          PY
+
+      # Enumerated, not pattern-matched. A test file added later is NOT picked
+      # up silently — whether it needs a database is a judgement, and the whole
+      # reason this job is scoped is that the suite quietly skipped 57% of
+      # itself when nobody was making that judgement explicitly.
+      - name: Database-free tests
+        run: |
+          python -m pytest -q \
+            tests/test_auth_expiry_reporting.py \
+            tests/test_llm_failover.py \
+            tests/test_release_guard.py \
+            tests/test_voice_and_mcp.py \
+            tests/test_voice_transfer.py
+
+      - name: State what was not verified
+        if: always()
+        run: |
+          echo "::warning::CI covers imports + 185 database-free tests."
+          echo "::warning::854 tests and ALL database-layer safety controls are"
+          echo "::warning::NOT verified here. See the header of this workflow."
+
+  # Dormant until a base schema is committed, then runs automatically.
+  integration:
+    name: full suite (needs base schema)
+    runs-on: ubuntu-latest
+    needs: checks
+    if: needs.checks.outputs.has_base_schema == 'true'
     services:
       postgres:
         image: postgres:16
@@ -20,34 +113,20 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 5s
           --health-timeout 5s --health-retries 10
-
     env:
       DATABASE_URL: postgresql://postgres:ci@localhost:5432/crmdb
-      # The whole point: an environment-shaped skip becomes a failure here.
+      # An environment-shaped skip becomes a failure here.
       CRM_REQUIRE_DB: '1'
-      # Deterministic, non-production values for the safety parameters.
       MEMORY_SIGNING_KEY: ci-signing-key-not-for-production
       MEMORY_SIGNING_KEY_ID: ci1
       DB_POOL_MAX: '8'
-
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11', cache: pip }
-
       - run: pip install -r requirements.txt -r requirements-dev.txt
-
-      # Ordered, checksummed, idempotent — the same runner used for production.
-      - name: Apply migrations
-        run: python -m scripts.migrate
-
-      - name: Verify schema is current
-        run: python -m scripts.migrate --check
-
-      - name: Test
-        run: python -m pytest tests/ -q --tb=short
-
-      # A green suite proved nothing about the DB-layer controls for months.
-      # These assert them from SQL, independent of the Python that uses them.
-      - name: Security invariants
-        run: python -m scripts.verify_invariants
+      - run: psql "$DATABASE_URL" -f sql/00_base_schema.sql
+      - run: python -m scripts.migrate
+      - run: python -m scripts.migrate --check
+      - run: python -m pytest tests/ -q --tb=short
+      - run: python -m scripts.verify_invariants
