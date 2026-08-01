@@ -414,6 +414,76 @@ def _run_behavior_evals() -> None:
         logger.error(f"[Evals] run failed: {exc}", exc_info=True)
 
 
+def _run_idle_distill_pass() -> None:
+    """Scheduled job: turn long-idle OPEN conversations into customer memory.
+
+    Distillation previously had exactly ONE trigger — conversation close — and
+    threads mostly do not get closed (61 of 62 were open), so the entire memory
+    corpus was a single row. The writer was starved, not broken. Threads stay
+    OPEN; only the memory is written. Re-distills only when a thread has new
+    words since its memory was last written, so a steady-state pass spends no
+    LLM budget."""
+    try:
+        from app.core.conversations import distill_idle
+        res = distill_idle()
+        if res.get("distilled"):
+            logger.info(f"[Memory] distilled {res['distilled']} idle "
+                        f"conversation(s) (examined {res['examined']})")
+    except Exception as exc:
+        logger.error(f"[Memory] idle distill failed: {exc}", exc_info=True)
+
+
+def _run_retention_pass() -> None:
+    """Scheduled job: expire data past its retention period. Self-gates on
+    RETENTION_ENABLED (off by default — this DELETES). Only stores with an
+    explicit policy and basis are touched; financial and audit records have no
+    policy and are therefore untouchable."""
+    try:
+        from app.core.retention import purge
+        res = purge()
+        if res.get("total"):
+            logger.info(f"[Retention] purged {res['total']} expired row(s)")
+    except Exception as exc:
+        logger.error(f"[Retention] purge failed: {exc}", exc_info=True)
+
+
+def _run_memory_consolidation_pass() -> None:
+    """Scheduled job: turn a customer's indexed records into COUNTED, evidence-
+    linked memories (Customer Memory v1). Retrieval can find records about
+    pricing; only consolidation can say the customer raised it four times.
+    Cheap in steady state — a theme whose evidence_hash is unchanged is not
+    rewritten."""
+    try:
+        from app.core.memory_consolidation import consolidate_pass
+        res = consolidate_pass()
+        if res.get("written") or res.get("dropped"):
+            logger.info(f"[Memory] consolidated {res['entities']} customer(s): "
+                        f"{res['written']} written, {res.get('dropped',0)} dropped")
+    except Exception as exc:
+        logger.error(f"[Memory] consolidation failed: {exc}", exc_info=True)
+
+
+def _run_content_index_pass() -> None:
+    """Scheduled job: keep the semantic index over the CRM's unstructured text
+    current (audit #2). Incremental and budgeted — a pass embeds at most
+    CONTENT_INDEX_BATCH rows, and re-embeds only records whose
+    (content_hash, model, dims) changed, so steady-state passes are nearly free
+    and a model change re-indexes the corpus over subsequent passes with no
+    manual step. Runs often because the value is freshness: a call logged this
+    morning should be findable by meaning this afternoon."""
+    try:
+        from app.core.content_index import reindex
+        res = reindex()
+        if res.get("embedded"):
+            logger.info(f"[ContentIndex] embedded {res['embedded']} record(s), "
+                        f"{res.get('pending', 0)} pending")
+        elif not res.get("ok") and res.get("reason") != "disabled":
+            logger.warning(f"[ContentIndex] pass incomplete: "
+                           f"{res.get('error') or 'embedding unavailable'}")
+    except Exception as exc:
+        logger.error(f"[ContentIndex] pass failed: {exc}", exc_info=True)
+
+
 def _run_kb_draft_pass() -> None:
     """Scheduled job (nightly): the knowledge loop's mining side — pair
     resolved support threads with their human resolution, LLM-draft articles,
@@ -788,6 +858,52 @@ async def lifespan(app: FastAPI):
         # Knowledge-loop mining — nightly 23:00 ET: resolved support threads →
         # LLM-drafted article proposals (governed kb.publish). Self-gates on
         # KB_DRAFT_ENABLED; publishes nothing without an approval.
+        # Idle-conversation distillation — hourly. Feeds One Customer Memory,
+        # which the content index and every agent recall path read from. Runs
+        # BEFORE the content-index pass conceptually: memories written here are
+        # picked up as indexable content on a later sweep.
+        _scheduler.add_job(
+            _run_idle_distill_pass,
+            trigger=IntervalTrigger(hours=1),
+            id="memory_idle_distill",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=1800,
+        )
+        # Retention — daily at 03:30, off-peak. No-op unless RETENTION_ENABLED=1.
+        _scheduler.add_job(
+            _run_retention_pass,
+            trigger=CronTrigger(hour=3, minute=30),
+            id="retention_purge",
+            replace_existing=True,
+            misfire_grace_time=7200,
+        )
+        # Memory consolidation — every 6h, after the index has had time to
+        # absorb the day's records. Themes change slowly; running it often would
+        # spend clustering effort to rewrite the same statements.
+        _scheduler.add_job(
+            _run_memory_consolidation_pass,
+            trigger=IntervalTrigger(hours=6),
+            id="memory_consolidation",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+        # Semantic index over CRM unstructured text — every 20 minutes. Cheap
+        # when nothing changed (two catalogue reads, no API call); bounded when
+        # it has (CONTENT_INDEX_BATCH rows per pass). coalesce+max_instances=1
+        # so a slow pass can never stack on itself and double-spend embeddings.
+        _scheduler.add_job(
+            _run_content_index_pass,
+            trigger=IntervalTrigger(minutes=20),
+            id="content_index_pass",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=600,
+        )
         _scheduler.add_job(
             _run_kb_draft_pass,
             trigger=CronTrigger(hour=23, minute=0),
@@ -1358,6 +1474,47 @@ app.include_router(knowledge_router, dependencies=_ADMIN)
 # -- Semantic retrieval (embedding index over the KB; rag_block fuses FTS+meaning)
 from app.core.semantic import router as semantic_router
 app.include_router(semantic_router, dependencies=_ADMIN)
+
+# -- Semantic index over the CRM's own unstructured text — activities, cases,
+#    case comments, conversation messages, interaction memories (audit #2).
+#    Admin-gated: this index contains INTERNAL notes. Customer-facing retrieval
+#    never comes through here; it goes via customer_memory.recall_relevant,
+#    which passes the verified customer's own scope + a 'customer' audience that
+#    content_index.search enforces fail-closed.
+from app.core.content_index import router as content_index_router
+app.include_router(content_index_router, dependencies=_ADMIN)
+
+# -- Customer Memory v1: consolidated, evidence-linked themes derived from the
+#    index. Admin-gated; customer-facing recall goes through the audience-gated
+#    memory_consolidation.recall(), never this router.
+from app.core.memory_consolidation import router as customer_memories_router
+app.include_router(customer_memories_router, dependencies=_ADMIN)
+
+# -- Retention (#7): time-based expiry. DELETES data, so it is OFF by default
+#    (RETENTION_ENABLED) and preview() is the approval surface.
+from app.core.retention import router as retention_router
+app.include_router(retention_router, dependencies=_ADMIN)
+
+# -- Source freshness (#8): what "as of" is allowed to claim. A briefing can be
+#    internally consistent and still describe three-day-old facts.
+from app.core.data_sources import router as data_sources_router
+app.include_router(data_sources_router, dependencies=_ADMIN)
+
+# -- Deploy state: which migrations ran, and do all replicas apply the SAME
+#    safety policy? Config divergence between replicas was undetectable.
+from app.core.deploy_state import router as deploy_state_router
+app.include_router(deploy_state_router, dependencies=_ADMIN)
+
+# -- Assurance: shadow mode (what an agent WOULD say), calibration of the
+#    confidence model against human judgement, and safety-path metrics
+#    including verification-bias detection.
+from app.core.memory_assurance import router as memory_assurance_router
+app.include_router(memory_assurance_router, dependencies=_ADMIN)
+
+# -- Verification throughput: the capacity plan that turns "human review does
+#    not scale" into a staffing figure, plus the sampled-review work queue.
+from app.core.verification_policy import router as verification_policy_router
+app.include_router(verification_policy_router, dependencies=_ADMIN)
 
 # -- Correlation-id trace (one id → the whole play across a2a/events/approvals)
 from app.core.trace import router as trace_router

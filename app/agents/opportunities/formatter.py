@@ -868,16 +868,24 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
         wr = report_data['win_rate']
         s  = wr.get('summary') or {}
 
+        # Key names and labels come from the Metric Registry (metrics.py), which
+        # the SP now sources via fn_metric_win_rate. Two DIFFERENT metrics used to
+        # share the label "Win Rate" here — 'Win Rate (by Count)' 89.6% next to
+        # 'Win Rate (by Value)' 98.9% — and only the first was reproducible from
+        # /metrics or Explore. They are now named as the registry names them.
         out.append('#### Key Metrics')
         out.append('')
         out.append(_md_header(['Metric', 'Value']))
-        out.append(_md_row(['Won',                 int(_safe_num(s.get('won_count')))]))
-        out.append(_md_row(['Lost',                int(_safe_num(s.get('lost_count')))]))
-        out.append(_md_row(['Total Closed',        int(_safe_num(s.get('total_count')))]))
-        out.append(_md_row(['Win Rate (by Count)', f"{_safe_num(s.get('win_rate_count_pct')):.1f}%"]))
-        out.append(_md_row(['Won Amount',          _fmt_currency(s.get('won_amount', 0))]))
-        out.append(_md_row(['Lost Amount',         _fmt_currency(s.get('lost_amount', 0))]))
-        out.append(_md_row(['Win Rate (by Value)', f"{_safe_num(s.get('win_rate_amount_pct')):.1f}%"]))
+        out.append(_md_row(['Won',               int(_safe_num(s.get('won_count')))]))
+        out.append(_md_row(['Lost',              int(_safe_num(s.get('lost_count')))]))
+        out.append(_md_row(['Total Decided',     int(_safe_num(s.get('decided_count')))]))
+        out.append(_md_row(['Win Rate',          f"{_safe_num(s.get('win_rate')):.1f}%"]))
+        out.append(_md_row(['Won Amount',        _fmt_currency(s.get('won_amount', 0))]))
+        out.append(_md_row(['Lost Amount',       _fmt_currency(s.get('lost_amount', 0))]))
+        out.append(_md_row(['Revenue Win Rate',  f"{_safe_num(s.get('win_rate_value')):.1f}%"]))
+        out.append('')
+        out.append('_Win Rate is deal-weighted; Revenue Win Rate is dollar-weighted. '
+                   'Both count a deal on its decision date._')
         out.append('')
 
         def _win_rate_table(title: str, data: list, name_col: str, name_label: str):
@@ -885,16 +893,16 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
                 return
             out.append(f'#### {title}')
             out.append('')
-            out.append(_md_header([name_label, 'Won', 'Lost', 'Win Rate %', 'Won Amount', 'Lost Amount', 'Win Rate % (Value)']))
+            out.append(_md_header([name_label, 'Won', 'Lost', 'Win Rate %', 'Won Amount', 'Decided Amount', 'Revenue Win Rate %']))
             for r in data:
                 out.append(_md_row([
                     r.get(name_col) or 'N/A',
                     int(_safe_num(r.get('won_count'))),
                     int(_safe_num(r.get('lost_count'))),
-                    f"{_safe_num(r.get('win_rate_count_pct')):.1f}%",
+                    f"{_safe_num(r.get('win_rate')):.1f}%",
                     _fmt_currency(r.get('won_amount', 0)),
-                    _fmt_currency(r.get('lost_amount', 0)),
-                    f"{_safe_num(r.get('win_rate_amount_pct')):.1f}%",
+                    _fmt_currency(r.get('decided_amount', 0)),
+                    f"{_safe_num(r.get('win_rate_value')):.1f}%",
                 ]))
             out.append('')
 

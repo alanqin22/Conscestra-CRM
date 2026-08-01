@@ -39,7 +39,7 @@ import datetime as _dt
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter
 
@@ -47,18 +47,46 @@ logger = logging.getLogger("metrics")
 
 
 # ============================================================================
-# Decision-event timestamp (shared with step 1). Prefer opportunities.decided_at;
-# fall back to updated_at on a pre-migration schema. Resolved once per process.
+# Decision-event timestamp. Prefer opportunities.decided_at; fall back to
+# close_date on a pre-migration schema. Resolved once per process.
 # Alias `o` — the opportunities metrics use base "opportunities o".
+#
+# The fallback is close_date, NOT updated_at (changed 2026-07-30). updated_at is
+# the LAST EDIT time: with it, "win rate last 7 days" silently meant "deals
+# EDITED in the last 7 days", so detect_win_rate_drop fired on editing activity
+# rather than on outcomes. close_date is at least a decision-shaped date. The
+# migration backfills decided_at so the fallback should reach ~0 rows — see
+# sql/metric_registry_migration.sql.
 # ============================================================================
 _DECISION_TS: Optional[str] = None
 
+# The canonical decision timestamp, as SQL. Kept as a module constant so the
+# SQL generator (metric_sql.py) emits the SAME expression the Python path uses.
+#
+# The fallback cast is `::timestamp AT TIME ZONE 'UTC'`, NOT `::timestamptz`.
+# A plain date→timestamptz cast reads the session TimeZone, so Postgres marks it
+# STABLE and REFUSES to build an index on it ("functions in index expression
+# must be marked IMMUTABLE"). Anchoring the zone as a literal makes it immutable,
+# which is what lets idx_opportunities_decided_ts exist AND match this predicate.
+# Same string in Python, in the generated view, and in the index — a mismatch
+# would silently cost the index and re-open the drift this module closes.
+DECISION_TS_SQL = "COALESCE(o.decided_at, o.close_date::timestamp AT TIME ZONE 'UTC')"
+DECISION_TS_FALLBACK_SQL = "(o.close_date::timestamp AT TIME ZONE 'UTC')"
+
 
 def decision_ts() -> str:
+    """The canonical decision-date SQL expression, probed once.
+
+    CACHING RULE: the POSITIVE result is cached forever (a column does not
+    disappear), the NEGATIVE result is NOT. Caching the fallback meant a worker
+    that started before sql/metric_registry_migration.sql ran would keep using
+    close_date for its whole lifetime — so during a rolling deploy, replicas
+    could answer the same question on two different time axes with no restart
+    scheduled anywhere. Re-probing on the fallback path costs one cheap
+    catalogue query per call until the migration lands, then never again."""
     global _DECISION_TS
     if _DECISION_TS is not None:
         return _DECISION_TS
-    expr = "o.updated_at"
     try:
         from app.core.database import get_connection
         conn = get_connection()
@@ -67,13 +95,13 @@ def decision_ts() -> str:
                 cur.execute("SELECT 1 FROM information_schema.columns "
                             "WHERE table_name='opportunities' AND column_name='decided_at'")
                 if cur.fetchone():
-                    expr = "COALESCE(o.decided_at, o.updated_at)"
+                    _DECISION_TS = DECISION_TS_SQL      # cache the positive only
+                    return _DECISION_TS
         finally:
             conn.close()
     except Exception as exc:
-        logger.debug(f"[metrics] decided_at probe failed, using updated_at: {exc}")
-    _DECISION_TS = expr
-    return expr
+        logger.debug(f"[metrics] decided_at probe failed, using close_date: {exc}")
+    return DECISION_TS_FALLBACK_SQL
 
 
 # ============================================================================
@@ -95,9 +123,22 @@ class Metric:
     # ratio:
     numerator_cond: Optional[str] = None
     denominator_cond: Optional[str] = None
+    # What a ratio COUNTS. Default 'count(*)' = one vote per row (deal-weighted).
+    # Override with 'sum(o.amount)' for a value-weighted ratio (win_rate_value).
+    #
+    # MUST be a BARE aggregate call — no COALESCE/ROUND wrapper. compute() emits
+    # `COALESCE(<ratio_agg> FILTER (WHERE cond), 0)`, and Postgres only accepts
+    # FILTER directly after an aggregate; wrapping it here is a syntax error at
+    # query time (caught by tests/test_metric_registry.py).
+    ratio_agg: str = "count(*)"
     # sum / avg / count:
     agg_expr: Optional[str] = None    # the summed/averaged expression ('*' implied for count)
     row_cond: Optional[str] = None    # optional row filter (e.g. only closed_won)
+    # Which external systems feed this metric (data_sources.source_key). Lets a
+    # freshness caveat name only the sources that actually matter: warning about
+    # a stale accounting sync on a metric accounting does not feed trains people
+    # to ignore the warning, which is worse than not showing one.
+    sources: Tuple[str, ...] = ()
 
     @property
     def additive(self) -> bool:
@@ -129,14 +170,40 @@ REGISTRY: Dict[str, Metric] = {
         name="win_rate", label="Win Rate", entity="opportunities",
         base="opportunities o", unit="percentage", kind="ratio",
         time_field="decided",
+        # Semantically redundant (the denominator is the same set), but it puts
+        # the status predicate in WHERE rather than only inside FILTER — which is
+        # what lets the planner use the partial idx_opportunities_decided_ts.
+        # Without it this query seq-scanned while the SQL path used the index.
+        base_where=WIN_DEN_COND,
         numerator_cond=WIN_NUM_COND, denominator_cond=WIN_DEN_COND,
-        definition=("Closed-won ÷ (closed-won + closed-lost) opportunities. "
-                    "Excludes open deals. Time-scoped by decision date (decided_at)."),
+        definition=("Closed-won ÷ (closed-won + closed-lost) opportunities, counted "
+                    "as DEALS. Excludes open deals. Time-scoped by decision date "
+                    "(decided_at). `status` is the authoritative outcome column — "
+                    "`stage` is pipeline position only, so closed_paid is already "
+                    "status='closed_won'."),
+    ),
+    # The dollar-weighted twin. Registered SEPARATELY and labelled distinctly
+    # because it answers a different question: win_rate says "we win 9 of 10
+    # deals", win_rate_value says "we win 99% of the dollars we compete for".
+    # Both were previously rendered under the single label "Win Rate" (the SP's
+    # win_rate_count_pct / win_rate_amount_pct) with no way for /metrics or
+    # Explore to reproduce the second one.
+    "win_rate_value": Metric(
+        name="win_rate_value", label="Revenue Win Rate", entity="opportunities",
+        base="opportunities o", unit="percentage", kind="ratio",
+        time_field="decided",
+        base_where=WIN_DEN_COND,          # index-enabling; see win_rate above
+        numerator_cond=WIN_NUM_COND, denominator_cond=WIN_DEN_COND,
+        ratio_agg="sum(o.amount)",
+        definition=("Closed-won AMOUNT ÷ (closed-won + closed-lost) amount. The "
+                    "same win/loss definition as win_rate, weighted by deal value "
+                    "instead of deal count. A ratio — never sum it across groups."),
     ),
     "won_revenue": Metric(
         name="won_revenue", label="Won Revenue", entity="opportunities",
         base="opportunities o", unit="currency", kind="sum",
         time_field="decided",
+        base_where=WIN_DEN_COND,          # index-enabling; won ⊂ decided, so a no-op
         agg_expr="o.amount", row_cond=WIN_NUM_COND,
         definition=("Sum of amount on closed-won opportunities, by decision date "
                     "(decided_at). Additive — safe to total across groups."),
@@ -157,24 +224,59 @@ REGISTRY: Dict[str, Metric] = {
 # expression T, each name maps to a SQL predicate (or None for all_time).
 # ============================================================================
 
+# The reporting calendar. date_trunc() on a timestamptz resolves month/quarter/
+# year boundaries in the SESSION's TimeZone, so "this month" silently meant
+# different things on different connections: a deal decided 2026-08-01 02:00 UTC
+# buckets into AUGUST under TimeZone=UTC and into JULY under America/New_York.
+# One definition string, two meanings — the property this registry exists to
+# guarantee, broken by session state rather than by a second formula.
+#
+# Anchoring the zone in the expression makes every bucket deterministic
+# regardless of who connects. Default matches the scheduler's America/New_York
+# so reported months line up with the business day the rest of the platform uses.
+METRICS_TZ = os.getenv("METRICS_TZ", "America/New_York")
+
+
+def _cal(expr: str) -> str:
+    """A timestamp expression resolved in the reporting calendar's zone."""
+    return f"(({expr}) AT TIME ZONE '{METRICS_TZ}')"
+
+
 def _windows(t: str) -> Dict[str, Optional[str]]:
+    # NOT-YET-HAPPENED GUARD (added 2026-07-30 — found while unifying the SQL
+    # surfaces). Every forward-open window used to be `{t} >= now() - N days`
+    # with NO upper bound, so any record carrying a FUTURE decision date fell
+    # into it. That is not hypothetical: 45 opportunities here are marked decided
+    # with dates up to 2.5 months ahead (closed deals whose close_date is a
+    # future forecast date, which decided_at falls back to). last_30d counted
+    # 352 deals where the bounded SQL path counted 307 — the 45 were the gap.
+    #
+    # It also made period-over-period comparisons ASYMMETRIC: prev_7d was bounded
+    # on both sides while last_7d was not, so detect_win_rate_drop compared a
+    # window with a future tail against one without. An outcome you cannot have
+    # observed yet must never land in a trailing window.
+    #
+    # all_time deliberately keeps them: they ARE won/lost deals, just misdated.
+    # sql/metric_registry_migration.sql exposes them via
+    # v_opportunity_future_decision for repair.
+    now = f" AND {t} <= now()"
     return {
         "all_time":     None,
-        "last_7d":      f"{t} >= now() - interval '7 days'",
+        "last_7d":      f"{t} >= now() - interval '7 days'{now}",
         "prev_7d":      f"{t} >= now() - interval '14 days' AND {t} < now() - interval '7 days'",
-        "last_14d":     f"{t} >= now() - interval '14 days'",
-        "last_30d":     f"{t} >= now() - interval '30 days'",
+        "last_14d":     f"{t} >= now() - interval '14 days'{now}",
+        "last_30d":     f"{t} >= now() - interval '30 days'{now}",
         "prev_30d":     f"{t} >= now() - interval '60 days' AND {t} < now() - interval '30 days'",
-        "last_90d":     f"{t} >= now() - interval '90 days'",
-        "this_month":   f"date_trunc('month', {t})   = date_trunc('month', now())",
-        "this_quarter": f"date_trunc('quarter', {t}) = date_trunc('quarter', now())",
-        "this_year":    f"date_trunc('year', {t})    = date_trunc('year', now())",
-        "qtd":          f"{t} >= date_trunc('quarter', now())",
-        "ytd":          f"{t} >= date_trunc('year', now())",
+        "last_90d":     f"{t} >= now() - interval '90 days'{now}",
+        "this_month":   f"date_trunc('month', {_cal(t)})   = date_trunc('month', {_cal('now()')}){now}",
+        "this_quarter": f"date_trunc('quarter', {_cal(t)}) = date_trunc('quarter', {_cal('now()')}){now}",
+        "this_year":    f"date_trunc('year', {_cal(t)})    = date_trunc('year', {_cal('now()')}){now}",
+        "qtd":          f"{_cal(t)} >= date_trunc('quarter', {_cal('now()')}){now}",
+        "ytd":          f"{_cal(t)} >= date_trunc('year', {_cal('now()')}){now}",
         # ── period-over-period partners (MoM / QoQ / YoY) ────────────────────
-        "prev_month":   f"date_trunc('month', {t}) = date_trunc('month', now() - interval '1 month')",
-        "prev_quarter": f"date_trunc('quarter', {t}) = date_trunc('quarter', now() - interval '3 months')",
-        "prev_year":    f"date_trunc('year', {t}) = date_trunc('year', now() - interval '1 year')",
+        "prev_month":   f"date_trunc('month', {_cal(t)}) = date_trunc('month', {_cal("now() - interval '1 month'")})",
+        "prev_quarter": f"date_trunc('quarter', {_cal(t)}) = date_trunc('quarter', {_cal("now() - interval '3 months'")})",
+        "prev_year":    f"date_trunc('year', {_cal(t)}) = date_trunc('year', {_cal("now() - interval '1 year'")})",
         # same slice one year back — the correct YoY partner for a seasonal metric
         "same_month_last_year":   f"date_trunc('month', {t}) = "
                                   f"date_trunc('month', now() - interval '1 year')",
@@ -253,6 +355,57 @@ def _run(sql: str) -> Dict[str, Any]:
 # COMPUTE — one metric, one window
 # ============================================================================
 
+def window_predicate(name: str, window: str) -> str:
+    """The registry's OWN time predicate for (metric, window), as SQL.
+
+    For a caller that must hand-write a related query (a COUNT DISTINCT the
+    registry does not model, say) and needs the SAME window semantics. Returns
+    'TRUE' for all_time so it is always safe to AND into a WHERE clause."""
+    return _window_pred(_metric(name), window) or "TRUE"
+
+
+def compute_sql(name: str, window: str = "all_time",
+                extra_where: Optional[str] = None) -> Tuple[str, Metric]:
+    """The SQL for (metric, window), plus the Metric, WITHOUT executing it.
+
+    Lets a caller that already holds a cursor run a registered metric on its own
+    connection — so, for example, every figure in one CEO briefing comes from a
+    single database snapshot instead of one transaction per metric. Pair it with
+    `value_from_row` so the arithmetic is shared too; a caller that re-derives
+    the value itself has re-introduced exactly the drift this module exists to
+    prevent."""
+    m = _metric(name)
+    guards = _where(m.base_where, _window_pred(m, window), extra_where)
+
+    if m.kind == "ratio":
+        return ((f"SELECT COALESCE({m.ratio_agg} FILTER (WHERE {m.numerator_cond}), 0)   AS numerator, "
+                 f"COALESCE({m.ratio_agg} FILTER (WHERE {m.denominator_cond}), 0) AS denominator "
+                 f"FROM {m.base} {guards}"), m)
+
+    agg = {"sum": "sum", "avg": "avg", "count": "count"}[m.kind]
+    inner = "*" if m.kind == "count" else m.agg_expr
+    expr = f"{agg}({inner})"
+    if m.row_cond:
+        expr += f" FILTER (WHERE {m.row_cond})"
+    if m.kind in ("sum", "count"):
+        expr = f"COALESCE({expr}, 0)"
+    return (f"SELECT {expr} AS value FROM {m.base} {guards}", m)
+
+
+def value_from_row(m: Metric, row: Any) -> Optional[float]:
+    """Interpret a compute_sql row the way compute() does. `row` may be a dict
+    (RealDictCursor) or a plain tuple, so any cursor style works."""
+    def _col(key: str, idx: int):
+        if isinstance(row, dict):
+            return row.get(key)
+        return row[idx] if row and len(row) > idx else None
+
+    if m.kind == "ratio":
+        return _ratio_value(_col("numerator", 0), _col("denominator", 1), m.unit)
+    v = _col("value", 0)
+    return round(float(v), 2) if v is not None else (0.0 if m.additive else None)
+
+
 def compute(name: str, window: str = "all_time",
             extra_where: Optional[str] = None) -> Dict[str, Any]:
     """Compute `name` over `window`. Returns a self-describing result carrying
@@ -260,29 +413,18 @@ def compute(name: str, window: str = "all_time",
     trusted predicate a governed caller may supply (step 3 row-scoping); it is
     never user/model text."""
     m = _metric(name)
-    pred = _window_pred(m, window)
-    guards = _where(m.base_where, pred, extra_where)
+    sql, _ = compute_sql(name, window, extra_where)
 
     if m.kind == "ratio":
-        sql = (f"SELECT count(*) FILTER (WHERE {m.numerator_cond})   AS numerator, "
-               f"count(*) FILTER (WHERE {m.denominator_cond}) AS denominator "
-               f"FROM {m.base} {guards}")
         r = _run(sql)
         num, den = r.get("numerator"), r.get("denominator")
-        value = _ratio_value(num, den, m.unit)
-        extra = {"numerator": int(num or 0), "denominator": int(den or 0)}
-    else:  # sum | count | avg
-        agg = {"sum": "sum", "avg": "avg", "count": "count"}[m.kind]
-        inner = "*" if m.kind == "count" else m.agg_expr
-        expr = f"{agg}({inner})"
-        if m.row_cond:
-            expr += f" FILTER (WHERE {m.row_cond})"
-        if m.kind in ("sum", "count"):
-            expr = f"COALESCE({expr}, 0)"
-        sql = f"SELECT {expr} AS value FROM {m.base} {guards}"
-        r = _run(sql)
-        v = r.get("value")
-        value = round(float(v), 2) if v is not None else (0.0 if m.additive else None)
+        value = value_from_row(m, r)
+        # A value-weighted ratio's num/den are money, not row counts — don't
+        # truncate them to int (that silently dropped cents on win_rate_value).
+        cast = int if m.ratio_agg == "count(*)" else (lambda v: round(float(v), 2))
+        extra = {"numerator": cast(num or 0), "denominator": cast(den or 0)}
+    else:  # sum | count | avg — sql already built by compute_sql above
+        value = value_from_row(m, _run(sql))
         extra = {}
 
     return {
@@ -311,16 +453,17 @@ def compare(name: str, window_a: str, window_b: str,
     if m.kind == "ratio":
         sql = (
             f"SELECT "
-            f"count(*) FILTER (WHERE {m.numerator_cond}   AND {pa}) AS num_a, "
-            f"count(*) FILTER (WHERE {m.denominator_cond} AND {pa}) AS den_a, "
-            f"count(*) FILTER (WHERE {m.numerator_cond}   AND {pb}) AS num_b, "
-            f"count(*) FILTER (WHERE {m.denominator_cond} AND {pb}) AS den_b "
+            f"COALESCE({m.ratio_agg} FILTER (WHERE {m.numerator_cond}   AND {pa}), 0) AS num_a, "
+            f"COALESCE({m.ratio_agg} FILTER (WHERE {m.denominator_cond} AND {pa}), 0) AS den_a, "
+            f"COALESCE({m.ratio_agg} FILTER (WHERE {m.numerator_cond}   AND {pb}), 0) AS num_b, "
+            f"COALESCE({m.ratio_agg} FILTER (WHERE {m.denominator_cond} AND {pb}), 0) AS den_b "
             f"FROM {m.base} {scope}")
         r = _run(sql)
+        cast = int if m.ratio_agg == "count(*)" else (lambda v: round(float(v), 2))
         a = {"value": _ratio_value(r.get("num_a"), r.get("den_a"), m.unit),
-             "numerator": int(r.get("num_a") or 0), "denominator": int(r.get("den_a") or 0)}
+             "numerator": cast(r.get("num_a") or 0), "denominator": cast(r.get("den_a") or 0)}
         b = {"value": _ratio_value(r.get("num_b"), r.get("den_b"), m.unit),
-             "numerator": int(r.get("num_b") or 0), "denominator": int(r.get("den_b") or 0)}
+             "numerator": cast(r.get("num_b") or 0), "denominator": cast(r.get("den_b") or 0)}
     else:
         agg = {"sum": "sum", "avg": "avg", "count": "count"}[m.kind]
         inner = "*" if m.kind == "count" else m.agg_expr
@@ -465,6 +608,54 @@ router = APIRouter(tags=["metrics"])
 def metrics_catalog():
     """The canonical metric registry + valid time windows."""
     return catalog()
+
+
+def compute_many(names: List[str], window: str = "all_time",
+                 extra_where: Optional[str] = None) -> Dict[str, Any]:
+    """Several metrics from ONE database snapshot.
+
+    Reading metrics one at a time gives one snapshot each — under READ COMMITTED
+    every statement sees a different state — so a dashboard showing win rate,
+    revenue and conversion side by side could show three moments while claiming
+    a single `as_of`. That is the same internal inconsistency the CEO briefing
+    had, one layer up, and it cannot be fixed client-side: six HTTP calls are
+    six snapshots no matter how they are batched in the UI.
+
+    `as_of` here is therefore a real claim rather than a decoration."""
+    from app.core.semantic_query import snapshot
+
+    out: Dict[str, Any] = {}
+    with snapshot():
+        for n in names:
+            try:
+                out[n] = compute(n, window, extra_where)
+            except MetricError as exc:
+                out[n] = {"metric": n, "error": str(exc)}
+    return {
+        "window": window,
+        "as_of": _dt.datetime.utcnow().isoformat() + "Z",
+        "snapshot": "repeatable_read",
+        "metrics": out,
+    }
+
+
+@router.get("/metrics")
+def metrics_batch(names: str = "", window: str = "all_time"):
+    """Several metrics over one window, from ONE snapshot.
+
+    `names` is a comma-separated list; empty means the whole registry. Prefer
+    this over N calls to /metrics/{name} whenever the numbers will be shown
+    together — it is the only way their `as_of` is truthful."""
+    wanted = [n.strip() for n in (names or "").split(",") if n.strip()] or list(REGISTRY)
+    unknown = [n for n in wanted if n not in REGISTRY]
+    if unknown:
+        return {"error": f"unknown metric(s): {', '.join(unknown)}. "
+                         f"Valid: {', '.join(REGISTRY)}"}
+    try:
+        return compute_many(wanted, window)
+    except Exception as exc:
+        logger.warning(f"[metrics] batch failed: {exc}")
+        return {"error": f"metrics batch failed: {str(exc)[:160]}"}
 
 
 @router.get("/metrics/{name}")

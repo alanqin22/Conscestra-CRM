@@ -24,6 +24,8 @@ SAFETY (defense in depth — see module tests):
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -253,14 +255,22 @@ def run_with_comparison(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     This makes period-over-period a SEMANTIC operation available to every explore
     (blind spot #10) rather than something each detector re-implements. Two
-    guarded read-only queries — no cross-period SQL gymnastics."""
+    guarded read-only queries — no cross-period SQL gymnastics.
+
+    BOTH QUERIES RUN IN ONE SNAPSHOT. They used to open a transaction each, and
+    a period-over-period comparison is the worst place for that: a deal that
+    closes between the two reads lands in one period's numbers while the other
+    period was measured before it existed, so the delta reports a change that
+    never happened. The whole point of this function is to compare two windows
+    of the SAME world."""
     cur_spec = dict(spec)
     prior = str(cur_spec.pop("compare_to"))
     base_window = cur_spec.get("window") or "all_time"
     prior_spec = {**cur_spec, "window": prior}
 
-    cur_rows = run_readonly(*compile(cur_spec))
-    prior_rows = run_readonly(*compile(prior_spec))
+    with snapshot():
+        cur_rows = run_readonly(*compile(cur_spec))
+        prior_rows = run_readonly(*compile(prior_spec))
 
     dims = list(cur_spec.get("dimensions") or [])
     meas = list(cur_spec.get("measures") or ["count"])
@@ -319,7 +329,97 @@ def columns_for(spec: Dict[str, Any]) -> List[Dict[str, str]]:
 # EXECUTE  (read-only transaction — the DB-enforced guarantee)
 # ============================================================================
 
+# ── Shared read snapshot ─────────────────────────────────────────────────────
+# Postgres defaults to READ COMMITTED, where EVERY STATEMENT takes a fresh
+# snapshot — so several metrics read back-to-back come from several database
+# states even on one connection (measured: 1001 then 1002 in one transaction
+# with a concurrent insert). Any surface that presents multiple numbers together
+# was therefore internally inconsistent while stamping a single `as_of`.
+#
+# `snapshot()` pins ONE repeatable-read connection for a block; run_readonly
+# reuses it when active and otherwise behaves exactly as before. A ContextVar
+# rather than a parameter, because the callers that need this (compute, compare,
+# series, the detectors) are several layers above the executor and threading a
+# connection through them would put transaction plumbing in every signature.
+_snapshot_conn: "contextvars.ContextVar[Optional[Any]]" = contextvars.ContextVar(
+    "readonly_snapshot_conn", default=None)
+
+
+# A leaked or long-running snapshot holds a transaction open, which pins the
+# xmin horizon and stops VACUUM reclaiming dead tuples anywhere in the database.
+# On a volume that is already near full, that turns a forgotten `with snapshot()`
+# into disk exhaustion rather than a slow query. The timeout makes an abandoned
+# snapshot self-terminate instead of accumulating bloat indefinitely.
+SNAPSHOT_IDLE_TIMEOUT_MS = int(os.getenv("ANALYTICS_SNAPSHOT_IDLE_MS", "30000"))
+
+
+@contextlib.contextmanager
+def snapshot():
+    """Pin one REPEATABLE READ snapshot for every run_readonly inside the block.
+
+    Read-only by construction, so a serialization failure cannot occur and the
+    reader never blocks a writer. Degrades to per-statement behaviour if the
+    isolation level cannot be set — a slightly inconsistent answer beats none.
+
+    NESTING REUSES THE OUTER SNAPSHOT. A nested block that opened its own
+    connection would silently read a DIFFERENT point in time while the code read
+    as though everything inside shared one — the precise illusion this function
+    exists to remove. Composition has to be safe: `compute_many` and
+    `detect_all` both open snapshots, and either may end up inside the other.
+
+    NOT INHERITED BY THREADS (verified): a thread starts with a fresh context, so
+    work handed to a thread inside a block runs UNPINNED. That is safe — no two
+    threads ever share this connection — but it is not consistent, so read work
+    that must share the snapshot has to stay on the calling thread.
+
+    ASYNCIO TASKS DO INHERIT (verified). Tasks spawned inside a block share this
+    one blocking connection; keep concurrent fan-out out of a snapshot."""
+    outer = _snapshot_conn.get()
+    if outer is not None:
+        yield outer                      # reuse — do not open a second snapshot
+        return
+
+    conn = None
+    token = None
+    try:
+        conn = get_connection()
+        try:
+            conn.set_session(isolation_level="REPEATABLE READ", readonly=True)
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL idle_in_transaction_session_timeout = %s",
+                            (SNAPSHOT_IDLE_TIMEOUT_MS,))
+        except Exception as exc:
+            logger.debug(f"[analytics] snapshot isolation unavailable: {exc}")
+        token = _snapshot_conn.set(conn)
+        yield conn
+    finally:
+        if token is not None:
+            _snapshot_conn.reset(token)
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def in_snapshot() -> bool:
+    return _snapshot_conn.get() is not None
+
+
 def run_readonly(sql: str, params: List[Any]) -> List[Dict[str, Any]]:
+    pinned = _snapshot_conn.get()
+    if pinned is not None:
+        # Inside a snapshot: reuse the pinned transaction. Do NOT close it —
+        # the context manager owns its lifecycle.
+        with pinned.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"SET LOCAL statement_timeout = {int(STMT_TIMEOUT_MS)}")
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
     conn = get_connection()
     try:
         conn.set_session(readonly=True)          # DB refuses any write/DDL
@@ -493,7 +593,16 @@ def explore_catalog():
 @router.post("/analytics/explore")
 def explore_run(body: Dict[str, Any]):
     """Run an ad-hoc explore. Body is either {"nl": "<question>"} (LLM-planned)
-    or {"spec": {...}} (a compiled spec directly, for the UI/tests)."""
+    or {"spec": {...}} (a compiled spec directly, for the UI/tests).
+
+    Wrapped in a snapshot. One spec compiles to one statement today, so this is
+    already consistent — the pin makes the guarantee structural rather than
+    incidental, so a future compiler that emits a second query (a total row, a
+    cardinality probe) cannot silently mix two database states.
+
+    CROSS-REQUEST consistency is NOT achievable and should not be implied: an
+    explore result and a /metrics tile fetched separately are two snapshots.
+    Use GET /metrics?names=… when several numbers must agree with each other."""
     if not ENABLED:
         return {"error": "Ad-hoc exploration is disabled."}
     if body.get("spec"):

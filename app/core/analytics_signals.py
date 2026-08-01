@@ -137,11 +137,16 @@ def detect_stalled_deals(pack: Optional[Dict[str, Any]] = None) -> Optional[Dict
     supervisor.detect_slipped_deals (past close date) and the executive pack's
     idle_deals (no logged ACTIVITY) — this is record-level stagnation."""
     try:
-        rows = execute_sp(
+        # run_readonly, NOT execute_sp: execute_sp opens its own connection and
+        # therefore escapes the snapshot detect_all() pins, so this detector was
+        # reading a different instant from the two that use metrics.compare().
+        # A pass that mixes instants can both invent a breach and hide one.
+        from app.core.semantic_query import run_readonly
+        rows = run_readonly(
             "SELECT count(*) AS n, COALESCE(SUM(amount),0) AS val "
             "FROM opportunities "
-            "WHERE status='open' AND updated_at < now() - (%(d)s || ' days')::interval",
-            {"d": STALL_DAYS})
+            "WHERE status='open' AND updated_at < now() - (%s || ' days')::interval",
+            [STALL_DAYS])
         r = rows[0] if rows else {}
         n, val = int(_num(r.get("n"))), _num(r.get("val"))
     except Exception as exc:
@@ -209,16 +214,25 @@ BREACH_GOALS: Dict[str, str] = {
 
 def detect_all() -> List[Dict[str, Any]]:
     """Run every detector and return the CURRENT anomalies (no dedupe — that is
-    a supervisor concern for alert emission; here we want the live picture)."""
+    a supervisor concern for alert emission; here we want the live picture).
+
+    ONE SNAPSHOT for the whole pass. Each detector previously opened its own
+    transaction, so a pass could observe the win rate before a deal closed and
+    the revenue after it — "the live picture" was several pictures. Anomaly
+    detection compares thresholds across metrics, so mixed instants can both
+    invent a breach and hide one."""
+    from app.core.semantic_query import snapshot
+
     out: List[Dict[str, Any]] = []
-    for det in DETECTORS:
-        try:
-            sig = det(None)
-        except Exception as exc:
-            logger.warning(f"[analytics] detector {det.__name__} failed: {exc}")
-            continue
-        if sig:
-            out.append(sig)
+    with snapshot():
+        for det in DETECTORS:
+            try:
+                sig = det(None)
+            except Exception as exc:
+                logger.warning(f"[analytics] detector {det.__name__} failed: {exc}")
+                continue
+            if sig:
+                out.append(sig)
     return out
 
 

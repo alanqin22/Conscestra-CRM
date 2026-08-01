@@ -18,9 +18,15 @@ turns them into scores a human (and an agent) can act on:
                "revenue reporting is reliable; segmentation is moderate."
 
 Every probe is READ-ONLY and defensive: a missing table/column degrades that one
-check to `no_data` and never raises. Provenance is a sixth dimension deliberately
-left UNTRACKED here — it needs the provenance envelope (next P1 step), so it is
-reported as such rather than scored.
+check to `no_data` and never raises.
+
+PROVENANCE IS NOW SCORED, not merely reported (it was deferred when this module
+was written, pending the envelope). Two questions, not one:
+  • is a source RECORDED?  — an unsourced value can't be judged at all;
+  • is the source TRUSTWORTHY? — enrichment falls back to fabricated stub
+    firmographics, and Explore segments on employee_band / revenue_band as
+    dimensions. A recorded source at confidence 0.15 is not a smaller version of
+    a real one; it is invented data wearing a label, and the score must say so.
 """
 
 from __future__ import annotations
@@ -188,6 +194,26 @@ CHECKS: List[Dict[str, Any]] = [
            "SELECT count(*) FILTER (WHERE source_type IS NOT NULL "
            "AND source_type <> 'unknown'), count(*) FROM custom_field_values",
            "{bad_pct}% of custom-field values have no recorded source (can't judge their trust)"),
+    _check("leads", "lead_provenance", "provenance",
+           "Enriched leads record where their firmographics came from",
+           "SELECT count(*) FILTER (WHERE source_type IS NOT NULL "
+           "AND source_type <> 'unknown'), count(*) FROM leads "
+           "WHERE COALESCE(is_deleted,false)=false "
+           "AND COALESCE(industry,employee_band,revenue_band) IS NOT NULL",
+           "{bad_pct}% of leads carrying firmographics don't record where they came from"),
+    # The value of the envelope is not that a source EXISTS — it is that a
+    # low-trust source is visible. Enrichment falls back to `_stub()`, which
+    # fabricates deterministic pseudo-firmographics from a hash of the domain,
+    # and semantic_model exposes employee_band / revenue_band as Explore
+    # DIMENSIONS. Segmenting on invented values is only safe if someone can see
+    # that is what is happening.
+    _check("leads", "lead_synthetic_firmographics", "provenance",
+           "Firmographics come from an observed source, not a synthesized one",
+           "SELECT count(*) FILTER (WHERE COALESCE(confidence,1) > 0.2), count(*) "
+           "FROM leads WHERE COALESCE(is_deleted,false)=false "
+           "AND COALESCE(industry,employee_band,revenue_band) IS NOT NULL",
+           "{bad_pct}% of enriched leads carry SYNTHESIZED firmographics "
+           "(confidence <= 0.2) — don't segment or forecast on them"),
     _check("accounts", "acc_provenance", "provenance",
            "Accounts record how they entered the CRM",
            "SELECT count(*) FILTER (WHERE source_type IS NOT NULL "

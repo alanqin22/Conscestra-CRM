@@ -16,13 +16,39 @@ supplied by a caller are bound as parameters by the compiler, never inlined.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List
 
 # The canonical win-rate fragment lives in the Metric Registry (P0 step 2), so the
 # explore's win_rate is THE SAME definition as /metrics and the anomaly detectors
 # — unified by construction, not three formulas that happen to agree. metrics.py
 # imports nothing from this module, so this import is safe (no cycle).
-from app.core.metrics import WIN_RATE_PCT_SQL
+from app.core.metrics import DECISION_TS_SQL, WIN_RATE_PCT_SQL
+
+# ── Trust floor on ENRICHED dimensions ───────────────────────────────────────
+# industry / employee_band / revenue_band are not typed by a person — they are
+# written by `enrichment.apply_to_lead`, which falls back to `_stub()` when no
+# provider key is configured. The stub FABRICATES firmographics from a hash of
+# the domain. Those values were segmentable in Explore exactly like observed
+# ones, so an executive could slice revenue by a band that was invented.
+#
+# The fix is NOT to drop the rows — silently excluding accounts would make
+# totals disagree with every other surface, which is the drift this model exists
+# to prevent. Instead a below-floor value renders as its own visible bucket, so
+# the segmentation still balances and the untrustworthy slice is impossible to
+# mistake for a real one.
+TRUST_FLOOR = float(os.getenv("PROVENANCE_TRUST_FLOOR", "0.3"))
+UNVERIFIED_LABEL = "Unverified (synthesized)"
+
+
+def _trusted(col: str, alias: str) -> Dict[str, str]:
+    """An enriched dimension that shows its own untrustworthiness.
+
+    `confidence` is NULL on rows written before the provenance envelope existed
+    — those are 'unknown origin', not 'known bad', so COALESCE keeps them in
+    their real bucket rather than dumping every legacy row into Unverified."""
+    return {"sql": (f"CASE WHEN COALESCE({alias}.confidence, 1) < {TRUST_FLOOR} "
+                    f"THEN '{UNVERIFIED_LABEL}' ELSE {col} END")}
 
 
 # ── Reusable time-grain dimension builders ──────────────────────────────────
@@ -44,8 +70,18 @@ EXPLORES: Dict[str, Dict[str, Any]] = {
     "opportunities": {
         "label": "Opportunities (pipeline / sales)",
         "base": "opportunities o LEFT JOIN accounts a ON a.account_id = o.account_id",
-        "mandatory_where": [],
-        "time_field": "o.close_date",
+        # Soft-delete guard. Opportunities use status='deleted' (sp_opportunities
+        # sets it) rather than an is_deleted flag, so this explore had NO guard
+        # while every SQL path filtered them out — Explore's count/total_amount
+        # would have counted deleted deals the moment one existed (audit #6).
+        "mandatory_where": ["o.status <> 'deleted'"],
+        # The DECISION axis, identical to the Metric Registry's. This was
+        # o.close_date, which meant Explore answered "win rate this year" as
+        # 99.5% while /metrics answered 89.2% — same formula, different clock,
+        # 10.3 points apart (audit re-verification, 2026-07-30). close_date is
+        # still available as an explicit `close_*` grain and filter below; it is
+        # simply no longer the DEFAULT time axis for outcome measures.
+        "time_field": DECISION_TS_SQL,
         # Optional joins the compiler adds ONLY when a selected field needs them.
         # cardinality 'one' = at most one joined row (safe for additive measures);
         # 'many' = fan-out (the compiler refuses additive measures — see #5 guard).
@@ -60,12 +96,20 @@ EXPLORES: Dict[str, Dict[str, Any]] = {
             "stage":          {"sql": "o.stage",          "label": "Stage"},
             "status":         {"sql": "o.status",         "label": "Status"},
             "lead_source":    {"sql": "o.lead_source",    "label": "Lead Source"},
-            "industry":       {"sql": "a.industry",       "label": "Industry"},
-            "employee_band":  {"sql": "a.employee_band",  "label": "Employee Band"},
-            "revenue_band":   {"sql": "a.revenue_band",   "label": "Revenue Band"},
-            "month":          _month("o.close_date"),
-            "quarter":        _quarter("o.close_date"),
-            "year":           _year("o.close_date"),
+            "industry":       dict(_trusted("a.industry", "a"),       label="Industry"),
+            "employee_band":  dict(_trusted("a.employee_band", "a"),  label="Employee Band"),
+            "revenue_band":   dict(_trusted("a.revenue_band", "a"),   label="Revenue Band"),
+            # Default time grains = DECISION date, so "win rate by month" from
+            # Explore buckets deals exactly the way /metrics windows them.
+            "month":          _month(DECISION_TS_SQL),
+            "quarter":        _quarter(DECISION_TS_SQL),
+            "year":           _year(DECISION_TS_SQL),
+            # Close-date grains kept, but named and labelled so they can never be
+            # mistaken for the decision grains. Use these for forecast/pipeline
+            # questions ("what is scheduled to close in Q3"), not for outcomes.
+            "close_month":    dict(_month("o.close_date"),   label="Close Month"),
+            "close_quarter":  dict(_quarter("o.close_date"), label="Close Quarter"),
+            "close_year":     dict(_year("o.close_date"),    label="Close Year"),
         },
         "measures": {
             "count":            {"sql": "count(*)", "label": "Count", "format": "number"},
@@ -84,6 +128,7 @@ EXPLORES: Dict[str, Dict[str, Any]] = {
             "industry": "a.industry", "employee_band": "a.employee_band",
             "revenue_band": "a.revenue_band", "amount": "o.amount",
             "close_date": "o.close_date", "created_at": "o.created_at",
+            "decided_at": DECISION_TS_SQL,
             "owner_name": {"sql": "NULLIF(TRIM(COALESCE(ow.first_name,'')||' '||"
                                   "COALESCE(ow.last_name,'')),'')", "join": "owner"},
         },
@@ -98,7 +143,7 @@ EXPLORES: Dict[str, Dict[str, Any]] = {
             "status":    {"sql": "ord.status",  "label": "Status"},
             "channel":   {"sql": "ord.channel", "label": "Channel"},
             "source":    {"sql": "ord.source",  "label": "Source"},
-            "industry":  {"sql": "a.industry",  "label": "Industry"},
+            "industry":  dict(_trusted("a.industry", "a"),  label="Industry"),
             "month":     _month("ord.order_date"),
             "quarter":   _quarter("ord.order_date"),
             "year":      _year("ord.order_date"),
@@ -124,7 +169,7 @@ EXPLORES: Dict[str, Dict[str, Any]] = {
             "source":     {"sql": "l.source",    "label": "Source"},
             "status":     {"sql": "l.status",    "label": "Status"},
             "rating":     {"sql": "l.rating",    "label": "Rating"},
-            "industry":   {"sql": "l.industry",  "label": "Industry"},
+            "industry":   dict(_trusted("l.industry", "l"),  label="Industry"),
             "province":   {"sql": "l.province",  "label": "Province"},
             "converted":  {"sql": "l.converted", "label": "Converted"},
             "month":      _month("l.created_at"),
@@ -159,11 +204,11 @@ EXPLORES: Dict[str, Dict[str, Any]] = {
                               "cardinality": "many", "label": "Opportunities"},
         },
         "dimensions": {
-            "industry":       {"sql": "a.industry",       "label": "Industry"},
+            "industry":       dict(_trusted("a.industry", "a"),       label="Industry"),
             "type":           {"sql": "a.type",           "label": "Type"},
             "status":         {"sql": "a.status",         "label": "Status"},
-            "employee_band":  {"sql": "a.employee_band",  "label": "Employee Band"},
-            "revenue_band":   {"sql": "a.revenue_band",   "label": "Revenue Band"},
+            "employee_band":  dict(_trusted("a.employee_band", "a"),  label="Employee Band"),
+            "revenue_band":   dict(_trusted("a.revenue_band", "a"),   label="Revenue Band"),
             "month":          _month("a.created_at"),
             "year":           _year("a.created_at"),
             "opp_stage":      {"sql": "o.stage", "label": "Opportunity Stage",
@@ -194,7 +239,7 @@ EXPLORES: Dict[str, Dict[str, Any]] = {
         "dimensions": {
             "status":      {"sql": "c.status",      "label": "Status"},
             "role":        {"sql": "c.role",        "label": "Role"},
-            "industry":    {"sql": "a.industry",    "label": "Account Industry"},
+            "industry":    dict(_trusted("a.industry", "a"),    label="Account Industry"),
             "is_customer": {"sql": "COALESCE(c.is_customer,false)", "label": "Is Customer"},
             "month":       _month("c.created_at"),
             "year":        _year("c.created_at"),
@@ -250,7 +295,7 @@ EXPLORES: Dict[str, Dict[str, Any]] = {
         "time_field": "i.issue_date",
         "dimensions": {
             "status":    {"sql": "i.status",    "label": "Status"},
-            "industry":  {"sql": "a.industry",  "label": "Industry"},
+            "industry":  dict(_trusted("a.industry", "a"),  label="Industry"),
             "month":     _month("i.issue_date"),
             "quarter":   _quarter("i.issue_date"),
             "year":      _year("i.issue_date"),
@@ -286,7 +331,7 @@ EXPLORES: Dict[str, Dict[str, Any]] = {
         "dimensions": {
             "status":         {"sql": "p.status",         "label": "Status"},
             "payment_method": {"sql": "p.payment_method", "label": "Method"},
-            "industry":       {"sql": "a.industry",       "label": "Industry"},
+            "industry":       dict(_trusted("a.industry", "a"),       label="Industry"),
             "month":          _month("p.payment_date"),
             "quarter":        _quarter("p.payment_date"),
         },

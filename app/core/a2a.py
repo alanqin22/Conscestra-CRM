@@ -787,6 +787,20 @@ async def _dispatch(req: A2ARequest, dry_run: bool = False) -> A2AResult:
     """Resolve the intent's capability and invoke the owning agent in-process."""
     cid = req.correlation_id or str(_uuid.uuid4())
     req.correlation_id = cid          # so delegated sub-calls share the lineage
+    # Bind the id for this play so any memory retrieval underneath — which
+    # happens several call-layers down, in modules that take no correlation id —
+    # is recorded against this trace. Reset in the finally below; a leaked token
+    # would attribute one play's grounding to the next.
+    from app.core import grounding as _grounding
+    _gtok = _grounding.set_correlation_id(cid)
+    try:
+        return await _dispatch_inner(req, cid, dry_run)
+    finally:
+        _grounding.reset_correlation_id(_gtok)
+
+
+async def _dispatch_inner(req: A2ARequest, cid: str,
+                          dry_run: bool = False) -> A2AResult:
     cap = resolve(req.intent, getattr(req, "to_agent", None))
     if not cap:
         # Negotiation: no exact capability — offer the closest matches.

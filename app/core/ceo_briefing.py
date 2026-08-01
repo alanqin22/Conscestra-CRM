@@ -51,6 +51,30 @@ def _one(cur, sql: str, params=None):
     return r if r else ()
 
 
+# ── Metric Registry bridge ───────────────────────────────────────────────────
+# The briefing must never restate a registered metric. It builds its SQL from
+# the registry's OWN fragments and runs them on the cursor it already holds, so
+# every figure in one briefing comes from a single database snapshot (metrics.
+# compute() would open a separate connection and transaction per metric).
+
+from app.core import metrics as _metrics   # noqa: E402  (after helpers, before use)
+
+_WON_COND = _metrics.WIN_NUM_COND                      # o.status = 'closed_won'
+_DECIDED_LAST_7D = _metrics.window_predicate("won_revenue", "last_7d")
+
+
+def _registry_value(name: str, window: str, cur) -> float:
+    """Compute a registered metric on THIS cursor. Falls back to 0.0 rather than
+    breaking the whole briefing if the metric or schema is unavailable."""
+    try:
+        sql, _ = _metrics.compute_sql(name, window)
+        row = _one(cur, sql)
+        return round(float(row[0] or 0), 2) if row else 0.0
+    except Exception as exc:
+        logger.warning(f"[ceo_briefing] registry metric '{name}' failed: {exc}")
+        return 0.0
+
+
 # ── Metric snapshot (powers "▲ vs yesterday" deltas + trend history) ────────────
 # key, label, unit, higher_is_better, importance
 _METRICS = [
@@ -164,9 +188,25 @@ def _delta_text(deltas, key) -> str:
 # ── Data gathering ──────────────────────────────────────────────────────────────
 
 def gather() -> Dict[str, Any]:
-    """Pull the strategic numbers from real CRM tables."""
+    """Pull the strategic numbers from real CRM tables.
+
+    ONE TRANSACTION, ONE SNAPSHOT. Sharing a connection is not enough: Postgres
+    defaults to READ COMMITTED, where every STATEMENT takes a fresh snapshot.
+    Measured — two counts in one READ COMMITTED transaction returned 1001 then
+    1002 with a concurrent insert between them. A briefing built that way reports
+    a dozen figures from a dozen database states under a single `as_of`
+    timestamp, which is exactly the internal inconsistency this was supposed to
+    fix. REPEATABLE READ pins one snapshot for the whole gather.
+
+    Safe here because gather() is strictly read-only: a serialization failure
+    cannot occur without writes, and a repeatable-read reader never blocks a
+    writer."""
     conn = get_connection()
     try:
+        try:
+            conn.set_session(isolation_level="REPEATABLE READ", readonly=True)
+        except Exception as exc:      # pre-existing txn / unsupported driver
+            logger.debug(f"[briefing] snapshot isolation unavailable: {exc}")
         with conn.cursor() as cur:
             discount_pressure = _discount_pressure(cur)
             rev_yest = _one(cur, "SELECT COALESCE(SUM(amount),0) FROM payments "
@@ -202,9 +242,10 @@ def gather() -> Dict[str, Any]:
                 "SELECT COALESCE(SUM(amount),0), COUNT(*) FROM opportunities "
                 "WHERE status='open' AND close_date < CURRENT_DATE")
 
+            # Decision axis, not updated_at — see the won_amt note below.
             advocates = _one(cur,
-                "SELECT COUNT(DISTINCT account_id) FROM opportunities "
-                "WHERE status='closed_won' AND updated_at >= now() - interval '7 days'")[0]
+                "SELECT COUNT(DISTINCT account_id) FROM opportunities o "
+                f"WHERE {_WON_COND} AND {_DECIDED_LAST_7D}")[0]
 
             new_leads_7d = _one(cur, "SELECT COUNT(*) FROM leads "
                                      "WHERE created_at >= now() - interval '7 days'")[0]
@@ -254,9 +295,13 @@ def gather() -> Dict[str, Any]:
             except Exception:
                 low_stock = None
 
-            won_amt = _one(cur,
-                "SELECT COALESCE(SUM(amount),0) FROM opportunities "
-                "WHERE status='closed_won' AND updated_at >= now() - interval '7 days'")[0]
+            # THE registry's won_revenue over last_7d — not a local restatement.
+            # This used to be `status='closed_won' AND updated_at >= now()-7d`,
+            # i.e. every deal EDITED in the last week regardless of when it was
+            # won. On real data that reported $5,276,400 where the registry says
+            # $402,101 — 13x, to the highest-stakes reader in the product
+            # (audit re-verification, 2026-07-30).
+            won_amt = _registry_value("won_revenue", "last_7d", cur)
 
             closing = _rows(cur,
                 "SELECT o.name, COALESCE(a.account_name,'—'), ROUND(o.amount::numeric,2), "
@@ -327,7 +372,19 @@ def gather() -> Dict[str, Any]:
         except Exception as exc:
             logger.warning(f"[ceo_briefing] anomalies skipped: {exc}")
             anomalies = []
+        # What this briefing is ALLOWED to claim. The snapshot makes every
+        # figure describe one moment of the DATABASE; it says nothing about
+        # whether the database reflects the BUSINESS. If a source is behind its
+        # SLA, the briefing has to say so rather than imply currency it lacks.
+        try:
+            from app.core.data_sources import as_of_qualifier
+            source_caveat = as_of_qualifier()
+        except Exception as exc:
+            logger.debug(f"[ceo_briefing] source freshness unavailable: {exc}")
+            source_caveat = None
+
         return {
+            "source_caveat": source_caveat,
             "rev_yest": rev_yest, "rev_7d": rev_7d,
             "rev_recent_date": rev_recent_date, "rev_recent_amt": rev_recent_amt,
             "pipeline": pipeline, "weighted": weighted, "open_cnt": open_cnt,

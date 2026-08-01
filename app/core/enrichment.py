@@ -33,6 +33,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional
 
+from app.core import provenance
+
 logger = logging.getLogger("enrichment")
 
 ENRICH_PROVIDER = os.getenv("LEADS_ENRICH_PROVIDER", "").strip().lower()
@@ -86,11 +88,20 @@ def enrich_company(company: Optional[str] = None, email: Optional[str] = None,
 
 
 def _stub(seed: str, company: Optional[str]) -> Dict[str, Any]:
-    """Deterministic pseudo-firmographics — stable per company, no network."""
+    """Deterministic pseudo-firmographics — stable per company, no network.
+
+    THESE VALUES ARE INVENTED. They are a hash of the domain, not an observation
+    of the company, and they exist so demo and dev environments have plausible
+    firmographics. The old `confidence` here was 0.60-0.95, which asserted
+    trustworthiness for fabricated data — worse than no confidence at all,
+    because every downstream consumer read it as a real match quality. It is now
+    STUB_CONFIDENCE, and `apply_to_lead` records source_type='computed' so a
+    reader can tell invented values from observed ones."""
     h = int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16)
     return {
         "matched": True,
         "source": "stub",
+        "synthetic": True,
         "company": company,
         "domain": seed,
         "website": f"https://{seed}",
@@ -98,8 +109,49 @@ def _stub(seed: str, company: Optional[str]) -> Dict[str, Any]:
         "employee_band": _EMPLOYEES[(h >> 5) % len(_EMPLOYEES)],
         "revenue_band": _REVENUE[(h >> 9) % len(_REVENUE)],
         "hq_location": _LOCATIONS[(h >> 13) % len(_LOCATIONS)],
-        "confidence": round(0.60 + (h % 36) / 100.0, 2),
+        "confidence": STUB_CONFIDENCE,
     }
+
+
+# Provenance mapping: enrichment `source` → the shared envelope's vocabulary.
+# 'external' = an outside system asserted it; 'ai' = we inferred it from web
+# text; 'computed' = we derived it ourselves, which is what a stub is.
+STUB_CONFIDENCE = 0.15
+
+# (source_type, RELIABILITY) per provider. Reliability is a property of the
+# SOURCE — it does not vary per record. Whatever the provider says about a
+# specific value is CERTAINTY, and the two multiply.
+_SOURCE_KIND = {
+    "apollo":  (provenance.EXTERNAL, 0.90),
+    "pdl":     (provenance.EXTERNAL, 0.85),
+    "generic": (provenance.EXTERNAL, 0.75),
+    "web":     (provenance.AI,       0.55),
+    # The stub is DETERMINISTIC — it returns the same answer every time, so its
+    # certainty is 1.0 — while being disconnected from the actual company, so
+    # its reliability is near zero. This row is why the two must be separate:
+    # a single number cannot say "perfectly repeatable and completely made up".
+    "stub":    (provenance.COMPUTED, STUB_CONFIDENCE),
+}
+
+
+def provenance_for(data: Dict[str, Any]) -> provenance.Provenance:
+    """The provenance envelope for one enrichment result.
+
+    A provider's stated match quality becomes CERTAINTY (clamped to 0..1); the
+    source's RELIABILITY comes from the table above and is not negotiable by the
+    provider — a vendor claiming 0.99 does not make a third-party guess as good
+    as something a person looked up. The composite `confidence` is their
+    product, so Apollo at a 92% match reads 0.90 × 0.92 = 0.828."""
+    src = str(data.get("source") or "unknown").lower()
+    kind, reliability = _SOURCE_KIND.get(src, (provenance.UNKNOWN, 0.30))
+    certainty = data.get("confidence")
+    if src == "stub":
+        certainty = 1.0          # deterministic by construction
+    return provenance.Provenance(
+        source_type=kind, source_id=f"enrichment:{src}",
+        reliability=reliability, certainty=certainty,
+        observed_at=data.get("observed_at"),
+    ).normalized()
 
 
 def apply_to_lead(lead_id: str, data: Dict[str, Any]) -> int:
@@ -110,6 +162,7 @@ def apply_to_lead(lead_id: str, data: Dict[str, Any]) -> int:
     if not data or not data.get("matched"):
         return 0
     from app.core.database import get_connection
+    p = provenance_for(data).as_columns()
     hq = (data.get("hq_location") or "")
     city = prov = None
     if "," in hq:
@@ -126,13 +179,26 @@ def apply_to_lead(lead_id: str, data: Dict[str, Any]) -> int:
                     revenue_band  = COALESCE(NULLIF(revenue_band, ''),  %(rev)s),
                     city          = COALESCE(NULLIF(city, ''),          %(city)s),
                     province      = COALESCE(NULLIF(province, ''),      %(prov)s),
+                    -- Provenance travels WITH the values. Without it an Apollo
+                    -- match, a web-scraped guess and a fabricated stub value are
+                    -- the same string in the same column, and Explore segments
+                    -- on employee_band / revenue_band as if a person typed them.
+                    source_type   = %(src_type)s,
+                    source_id     = %(src_id)s,
+                    reliability   = %(rel)s,
+                    certainty     = %(cert)s,
+                    confidence    = %(conf)s,
+                    observed_at   = %(observed)s::timestamptz,
                     enriched_at   = now(),
                     updated_at    = now()
                 WHERE lead_id = %(id)s
                 """,
                 {"industry": data.get("industry"), "website": data.get("website"),
                  "emp": data.get("employee_band"), "rev": data.get("revenue_band"),
-                 "city": city, "prov": prov, "id": lead_id},
+                 "city": city, "prov": prov, "id": lead_id,
+                 "src_type": p["source_type"], "src_id": p["source_id"],
+                 "rel": p["reliability"], "cert": p["certainty"],
+                 "conf": p["confidence"], "observed": p["observed_at"]},
             )
             n = cur.rowcount
         conn.commit()
