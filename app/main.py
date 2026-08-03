@@ -249,6 +249,35 @@ def _run_activities_auto_sweep() -> None:
 MILESTONE_COMPLETE_DRY_RUN = False
 
 
+def _run_anonymise_erasure_log() -> None:
+    """Monthly: strip the personal link from erasure-register rows over two
+    years old (sql/erasure_log_retention.sql).
+
+    The register is append-only and permanent, which is what makes it evidence.
+    Left alone it also becomes a permanent index of who asked to be forgotten,
+    so the identifiers age out while the EVENT — when, by whom, how many rows,
+    under what declared reason — is kept forever.
+
+    Nothing happens for two years after the first erasure; that is the point.
+    A job that does nothing today and the right thing in 2028 has to be wired
+    now, because nobody will remember to wire it then."""
+    try:
+        from app.core.database import get_connection
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT anonymise_old_erasure_log()")
+                n = cur.fetchone()[0]
+            conn.commit()
+        finally:
+            conn.close()
+        if n:
+            logger.info(f"[retention] anonymised {n} erasure-register row(s) "
+                        f"older than the retention window")
+    except Exception as exc:
+        logger.error(f"[retention] erasure-register anonymisation failed: {exc}")
+
+
 def _run_expire_quotes() -> None:
     """Nightly: mark quotes past their validity as expired (C3.0).
 
@@ -787,12 +816,23 @@ async def lifespan(app: FastAPI):
         # has, and it inflates every open-quote figure. Safe at 22:25 because
         # the predicate is `valid_until < current_date`: a quote valid THROUGH
         # today survives until the date actually rolls over.
-        scheduler.add_job(
+        _scheduler.add_job(
             _run_expire_quotes,
             trigger=CronTrigger(hour=22, minute=25), # 10:25 PM ET — expire stale quotes
             id="expire_quotes",
             replace_existing=True,
         )
+        # Retention for the erasure register — monthly, not nightly. It only
+        # touches rows older than two years, so running it daily would be 30
+        # no-op queries a month for no benefit.
+        _scheduler.add_job(
+            _run_anonymise_erasure_log,
+            trigger=CronTrigger(day=1, hour=3, minute=0),   # 03:00 ET, 1st of month
+            id="anonymise_erasure_log",
+            replace_existing=True,
+            misfire_grace_time=86400,   # a missed month should still run late
+        )
+
         # Agent-bus nightly sweeps — emit events for the consumer to act on.
         # Run after the seed passes so they see the freshest data. No-op unless
         # AGENT_BUS_ENABLED=1 (the job functions self-gate).
@@ -1046,6 +1086,19 @@ async def lifespan(app: FastAPI):
             _scheduler = None
         else:
             _scheduler.start()
+            # A DEAD SCHEDULER MUST NOT LOOK LIKE A LIVE ONE.
+            #
+            # A single typo — `scheduler.add_job` for `_scheduler.add_job` —
+            # raised NameError partway through setup. The broad handler below
+            # logged it and the app carried on serving happily, so 22 of 28 jobs
+            # never registered and start() never ran. Nightly order advancement,
+            # quote expiry, activity sweeps, agent-bus emission and the
+            # supervisor tick had simply not fired, and nothing anywhere said so.
+            #
+            # The count is recorded and reported on /health, so "the scheduler is
+            # running" becomes a claim that can be contradicted.
+            app.state.scheduler_jobs = len(_scheduler.get_jobs())
+            app.state.scheduler_running = True
             logger.info(
                 "[Scheduler] Started (America/New_York) — "
             "opps advance 22:00 ET | orders advance 22:05 ET | "
@@ -1060,6 +1113,10 @@ async def lifespan(app: FastAPI):
             "Or use pg_cron on Railway/Supabase (see sql/fn_advance_order_statuses.sql)."
         )
     except Exception as exc:
+        # Recorded, not just logged: a failure only present in a log line is a
+        # failure nobody sees.
+        app.state.scheduler_running = False
+        app.state.scheduler_error = str(exc).splitlines()[0][:160]
         logger.error(f"[OrderAdvance] Scheduler setup failed: {exc}", exc_info=True)
         if _scheduler is not None:
             try:
@@ -1831,11 +1888,19 @@ async def health():
     except Exception as exc:                                  # noqa: BLE001
         _db = {"ok": False, "error": str(exc).splitlines()[0][:180]}
 
+    # Background jobs: reported, never fatal. A follower legitimately runs none,
+    # and an HTTP node that cannot schedule can still serve reads correctly.
+    _sched = {"running": getattr(app.state, "scheduler_running", None),
+              "jobs": getattr(app.state, "scheduler_jobs", 0)}
+    if getattr(app.state, "scheduler_error", None):
+        _sched["error"] = app.state.scheduler_error
+
     _status = "healthy" if _db["ok"] else "degraded"
     _payload = {
         "status":  _status,
         "version": "2.2.0",
         "database": _db,
+        "scheduler": _sched,
         "ha": _ha,   # leader | follower | standalone — which process runs the background singletons (#7)
         "home_index": {"endpoint": "GET /home-index", "sp": "sp_home_index"},
         "agents": {
