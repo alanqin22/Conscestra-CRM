@@ -327,6 +327,18 @@ def claim_hash(statement: str, evidence_hash: str) -> str:
     ).hexdigest()
 
 
+def _distinct_templates(members) -> int:
+    """How many distinct WORDINGS the evidence contains.
+
+    Breadth, not volume. 480 copies of "Requested additional information from
+    customer." across 120 cases is ONE observation replicated — the clusterer
+    found a similarity that was never in question. `certainty` was already
+    documented as scaling with breadth rather than raw volume; `occurrences`,
+    the number actually asserted in the sentence a human reads, was not."""
+    from app.core.content_index import template_fingerprint
+    return len({template_fingerprint(m.get("snippet") or "") for m in members})
+
+
 def _distinct_occasions(members: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Collapse a cluster to the distinct OCCASIONS it represents.
 
@@ -337,19 +349,45 @@ def _distinct_occasions(members: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     is boilerplate mistaken for customer behaviour, asserted with high certainty
     to whoever reads the memory.
 
-    An occasion is (template, day): the same boilerplate on one day is one
-    occasion, and the same wording genuinely recurring on different days IS
-    distinct — a customer who complains about billing every month is exactly
-    what the count should capture. Reuses content_index.template_fingerprint, so
-    the notion of "same wording" is shared with retrieval's dedupe rather than
-    reinvented with different rules."""
+    AN OCCASION IS (template, PARENT OBJECT), falling back to (template, day)
+    when the record has no parent.
+
+    It was (template, day) alone, on the reasoning that the same wording on
+    different days IS recurrence — a customer complaining about billing every
+    month is exactly what a count should capture. That reasoning is right and
+    is preserved by the fallback. What it missed is duplication against ONE
+    business object:
+
+        order SO-2026-100202 (one order, one related_id)
+          "Order shipped - follow up with customer"   2026-06-01, 06-10, 06-12
+        invoice INV-000246 (one invoice)
+          "Payment reminder (urgent) drafted"         x23
+
+    An order does not ship three times and an invoice is not 23 separate
+    reminders. Those rows became "We contacted them about delivery 7 times" —
+    a false count asserted to a human about a customer.
+
+    WHY PARENT RATHER THAN A TIME WINDOW. "Same template within N days" needs an
+    N nobody can defend, and this project has already withdrawn one statistical
+    guess on principle. The parent is a schema fact that already exists.
+    Different templates on one parent stay distinct ("shipped" and "fulfilled"
+    are two events); only identical wording about the identical object
+    collapses. It also errs safely: overcounting says something FALSE about a
+    person, undercounting says less.
+
+    Reuses content_index.template_fingerprint, so "same wording" is shared with
+    retrieval's dedupe rather than reinvented with different rules."""
     from app.core.content_index import template_fingerprint
 
     seen: set = set()
     out: List[Dict[str, Any]] = []
     for m in members:
-        day = m["occurred_at"].date().isoformat() if m.get("occurred_at") else "?"
-        key = (template_fingerprint(m.get("snippet") or ""), day)
+        parent = m.get("parent_key")
+        # No parent → keep the original rule. A record about nothing in
+        # particular has only its date to distinguish it.
+        scope = f"parent:{parent}" if parent else (
+            m["occurred_at"].date().isoformat() if m.get("occurred_at") else "?")
+        key = (template_fingerprint(m.get("snippet") or ""), scope)
         if key in seen:
             continue
         seen.add(key)
@@ -435,7 +473,18 @@ def _assertion_blockers(*, verified_by, verified_actor, verification_expires_at,
         blockers.append(f"{evidence_missing} evidence record(s) no longer exist")
     if truncated:
         blockers.append("count is a lower bound, not exact")
-    if effective_certainty is not None and effective_certainty < ASSERT_FLOOR:
+    # ABSENT IS NOT ABOVE THE FLOOR.
+    #
+    # This read `if effective_certainty is not None and ... < ASSERT_FLOOR`, so
+    # a NULL certainty skipped the check and returned NO blockers at all — a
+    # fully assertable claim. Found by red team, and it became REACHABLE the
+    # moment trust values were made nullable: clearing a verification leaves
+    # `certainty` pinned or absent, and nothing recomputes it for a retired row.
+    #
+    # Same rule as every other gate input: not knowing is a reason to refuse.
+    if effective_certainty is None:
+        blockers.append("certainty not available")
+    elif effective_certainty < ASSERT_FLOOR:
         blockers.append(f"certainty {round(effective_certainty, 2)} below "
                         f"floor {ASSERT_FLOOR}")
     return blockers
@@ -644,7 +693,7 @@ def _load_records(cur, entity_type: str, entity_id: str):
     col = "contact_id" if entity_type == "contact" else "account_id"
     cur.execute(
         f"""SELECT source_type, source_id, embedding, dims, snippet, visibility,
-                   occurred_at, direction, actor, speech_act
+                   occurred_at, direction, actor, speech_act, parent_key
               FROM content_embeddings
              WHERE {col} = %s::uuid AND model = %s AND dims = %s
              -- TOTAL order. `occurred_at DESC` alone is not deterministic:
@@ -660,14 +709,15 @@ def _load_records(cur, entity_type: str, entity_id: str):
         (entity_id, E.MODEL, E.DIMS, MAX_RECORDS))
     out = []
     for (st, sid, blob, dims, snippet, vis, occurred, direction,
-         actor, act) in cur.fetchall():
+         actor, act, parent) in cur.fetchall():
         vec = E.decode(bytes(blob), dims)
         if vec is None:
             continue
         out.append({"source_type": st, "source_id": sid, "vec": vec,
                     "snippet": snippet or "", "visibility": vis or INTERNAL,
                     "occurred_at": occurred, "direction": direction,
-                    "actor": actor, "speech_act": act})
+                    "actor": actor, "speech_act": act,
+                    "parent_key": parent})
 
     # Did the window actually exclude anything? Compare against the unbounded
     # minimum rather than assuming. Any excluded record could belong to ANY
@@ -705,6 +755,13 @@ def consolidate_entity(entity_type: str, entity_id: str) -> Dict[str, Any]:
             # that the first pass is about to delete. Non-blocking — a losing
             # caller returns rather than queueing, because the winner is doing
             # exactly the same work.
+            # DECLARE THIS WORK. Consolidation's sweep is a named, expected
+            # operation, and leaving it in the 'undeclared' bucket drowned the
+            # one signal that bucket exists for: 14,162 undeclared deletions in
+            # 24h, against which the 270-row silent deletion it was built to
+            # catch would have been invisible. A catch-all that catches
+            # everything catches nothing.
+            cur.execute("SET LOCAL app.repair_key = 'consolidate:sweep'")
             cur.execute("SELECT pg_try_advisory_xact_lock(hashtext(%s))",
                         (f"consolidate:{entity_type}:{entity_id}",))
             if not cur.fetchone()[0]:
@@ -717,19 +774,49 @@ def consolidate_entity(entity_type: str, entity_id: str) -> Dict[str, Any]:
                         "written": 0, "note": "not enough records"}
 
             written, unchanged = 0, 0
-            live_topics: List[str] = []
+            # (topic, actor), not topic. Company activity outnumbers customer
+            # voice 6,701 to 768 here, so "strongest cluster per topic wins"
+            # meant the company cluster evicted the customer one on every
+            # shared topic — 13 occasions of "Customer reported: intermittent
+            # issues affecting work" were discarded because we had logged more
+            # of our own billing tasks than they had billing complaints.
+            live_claims: List[tuple] = []
+
+            # RESOLVE ALL CLUSTERS FIRST, THEN RANK THEM.
+            #
+            # The dedup below keeps one cluster per (topic, actor) and its
+            # comment said "strongest wins". It was FIRST wins: `_cluster`
+            # emits in seed order, so whichever cluster appeared first took the
+            # slot. Measured over 80 entities, 15 varied clusters were
+            # discarded by weaker single-wording ones —
+            #     KEPT  1 template,  5 occasions
+            #     LOST  3 templates, 14 occasions
+            # — the richer, larger theme thrown away on ordering alone.
+            #
+            # Ranked by BREADTH first, then volume: a theme said five different
+            # ways is stronger evidence than one sentence repeated thirty
+            # times. A total order, not a threshold.
+            candidates = []
             for idx in _cluster(records):
                 if len(idx) < MIN_CLUSTER:
                     continue
                 members = _distinct_occasions([records[i] for i in idx])
                 if len(members) < MIN_CLUSTER:
                     continue          # boilerplate repeated, not a recurring theme
+                candidates.append((_distinct_templates(members), len(members),
+                                   members))
+            candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+
+            for n_templates, _n_occ, members in candidates:
                 ev_ids = [f"{m['source_type']}:{m['source_id']}" for m in members]
                 ev_hash = _evidence_hash(ev_ids)
                 topic = _topic_for([m["snippet"] for m in members])
-                if topic in live_topics:
-                    continue                     # strongest cluster per topic wins
-                live_topics.append(topic)
+                # Actor is resolved here rather than further down, because it is
+                # now part of the claim's identity and the dedup below needs it.
+                actor = _cluster_actor(members)
+                if (topic, actor) in live_claims:
+                    continue        # strongest cluster per (topic, actor) wins
+                live_claims.append((topic, actor))
 
                 # RULE 1 — most restrictive visibility wins.
                 visibility = (CUSTOMER
@@ -746,12 +833,12 @@ def consolidate_entity(entity_type: str, entity_id: str) -> Dict[str, Any]:
                                          if m["occurred_at"] else None)}
                             for m in members[:MAX_EVIDENCE]]
 
-                actor = _cluster_actor(members)
                 statement = _statement(topic, len(members), first, last,
-                                       actor, clipped)
+                                       actor, clipped,
+                                       single_wording=(n_templates == 1))
                 dclass = decay_class_for(topic)
                 independent = len({m.get("source_type") for m in members})
-                reliability, certainty = _derive_trust(cur, members)
+                reliability, certainty = _derive_trust(cur, members, n_templates)
                 truncated = clipped
 
                 cur.execute(
@@ -761,10 +848,11 @@ def consolidate_entity(entity_type: str, entity_id: str) -> Dict[str, Any]:
                           source_type, reliability, certainty, generator,
                           visibility, first_observed_at, last_observed_at,
                           status, truncated, evidence_missing, evidence_checked_at,
-                          valid_until, actor, decay_class, independent_sources)
+                          valid_until, actor, decay_class, independent_sources,
+                          distinct_templates)
                        VALUES (%s,%s::uuid,%s,%s,%s,%s,%s::jsonb,%s,%s,
-                               'ai',%s,%s,%s,%s,%s,%s,%s,%s,0,now(),%s,%s,%s,%s)
-                       ON CONFLICT (entity_type, entity_id, topic, kind, generator)
+                               'ai',%s,%s,%s,%s,%s,%s,%s,%s,0,now(),%s,%s,%s,%s,%s)
+                       ON CONFLICT (entity_type, entity_id, topic, kind, generator, actor)
                        DO UPDATE SET
                          statement=EXCLUDED.statement,
                          occurrences=EXCLUDED.occurrences,
@@ -782,6 +870,7 @@ def consolidate_entity(entity_type: str, entity_id: str) -> Dict[str, Any]:
                          actor=EXCLUDED.actor,
                          decay_class=EXCLUDED.decay_class,
                          independent_sources=EXCLUDED.independent_sources,
+                         distinct_templates=EXCLUDED.distinct_templates,
                          -- Evidence moved, so a prior human verification no
                          -- longer applies to what this memory now claims.
                          verified_by=CASE WHEN customer_memories.verified_evidence_hash
@@ -803,7 +892,7 @@ def consolidate_entity(entity_type: str, entity_id: str) -> Dict[str, Any]:
                      json.dumps(evidence), len(evidence), ev_hash,
                      reliability, certainty, GENERATOR, visibility, first, last,
                      ACTIVE, truncated, _valid_until(last), actor, dclass,
-                     independent))
+                     independent, n_templates))
                 if cur.fetchone():
                     written += 1
                 else:
@@ -841,9 +930,17 @@ def consolidate_entity(entity_type: str, entity_id: str) -> Dict[str, Any]:
                 # old generator returns, the upsert's status CASE only resets a
                 # row to 'active' when verified_by IS NULL, so a verified row
                 # would otherwise stay superseded while being current again.
+                # `verify()` PINS certainty to 1.0 and clears valid_until —
+                # that is a human's judgement, not a derived value. Withdrawing
+                # the verification must withdraw the pin too, or the row keeps
+                # maximum certainty and no expiry with nobody standing behind
+                # it. NULL rather than a recomputed number: the derived value
+                # is not stored, and inventing one here is what the reliability
+                # fix just removed.
                 """UPDATE customer_memories
                       SET status='superseded', updated_at=now(),
-                          verified_by=NULL, verified_actor=false
+                          verified_by=NULL, verified_actor=false,
+                          certainty=NULL, valid_until=NULL
                     WHERE entity_type=%s AND entity_id=%s::uuid AND kind=%s
                       AND generator <> %s AND status <> 'superseded'""",
                 (entity_type, entity_id, THEME, GENERATOR))
@@ -858,8 +955,13 @@ def consolidate_entity(entity_type: str, entity_id: str) -> Dict[str, Any]:
                     WHERE entity_type=%s AND entity_id=%s::uuid
                       AND kind=%s AND generator=%s
                       AND verified_by IS NULL
-                      AND NOT (topic = ANY(%s))""",
-                (entity_type, entity_id, THEME, GENERATOR, live_topics or [""]))
+                      AND NOT EXISTS (
+                            SELECT 1 FROM unnest(%s::text[], %s::text[]) AS live(t, a)
+                             WHERE live.t = customer_memories.topic
+                               AND live.a = COALESCE(customer_memories.actor,'unknown'))""",
+                (entity_type, entity_id, THEME, GENERATOR,
+                 [t for t, _ in live_claims] or [""],
+                 [a for _, a in live_claims] or [""]))
             dropped = cur.rowcount
             conflicts = _link_contradictions(cur, entity_type, entity_id)
         conn.commit()
@@ -953,7 +1055,51 @@ def _cluster_actor(members: List[Dict[str, Any]]) -> str:
     return top if n / len(actors) >= 0.8 else "mixed"
 
 
-def _derive_trust(cur, members: List[Dict[str, Any]]) -> Tuple[float, float]:
+# What BREADTH is made of. Named constants because these decide how much a
+# claim is trusted, and a number buried in an expression is a number nobody
+# reviews.
+#
+# WORDING CARRIES THE MOST WEIGHT AND ITS FLOOR IS ZERO. Days and sources can
+# BOTH be high for a single automated note — the worst case in this corpus is
+# one sentence repeated across 26 distinct days, which maxed the day term and
+# scored certainty 0.950, the cap, while the statement itself said "one
+# recurring note". Only distinct wording is evidence that someone said
+# something DIFFERENT; a repeated string spanning a year is still one
+# observation.
+#
+# The three weights are a JUDGEMENT, not derived — earning them needs
+# calibration against verification outcomes, which is blocked on real data.
+# What is structural, and the reason this term exists, is that one wording
+# contributes exactly zero.
+_W_DAYS, _W_SOURCES, _W_WORDINGS = 0.40, 0.25, 0.35
+
+
+# The model is a source too, and cannot be more reliable than its weakest
+# evidence. This is a CEILING, not a floor.
+MODEL_RELIABILITY = 0.70
+
+
+def _reliability_from(weakest: Optional[float]) -> Optional[float]:
+    """Trust in the evidence behind a claim, or None if nobody measured it.
+
+    Extracted as a pure function so `_wording_fingerprint` can PROBE it. The
+    derivation identity previously captured trust CONSTANTS but not trust
+    LOGIC, so changing this rule left 848 stored rows holding a value derived
+    from code that no longer existed — the upsert only rewrites when
+    evidence_hash moves. That trap has now fired three times (decay policy,
+    trust weights, this). Probing behaviour closes it for good: any change to
+    what this returns changes the generator, which retires the stale rows.
+
+    None is a real answer. It means no evidence source carries a confidence
+    score, which is the current state of this database (0 of 180 contacts,
+    0 of 179 accounts) — and it is NOT 0.70."""
+    if weakest is None:
+        return None
+    return min(MODEL_RELIABILITY, float(weakest))
+
+
+def _derive_trust(cur, members: List[Dict[str, Any]],
+                  n_templates: int = 1) -> Tuple[Optional[float], float]:
     """Trust DERIVED from the evidence, not hardcoded.
 
     v1 gave every memory reliability 0.70 and a count-based certainty that
@@ -968,7 +1114,25 @@ def _derive_trust(cur, members: List[Dict[str, Any]]) -> Tuple[float, float]:
     src_types = {m["source_type"] for m in members}
     days = {m["occurred_at"].date() for m in members if m.get("occurred_at")}
 
-    reliability = 0.70                      # the model as a source
+    # UNMEASURED IS NOT 0.70.
+    #
+    # This read `min(0.70, min(COALESCE(ct.confidence, a.confidence, 1.0)))`.
+    # No contact and no account in this database has `confidence` populated
+    # (0 of 180 and 0 of 179), so the COALESCE fabricated 1.0 for every record,
+    # the min never bit, and all 848 memories stored exactly 0.700 — ONE
+    # distinct value.
+    #
+    # That is the round-2 defect returning by a different route. Then the join
+    # was impossible (leads.lead_id = contact_id); now the join is right and the
+    # DATA is absent. The verdict from that round stands unchanged: a trust
+    # signal that is secretly a constant is worse than none, because it looks
+    # earned.
+    #
+    # So reliability is None until some evidence actually carries a confidence
+    # score, and it becomes real on its own the moment enrichment stamps one.
+    # `confidence = reliability x certainty` then reads NULL rather than a
+    # number with a decorative factor in it.
+    reliability: Optional[float] = None
     try:
         ids = [(m["source_type"], m["source_id"]) for m in members]
         # JOIN ON THE RIGHT KEY. This previously read
@@ -980,22 +1144,31 @@ def _derive_trust(cur, members: List[Dict[str, Any]]) -> Tuple[float, float]:
         # and had never once executed. A trust signal that is secretly a
         # constant is worse than none: it looks earned.
         cur.execute(
-            """SELECT min(COALESCE(ct.confidence, a.confidence, 1.0))
+            # No COALESCE fallback: a source with no confidence score must not
+            # contribute a fabricated 1.0. min() over no scores is NULL, which
+            # is the honest answer.
+            """SELECT min(COALESCE(ct.confidence, a.confidence))
                  FROM content_embeddings ce
                  LEFT JOIN contacts ct ON ct.contact_id = ce.contact_id
                  LEFT JOIN accounts a  ON a.account_id  = ce.account_id
                 WHERE (ce.source_type, ce.source_id) IN %s""", (tuple(ids),))
         row = cur.fetchone()
         weakest = row[0] if row else None
-        if weakest is not None:
-            reliability = min(reliability, float(weakest))
+        reliability = _reliability_from(weakest)
     except Exception as exc:
         cur.connection.rollback()           # unknown evidence trust → keep default
         logger.debug(f"[memory] evidence reliability lookup skipped: {exc}")
 
-    breadth = min(1.0, (len(days) / 6.0) * 0.6 + (len(src_types) / 3.0) * 0.4)
+    # (n_templates - 1) / 2 → one wording scores 0.0, two 0.5, three or more
+    # 1.0. The zero is the point: it is not a small discount, it is the
+    # statement that a repeated sentence adds no corroboration however widely
+    # it is spread.
+    breadth = min(1.0,
+                  _W_DAYS * min(1.0, len(days) / 6.0)
+                  + _W_SOURCES * min(1.0, len(src_types) / 3.0)
+                  + _W_WORDINGS * min(1.0, max(0, n_templates - 1) / 2.0))
     certainty = round(min(0.95, 0.35 + 0.6 * breadth), 3)
-    return round(reliability, 3), certainty
+    return (round(reliability, 3) if reliability is not None else None), certainty
 
 
 def _valid_until(last_observed):
@@ -1008,7 +1181,8 @@ def _valid_until(last_observed):
 
 
 def _statement(topic: str, n: int, first, last,
-               actor: Optional[str] = None, clipped: bool = False) -> str:
+               actor: Optional[str] = None, clipped: bool = False,
+               single_wording: bool = False) -> str:
     """A deterministic sentence built from the cluster's own facts.
 
     Templated rather than LLM-written on purpose: consolidation runs unattended
@@ -1034,6 +1208,28 @@ def _statement(topic: str, n: int, first, last,
     sees a column, so the hedge belongs in the sentence: the count becomes a
     floor ("at least"), and the range is explicitly labelled as the part of the
     history that was looked at."""
+    # ONE WORDING IS NOT A RECURRENCE. When every cited record is the same
+    # sentence, the topic did not "come up" N times — one note was applied N
+    # times. 480 copies of "Requested additional information from customer."
+    # across 120 cases rendered as "Returns came up at least 110 times", which
+    # a rep reads as a customer with a returns problem. The count is accurate;
+    # the implication is false.
+    #
+    # The memory is NOT suppressed — "this account received the standard note
+    # on 110 records" is genuinely useful. It stops claiming to be evidence of
+    # customer behaviour.
+    if single_wording:
+        f = first.date().isoformat() if first else None
+        l = last.date().isoformat() if last else None
+        span = ""
+        if f and l:
+            span = f" between {f} and {l}" if f != l else f" on {f}"
+        approx = "at least " if clipped else ""
+        tail = " Earlier history was not examined." if clipped else ""
+        return (f"One repeated {topic} entry appears on {approx}{n} records"
+                f"{span} — the same wording each time, so this is one recurring "
+                f"note rather than {n} distinct observations.{tail}")
+
     when = ""
     if first and last:
         f, l = first.date().isoformat(), last.date().isoformat()
@@ -1499,6 +1695,24 @@ def verify(memory_id: str, verified_by: str, as_fact: bool = True,
     if not verified_by:
         return {"ok": False, "error": "verified_by is required — verification "
                                       "must name a person"}
+    # REFUSE UP FRONT WITH NO SIGNING KEY.
+    #
+    # Without one, signature_for() returns None, this function stored NULL in
+    # verified_signature, committed, appended to the immutable trail and
+    # returned ok=True. The approver was told it worked. But signature_valid()
+    # fails closed on a missing signature, so the memory could never become
+    # assertable — and nothing said so. Two people would complete a dual
+    # approval on a high-consequence topic and produce a permanently unusable
+    # claim, with the audit trail recording a success.
+    #
+    # A control that cannot be satisfied must refuse loudly, not accept work it
+    # will silently discard.
+    if not _SIGNING_KEY:
+        return {"ok": False, "error":
+                "MEMORY_SIGNING_KEY is not configured, so approvals cannot be "
+                "signed. Verification is refused rather than recorded: an "
+                "unsigned approval is accepted by the database but can never "
+                "pass the assertion gate. Set MEMORY_SIGNING_KEY and retry."}
     if VERIFY_ROLES and (role or "").strip().lower() not in VERIFY_ROLES:
         return {"ok": False, "error": f"role '{role or 'none'}' may not verify "
                                       f"memories (allowed: {sorted(VERIFY_ROLES)})"}
@@ -1827,12 +2041,24 @@ def _wording_fingerprint() -> str:
     for actor in ("customer_said", "customer_did", "company_did",
                   "third_party_did", None):
         for clipped in (False, True):
-            for n, first, last in ((1, a, a), (7, a, b), (3, None, None)):
-                probes.append(_statement("billing", n, first, last, actor, clipped))
+            for single in (False, True):
+                for n, first, last in ((1, a, a), (7, a, b), (3, None, None)):
+                    probes.append(_statement("billing", n, first, last, actor,
+                                             clipped, single))
     # Decay policy, in a stable order.
     probes.append("|".join(f"{t}={decay_class_for(t)}"
                            for t, _ in sorted(_TOPICS)))
     probes.append(f"fallback={decay_class_for('~absent-from-vocabulary~')}")
+    # Trust weights. Certainty is what the assertion gate reads, so a change
+    # here changes what may be stated — the same reason decay policy is in
+    # scope. Without this the upsert (gated on evidence_hash) would leave every
+    # stored certainty derived from code that no longer exists.
+    probes.append(f"trust={_W_DAYS},{_W_SOURCES},{_W_WORDINGS}")
+    # Trust LOGIC, not just its constants. Reliability is a gate input and a
+    # signed field, so a change to how it is decided changes what may be
+    # stated — and must retire every row derived under the old rule.
+    probes.append("reliability=" + ",".join(
+        str(_reliability_from(w)) for w in (None, 0.0, 0.25, 0.7, 0.9, 1.0)))
     return hashlib.sha256("␟".join(probes).encode()).hexdigest()[:12]
 
 

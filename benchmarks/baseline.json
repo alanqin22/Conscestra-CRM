@@ -1,0 +1,113 @@
+{
+ "schema": 2,
+ "corpora": {
+  "bbdf79181920c6ac": {
+   "corpus_id": "bbdf79181920c6ac",
+   "generator": "memory_consolidation/v1+text-embedding-3-small@512+wd14b0a9474c1",
+   "metrics": {
+    "clusters": 141,
+    "themes": 109,
+    "occasions_total": 893,
+    "single_wording_themes": 62,
+    "mean_certainty": 0.6333,
+    "mean_distinct_templates": 1.4495,
+    "actor_distribution": "{\"company_did\": 100, \"customer_said\": 1, \"mixed\": 7, \"unknown\": 1}",
+    "statement_digest": "b105e937e94ab338",
+    "evidence_digest": "87711c87c2ef0d46",
+    "attribution_distribution": "{\"company_did\": 1144, \"customer_did\": 41, \"customer_said\": 67, \"unknown\": 60}",
+    "actor_matrix_digest": "bba522ee7b110d13",
+    "gate_digest": "5e05f972d64ed192",
+    "gate_cases_passing": 1,
+    "gate_blockers_total": 15,
+    "latency_ms": 220.8
+   },
+   "gate_detail": {
+    "clean": [],
+    "unverified": [
+     "not human-verified"
+    ],
+    "actor_unconfirmed": [
+     "verifier did not confirm who acted"
+    ],
+    "statement_drifted": [
+     "statement changed since it was verified"
+    ],
+    "no_claim_hash": [
+     "no claim hash recorded at verification"
+    ],
+    "signature_missing": [
+     "verification signature invalid or unsigned"
+    ],
+    "signature_invalid": [
+     "verification signature invalid or unsigned"
+    ],
+    "not_a_fact": [
+     "kind is 'theme', not a fact"
+    ],
+    "internal_evidence": [
+     "evidence is internal-only"
+    ],
+    "actor_unknown": [
+     "actor is 'unknown'"
+    ],
+    "actor_mixed": [
+     "actor is 'mixed'"
+    ],
+    "contradicted": [
+     "unresolved conflict with 1 other memory/memories"
+    ],
+    "high_conflict": [
+     "high-severity conflict"
+    ],
+    "evidence_gone": [
+     "2 evidence record(s) no longer exist"
+    ],
+    "truncated_count": [
+     "count is a lower bound, not exact"
+    ],
+    "below_floor": [
+     "certainty 0.1 below floor 0.6"
+    ]
+   },
+   "actor_detail": {
+    "webchat_inbound_plain": "customer_said",
+    "webchat_outbound_plain": "company_did",
+    "webchat_inbound_names_carrier": "customer_said",
+    "webchat_outbound_names_carrier": "company_did",
+    "case_inbound": "customer_said",
+    "case_comment_outbound": "company_did",
+    "outbound_quoting_customer": "company_did",
+    "inbound_quoting_customer": "customer_said",
+    "activity_names_carrier": "third_party_did",
+    "activity_lowercase_ups": "unknown",
+    "internal_work_item": "company_did",
+    "rep_recording_customer": "customer_said",
+    "bare_outbound": "company_did",
+    "bare_inbound": "customer_did",
+    "no_signal": "unknown"
+   },
+   "recorded": {
+    "at": "2026-08-02T03:06:52.395695+00:00",
+    "by": "chief-architect",
+    "reason": "red team: sender now outranks text cues; actor_matrix gained the outbound-quoting-customer case",
+    "supersedes": {
+     "clusters": 141,
+     "themes": 109,
+     "occasions_total": 893,
+     "single_wording_themes": 62,
+     "mean_certainty": 0.6333,
+     "mean_distinct_templates": 1.4495,
+     "actor_distribution": "{\"company_did\": 100, \"customer_said\": 1, \"mixed\": 7, \"unknown\": 1}",
+     "statement_digest": "b105e937e94ab338",
+     "evidence_digest": "87711c87c2ef0d46",
+     "attribution_distribution": "{\"company_did\": 1144, \"customer_did\": 41, \"customer_said\": 67, \"unknown\": 60}",
+     "actor_matrix_digest": "2614f154f796f69b",
+     "gate_digest": "5e05f972d64ed192",
+     "gate_cases_passing": 1,
+     "gate_blockers_total": 15,
+     "latency_ms": 224.2
+    }
+   }
+  }
+ }
+}

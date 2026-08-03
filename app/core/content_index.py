@@ -184,9 +184,30 @@ _INTERNAL_WORK_ITEM_TYPES = {"task", "note", "todo", "reminder"}
 # To reinstate: label a sample by hand, and require >=95% precision on held-out
 # rows before trusting it for anything an agent may state.
 _COMPANY_ACTIVITY_TYPES: set = set()
-_THIRD_PARTY = re.compile(
-    r"(?i)\b(carrier|courier|ups|fedex|dhl|canada post|purolator|"
+# Split by case-sensitivity, because a hyphen IS a word boundary and the short
+# carrier acronyms are ordinary word endings in lower case. `\bups\b` matched
+# "follow-ups", "sign-ups", "back-ups" and "start-ups" — and all 14
+# `third_party_did` attributions in this corpus were that one false positive,
+# every one of them a webchat line such as
+#     "We struggle to keep track of customer follow-ups across our team"
+# attributed to a courier. 14 of 14 wrong, and the entire remaining error mode
+# in the attribution metric.
+_THIRD_PARTY_ANY = re.compile(
+    r"(?i)\b(carrier|courier|fedex|canada post|purolator|"
     r"payment processor|stripe|bank|supplier|vendor|warehouse)\b")
+# Acronyms, case-SENSITIVE: "UPS" is a courier, "ups" is a suffix.
+_THIRD_PARTY_ACRONYM = re.compile(r"\b(UPS|DHL)\b")
+
+
+def _mentions_third_party(text: str) -> bool:
+    return bool(_THIRD_PARTY_ANY.search(text)
+                or _THIRD_PARTY_ACRONYM.search(text))
+
+
+# Channels where the sender is structurally known: the record IS one party's
+# turn in a two-party exchange, so who sent it is a property of the channel and
+# not something to infer from wording.
+_KNOWN_SPEAKER_SOURCES = {"conversation_message", "case_comment", "case"}
 _CUSTOMER_SPOKE = re.compile(
     r"(?i)\b(customer (said|asked|reported|replied|wrote|called|emailed)|"
     r"they (said|asked|reported|mentioned)|per the customer|"
@@ -201,10 +222,32 @@ def actor_for(direction: Optional[str], source_type: str,
     unattributed memory says less, but a WRONGLY attributed one says something
     false about a customer, and that is the error that reached production."""
     t = text or ""
-    if _THIRD_PARTY.search(t):
+
+    # WHO SENT IT SETTLES IT. NO TEXT CUE APPLIES.
+    #
+    # On a channel where the sender is structurally known — a webchat turn, a
+    # case the customer opened — the record IS one party's message. A third
+    # party can be discussed, and the sender can quote the other party, but
+    # neither changes who typed it.
+    #
+    # This was applied to the third-party cue and NOT to the customer-speech
+    # cue, and a red-team attack walked straight through the gap: an OUTBOUND
+    # webchat line reading "Customer said they approved this. Per the customer,
+    # proceed." was attributed `customer_said`. Text we wrote, credited to
+    # them — the precise false-attribution class this rule exists to prevent,
+    # and trivially forgeable by anyone who can put words in an outbound
+    # message.
+    #
+    # Returning early is the fix, not another ordering tweak: any cue added
+    # later is automatically subordinate to the sender rather than needing to
+    # remember it.
+    if source_type in _KNOWN_SPEAKER_SOURCES and direction in ("inbound",
+                                                               "outbound"):
+        return CUSTOMER_SAID if direction == "inbound" else COMPANY_DID
+
+    # Sender unknown from here down, so the text is the only evidence there is.
+    if _mentions_third_party(t):
         return THIRD_PARTY_DID
-    if source_type in ("case", "conversation_message") and direction == "inbound":
-        return CUSTOMER_SAID          # the customer's own words, verbatim
     if _CUSTOMER_SPOKE.search(t):
         return CUSTOMER_SAID          # a rep RECORDING what the customer said
     # Checked BEFORE direction: for a work item `direction` is noise, so letting
@@ -281,9 +324,44 @@ SOURCES: Dict[str, Dict[str, Any]] = {
                    'internal',
                    COALESCE(a.completed_at, a.start_at, a.due_at),
                    a.direction,
-                   a.type
+                   a.type,
+                   -- The business object this record is ABOUT.
+                   -- Two records with the same wording about the
+                   -- same order are one occasion logged twice.
+                   CASE WHEN a.related_type IS NOT NULL
+                         AND a.related_id IS NOT NULL
+                        THEN concat(a.related_type, ':', a.related_id::text)
+                   END
             FROM activities a
             WHERE length(concat_ws(' ', a.subject, a.description)) >= %(min_chars)s
+              -- SYSTEM BOOKKEEPING IS NOT A CUSTOMER INTERACTION.
+              --
+              -- Found by reading evidence during the abandoned labelling round:
+              -- the memory "General came up 2 times on 2026-01-06" was built
+              -- from two rows reading
+              --     "Lead imported: Ethan Wong - Lead created during legacy
+              --      data import."
+              -- That is a migration receipt. Nothing happened between us and
+              -- the customer, and no rep would act on it.
+              --
+              -- These records will STILL BE HERE when real customers arrive,
+              -- so this noise survives the switch to real data rather than
+              -- being replaced by it.
+              --
+              -- Same class as _INTERNAL_WORK_ITEM_TYPES: a claim about what a
+              -- record IS, not a statistical guess about what it probably
+              -- means. Each pattern below is a system-generated string with no
+              -- human author.
+              AND a.description NOT LIKE 'Lead created during legacy data import%%'
+              AND COALESCE(a.description, '') <> 'General activity logged in CRM'
+              AND a.subject NOT LIKE 'Lead imported:%%'
+              -- Lifecycle bookkeeping, written TWICE for one event (once
+              -- against the lead, once against the account) and carrying no
+              -- date. It produced the dateless "General came up 2 times."
+              -- A conversion is a real business event; it is not an
+              -- interaction with the customer, and no rep acts on the receipt.
+              AND a.subject NOT LIKE 'Lead converted:%%'
+              AND a.subject NOT LIKE 'Converted from lead:%%'
         """,
     },
     # The customer's own problem statement. Customer-visible: they wrote it and
@@ -299,6 +377,7 @@ SOURCES: Dict[str, Dict[str, Any]] = {
                    'customer',
                    c.created_at,
                    'inbound',
+                   NULL,
                    NULL
             FROM cases c
             WHERE length(concat_ws(' ', c.subject, c.description)) >= %(min_chars)s
@@ -317,7 +396,8 @@ SOURCES: Dict[str, Dict[str, Any]] = {
                         WHEN c.account_id IS NOT NULL THEN 'account:'||c.account_id::text END,
                    CASE WHEN COALESCE(cc.is_internal,true) THEN 'internal' ELSE 'customer' END,
                    cc.created_at,
-                   NULL, NULL
+                   NULL, NULL,
+                   concat('case:', cc.case_id::text)
             FROM case_comments cc
             JOIN cases c ON c.case_id = cc.case_id
             WHERE length(COALESCE(cc.comment,'')) >= %(min_chars)s
@@ -338,6 +418,7 @@ SOURCES: Dict[str, Dict[str, Any]] = {
                    CASE WHEN cv.scope='external' THEN 'customer' ELSE 'internal' END,
                    m.created_at,
                    m.direction,
+                   NULL,
                    NULL
             FROM conversation_messages m
             JOIN conversations cv ON cv.conversation_id = m.conversation_id
@@ -358,6 +439,7 @@ SOURCES: Dict[str, Dict[str, Any]] = {
                    'internal',
                    im.created_at,
                    'inbound',
+                   NULL,
                    NULL
             FROM interaction_memories im
             WHERE length(COALESCE(im.summary,'')) >= %(min_chars)s
@@ -366,7 +448,8 @@ SOURCES: Dict[str, Dict[str, Any]] = {
 }
 
 _COLS = ("source_id", "text", "account_id", "contact_id", "opportunity_id",
-         "party_key", "visibility", "occurred_at", "direction", "activity_type")
+         "party_key", "visibility", "occurred_at", "direction", "activity_type",
+         "parent_key")
 
 
 def _fetch_source(cur, source_type: str) -> List[Dict[str, Any]]:
@@ -422,6 +505,14 @@ def reindex(source_types: Optional[List[str]] = None,
                 live = {r["source_id"] for r in rows}
                 gone = [sid for sid in stored if sid not in live]
                 if gone:
+                    # NAME THIS WORK. Pruning index entries whose source row is
+                    # gone is a known operation, and leaving it in the
+                    # 'undeclared' bucket is how that bucket stopped being a
+                    # signal: it reached 14,162 rows in 24h, against which the
+                    # 270-row silent deletion it exists to catch would have been
+                    # invisible. Excluding the migration artefacts in N1 would
+                    # have added 663 more on the next reindex.
+                    cur.execute("SET LOCAL app.repair_key = 'index:prune'")
                     cur.execute("DELETE FROM content_embeddings "
                                 "WHERE source_type=%s AND source_id = ANY(%s)",
                                 (st, gone))
@@ -487,8 +578,8 @@ def reindex(source_types: Optional[List[str]] = None,
                              (source_type, source_id, content_hash, model, dims,
                               embedding, account_id, contact_id, opportunity_id,
                               party_key, visibility, occurred_at, snippet,
-                              speech_act, direction, actor, chunk_ix)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)
+                              speech_act, direction, actor, parent_key, chunk_ix)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)
                            -- chunk_ix is part of the PK since schema v2. A
                            -- short record is chunk 0; long-form sources will
                            -- write 0..n. The conflict target MUST match the PK
@@ -501,6 +592,7 @@ def reindex(source_types: Optional[List[str]] = None,
                              contact_id=EXCLUDED.contact_id,
                              opportunity_id=EXCLUDED.opportunity_id,
                              party_key=EXCLUDED.party_key,
+                             parent_key=EXCLUDED.parent_key,
                              visibility=EXCLUDED.visibility,
                              occurred_at=EXCLUDED.occurred_at,
                              snippet=EXCLUDED.snippet,
@@ -514,7 +606,8 @@ def reindex(source_types: Optional[List[str]] = None,
                          r["visibility"] or INTERNAL, r["occurred_at"],
                          text[:2000], speech_act(text), r.get("direction"),
                          actor_for(r.get("direction"), st, text,
-                                   r.get("activity_type"))))
+                                   r.get("activity_type")),
+                         r.get("parent_key")))
                     out["embedded"] += 1
 
                 budget -= len(take)

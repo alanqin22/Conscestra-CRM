@@ -463,6 +463,19 @@ def _run_memory_consolidation_pass() -> None:
         logger.error(f"[Memory] consolidation failed: {exc}", exc_info=True)
 
 
+def _run_memory_observability_snapshot() -> None:
+    """Persist one reading of the memory metrics.
+
+    Never raises: an observer that can break the thing it observes gets
+    switched off, and then there is no observability."""
+    try:
+        from app.core import memory_observability
+        out = memory_observability.snapshot(persist=True)
+        logger.info(f"[observability] snapshot {out}")
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning(f"[observability] snapshot failed: {exc}")
+
+
 def _run_content_index_pass() -> None:
     """Scheduled job: keep the semantic index over the CRM's unstructured text
     current (audit #2). Incremental and budgeted — a pass embeds at most
@@ -903,6 +916,20 @@ async def lifespan(app: FastAPI):
             coalesce=True,
             max_instances=1,
             misfire_grace_time=600,
+        )
+
+        # Phase 5: one reading of every memory metric, KEPT. Every measurement
+        # surface in this system was point-in-time, which made "drift over
+        # time" uncomputable rather than merely unimplemented — the index moved
+        # 7278 -> 8049 -> 7278 -> 7394 within one session and none of that is
+        # recoverable now. Runs at 22:55, after the other daily jobs, so it
+        # observes the state they left behind.
+        _scheduler.add_job(
+            _run_memory_observability_snapshot,
+            trigger=CronTrigger(hour=22, minute=55),
+            id="memory_observability_snapshot",
+            replace_existing=True,
+            misfire_grace_time=3600,
         )
         _scheduler.add_job(
             _run_kb_draft_pass,
@@ -1510,6 +1537,16 @@ app.include_router(deploy_state_router, dependencies=_ADMIN)
 #    including verification-bias detection.
 from app.core.memory_assurance import router as memory_assurance_router
 app.include_router(memory_assurance_router, dependencies=_ADMIN)
+
+# Phase 5 observability. Admin-gated like the assurance surface: these readings
+# describe how much the system trusts its own claims about customers, which is
+# not something to expose more widely than the claims themselves.
+from app.core.memory_observability import router as memory_observability_router
+app.include_router(memory_observability_router, dependencies=_ADMIN)
+
+# Phase 2 paired shadow evaluation.
+from app.core.shadow_eval import router as shadow_eval_router
+app.include_router(shadow_eval_router, dependencies=_ADMIN)
 
 # -- Verification throughput: the capacity plan that turns "human review does
 #    not scale" into a staffing figure, plus the sampled-review work queue.

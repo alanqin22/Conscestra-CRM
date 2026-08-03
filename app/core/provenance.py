@@ -131,7 +131,16 @@ class Provenance:
         what a single number hides."""
         p = self.normalized()
         base = describe(p.source_type, None)
-        return (f"{base} (source reliability {round(p.reliability * 100)}%, "
+        # SAY WHETHER IT WAS MEASURED. `normalized()` fills an absent
+        # reliability from DEFAULT_RELIABILITY, which is a legitimate per-source
+        # PRIOR — "this came from Apollo, so roughly 0.90" is a real claim. What
+        # is not legitimate is rendering that prior as "70%" beside a measured
+        # 70%, indistinguishable. The same substitution one layer down produced
+        # 848 memories all reading exactly 0.700.
+        assumed = self.reliability is None
+        rel = (f"assumed {round(p.reliability * 100)}% for this source type"
+               if assumed else f"{round(p.reliability * 100)}%")
+        return (f"{base} (source reliability {rel}, "
                 f"stated certainty {round(p.certainty * 100)}%)")
 
 

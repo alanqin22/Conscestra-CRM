@@ -169,8 +169,51 @@ def _check_training_ack() -> Dict[str, Any]:
             "message": "no free-tier training acknowledgement in force"}
 
 
+def _check_secret_strength() -> Dict[str, Any]:
+    """A weak secret behaves exactly like a strong one until it is attacked.
+
+    MEMORY_SIGNING_KEY sat on a development placeholder while the assertion
+    gate, the verification trail and four red-team controls were all built on
+    top of it — nothing failed, nothing logged, and every test stayed green. It
+    is the only control here whose compromise silently converts "the attacker
+    must forge an HMAC" into "the attacker types a string from the repo".
+
+    BLOCKING on the signing key specifically, because a deployed environment
+    running it with a guessable key can state fabricated claims to customers as
+    verified fact. The rest are advisory: they are real problems, but refusing
+    to boot over them would strand a running business.
+    """
+    from app.core.secret_health import report as _secret_report
+    r = _secret_report()
+
+    signing = next((f for f in r["secrets"]
+                    if f["name"] == "MEMORY_SIGNING_KEY"), None)
+    if signing and not signing["ok"]:
+        return {"control": "secret_strength", "ok": False,
+                "severity": "blocking",
+                "message": f"MEMORY_SIGNING_KEY is unusable "
+                           f"({'; '.join(signing['problems'])}). It authenticates "
+                           f"every human verification; with a guessable key the "
+                           f"assertion gate can be forged and the system will "
+                           f"state invented claims to customers as verified fact."}
+
+    weak = [n for n in r["weak"] if n != "MEMORY_SIGNING_KEY"]
+    if weak or r["shared_values"]:
+        parts = []
+        if weak:
+            parts.append("weak or unset: " + ", ".join(weak))
+        parts.extend(r["shared_values"])
+        return {"control": "secret_strength", "ok": False, "severity": "advisory",
+                "message": "; ".join(parts)}
+
+    fps = ", ".join(f"{f['name'].split('_')[0].lower()}:{f['fingerprint']}"
+                    for f in r["secrets"] if f["fingerprint"])
+    return {"control": "secret_strength", "ok": True, "severity": "ok",
+            "message": f"guarded secrets configured and distinct ({fps})"}
+
+
 CHECKS = (_check_calendar_feed, _check_api_auth, _check_admin_token,
-          _check_training_ack)
+          _check_training_ack, _check_secret_strength)
 
 
 def audit() -> Dict[str, Any]:

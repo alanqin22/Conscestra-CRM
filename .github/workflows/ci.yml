@@ -14,8 +14,11 @@
 #
 # COVERED HERE
 #   * every app module imports (222 of them) — catches syntax errors, broken
-#     imports and circular dependencies across the whole codebase. That is the
-#     entire signal this pipeline provides.
+#     imports and circular dependencies across the whole codebase
+#   * the Phase 4 memory benchmark: the derivation pipeline run against a
+#     frozen corpus with its own embeddings, so clustering, statements,
+#     evidence selection and trust scores are all regression-gated WITHOUT a
+#     database
 #
 # NOT COVERED HERE — all 1039 tests, verified locally against Postgres and on
 # Railway by `python -m scripts.verify_invariants` after every deployment:
@@ -47,7 +50,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11', cache: pip }
+        # 3.12 OR NEWER IS REQUIRED — do not lower this.
+        #
+        # The codebase uses PEP 701 f-strings (nested same-type quotes), e.g.
+        #   f"...{_cal("now() - interval '1 month'")}..."   app/core/metrics.py
+        # which is a SyntaxError before 3.12. On 3.11 this step failed with 14
+        # modules unable to import, including app.main — the whole application.
+        # Railway runs 3.12+, which is the only reason production works; CI was
+        # testing a Python the product does not run on, and reported a red tick
+        # that said nothing about the deployed environment.
+        with: { python-version: '3.12', cache: pip }
 
       - name: Detect base schema
         id: detect_schema
@@ -80,13 +92,22 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      # Phase 4 gate. Runs the derivation pipeline end to end against a FROZEN
+      # corpus that carries its own embeddings — no database, so this is the
+      # only behavioural coverage CI has. Any movement in clustering,
+      # statements, evidence selection or trust fails the build.
+      - name: Memory benchmark (regression gate)
+        run: python -m app.core.memory_bench
+
       - name: State what was not verified
         if: always()
         run: |
-          echo "::warning::CI verifies ONLY that all 222 app modules import."
-          echo "::warning::No test runs here: tests/ is not published. All 1039"
-          echo "::warning::tests and every database-layer control are verified"
-          echo "::warning::locally and on Railway. See this workflow's header."
+          echo "::warning::CI verifies imports + the frozen memory benchmark."
+          echo "::warning::tests/ is not published, so all 1088 tests and every"
+          echo "::warning::database-layer control are verified locally and on"
+          echo "::warning::Railway. Extrinsic quality (topic precision, cluster"
+          echo "::warning::validity, usefulness) needs human labels and is"
+          echo "::warning::blocked on real data. See this workflow's header."
 
   # Dormant. Needs BOTH a base schema and a published tests/ directory; neither
   # is in the repository today, so this never runs. Kept rather than deleted so
@@ -116,7 +137,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11', cache: pip }
+        # 3.12+ required — see the import-check job above.
+        with: { python-version: '3.12', cache: pip }
       - run: pip install -r requirements.txt -r requirements-dev.txt
       - run: psql "$DATABASE_URL" -f sql/00_base_schema.sql
       - run: python -m scripts.migrate

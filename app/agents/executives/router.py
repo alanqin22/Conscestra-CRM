@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.core.auth_dep import require_admin
-from app.core.database import get_connection
+from app.core.database import ensure_table, get_connection
 
 logger = logging.getLogger("executives")
 
@@ -112,7 +112,10 @@ def delete_executive(executive_id: str):
 # Company Profile card on executives-mgmt.html.
 
 def _ensure_company_profile(cur) -> None:
-    cur.execute(
+    # Wrapped: a non-owner role is refused CREATE on the schema even when the
+    # table exists, and the failed statement would poison the transaction —
+    # taking the seed INSERT and the caller's query down with it.
+    ensure_table(cur, "public.company_profile",
         "CREATE TABLE IF NOT EXISTS company_profile ("
         " profile_id INT PRIMARY KEY DEFAULT 1 CHECK (profile_id = 1),"
         " company_name TEXT NOT NULL DEFAULT 'Conscestra CRM',"
