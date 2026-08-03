@@ -175,6 +175,39 @@ def get_connection():
     return conn
 
 
+def ensure_table(cur, table: str, ddl: str) -> bool:
+    """Create a table lazily, tolerating a role that is not allowed to.
+
+    Three modules create their tables at first use with
+    `CREATE TABLE IF NOT EXISTS`. Under the non-superuser `crm_app` role that
+    statement fails even when the table ALREADY EXISTS — PostgreSQL checks
+    CREATE permission on the schema before the IF NOT EXISTS short-circuit, so
+    the answer is `permission denied for schema public`, not a quiet no-op.
+
+    Worse, a failed statement POISONS the surrounding transaction: every
+    subsequent query in the same block fails too, so a startup helper that
+    "just tries" would take the whole request down with it.
+
+    A SAVEPOINT contains the failure. If the table is already there — the normal
+    case, because migrations now declare these — the caller proceeds. If it is
+    genuinely missing and we cannot create it, that is a real deployment fault
+    and the error is raised rather than swallowed.
+    """
+    cur.execute("SAVEPOINT ensure_table")
+    try:
+        cur.execute(ddl)
+        cur.execute("RELEASE SAVEPOINT ensure_table")
+        return True
+    except Exception as exc:                              # noqa: BLE001
+        cur.execute("ROLLBACK TO SAVEPOINT ensure_table")
+        cur.execute("SELECT to_regclass(%s)", (table,))
+        if cur.fetchone()[0] is not None:
+            logger.debug(f"[db] {table} exists; lazy CREATE not permitted "
+                         f"for this role ({str(exc).splitlines()[0][:80]})")
+            return False
+        raise
+
+
 # ── Generic SP executor ───────────────────────────────────────────────────────
 
 def execute_sp(query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:

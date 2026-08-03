@@ -29,21 +29,40 @@ from typing import Any, Dict, Tuple
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 
-from app.core.database import get_connection
+from app.core.database import ensure_table, get_connection
 
 logger = logging.getLogger("consent")
 
 
 def _secret() -> bytes:
+    """The key behind every unsubscribe link.
+
+    The last resort used to be the literal string 'conscestra-unsubscribe-default'.
+    That is published in source, so anyone could compute a valid token for any
+    address and opt arbitrary customers out of mail they had asked for — and the
+    only signal was a warning line in a log nobody reads at 3am.
+
+    A guessable key is not a weaker key, it is no key. Raising means commercial
+    mail stops until it is configured, which is also the CASL-correct outcome:
+    a message you cannot offer a working unsubscribe for is one you may not send.
+    ADMIN_API_TOKEN is kept as a fallback because it is a real secret, but it is
+    reported loudly — sharing one secret across two purposes means rotating
+    either one breaks the other.
+    """
     s = (os.getenv("UNSUBSCRIBE_SECRET", "") or "").strip()
-    if not s:
-        s = (os.getenv("ADMIN_API_TOKEN", "") or "").strip()
-        if s:
-            logger.warning("[consent] UNSUBSCRIBE_SECRET unset — falling back to ADMIN_API_TOKEN")
-        else:
-            s = "conscestra-unsubscribe-default"
-            logger.warning("[consent] UNSUBSCRIBE_SECRET unset — using insecure default; set it in .env")
-    return s.encode()
+    if s:
+        return s.encode()
+    s = (os.getenv("ADMIN_API_TOKEN", "") or "").strip()
+    if s:
+        logger.warning("[consent] UNSUBSCRIBE_SECRET unset — falling back to "
+                       "ADMIN_API_TOKEN. Set a dedicated secret: rotating the "
+                       "admin token would invalidate every live unsubscribe link.")
+        return s.encode()
+    raise RuntimeError(
+        "UNSUBSCRIBE_SECRET is not configured and there is no ADMIN_API_TOKEN to "
+        "fall back to. Unsubscribe links would be signed with a key published in "
+        "this repository, letting anyone forge an opt-out for any address. "
+        "Commercial email is refused until UNSUBSCRIBE_SECRET is set.")
 
 
 def _app_url() -> str:
@@ -91,12 +110,23 @@ def _mailing_address() -> str:
 # ── Suppression list ────────────────────────────────────────────────────────
 
 def _ensure_table(cur) -> None:
-    cur.execute(
+    """Create the suppression list on first use.
+
+    Wrapped because a non-owner role (crm_app) is refused CREATE on the schema
+    even when the table already exists, and the failed statement would poison
+    the transaction. `is_suppressed` fails OPEN, so that would have silently
+    reported every unsubscribed address as mailable — a CASL breach reached
+    through a permission error. See database.ensure_table.
+    """
+    ensure_table(cur, "public.email_suppression",
         "CREATE TABLE IF NOT EXISTS email_suppression ("
         " email TEXT PRIMARY KEY,"
         " reason TEXT NOT NULL DEFAULT 'unsubscribed',"
         " source TEXT NOT NULL DEFAULT 'unsubscribe_link',"
         " created_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+
+
+
 
 
 def is_suppressed(email: str) -> bool:
@@ -186,8 +216,17 @@ def guard_outbound(to: str, body_html: str, body_text: str
     if is_suppressed(to):
         logger.info(f"[consent] blocked commercial email to unsubscribed {to}")
         return False, body_html, body_text
-    return True, (body_html or "") + casl_footer_html(to), \
-           (body_text or "") + casl_footer_text(to)
+    try:
+        return True, (body_html or "") + casl_footer_html(to), \
+               (body_text or "") + casl_footer_text(to)
+    except RuntimeError as exc:
+        # No usable signing secret. Refusing the send is the compliant outcome —
+        # a commercial message without a working unsubscribe must not go out —
+        # and it is reported as a blocked send rather than a 500 from whichever
+        # agent happened to call us.
+        logger.error(f"[consent] commercial send refused, unsubscribe links "
+                     f"cannot be signed: {exc}")
+        return False, body_html, body_text
 
 
 # ── Public unsubscribe endpoint ─────────────────────────────────────────────

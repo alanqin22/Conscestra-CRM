@@ -82,7 +82,14 @@ celerybeat-schedule
 *.sage.py
 
 # Environments
+# .env alone matched ONLY the exact filename. A timestamped backup written
+# during secret rotation (.env.backup-20260802-134451) contained every secret
+# in the project, including ones already known-leaked, and was fully
+# committable. Any derivative of .env is a copy of the secrets.
 .env
+.env.*
+!.env.example
+!.env.sample
 .venv
 env/
 venv/
@@ -131,6 +138,13 @@ deploy_winscp.log
 # via `python -m scripts.verify_invariants`.
 /tests/
 
+# Benchmark corpora built from REAL data. benchmarks/corpus.json.gz is
+# synthetic and committed so CI can run the Phase-4 gate; anything named
+# corpus-real* stores verbatim customer text and entity uuids and must never
+# reach a public repository. scripts/make_benchmark refuses to write real data
+# to any other name.
+/benchmarks/corpus-real*.json.gz
+
 # Claude Code workspace (skills, local settings) — local only.
 .claude/
 
@@ -140,3 +154,28 @@ docs/raillway password and url.txt
 docs/railway upload.txt
 45b23d9a1f8e4c7b8d2a6c9e3f1b4d8a.txt
 backups/
+
+# ── Local-only working material ─────────────────────────────────────────────
+# This repository is the BACKEND. The agentorc.ca site assets, the CRM data
+# exports and the deploy scripts are local working files that happen to share
+# a folder with it. None were ignored, so a single `git add -A` would have
+# published 281 MB of images and a directory of contact/account CSVs.
+# Selective staging is not a control; this is.
+data/
+image/
+logo/
+video/
+video scripts/
+agentorc/
+docs/n8n_workflows/
+docs/n8n_system_prompts/
+docs/old_site_custom.css
+docs/*.png
+*.htaccess
+.htaccess
+robots.txt
+sitemap.xml
+deploy_html.ps1
+deploy_sp.ps1
+submit_indexnow.py
+task.json

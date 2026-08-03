@@ -1706,36 +1706,620 @@ validation — see the deployment checklist in the round-11 report.
   Railway volume resized to 1 GB 2026-07-31, so this is hygiene, not urgency.
 - **Deployment is the user's to run. Claude does not touch Railway.**
 
-### Phase 1.5 — Evidence-base repair  ← NEW, from the finding above
-Either index the customer-voice sources that today contribute 9.6%
-(conversations, case comments, inbound email/call transcripts), or rename the
-product to what it is and scope its claims accordingly. Both legitimate;
-neither-of-the-two is not. **Do this before Phase 3 or Phase 3 measures noise.**
+### Phase 1.5 — Evidence-base repair  ← **DONE 2026-08-01**
+The premise was wrong in an instructive way. "Index the customer-voice sources"
+was not available: **the indexer already covers everything** — activities 97.2%,
+cases 100%, case_comments 100%, conversations 81.5%. Nothing was left to index.
 
-### Phase 2 — Shadow mode, INTERNAL path first
+The real defect was **suppression, not absence**. ~1,300 of 8,022 indexed
+records (17%) genuinely carry customer voice, yet only 4 of 765 themes (0.5%)
+were attributed to the customer, because a theme was identified by **topic
+alone**:
+
+    if topic in live_topics: continue   # strongest cluster per topic wins
+    UNIQUE (entity_type, entity_id, topic, kind, generator)
+
+Company activity outnumbers customer voice 6,701 to 768, so the company cluster
+always won and every customer-voice theme on a shared topic was **silently
+discarded**. Measured over 60 entities: 6 `customer_said`, 3 `customer_did`,
+8 `mixed` clusters thrown away — including **13 distinct occasions** of
+*"Refund request — Customer reported: intermittent issues affecting work"*,
+dropped because we had logged more of our own billing tasks than they had
+billing complaints.
+
+`_statement()`'s docstring already said these are different claims:
+*"'They raised it' and 'we contacted them about it' are different claims about
+different people."* **The key was contradicting the sentence it keyed.**
+
+FIX — `sql/customer_memories_actor_key.sql`: identity is `(topic, actor)`, in
+the constraint, the ON CONFLICT target, the in-memory dedup (`live_claims`) and
+the sweep. Result: customer-attributed themes **4 → 13**, non-company themes
+**9 → 51** (13 customer + 38 mixed). 1044 tests pass.
+
+**The residual imbalance is real data, not a defect.** 747 of 815 themes remain
+`company_did` because we genuinely do ~90% of the talking in this CRM. The fix
+removed the suppression; it cannot manufacture voice that was never captured.
+Phase 3 can now measure something real, but any usefulness claim must be scoped
+to that ratio.
+
+### Phase 2 — Shadow mode, INTERNAL path first  ← **BUILT 2026-08-01**
+`sql/shadow_paired_eval.sql` + `app/core/shadow_eval.py`.
+
+**A PAIR is the unit of evidence.** Plain shadow mode recorded what an agent
+WOULD say — that establishes safety and nothing else, so the autonomy bar could
+be met in full without ever showing memory changed one answer for the better.
+`capture_pair()` answers the same prompt twice (memory withheld / memory
+present), records both, sends neither. `answer_fn` receives the memory list, so
+the caller owns the model call and any agent works unmodified.
+
+- **Blind review** — `v_shadow_review_blind` + `next_pairs()` hide `variant`,
+  `memory_ids` and `memory_count`, and order arms by a hash of (pair, variant).
+  A reviewer who can see which arm had memory will find memory helpful. Tested.
+- **`unnecessary` is a first-class verdict.** The likeliest honest outcome is
+  "safe, accurate, changed nothing" — a vocabulary of safety words alone could
+  never express it.
+- **`identical_rate` is reported first** in `weekly_report()`: if memory
+  changes nothing, every safety metric looks perfect.
+- Verdict requires a NAMED reviewer; anonymous is refused.
+- Verified end to end: 3 pairs, 4–6 memories delivered, `identical_rate` 0.0,
+  `autonomy_ready: false` with honest blockers (3/500 pairs, 1/100 reviewed).
+
+### Phase 2 (original note) — Shadow mode, INTERNAL path first
 Record production response + memory-enhanced candidate; expose neither. Label:
 accepted / rejected / hallucinated / unnecessary / harmful + latency +
 confidence. Target the internal agent path, where 86 memories demonstrably
 flow. `autonomy_ready` bar: ≥500 utterances, ≥100 reviewed, zero harmful.
 Currently 1 / 0.
 
-### Phase 3 — Scientific validation
+### Phase 3 — Scientific validation  ← **BUILT + FIRST RUN 2026-08-01**
+`app/core/memory_eval.py`. Thresholds declared BEFORE the run so a failing
+metric cannot be reinterpreted afterwards.
+
+**INTRINSIC (real numbers, today):**
+
+| metric | n | value | bar | status |
+|---|---|---|---|---|
+| determinism | 60 | 1.000 (0 failures) | 1.00 | PASS |
+| evidence_resolvable | 1982 | 1.000 | 0.95 | PASS |
+| count_consistency | 287 | 1.000 (0 failures) | 1.00 | PASS |
+| **actor_accuracy** | 134 | **0.8955** CI [0.832, 0.937] | 0.90 | **FAIL** |
+
+**EXTRINSIC: DEFERRED 2026-08-01 — the corpus is synthetic.** Attempted with
+two reviewers (alan, James), 120 items each, and abandoned ON EVIDENCE:
+
+- **kappa = −0.026** on `topic_correct` (raw agreement 94.2%). Below zero is
+  worse than chance — the 94% was both reviewers defaulting to "yes".
+- Cause was the INSTRUMENT: v1 showed evidence as `{source_type, source_id,
+  on_date}` and asked *"is the topic right FOR THIS EVIDENCE?"* — **the evidence
+  was never displayed.** Fixed (v2 shows the indexed text); labels carry
+  `instrument_version` and v1's 222 are kept as evidence about the instrument
+  but excluded from every metric.
+- With text visible the corpus disqualified itself: **40 of 180 contact emails
+  are on RFC 2606 reserved domains** (unreachable by specification), and
+  **1,129 activities are ONE template** ("Order shipped – follow up with
+  customer", 642 + 487 differing only by en-dash). Subject diversity 54%.
+- `corpus_realism()` DETECTS this rather than taking a flag, and the status is
+  `deferred_synthetic_corpus`, not `insufficient_labels` — the latter reads
+  like an outstanding task; this is blocked on data that does not exist.
+
+**Labelling seed data measures the seed generator, not the memory system.**
+The harness, thresholds, reviewer CLI and quality gates are complete and
+waiting. Re-run when the database holds real customer records.
+
+**Original note — `insufficient_labels`:** Topic precision, cluster precision and
+usefulness CANNOT be computed without a human judging them, and this module
+will not substitute a proxy — that substitution is the most repeated failure in
+this project's history. `--labels` emits a stratified task (by actor × topic,
+because a uniform sample is 92% company_did) that **does not show the system's
+answer**, so a reviewer judges rather than confirms.
+
+**TWO METHODOLOGY BUGS FOUND BY RUNNING IT:**
+1. A **1.0 threshold judged on a Wilson LOWER bound can never pass** — the
+   first run reported determinism as FAIL at a measured 1.000 with 0 failures.
+   Zero-defect bars now test observed failures + a rule-of-three bound (3/n).
+2. **7 `count_consistency` failures were pytest fixtures** left in the shared
+   database. A production metric computed over synthetic rows measures the
+   fixtures. `EXCLUDED_GENERATORS` now filters them — with `left()`, not
+   `LIKE '%'`, because psycopg2 reads `%` as a parameter placeholder.
+
+**THE ONE REAL FAILURE — FIXED 2026-08-01, and it was a genuine bug.**
+All 14 errors were one mode: `third_party_did` on `conversation_message`.
+Cause: **a hyphen is a word boundary**, so `ups` matched "follow-**ups**",
+"sign-ups", "back-ups", "start-ups". Every one of the 14 `third_party_did`
+attributions in the entire corpus was that false positive — webchat lines like
+*"We struggle to keep track of customer follow-ups across our team"* attributed
+to a courier.
+
+Two principled fixes (neither fitted to the errors):
+1. Carrier acronyms (`UPS`, `DHL`) are matched **case-sensitively** — "UPS" is
+   a courier, "ups" is a suffix.
+2. **Who sent it outranks what it mentions.** On a channel where the sender is
+   structurally known (`conversation_message`, `case`, `case_comment` with a
+   direction), a third party can be DISCUSSED but did not type the message.
+
+**THEN THE METRIC NEARLY GAMED ME.** Precision went 0.8955 → 1.000 — but
+abstentions rose by **exactly 14**. The errors were *removed, not corrected*,
+and the headline improved for it. Precision alone rewards abstaining from
+everything. `actor_coverage` is now scored beside it and can fail the run.
+The 0.05 floor was set AFTER seeing 0.076 — disclosed, because that ordering is
+the bias this project keeps finding in itself; it is a "is this rule doing
+anything" floor, not a quality bar.
+
+**FINAL INTRINSIC RESULTS — all pass:**
+
+| metric | n | value | bar |
+|---|---|---|---|
+| determinism | 60 | 1.000 (0 failures) | 1.00 |
+| evidence_resolvable | 1984 | 1.000 | 0.95 |
+| count_consistency | 290 | 1.000 (0 failures) | 1.00 |
+| actor_accuracy | 120 | 1.000 | 0.90 |
+| actor_coverage (direction withheld) | 1582 | 0.076 | 0.05 |
+| production_attribution | 8036 | **0.931** | reported |
+
+`actor_accuracy` withholds `direction` on purpose — it tests whether text and
+schema alone recover the actor. **Production passes direction, so live
+attribution is 93.1%**, which is the operational number.
+
+### Phase 3 (original note) — Scientific validation
 Labelled benchmark; inter-reviewer agreement; topic precision/recall;
 clustering precision & recall; attribution and actor accuracy; confidence and
 decay calibration; evidence completeness; usefulness. Statistical methodology
 and pass/fail thresholds stated in advance.
 
-### Phase 4 — Continuous memory-quality benchmark
+## ⏸ PARKED — first task when real data arrives
+
+> Nothing below is blocked on engineering. It is blocked on the database
+> holding real customer records. Phase 3's harness, thresholds, reviewer CLI,
+> rubber-stamp gate and kappa are all complete and tested; they refuse to run
+> on seed data by design (`corpus_realism()` → `deferred_synthetic_corpus`).
+>
+> **Trigger:** `python -m app.core.memory_eval --corpus` reports
+> `"synthetic": false`.
+
+### T1 — Memory review UI  ← **THE FIRST TASK**
+
+Replace the terminal reviewer (`--review`) with a web page. The CLI works and
+is fully tested, but 120 items × 4 questions is a 30-minute keyboard sitting,
+and the people who can judge whether a memory is *useful* are reps and managers,
+not whoever has a Python prompt.
+
+**Why it is parked rather than built now:** built today it would sit unvalidated
+against the data it exists for — which is precisely how the v1 labelling
+instrument shipped broken (it asked "is the topic right for this evidence?"
+while never displaying the evidence, and produced kappa −0.026). Build it
+against real records so the same class of defect is visible immediately.
+
+**Must do, all of which the CLI already does — do not regress them:**
+
+| requirement | why it exists |
+|---|---|
+| Show the **indexed text** of every cited record | v1 showed ids and dates and asked about "this evidence". Reviewers guessed; kappa went below chance. |
+| **Hide** the assigned topic and actor | A reviewer shown the answer confirms rather than judges. |
+| `unsure` distinct from `no` | Stored as NULL. "I cannot tell" is not "the system is wrong"; collapsing them understates quality while looking like a measurement. |
+| **Save per item**, resume where it stopped | A long sitting must survive a closed tab. `_pending()` already keys on (memory_id, labelled_by). |
+| Named reviewer, no anonymous submit | An anonymous verdict cannot be audited or checked against a second opinion. |
+| Two reviewers on the **same** sample | Without overlap kappa is uncomputable and every precision figure is one opinion. The UI should make inviting a second reviewer obvious, not optional. |
+| Record `instrument_version` | If the UI changes what a reviewer sees, it is a NEW instrument and its labels are not comparable. Bump it. |
+
+**Reuse, do not reimplement:** `labelling_task()`, `record_labels()`,
+`label_status()`, `label_quality()`, `format_item()` are the contract. The UI is
+a presentation layer over them — a second implementation of the sampling or the
+gates is exactly the divergence `gate_inputs()` was built to eliminate.
+
+**Constraints:** write the HTML locally and hand it over — Claude does not
+deploy to agentorc.ca. New pages need adding to the `_CHAT_PAGES` whitelist.
+
+### T2 — Re-run Phase 3 end to end
+`--labels --out`, two reviewers, then `run_all()`. Thresholds are already
+declared (`THRESHOLDS`) so a failing metric cannot be reinterpreted afterwards.
+Expect the extrinsic verdict to be a real PASS or a real FAIL for the first
+time.
+
+### T3 — Phase 2 shadow mode against real traffic
+`shadow_eval.capture_pair()` on the INTERNAL agent path. Bar: ≥500 pairs,
+≥100 reviewed, zero graded harmful. Currently 3 / 1. Watch `identical_rate`
+first — if memory changes no answer, every safety metric looks perfect.
+
+---
+
+### N2 — Parent-based occasions  ← **DONE 2026-08-01**
+`sql/content_index_parent.sql` + `content_index` + `_distinct_occasions`.
+
+**An occasion is `(template, PARENT OBJECT)`, falling back to `(template, day)`
+when a record has no parent.** `parent_key` is stored on
+`content_embeddings` (activities → `related_type:related_id`, case_comments →
+`case:<id>`), 96% populated.
+
+The old `(template, day)` rule was wrong in BOTH directions:
+- **Over-counted duplicates on one object.** Order SO-2026-100202 logged
+  "Order shipped - follow up" on 3 dates; invoice INV-000246 logged "Payment
+  reminder (urgent) drafted" **23 times**. An order does not ship 3 times.
+- **UNDER-counted distinct objects sharing a day.** One account has **120
+  cases, ALL carrying the identical comment** "Requested additional information
+  from customer." (480 comments). Old rule → 26 occasions, because only 26
+  distinct days existed. New rule → 110. **120 cases each receiving that
+  comment IS 120 events**; collapsing them by date was the larger error.
+
+Net: avg occurrences **7.03 → 8.09**, max **27 → 110**, themes 793 → 853.
+
+**Why parent and not a time window:** "same template within N days" needs an N
+nobody can defend, and this project already withdrew one statistical guess on
+principle. The parent is a schema fact. Different templates on one object stay
+distinct ("shipped" vs "fulfilled"); only identical wording about the identical
+object collapses. It also errs safely — overcounting says something FALSE about
+a person, undercounting says less.
+
+**KNOWN CONSEQUENCE, measured not hidden:** the actor mix inside clusters
+shifted, so the 80% supermajority fails more often — `customer_did` 13 → 4
+while `mixed` 38 → 68. **Non-company themes ROSE 51 → 73**, and the claim key
+still includes `actor`, so Phase 1.5's anti-eviction fix holds. `mixed` renders
+the neutral "X came up N times" rather than claiming the customer acted, which
+is the right answer when a cluster genuinely mixes actors.
+
+### N3 — Breadth over volume  ← **DONE 2026-08-01**
+`sql/theme_breadth.sql`. Two measured failure modes:
+
+- **FM-1** 66% of surviving clusters (198/299) held exactly ONE distinct
+  wording. 480 copies of one sentence across 120 cases rendered as *"Returns
+  came up at least 110 times"* — count accurate, implication false.
+- **FM-2** Selection was **FIRST-wins while the comment claimed
+  STRONGEST-wins.** `_cluster` emits in seed order, so 15 varied clusters were
+  discarded by weaker single-wording ones: *KEPT 1 template/5 occasions, LOST
+  3 templates/14*; *KEPT 1/13, LOST 3/31.*
+
+**Fix — the concept already existed.** `certainty` was documented as scaling
+with BREADTH, not volume; `occurrences` (the number in the sentence a human
+reads) was pure volume. `distinct_templates` is now a stored fact, clusters are
+**ranked by (breadth, volume)** before the (topic, actor) dedup, and a
+single-wording theme is **restated, not suppressed**:
+
+> One repeated returns entry appears on at least 110 records between
+> 2025-12-15 and 2026-01-09 — the same wording each time, so this is one
+> recurring note rather than 110 distinct observations.
+
+**NO THRESHOLD.** `distinct_templates = 1` is exact; ranking is a total order.
+Results: **510 of 853 themes restated** (all of them), weaker-cluster-wins
+**15 → 0**.
+
+### N4 — Wording breadth in `certainty`  ← **DONE 2026-08-01**
+
+**TWO CORRECTIONS to what N3 claimed.**
+
+1. *"A cluster with 2 wordings where one is 99% of volume is still boilerplate
+   and this misses it."* — **empirically empty.** 0 of 132 clusters have >=2 raw
+   wordings but effective diversity < 1.5. `_distinct_occasions` already keeps
+   one occasion per (template, parent), so dominance is destroyed before
+   anything measures it. An entropy / inverse-Simpson measure would add
+   machinery with **no measured effect** — rejected on that evidence.
+
+2. *"`certainty` already discounts breadth-poor clusters."* — **false.**
+   `breadth = (days/6)*0.6 + (source_types/3)*0.4`; wording was not in it. The
+   110-record theme built from 480 identical sentences carried **certainty
+   0.950, the cap**, because 26 distinct days maxed the day term. The sentence
+   said "one recurring note" while the trust score said maximum confidence —
+   and `certainty` is what the assertion gate reads.
+
+**FIX** — wording joins breadth, and one wording contributes **exactly zero**:
+
+    breadth = 0.40*min(1, days/6) + 0.25*min(1, sources/3)
+            + 0.35*min(1, (wordings-1)/2)
+
+Zero rather than a small discount because days and sources can BOTH be high for
+a single automated note. Only distinct wording is evidence that someone said
+something different.
+
+| | before | after |
+|---|---|---|
+| 1 wording (n=510) | avg 0.666, **max 0.950** | avg 0.544, **max 0.640** |
+| 2 wordings (n=297) | avg 0.878, max 0.950 | avg 0.732, max 0.745 |
+| 3 wordings (n=45) | avg 0.934, max 0.950 | avg 0.846, max 0.850 |
+
+Gate effect (`effective_certainty` vs ASSERT_FLOOR 0.6): 1 wording **134/510
+(26%)** clear, 2 wordings 95%, 3 wordings 100%.
+
+Trust weights are inside the derivation fingerprint, so all 853 stored
+certainties were rebuilt — the upsert is gated on `evidence_hash` and would
+otherwise have left them derived from code that no longer exists.
+
+**HONEST CAVEAT:** the three weights are a judgement, not derived. What is
+structural is that one wording scores zero. Earning the weights needs
+calibration against verification outcomes — blocked on real data, same as
+Phase 3.
+
+**RESOLVED — was: boilerplate is not a theme.** 480 identical comments across 120
+cases is a canned workflow string, not customer behaviour. Parent-keying counts
+it *more accurately* without making it *meaningful*. A cluster whose members
+collapse to ONE template fingerprint is a process, not a recurrence. Same class
+as N1. Not implemented: the obvious test is prevalence-based, which needs a
+threshold, and thresholds are what this project keeps having to withdraw.
+
+### N5 — Unmeasured reliability  ← **DONE 2026-08-02**
+
+**`reliability` was 0.700 on all 848 memories — one distinct value.**
+`min(0.70, min(COALESCE(confidence, 1.0)))` fabricated a 1.0 for every source
+with no score (0 of 180 contacts, 0 of 179 accounts have one), so the min never
+bit. The round-2 defect by a different route: then the join was impossible, now
+the join is right and the DATA is absent. Verdict unchanged — **a trust signal
+that is secretly a constant is worse than none, because it looks earned.**
+
+Fixed by REPORTING IT AS UNMEASURED (`NULL`), not by inventing a value.
+`_reliability_from(None) → None`; the COALESCE fallback is gone; the signal
+becomes real on its own the moment enrichment stamps a confidence.
+853 of 853 now correctly unmeasured.
+
+**THREE MORE INSTANCES OF THE SAME LIE, FOUND WHILE FIXING IT:**
+1. **`COALESCE(cm.reliability,0)` in calibration** turned "never measured" into
+   "confidence 0" — the same fabrication in the other direction. A curve built
+   from invented zeroes is worse than a shorter one. Now excluded.
+2. **`provenance.describe()` rendered a DEFAULT as a measurement.**
+   `normalized()` fills an absent reliability from `DEFAULT_RELIABILITY`, which
+   is a legitimate per-source prior — but printing it as a bare "70%" beside a
+   measured 70% is indistinguishable. Now "assumed 70% for this source type".
+3. **`mean_reliability: None` reads as an outage in a dashboard.** Added
+   `trust.reliability_measured_share` (0.0) with an explicit note.
+
+**THE PROPAGATION TRAP FIRED A THIRD TIME.** After the fix, 848 rows kept the
+stale 0.700 — the upsert only rewrites when `evidence_hash` moves, and the
+derivation fingerprint captured trust CONSTANTS but not trust LOGIC. Closed
+structurally: `_reliability_from` is a pure function that
+`_wording_fingerprint` PROBES, so any change to what it returns moves GENERATOR
+and retires the stale rows. (Same pattern as `_statement`; previously caught
+decay policy and trust weights.)
+
+## 🔧 ACTIONABLE NOW — does not need real data
+
+### N1 — Exclude data-migration artefacts  ← **DONE 2026-08-01**
+`content_index.SOURCES["activity"]` now excludes system bookkeeping in the
+SOURCE query (purging the index alone would not survive the next reindex):
+
+    Lead created during legacy data import   |  General activity logged in CRM
+    Lead imported:                           |  Lead converted: / Converted from lead:
+
+663 indexed records removed under declared repair keys (fully recoverable via
+`governed_deletions`). Result: themes **863 → 757**, `general` **79 → 52**,
+dateless **8 → 9**, and *"General came up 2 times."* — the catch-all topic, no
+dates, built from two migration receipts — **gone entirely (0)**.
+
+**GOTCHA, caught by the eval suite:** re-consolidating over entities that have
+EMBEDDINGS misses entities whose memories outlived their evidence. 130 stale
+memories kept citing deleted records and `evidence_resolvable` dropped to
+0.9524 → FAIL. Drive the sweep from `customer_memories`, not from
+`content_embeddings`. Back to 1.000 after re-sweeping 341 memory-holding
+entities.
+
+**Original note:**
+Found while reading evidence during the abandoned labelling round. Themes are
+being built from records like:
+
+    "Lead imported: Ethan Wong — Lead created during legacy data import."
+
+which produced the memory *"General came up 2 times on 2026-01-06."* These are
+migration bookkeeping, not customer interactions, and **they will still be in
+the database when real customers arrive** — so this noise survives the switch
+to real data. `content_index.SOURCES` should skip them, the same way
+`_INTERNAL_WORK_ITEM_TYPES` handles work items: a claim about the schema, not a
+statistical guess.
+
+Also seen: *"Onboarding came up at least 2 times"* citing **the same sentence
+twice** one day apart — `_distinct_occasions` keys on (template, day), so
+identical text on consecutive days counts as two occasions. Worth deciding
+whether that is right.
+
+### Phase 4 — Continuous memory-quality benchmark  ← **BUILT 2026-08-01**
+`benchmarks/corpus.json.gz` + `app/core/memory_bench.py` + `scripts/make_benchmark.py`.
+
+**Started WITHOUT Phase 3 finished, deliberately.** A regression gate is
+DIFFERENTIAL — it asks "did this build make things worse", which needs a stable
+baseline, not a correct one. The four intrinsic metrics are real and passing
+today; extrinsic ones join automatically when labels exist.
+
+**THE DESIGN DECISION THAT MATTERS: the corpus is FROZEN.** Measured over one
+afternoon with no benchmark activity, live data moved 7278→8049→7278→7394
+records, themes 757→853→863→848, `production_attribution` 0.9312→0.9243→0.9340.
+A gate reading live data fires on every reindex and stays silent on real code
+regressions. The fixture carries its own embeddings, so **it needs no database**
+— which is why CI can run it at all (CI executes 185 DB-free tests of 1095 and
+previously could not touch the derivation pipeline).
+
+40 entities / 966 records / 1.4 MiB gzipped → 117 clusters, 96 themes, 110 ms.
+
+**Gated (exact-zero tolerance — frozen input makes these deterministic):**
+clusters, themes, occasions, single_wording_themes, mean_certainty,
+mean_distinct_templates, actor_distribution, `statement_digest`,
+`evidence_digest`. The two digests matter most: counts can be identical while
+the sentence asserted about a person changes, or while evidence selection moves
+(which is what invalidates a human verification).
+
+**`corpus_id` guards the comparison** — a rebuilt corpus returns
+`corpus_changed`, never a silent diff against different input.
+
+**PROVEN IN BOTH DIRECTIONS:** weakening `_W_WORDINGS` moved `mean_certainty`
+0.6334→0.7113 and exited 1; clean tree exits 0 on 4/4 runs.
+
+**GOTCHA — latency must NOT gate.** The first clean run after recording a
+baseline exited 1 on nothing but a cold start (110 ms baseline, >176 ms to trip
+a 60% tolerance). On a shared runner that fires at random, and a gate that
+fires at random is worse than no gate. `REPORTED_ONLY` — still shown (±2%
+observed), never blocking.
+
+**DOES NOT COVER:** retrieval accuracy, commitment extraction, temporal
+reasoning, reviewer agreement — all need human labels, all blocked with Phase 3.
+Stated in the module docstring and asserted by a test.
+
+#### Phase 4 hardening #2 — coverage (2026-08-02, from the adversarial audit)
+
+**THE GATE HAD A HOLE OVER THE CODE IT WAS BUILT TO PROTECT.**
+
+1. **Corpus was 100% `activity`.** The 8-60 record band excluded the handful of
+   contacts holding the other sources (case_comment: ONE contact, 480 records;
+   case: one, 120). `_KNOWN_SPEAKER_SOURCES` fires only on case /
+   case_comment / conversation_message and is the fix that corrected all 14
+   wrong third-party attributions — **the gate could not execute it.**
+   Fixed: selection guarantees every source type, and the record cap is per
+   **(entity, source_type)** — a flat per-entity cap taking the newest 60 rows
+   silently dropped the very source an entity had been chosen FOR.
+   Now 5/5 sources, customer-voice share 8.2% (live 7.1%).
+
+2. **Attribution was READ BACK, not derived.** The fixture stores the actor
+   computed when it was frozen, so the benchmark never called `actor_for`.
+   Now re-derived from raw fields; `actor_at_freeze` kept for reference only.
+
+3. **Stratifying was necessary and NOT sufficient.** 0 of 1312 corpus records
+   mention a carrier, so the known-speaker precedence stayed unreachable
+   through the DATA — `_KNOWN_SPEAKER_SOURCES = set()` still exited 0.
+   **A frozen corpus proves what the code does on data that exists; waiting for
+   the right sentence to appear is not a test strategy.** Added `actor_matrix`:
+   13 constructed cases, one per branch.
+
+4. **The assertion gate had NO regression coverage** — `recall`, `explain`,
+   `gate_inputs`, `_assertion_blockers` were never executed, and that path has
+   already diverged once. Added `gate_matrix`: 16 cases, one per condition,
+   exactly one of which may pass.
+
+**Proven caught, all previously invisible:**
+
+| injected regression | detected by |
+|---|---|
+| disable the signature check | `gate_cases_passing` 1 → 3 |
+| delete known-speaker precedence | `actor_matrix_digest` |
+| carrier acronyms case-insensitive again | `actor_matrix_digest` |
+| drop the internal-work-item rule | 10 metrics incl. both digests |
+
+#### Phase 4 hardening — publication safety + baseline lifecycle (2026-08-01)
+
+**COMMIT `benchmarks/` — YES, but the safety is structural, not a promise.**
+The fixture stores VERBATIM indexed text and real entity uuids. Safe today
+because the corpus is seed data; unsafe the moment `make_benchmark` is re-run
+against real customers — and **nothing about that run would look different**:
+same command, same file size, same green CI, real sentences in a public repo.
+So the builder calls `corpus_realism()` and REFUSES to write a non-synthetic
+corpus unless `--allow-real` AND the name is `corpus-real*.json.gz`, which
+`.gitignore` excludes. Detected, not configured.
+
+**RE-RECORD THE BASELINE ON REAL DATA — NO. Corpora ACCUMULATE.**
+Re-recording launders regressions: any defect introduced in between becomes the
+new reference, silently and permanently. `corpus.json.gz` is synthetic and
+committed — it tests CODE, and code does not care that its input is seed data.
+A real corpus is ADDED beside it (gitignored) and additionally catches "breaks
+on real-world text shapes". Every corpus present must pass.
+
+**THREE SILENT FAILURE MODES FOUND IN WHAT I HAD JUST BUILT:**
+1. **Model drift.** The fixture stores raw float32 vectors; change EMBED_MODEL
+   and they still DECODE — same dims, same bytes — so every metric keeps
+   passing against a model no longer in use. Green and meaningless is the worst
+   state a gate can occupy. Now refuses on `(model, dims)` mismatch.
+2. **Baseline laundering.** `--record` overwrote unconditionally: a red gate was
+   one keystroke from green. Now requires `--reason`, stamps `at/by/reason`, and
+   stores `supersedes` so an adopted regression stays visible.
+3. **Schema-1 migration corrupted its own map.** `_baselines()` read a
+   single-result file AS the corpus map, merging `corpus_id`/`generator`/
+   `metrics` in as if each were a corpus — a silent corruption inside the
+   machinery built to prevent silent corruption. Detected by shape now.
+
+All four guards verified firing; 1101 tests.
+
+### Phase 4 (original note) — Continuous memory-quality benchmark
 Every build evaluated; no deploy if regression exceeds threshold. The AI-quality
 equivalent of unit tests.
 
-### Phase 5 — AI-specific observability
+### Phase 5 — AI-specific observability  ← **BUILT 2026-08-02**
+`sql/memory_observability.sql` + `app/core/memory_observability.py`.
+
+**THE GAP WAS NOT A DASHBOARD.** Eight surfaces already measured this system —
+`safety_metrics`, `shadow_report`, `calibration`, `roster_health`,
+`weekly_report`, `run_all`, `label_status`, `corpus_realism` — and every one
+answered only "what is true right now". Nothing was retained, so *"memory drift
+over time"* was **uncomputable**, not merely unimplemented. Over one session the
+index moved 7278→8049→7278→7394 and themes 757→853→863→848; every figure was
+known only because someone ran a query at that instant, and none is recoverable.
+
+`memory_metrics_history` (long format — a new metric needs no migration) +
+`v_memory_drift` + a **22:55 ET daily snapshot** + admin-gated endpoints
+(`/memory/observability`, `/drift`, `/snapshot`). 26 metrics per reading,
+grouped by the question they answer: corpus, trust, lifecycle, quality, gate,
+eval, shadow, labels, roster, safety, ops.
+
+**COMPOSES, NEVER RECOMPUTES.** Every number comes from the surface that owns
+it — a second implementation of a metric is exactly how `explain()` came to
+apply a weaker gate than `recall()`. A test asserts it and forbids local trust
+arithmetic. One surface failing leaves a hole in the reading, not an exception
+in the caller.
+
+**NO ALERT THRESHOLDS.** Production metrics are SUPPOSED to move; the question
+is whether one moved unexpectedly fast, and that needs history this table does
+not have yet. Inventing a cutoff now would be the third withdrawn guess in this
+project. Deltas are reported; a test forbids the drift rows carrying a verdict.
+
+**THE FINDING IT PRODUCED ON ITS FIRST RUN — the `undeclared` signal was
+drowning.** `ops.undeclared_deletions_24h` read **14,162** across 1,605
+transactions (agent_utterances 8,827, customer_memories 4,399,
+content_embeddings 936) — consolidation's own sweep, retention and test
+cleanup all landing in the bucket built to catch the 270-row silent deletion.
+That spike would have been invisible. **A catch-all that catches everything
+catches nothing.** Consolidation now declares `consolidate:sweep`, retention
+declares `retention:<table>`; `undeclared` returns to meaning "nobody explained
+this". Verified: 25 re-consolidations added 0 to the bucket.
+
+### Phase 5 (original note) — AI-specific observability
 Generation / verification / rejection / conflict rates; stale memories;
 confidence, decay and topic distributions; reviewer agreement; gate failures;
 retrieval and embedding latency; shadow acceptance; memory drift.
 Already shipped: `v_governed_deletion_activity` (undeclared-deletion spike).
 
-### Phase 6 — Red team
+### Phase 6 — Red team  ← **BUILT + RUN 2026-08-02**
+`scripts/red_team.py`. **Attacks EXECUTED against the live system, not
+enumerated.** Every control here was once believed to work while it did not —
+append-only silently discarded statements, the sanctioned erasure path deleted
+nothing, "weakest evidence link" never executed. A prose threat model would
+have passed all three.
+
+**8 of 9 blocked. Two REAL defects found, one known gap confirmed.**
+
+**Defence in depth held on the forge chain** — each layer alone looks
+sufficient, and each was needed:
+claim-hash mismatch → no audit trail → dual approval → **HMAC** → evidence
+visibility. The database ACCEPTED the fully-forged row; the gate still refused
+`['verification signature invalid or unsigned', 'evidence is internal-only']`.
+
+**DEFECT 1 — a NULL certainty produced NO blockers at all.** The floor read
+`if effective_certainty is not None and ... < ASSERT_FLOOR`, so an absent value
+skipped the check and the claim was fully assertable. **Reachable only because
+trust values had just been made nullable** (N5): `verify()` pins certainty,
+withdrawing a verification leaves it absent, nothing recomputes it for a retired
+row. Now `certainty not available` blocks. *The most serious finding of the
+session — a fix in one place opened a hole in another.*
+
+**DEFECT 2 — our own outbound text credited to the customer.** An OUTBOUND
+webchat line reading *"Customer said they approved this. Per the customer,
+proceed."* was attributed `customer_said`. The sender-outranks-text rule had
+been applied to the third-party cue and **not** to the customer-speech cue.
+Restructured so a known sender RETURNS EARLY — any cue added later is
+automatically subordinate rather than needing to remember. Added to
+`actor_matrix`, so the benchmark now guards it.
+
+**Also fixed: `verify()`'s pin outlived its verification.** Retirement cleared
+`verified_by` but left `certainty=1.0` and `valid_until=NULL` — maximum
+certainty with nobody behind it. Now withdrawn together.
+
+**THE RED TEAM'S OWN FAILURES, both instructive:**
+1. It reported a FALSE BREACH — the self-approval attack hit `delivery`, which
+   requires ONE approval, so the second call promoted the claim exactly as
+   designed. **An attack that defeats a rule which does not apply proves
+   nothing.** Now targets a 2-approver topic explicitly.
+2. It left `certainty = 1.000` behind (above the 0.95 cap), found by a test
+   hours later. **A suite that mutates production data must prove it cleaned
+   up, or it becomes the anomaly it exists to find.** `_residue()` now checks
+   and fails the run.
+
+**REMAINING BREACH — the standing superuser gap.** The app connects as a
+PostgreSQL superuser and owns every object, so it can `DISABLE TRIGGER` on its
+own controls. No database privilege can bind it. Mitigations that DO hold: the
+HMAC still blocks assertion (the key is not in the database), and
+`verify_invariants` detects a disabled control after the fact. **The fix is a
+non-superuser application role** — already listed in Deferred items, and this
+run is the evidence for prioritising it.
+
+### Phase 6 (original note) — Red team
 Compromised app server; compromised DB credentials; malicious admin; malicious
 employee; prompt injection; poisoned CRM data; replay; migration rollback;
 replica inconsistency. **Standing gap: the app connects as a PostgreSQL

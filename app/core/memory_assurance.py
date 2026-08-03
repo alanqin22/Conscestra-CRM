@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
 
-from app.core.database import get_connection
+from app.core.database import ensure_table, get_connection
 
 logger = logging.getLogger("memory_assurance")
 
@@ -45,11 +45,15 @@ SHADOW_ENABLED = _flag("MEMORY_SHADOW_MODE", "1")
 
 
 def ensure_tables() -> bool:
+    # A non-owner role cannot CREATE in the schema even when the table is
+    # already there. Returning False on that would silently switch SHADOW MODE
+    # OFF — the recording that everything downstream is measured from — for a
+    # reason that is not a fault. ensure_table checks existence and proceeds.
     try:
         conn = get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("""
+                ensure_table(cur, "public.agent_utterances", """
                     CREATE TABLE IF NOT EXISTS public.agent_utterances (
                         utterance_id   bigserial PRIMARY KEY,
                         correlation_id text,
@@ -221,14 +225,20 @@ def calibration(bucket: float = 0.1) -> Dict[str, Any]:
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT width_bucket(COALESCE(cm.reliability,0)*COALESCE(cm.certainty,0),
-                                        0, 1, %s) AS b,
+                    -- EXCLUDE unmeasured reliability, do not score it 0.
+                    -- COALESCE(reliability,0) turned "we never measured this"
+                    -- into "confidence 0", which is the same fabrication as
+                    -- the 1.0 that produced the constant in the first place —
+                    -- just in the other direction. A calibration curve built
+                    -- from invented zeroes is worse than a shorter one.
+                    SELECT width_bucket(cm.reliability * cm.certainty, 0, 1, %s) AS b,
                            count(*) AS n,
                            count(*) FILTER (WHERE v.action='verified')  AS approved,
                            count(*) FILTER (WHERE v.action='rejected')  AS rejected,
-                           avg(COALESCE(cm.reliability,0)*COALESCE(cm.certainty,0)) AS mean_conf
+                           avg(cm.reliability * cm.certainty) AS mean_conf
                       FROM customer_memories cm
                       JOIN memory_verifications v ON v.memory_id = cm.memory_id
+                     WHERE cm.reliability IS NOT NULL AND cm.certainty IS NOT NULL
                      GROUP BY b ORDER BY b""", (int(1 / bucket),))
                 rows = cur.fetchall()
         finally:

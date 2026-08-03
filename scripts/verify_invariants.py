@@ -26,12 +26,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.config import get_settings          # noqa: E402
 
 FAILURES: list = []
+PENDING: list = []
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""))
     if not ok:
         FAILURES.append(name)
+
+
+def pending(name: str, done: bool, detail: str = "") -> None:
+    """A ROLLOUT step, not an invariant.
+
+    Distinguished because the two need opposite handling. An invariant that
+    fails means the system is wrong and the build must stop. A rollout step that
+    is unfinished means a human has not yet performed a deployment action —
+    generating a password, changing an env var — and blocking every unrelated
+    run on it just trains people to ignore the whole report.
+
+    It is still printed every time, and it still says exactly what is missing.
+    """
+    print(f"  {'DONE' if done else 'TODO'}  {name}" + (f"  — {detail}" if detail else ""))
+    if not done:
+        PENDING.append(name)
 
 
 def main() -> int:      # noqa: C901
@@ -73,7 +90,11 @@ def main() -> int:      # noqa: C901
     cur.execute("DELETE FROM customer_memories WHERE memory_id=%s::uuid", (mid,))
     cur.execute("SELECT count(*) FROM governed_deletions WHERE row_pk=%s", (mid,))
     check("ordinary delete is logged", cur.fetchone()[0] == 1)
-    cur.execute("SELECT restore_governed_deletion('undeclared')")
+    # ONE row, by id. Restoring the whole 'undeclared' bucket resurrected the
+    # entire deletion history — 2,421 customer_memories rows per run.
+    cur.execute("SELECT deletion_id FROM governed_deletions WHERE row_pk=%s "
+                "ORDER BY deletion_id DESC LIMIT 1", (mid,))
+    cur.execute("SELECT restore_governed_deletion_row(%s)", (cur.fetchone()[0],))
     cur.execute("SELECT count(*) FROM customer_memories WHERE memory_id=%s::uuid", (mid,))
     check("logged delete is restorable", cur.fetchone()[0] == 1)
 
@@ -95,6 +116,9 @@ def main() -> int:      # noqa: C901
     n = cur.fetchone()[0]
     check("no unerasable verification rows", n == 0, f"{n} rows with no entity")
 
+    print("\nPrivilege-separation invariants")
+    check_app_role(cur)
+
     conn.close()
 
     print("\nMigration-set invariants")
@@ -104,6 +128,64 @@ def main() -> int:      # noqa: C901
     return 1 if FAILURES else 0
 
 
+
+
+def check_app_role(cur) -> None:
+    """The application role must be unable to switch its own controls off.
+
+    Every DB-layer control above is a trigger on a table the role could own. If
+    the app connects as an owner or a superuser, `ALTER TABLE ... DISABLE
+    TRIGGER` defeats all of them in one statement, and every invariant checked
+    above becomes a statement about a system the attacker can simply turn off.
+
+    Checked from the CATALOG, not by connecting, so this runs from the owner DSN
+    that migrations and the test harness legitimately use — the test suite
+    purges its fixtures by disabling an append-only trigger, which is admin work
+    and is fine. What is NOT fine is the running application holding that power.
+    """
+    cur.execute("SELECT rolsuper, rolcreatedb, rolcreaterole, rolbypassrls "
+                "FROM pg_roles WHERE rolname = 'crm_app'")
+    row = cur.fetchone()
+    if row is None:
+        check("app role crm_app exists", False,
+              "not created — apply sql/app_role.sql")
+        return
+    is_super, createdb, createrole, bypassrls = row
+    check("app role crm_app exists", True)
+    elevated = any((is_super, createdb, createrole, bypassrls))
+    check("app role holds no elevated attributes", not elevated,
+          "" if not elevated else
+          f"super={is_super} createdb={createdb} createrole={createrole} "
+          f"bypassrls={bypassrls}")
+
+    # Owning even ONE of these tables is enough to disable its triggers.
+    cur.execute("""SELECT count(*) FROM pg_class c
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public' AND c.relkind = 'r'
+                      AND pg_catalog.pg_get_userbyid(c.relowner) = 'crm_app'""")
+    owned = cur.fetchone()[0]
+    check("app role owns no tables", owned == 0,
+          "" if owned == 0 else
+          f"owns {owned} table(s) — it can DISABLE TRIGGER on each")
+
+    cur.execute("SELECT has_schema_privilege('crm_app','public','CREATE')")
+    can_create = cur.fetchone()[0]
+    check("app role cannot create objects in public", not can_create,
+          "" if not can_create else
+          "CREATE on schema public lets it shadow or add objects")
+
+    # The role is pointless if the app does not USE it. This is the check that
+    # would have caught "we created crm_app and left DB_DSN on postgres".
+    import os as _os
+    dsn = (_os.getenv("DATABASE_URL") or _os.getenv("DB_DSN") or "")
+    configured = "crm_app" in dsn
+    pending("application DSN points at crm_app", configured,
+            "" if configured else
+            "DB_DSN/DATABASE_URL still names an owner account. The role exists "
+            "and is proven to block the attack, but nothing is using it yet. "
+            "Finish: ALTER ROLE crm_app WITH PASSWORD '<generated>'; then set "
+            "DB_DSN=postgresql://crm_app:<pw>@host:port/db (migrations and the "
+            "test harness keep the owner DSN)")
 
 
 def check_migration_overlap() -> None:

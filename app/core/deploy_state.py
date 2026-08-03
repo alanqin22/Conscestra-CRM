@@ -56,6 +56,15 @@ REQUIRED_MIGRATIONS: List[str] = [
     "memory_audit_erasure.sql",
     "governed_mutation.sql",
     "activity_direction_enforcement.sql",
+    "customer_memories_actor_key.sql",
+    "shadow_paired_eval.sql",
+    "memory_eval_labels.sql",
+    "memory_eval_instrument.sql",
+    "content_index_parent.sql",
+    "theme_breadth.sql",
+    "memory_observability.sql",
+    "app_role.sql",
+    "erasure_authorization.sql",
 ]
 
 # The parameters that decide what an agent may SAY. A difference in any of these

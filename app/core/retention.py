@@ -206,6 +206,10 @@ def purge(dry_run: bool = False) -> Dict[str, Any]:
                                     (str(p.days),))
                         deleted[p.table] = int(cur.fetchone()[0])
                     else:
+                        # Name the policy that expired these rows, so the 'undeclared'
+                        # signal keeps meaning "nobody explained this".
+                        cur.execute("SET LOCAL app.repair_key = %s",
+                                    (f'retention:{p.table}',))
                         cur.execute(sql, (str(p.days),))
                         deleted[p.table] = cur.rowcount
                 except Exception as exc:
