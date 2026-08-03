@@ -197,6 +197,7 @@ def undo_genuinely_assertable(cur) -> None:
     if not st:
         return
     cur.execute("SET app.repair_key = 'observability-audit:revert'")
+    cur.execute("SET app.erasure_reason = 'observability-audit:harness'")
     cur.execute("SELECT erase_memory_verifications(ARRAY[%s]::uuid[])", (st["mid"],))
     cur.execute("""UPDATE customer_memories
                       SET visibility=%s, kind=%s, certainty=%s, verified_by=NULL,
@@ -326,6 +327,7 @@ def defect_erased_audit_trail(cur) -> List[str]:
     """The sanctioned GDPR path used as a cover-up."""
     mids = defect_forged_verified(cur)
     cur.execute("SET app.erasure_reason = 'observability-audit:probe'")
+    cur.execute("SET app.erasure_reason = 'observability-audit:harness'")
     cur.execute("SELECT erase_memory_verifications(ARRAY[%s]::uuid[])", (mids[0],))
     return mids
 
@@ -371,6 +373,9 @@ def _cleanup(cur) -> None:
     cur.execute(f"""SELECT memory_id::text FROM customer_memories
                      WHERE generator = '{PROBE_GENERATOR}'""")
     for (mid,) in cur.fetchall():
+        # Label it: the register is permanent, so an undeclared harness erasure
+        # is indistinguishable from a real subject request, forever.
+        cur.execute("SET app.erasure_reason = 'observability-audit:harness'")
         cur.execute("SELECT erase_memory_verifications(ARRAY[%s]::uuid[])", (mid,))
         cur.execute("DELETE FROM customer_memories WHERE memory_id=%s::uuid", (mid,))
     cur.execute("DELETE FROM content_embeddings WHERE snippet = 'observability probe'")
@@ -450,12 +455,24 @@ def main() -> int:
         print(f"  {verdict:14} {name}")
         print(f"                 {movers[:110]}")
 
+    # METRICS BACKED BY AN APPEND-ONLY REGISTER CANNOT BE RESTORED.
+    #
+    # `ops.undeclared_erasures` counts rows in memory_erasure_log, which refuses
+    # DELETE by design — including from this harness, which is the control
+    # working. Every audit run legitimately and permanently adds erasure events,
+    # so its detail can never return to the baseline.
+    #
+    # Reporting that as residue would make "restored cleanly: False" the normal
+    # outcome, and a warning that is always on is one nobody reads. It is
+    # excluded and named, not silently dropped.
+    MONOTONIC = {"ops.undeclared_erasures"}
+
     restored = read_metrics()
     # Unstable metrics differ between any two reads by definition; including
     # them would report residue on every clean run and train the reader to
     # ignore the line that matters.
     drift = {k: v for k, v in _delta(baseline, restored).items()
-             if k not in unstable}
+             if k not in unstable and k not in MONOTONIC}
     print(f"\n  restored cleanly: {not drift}"
           + ("" if not drift else f"  LEFTOVER: {sorted(drift)}"))
 

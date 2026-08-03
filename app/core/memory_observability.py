@@ -132,6 +132,27 @@ def _corpus_shape() -> Dict[str, Tuple[Optional[float], Any]]:
                 {"note": "count of ENABLED deletion-log triggers; a drop means "
                          "deletions stopped being recorded, not that they stopped"})
 
+            # ERASURES WITH NO STATED REASON.
+            #
+            # The register is append-only and permanent, so an erasure recorded
+            # without `app.erasure_reason` is indistinguishable from a genuine
+            # subject request — forever. 48 such rows were written to production
+            # by the verification harness itself before anyone looked.
+            #
+            # Requiring a reason in the database would be stronger, and would
+            # also break the app's legitimate erasure path the first time a
+            # caller forgot. Making them visible costs nothing and cannot cause
+            # an outage; a number that climbs is a question someone can ask.
+            cur.execute("""SELECT count(*) FILTER (WHERE declared_by IS NULL),
+                                  count(*)
+                             FROM memory_erasure_log""")
+            undeclared, total = cur.fetchone()
+            out["ops.undeclared_erasures"] = (
+                float(undeclared or 0),
+                {"total_erasure_events": total,
+                 "note": "erasures with no declared reason are "
+                         "indistinguishable from real subject requests"})
+
             cur.execute("""SELECT decay_class, count(*) FROM customer_memories
                             WHERE status='active' GROUP BY 1""")
             out["lifecycle.decay_distribution"] = (None, dict(cur.fetchall()))
