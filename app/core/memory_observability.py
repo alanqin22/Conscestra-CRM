@@ -90,6 +90,48 @@ def _corpus_shape() -> Dict[str, Tuple[Optional[float], Any]]:
                          "no evidence source carries a confidence score; "
                          "reliability is not measured, and is NOT 0.70"})
 
+            # NULL CERTAINTY IS INVISIBLE TO AN AVERAGE.
+            #
+            # `avg(certainty)` skips NULLs, so a theme with no certainty at all
+            # leaves trust.mean_certainty untouched — correct arithmetic, and
+            # silent about the one state that matters most: the gate FAILS
+            # CLOSED on absent certainty, so such a theme can never be
+            # asserted. A population of them would be permanently unusable
+            # while every trust metric looked healthy.
+            #
+            # Mirrors trust.reliability_measured_share, which exists for the
+            # same reason on the same table.
+            cur.execute("""SELECT count(*) FILTER (WHERE certainty IS NOT NULL),
+                                  count(*)
+                             FROM customer_memories WHERE status='active'""")
+            measured, total = cur.fetchone()
+            out["trust.certainty_measured_share"] = (
+                round((measured or 0) / (total or 1), 4),
+                {"measured": measured, "unmeasured": (total or 0) - (measured or 0),
+                 "note": "a theme with NULL certainty is refused by the gate "
+                         "and reported by no average"})
+
+            # ARE THE DELETION LOGS STILL ARMED?
+            #
+            # Disabling a deletion-log trigger does not raise a number — it
+            # LOWERS one. Deletions stop being recorded, so
+            # ops.undeclared_deletions_24h goes quiet and the dashboard reads
+            # calmer than before. The one action an attacker takes to hide bulk
+            # deletion also silences the metric that would report it.
+            #
+            # A control that can be switched off needs a metric that counts it
+            # as ON, not a metric that counts its output.
+            cur.execute("""SELECT count(*) FROM pg_trigger t
+                             JOIN pg_class c ON c.oid = t.tgrelid
+                            WHERE t.tgname LIKE '%_deletion_log'
+                              AND NOT t.tgisinternal
+                              AND t.tgenabled IN ('O','A')""")
+            armed = cur.fetchone()[0]
+            out["ops.deletion_logs_armed"] = (
+                float(armed),
+                {"note": "count of ENABLED deletion-log triggers; a drop means "
+                         "deletions stopped being recorded, not that they stopped"})
+
             cur.execute("""SELECT decay_class, count(*) FROM customer_memories
                             WHERE status='active' GROUP BY 1""")
             out["lifecycle.decay_distribution"] = (None, dict(cur.fetchall()))
@@ -122,8 +164,24 @@ def _corpus_shape() -> Dict[str, Tuple[Optional[float], Any]]:
             # times. This was the fifth. It now calls the gate.
             from app.core.memory_consolidation import (_assertion_blockers,
                                                        gate_inputs)
+            # EVERY field gate_inputs() reads, or the fingerprint is wrong.
+            #
+            # The first version of this query omitted reliability, occurrences,
+            # evidence_count, topic, decay_class and independent_sources.
+            # gate_inputs() fetches them with row.get(), which returns None for
+            # a missing key rather than raising — so the signature was verified
+            # against a fingerprint built from six Nones and never matched.
+            # Every genuinely verified memory was reported as "verification
+            # signature invalid or unsigned", and the metric could not count a
+            # single assertable theme under any circumstances.
+            #
+            # A partial SELECT and a tampered row are indistinguishable to a
+            # signature check. That is the point of signing the whole gate
+            # surface, and it means the reader must supply the whole surface.
             cur.execute("""SELECT memory_id, statement, evidence_hash, kind,
-                                  visibility, actor, truncated, certainty,
+                                  visibility, actor, truncated, reliability,
+                                  certainty, occurrences, evidence_count, topic,
+                                  decay_class, independent_sources,
                                   contradicts, conflict_severity, evidence_missing,
                                   verified_by, verified_actor,
                                   verification_expires_at, verified_claim_hash,
@@ -155,11 +213,34 @@ def _corpus_shape() -> Dict[str, Tuple[Optional[float], Any]]:
 
             # The signal that already exists and had no home: undeclared bulk
             # deletion. 270 rows once vanished across 59 innocuous statements.
-            cur.execute("""SELECT COALESCE(sum(rows_deleted),0)
-                             FROM v_governed_deletion_activity
-                            WHERE repair_key='undeclared'
-                              AND last_seen > now() - interval '1 day'""")
-            out["ops.undeclared_deletions_24h"] = (float(cur.fetchone()[0]), None)
+            #
+            # THIS WAS NOT A 24-HOUR NUMBER. `v_governed_deletion_activity`
+            # aggregates all history into one row per (table, repair_key,
+            # principal), so filtering it on `last_seen > now() - 1 day`
+            # selects GROUPS touched recently and then sums their ENTIRE
+            # lifetime. Measured: it reported 14581 when the true 24-hour
+            # figure was 198 — the all-time total, wearing a 24h label.
+            #
+            # The consequence is worse than the wrong number. A total is
+            # monotonic: it can never fall, so the metric can never say the
+            # problem stopped, and a genuine spike of 5000 is invisible
+            # against a baseline of 14581. An alert that only ever rises is
+            # read once and then ignored.
+            #
+            # Counted from the rows themselves, with the time filter on the
+            # event. Transactions are reported alongside rows because 9034
+            # rows in ONE statement and 9034 separate deletions are different
+            # incidents, and the row count alone cannot tell them apart.
+            cur.execute("""SELECT count(*), count(DISTINCT txid)
+                             FROM governed_deletions
+                            WHERE repair_key = 'undeclared'
+                              AND deleted_at > now() - interval '1 day'""")
+            rows, txns = cur.fetchone()
+            out["ops.undeclared_deletions_24h"] = (
+                float(rows), {"transactions": txns,
+                              "note": "rows in the last 24h; transactions "
+                                      "distinguishes one bulk delete from many"})
+            out["ops.undeclared_deletion_txns_24h"] = (float(txns), None)
     finally:
         conn.close()
     return out

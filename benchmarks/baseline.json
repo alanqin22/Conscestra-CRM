@@ -17,9 +17,22 @@
     "attribution_distribution": "{\"company_did\": 1144, \"customer_did\": 41, \"customer_said\": 67, \"unknown\": 60}",
     "actor_matrix_digest": "bba522ee7b110d13",
     "gate_digest": "5e05f972d64ed192",
+    "trust_matrix_digest": "8dd32f3422fc39aa",
     "gate_cases_passing": 1,
     "gate_blockers_total": 15,
-    "latency_ms": 220.8
+    "latency_ms": 225.5
+   },
+   "trust_detail": {
+    "floor": 0.44,
+    "cap": 0.95,
+    "cap_binds": 0.95,
+    "breadth_zero": 0.0,
+    "breadth_full": 1.0,
+    "days_only": 0.4,
+    "sources_only": 0.25,
+    "wordings_only": 0.35,
+    "one_wording": 0.0,
+    "two_wordings": 0.175
    },
    "gate_detail": {
     "clean": [],
@@ -87,9 +100,9 @@
     "no_signal": "unknown"
    },
    "recorded": {
-    "at": "2026-08-02T03:06:52.395695+00:00",
-    "by": "chief-architect",
-    "reason": "red team: sender now outranks text cues; actor_matrix gained the outbound-quoting-customer case",
+    "at": "2026-08-03T12:50:56.945018+00:00",
+    "by": "adversarial signal audit",
+    "reason": "Adds trust_matrix cap_binds probe. FLOOR+SPAN equals CAP exactly, so the cap is non-binding and unobservable through any reachable input; probing at breadth=2.0 makes it bind. Derivation outputs unchanged.",
     "supersedes": {
      "clusters": 141,
      "themes": 109,
@@ -101,11 +114,12 @@
      "statement_digest": "b105e937e94ab338",
      "evidence_digest": "87711c87c2ef0d46",
      "attribution_distribution": "{\"company_did\": 1144, \"customer_did\": 41, \"customer_said\": 67, \"unknown\": 60}",
-     "actor_matrix_digest": "2614f154f796f69b",
+     "actor_matrix_digest": "bba522ee7b110d13",
      "gate_digest": "5e05f972d64ed192",
+     "trust_matrix_digest": "5cae49845d6a2cd4",
      "gate_cases_passing": 1,
      "gate_blockers_total": 15,
-     "latency_ms": 224.2
+     "latency_ms": 223.4
     }
    }
   }

@@ -73,6 +73,7 @@ TOLERANCE: Dict[str, float] = {
     "attribution_distribution": 0.0,
     "actor_matrix_digest": 0.0,
     "gate_digest": 0.0,
+    "trust_matrix_digest": 0.0,
     "gate_cases_passing": 0.0,
     "gate_blockers_total": 0.0,
 }
@@ -251,6 +252,46 @@ def gate_matrix() -> Dict[str, Any]:
     return out
 
 
+def trust_matrix() -> Dict[str, float]:
+    """The trust arithmetic probed at its BOUNDARIES, not through the corpus.
+
+    Corpus data covers whatever it happens to contain. Measured: raising the
+    certainty CAP from 0.95 to 0.99 moved `mean_certainty` by exactly zero,
+    because no cluster in the frozen corpus is broad enough to reach the cap —
+    so the rule "a derivation may never assert the confidence only a human
+    confers" was unguarded, while the gate reported `ok`.
+
+    Constructed inputs cover the branches data does not: the floor with no
+    corroboration, the cap with total corroboration, and each weighting term in
+    isolation so a change to one cannot hide behind another.
+    """
+    from app.core import memory_consolidation as MC
+    return {
+        # Floor: one day, one source, one wording — nothing corroborates it.
+        "floor":        MC.certainty_from_breadth(MC.breadth_of(1, 1, 1)),
+        # Cap: saturated on every axis. The value that data never reaches.
+        "cap":          MC.certainty_from_breadth(MC.breadth_of(99, 99, 99)),
+        # THE CAP WHERE IT ACTUALLY BINDS.
+        #
+        # FLOOR + SPAN == 0.35 + 0.60 == 0.95 == CAP exactly, so `min()` never
+        # selects the cap and changing it alters no output — raising it to 0.99
+        # left every metric identical, including the boundary probes above. A
+        # backstop that is currently non-binding cannot be observed through any
+        # reachable input, which is precisely why it needs an input chosen to
+        # make it bind. If someone widens SPAN, this is the number that moves.
+        "cap_binds":    MC.certainty_from_breadth(2.0),
+        "breadth_zero": MC.breadth_of(0, 0, 0),
+        "breadth_full": MC.breadth_of(99, 99, 99),
+        # Each term alone, so reweighting cannot be silently compensated.
+        "days_only":    MC.breadth_of(99, 0, 0),
+        "sources_only": MC.breadth_of(0, 99, 0),
+        "wordings_only": MC.breadth_of(0, 0, 99),
+        # One wording contributes exactly zero, however often it repeats.
+        "one_wording":  MC.breadth_of(0, 0, 1),
+        "two_wordings": MC.breadth_of(0, 0, 2),
+    }
+
+
 def run(corpus: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Derive themes for every frozen entity and summarise the result."""
     import hashlib
@@ -326,11 +367,15 @@ def run(corpus: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             # actually decides.
             days = {m["occurred_at"].date() for m in members if m["occurred_at"]}
             srcs = {m["source_type"] for m in members}
-            breadth = min(1.0,
-                          MC._W_DAYS * min(1.0, len(days) / 6.0)
-                          + MC._W_SOURCES * min(1.0, len(srcs) / 3.0)
-                          + MC._W_WORDINGS * min(1.0, max(0, n_tpl - 1) / 2.0))
-            certainties.append(round(min(0.95, 0.35 + 0.6 * breadth), 3))
+            # CALL the product's arithmetic; never restate it.
+            #
+            # These two lines were a verbatim copy of the formula in
+            # memory_consolidation, literals and all. A gate that recomputes
+            # what it is guarding cannot detect a change to it: mutating the
+            # certainty floor from 0.35 to 0.40 in the product moved
+            # mean_certainty by 0.0000 and the gate reported `ok`.
+            breadth = MC.breadth_of(len(days), len(srcs), n_tpl)
+            certainties.append(MC.certainty_from_breadth(breadth))
 
     # THE GATE. Its inputs are pure, so it needs no database and no fixture —
     # only the same code the assertion path runs.
@@ -342,6 +387,7 @@ def run(corpus: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
     actors_matrix = actor_matrix()
     gate = gate_matrix()
+    trust = trust_matrix()
     gate_pass = [name for name, blockers in gate.items() if not blockers]
     gate_blockers_total = sum(len(b) for b in gate.values())
 
@@ -375,12 +421,17 @@ def run(corpus: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             "actor_matrix_digest": digest(
                 [f"{k}={v}" for k, v in actors_matrix.items()]),
             "gate_digest": digest([f"{k}={','.join(v)}" for k, v in gate.items()]),
+            # The trust arithmetic at its boundaries — covers the cap and each
+            # weighting term, which corpus data does not reach.
+            "trust_matrix_digest": digest(
+                [f"{k}={v}" for k, v in sorted(trust.items())]),
             # Exactly one case ("clean") may pass. If a second appears, some
             # condition stopped firing.
             "gate_cases_passing": len(gate_pass),
             "gate_blockers_total": gate_blockers_total,
             "latency_ms": round(elapsed, 1),
         },
+        "trust_detail": trust,
         "gate_detail": gate,
         "actor_detail": actors_matrix,
     }
