@@ -144,6 +144,85 @@ def undo_disabled_deletion_trigger(cur) -> None:
                 "ENABLE TRIGGER trg_content_embeddings_deletion_log")
 
 
+_ASSERTABLE_SAVED: Dict[str, Any] = {}
+
+
+def probe_genuinely_assertable(cur) -> List[str]:
+    """A memory that is ACTUALLY assertable — real evidence, real dual approval.
+
+    gate.assertable_themes reads 0.0 in every environment examined, and a metric
+    pinned at zero is indistinguishable from a broken one. Proving it can count
+    is the only way to know the corrected implementation works.
+
+    A SYNTHETIC theme cannot be used: verify() refuses one whose actor is not
+    supported by evidence ("the statement's actor does not match its evidence"),
+    which is the verification path doing its job. So this borrows a real
+    evidence-backed memory and puts every field back afterwards.
+    """
+    from app.core import memory_consolidation as MC
+    cur.execute("""SELECT memory_id::text, visibility, kind, certainty
+                     FROM customer_memories
+                    WHERE status='active' AND evidence_count > 0
+                      AND generator LIKE 'memory_consolidation%'
+                    ORDER BY evidence_count DESC LIMIT 1""")
+    row = cur.fetchone()
+    if not row:
+        return []
+    mid, vis, kind, cert = row
+    _ASSERTABLE_SAVED.update(mid=mid, visibility=vis, kind=kind, certainty=cert)
+    cur.execute("UPDATE customer_memories SET visibility='customer' "
+                "WHERE memory_id=%s::uuid", (mid,))
+    # TWO DISTINCT verifiers: high-consequence topics require dual approval, and
+    # one approval leaves the claim pending rather than assertable.
+    for who in ("obs-audit-a", "obs-audit-b"):
+        pv = MC.verification_preview(mid)
+        if pv.get("ok"):
+            MC.verify(mid, verified_by=who, role="admin",
+                      acknowledged_evidence_hash=pv.get("evidence_hash"),
+                      actor_confirmed=True)
+    return []
+
+
+def undo_genuinely_assertable(cur) -> None:
+    st = _ASSERTABLE_SAVED
+    if not st:
+        return
+    cur.execute("SET app.repair_key = 'observability-audit:revert'")
+    cur.execute("SELECT erase_memory_verifications(ARRAY[%s]::uuid[])", (st["mid"],))
+    cur.execute("""UPDATE customer_memories
+                      SET visibility=%s, kind=%s, certainty=%s, verified_by=NULL,
+                          verified_actor=false, verified_claim_hash=NULL,
+                          verified_signature=NULL, verified_evidence_hash=NULL,
+                          verified_at=NULL, verification_expires_at=NULL
+                    WHERE memory_id=%s::uuid""",
+                (st["visibility"], st["kind"], st["certainty"], st["mid"]))
+    cur.execute("RESET app.repair_key")
+    st.clear()
+
+
+def probe_reliability_recorded(cur) -> List[str]:
+    """trust.mean_reliability and reliability_measured_share are NULL/0 while no
+    evidence source carries a confidence score. Untested at any other value."""
+    mid = _new_theme(cur)
+    cur.execute("UPDATE customer_memories SET reliability = 0.42 "
+                "WHERE memory_id = %s::uuid", (mid,))
+    return [mid]
+
+
+def probe_indexed_record(cur) -> List[str]:
+    """corpus.indexed_records counts content_embeddings; never exercised."""
+    cur.execute("""INSERT INTO content_embeddings
+        (source_type, source_id, content_hash, snippet, visibility, occurred_at,
+         embedding, model, dims, contact_id, account_id, party_key)
+        SELECT 'activity', 'obsaudit-' || substr(md5(random()::text),1,10),
+               md5(random()::text), 'observability probe', 'internal', now(),
+               embedding, model, dims, contact_id, account_id, party_key
+          FROM content_embeddings LIMIT 1
+        RETURNING source_id""")
+    row = cur.fetchone()
+    return [f"embedding:{row[0]}"] if row else []
+
+
 def defect_erased_audit_trail(cur) -> List[str]:
     """The sanctioned GDPR path used as a cover-up."""
     mids = defect_forged_verified(cur)
@@ -172,6 +251,12 @@ DEFECTS: List[Tuple[str, Callable, Tuple[str, ...], Optional[Callable]]] = [
      ("ops.deletion_logs_armed",), undo_disabled_deletion_trigger),
     ("audit trail erased",         defect_erased_audit_trail,
      (), None),
+    ("a genuinely assertable memory", probe_genuinely_assertable,
+     ("gate.assertable_themes",), undo_genuinely_assertable),
+    ("reliability actually recorded", probe_reliability_recorded,
+     ("trust.mean_reliability", "trust.reliability_measured_share"), None),
+    ("a newly indexed record",      probe_indexed_record,
+     ("corpus.indexed_records",), None),
 ]
 
 
@@ -183,6 +268,7 @@ def _cleanup(cur) -> None:
     for (mid,) in cur.fetchall():
         cur.execute("SELECT erase_memory_verifications(ARRAY[%s]::uuid[])", (mid,))
         cur.execute("DELETE FROM customer_memories WHERE memory_id=%s::uuid", (mid,))
+    cur.execute("DELETE FROM content_embeddings WHERE snippet = 'observability probe'")
     cur.execute(f"""DELETE FROM governed_deletions
                      WHERE old_row->>'generator' = '{PROBE_GENERATOR}'""")
     # memory_erasure_log is DELIBERATELY not cleaned.
@@ -211,6 +297,11 @@ def main() -> int:
     print(f"OBSERVABILITY NEGATIVE CONTROLS — {len(baseline)} metrics\n")
 
     blind, unwatched = [], []
+    # Which METRICS ever move? A defect being detected does not mean every
+    # metric has a negative control — most moved because one probe row changed
+    # a corpus count. A metric that never moves under ANY planted defect has
+    # not been shown capable of failing at all.
+    ever_moved: set = set()
     for name, plant, expect, undo in DEFECTS:
         plant(cur)
         after = read_metrics()
@@ -220,6 +311,7 @@ def main() -> int:
             undo(cur)
         _cleanup(cur)
 
+        ever_moved.update(moved)
         responded = [k for k in expect if k in moved]
         if not moved:
             unwatched.append(name)
@@ -238,6 +330,20 @@ def main() -> int:
     drift = _delta(baseline, restored)
     print(f"\n  restored cleanly: {not drift}"
           + ("" if not drift else f"  LEFTOVER: {sorted(drift)}"))
+
+    # COVERAGE IS PER METRIC, NOT PER DEFECT.
+    #
+    # Nine defects being detected does not mean 31 metrics are guarded. Most of
+    # the movement above is one probe row nudging a corpus count. A metric that
+    # never moves under ANY planted defect has not been shown capable of
+    # failing, which is the property this whole exercise exists to establish.
+    never = sorted(k for k in baseline if k not in ever_moved)
+    if never:
+        print(f"\n  {len(never)} of {len(baseline)} metric(s) NEVER moved under "
+              f"any planted defect —")
+        print("  no negative control has been demonstrated for these:")
+        for k in never:
+            print(f"    {k}")
 
     if blind:
         print(f"\n  {len(blind)} metric(s) BLIND to the defect they name:")

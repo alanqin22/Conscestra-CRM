@@ -164,8 +164,24 @@ def _corpus_shape() -> Dict[str, Tuple[Optional[float], Any]]:
             # times. This was the fifth. It now calls the gate.
             from app.core.memory_consolidation import (_assertion_blockers,
                                                        gate_inputs)
+            # EVERY field gate_inputs() reads, or the fingerprint is wrong.
+            #
+            # The first version of this query omitted reliability, occurrences,
+            # evidence_count, topic, decay_class and independent_sources.
+            # gate_inputs() fetches them with row.get(), which returns None for
+            # a missing key rather than raising — so the signature was verified
+            # against a fingerprint built from six Nones and never matched.
+            # Every genuinely verified memory was reported as "verification
+            # signature invalid or unsigned", and the metric could not count a
+            # single assertable theme under any circumstances.
+            #
+            # A partial SELECT and a tampered row are indistinguishable to a
+            # signature check. That is the point of signing the whole gate
+            # surface, and it means the reader must supply the whole surface.
             cur.execute("""SELECT memory_id, statement, evidence_hash, kind,
-                                  visibility, actor, truncated, certainty,
+                                  visibility, actor, truncated, reliability,
+                                  certainty, occurrences, evidence_count, topic,
+                                  decay_class, independent_sources,
                                   contradicts, conflict_severity, evidence_missing,
                                   verified_by, verified_actor,
                                   verification_expires_at, verified_claim_hash,
