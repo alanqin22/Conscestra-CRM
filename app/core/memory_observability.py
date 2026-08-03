@@ -155,11 +155,34 @@ def _corpus_shape() -> Dict[str, Tuple[Optional[float], Any]]:
 
             # The signal that already exists and had no home: undeclared bulk
             # deletion. 270 rows once vanished across 59 innocuous statements.
-            cur.execute("""SELECT COALESCE(sum(rows_deleted),0)
-                             FROM v_governed_deletion_activity
-                            WHERE repair_key='undeclared'
-                              AND last_seen > now() - interval '1 day'""")
-            out["ops.undeclared_deletions_24h"] = (float(cur.fetchone()[0]), None)
+            #
+            # THIS WAS NOT A 24-HOUR NUMBER. `v_governed_deletion_activity`
+            # aggregates all history into one row per (table, repair_key,
+            # principal), so filtering it on `last_seen > now() - 1 day`
+            # selects GROUPS touched recently and then sums their ENTIRE
+            # lifetime. Measured: it reported 14581 when the true 24-hour
+            # figure was 198 — the all-time total, wearing a 24h label.
+            #
+            # The consequence is worse than the wrong number. A total is
+            # monotonic: it can never fall, so the metric can never say the
+            # problem stopped, and a genuine spike of 5000 is invisible
+            # against a baseline of 14581. An alert that only ever rises is
+            # read once and then ignored.
+            #
+            # Counted from the rows themselves, with the time filter on the
+            # event. Transactions are reported alongside rows because 9034
+            # rows in ONE statement and 9034 separate deletions are different
+            # incidents, and the row count alone cannot tell them apart.
+            cur.execute("""SELECT count(*), count(DISTINCT txid)
+                             FROM governed_deletions
+                            WHERE repair_key = 'undeclared'
+                              AND deleted_at > now() - interval '1 day'""")
+            rows, txns = cur.fetchone()
+            out["ops.undeclared_deletions_24h"] = (
+                float(rows), {"transactions": txns,
+                              "note": "rows in the last 24h; transactions "
+                                      "distinguishes one bulk delete from many"})
+            out["ops.undeclared_deletion_txns_24h"] = (float(txns), None)
     finally:
         conn.close()
     return out
