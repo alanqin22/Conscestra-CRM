@@ -18,6 +18,7 @@ mutate live rows revert themselves; anything left behind is reported.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -311,14 +312,60 @@ def attack_disable_control(cur) -> None:
     except Exception:
         disabled = False
 
+    # WHICH ROLE IS THE QUESTION ABOUT?
+    #
+    # The live attempt above is real evidence about the connection this run
+    # holds. On post-deploy verification that connection is an ADMIN account by
+    # design, so it can always disable the trigger — and reporting that as a
+    # breach made the gate permanently red on a deployment that was correctly
+    # configured. A check that can never pass gets ignored, which is how the
+    # controls in this system went unexamined in the first place.
+    #
+    # When the caller knows which role the APPLICATION uses (postdeploy_verify
+    # reads it from /health), the verdict is about THAT role. Its capability is
+    # decidable from the catalog without holding its password: a role that owns
+    # no tables and is not a superuser cannot ALTER TABLE ... DISABLE TRIGGER.
+    app_role = (os.getenv("REDTEAM_APP_ROLE") or "").strip()
+    if app_role and app_role != role:
+        cur.execute("""SELECT COALESCE((SELECT rolsuper FROM pg_roles
+                                         WHERE rolname = %s), NULL),
+                              (SELECT count(*) FROM pg_class c
+                                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                                WHERE n.nspname='public' AND c.relkind='r'
+                                  AND pg_catalog.pg_get_userbyid(c.relowner) = %s)
+                    """, (app_role, app_role))
+        app_super, app_owns = cur.fetchone()
+        if app_super is None:
+            not_run("rollback: disable the gate trigger",
+                    f"the application reports connecting as '{app_role}', which "
+                    f"does not exist on this database — the app and this check "
+                    f"are not looking at the same server")
+            return
+        app_safe = (not app_super) and app_owns == 0
+        record("rollback: disable the gate trigger",
+               f"the APPLICATION's database credentials ('{app_role}')",
+               app_safe,
+               "object ownership — the application role owns nothing"
+               if app_safe else "NOTHING: the application role can disable it",
+               f"'{app_role}': superuser={app_super}, owns {app_owns} table(s). "
+               f"This run's own connection ('{role}') could disable the trigger, "
+               f"which is expected for an admin dsn and is not the question.")
+        return
+
     if disabled:
-        stopped_by = "NOTHING at the database layer"
-        detail = (f"the app connects as '{role}' "
+        stopped_by = "NOTHING at the database layer for THIS role"
+        detail = (f"this run connects as '{role}' "
                   f"({'superuser' if is_super else 'table owner'}), so no DB "
-                  "privilege can bind it. The HMAC still blocks assertion and "
-                  "verify_invariants detects it after the fact, but the control "
-                  "itself is switchable. Fix: apply sql/app_role.sql and point "
-                  "DB_DSN at crm_app.")
+                  "privilege binds it.\n"
+                  "                  NOTE: that is the role THIS CHECK used, "
+                  "not necessarily the one the application uses. Post-deploy "
+                  "verification runs on an ADMIN dsn by design — the harness "
+                  "needs owner rights — so this result is EXPECTED there and "
+                  "says nothing about the app.\n"
+                  "                  What the app connects as is readable only "
+                  "from the running app: `database.connected_as` on /health. "
+                  "Whether the app ROLE is safe is covered by the "
+                  "privilege-separation invariants in scripts.verify_invariants.")
     else:
         stopped_by = "object ownership — the app role owns nothing"
         detail = (f"connected as '{role}' (superuser={is_super}, owns "

@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from typing import Optional
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +75,81 @@ def _run(label: str, module: str, env: dict) -> tuple[str, int, str]:
     return label, proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
+def _app_identity(app_url: str) -> Optional[str]:
+    """Ask the RUNNING APPLICATION which database role it connects as.
+
+    This is the only place that fact exists. The verifier's own connection is
+    an admin account by design, the catalog cannot say which credentials a
+    remote process used, and `pg_stat_activity` only shows roles that happen to
+    hold a session right now — an idle app shows nothing.
+
+    So the app reports it about itself, on /health. Everything else here is
+    inference; this is observation.
+    """
+    import json as _json
+    import urllib.request
+    url = app_url.rstrip("/") + "/health"
+    try:
+        with urllib.request.urlopen(url, timeout=25) as r:
+            body = _json.loads(r.read().decode("utf-8"))
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"  SKIP  app identity — {url} unreachable ({str(exc)[:60]})\n")
+        return None
+    db = body.get("database")
+    if db is None:
+        print(f"  SKIP  app identity — {url} does not report `database`; that "
+              f"build predates the health-check fix, so it cannot say whether "
+              f"it can reach the database at all\n")
+        return None
+    if not db.get("ok"):
+        print(f"  FAIL  app identity — the app CANNOT reach its database: "
+              f"{str(db.get('error'))[:120]}\n")
+        return None
+    who = db.get("connected_as")
+    print(f"  PASS  app identity — the application connects as '{who}'\n")
+    return who
+
+
+def _report_connected_roles(dsn: str) -> None:
+    """Which roles are ACTUALLY connected to this database?
+
+    Everything else here reasons about the connection the VERIFIER opened,
+    which is deliberately an owner account — the harness needs owner rights.
+    That means the red team's 'the app connects as a superuser' finding is
+    expected here and says nothing about the application, which was read as a
+    live breach on a deployment that had already been switched over.
+
+    A privilege-separation claim is about the running app, and the only honest
+    way to see that from outside is to look at who holds sessions. It is an
+    OBSERVATION, not a gate: an idle app holds no connections, so absence
+    proves nothing and this never fails the run.
+    """
+    try:
+        import psycopg2
+        conn = psycopg2.connect(dsn)
+    except Exception:
+        return
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("""SELECT usename, count(*)
+                             FROM pg_stat_activity
+                            WHERE datname = current_database()
+                              AND pid <> pg_backend_pid()
+                            GROUP BY 1 ORDER BY 2 DESC""")
+            rows = cur.fetchall()
+        print("observed connections (who is actually using this database):")
+        if not rows:
+            print("    none besides this check — an idle app holds no "
+                  "connections, so this is not evidence either way")
+        for user, n in rows:
+            print(f"    {user:12} {n} session(s)")
+        print("    the app's own view is authoritative: "
+              "GET /health -> database.connected_as\n")
+    finally:
+        conn.close()
+
+
 def main() -> int:
     label, dsn = _target_dsn(sys.argv)
 
@@ -90,6 +166,18 @@ def main() -> int:
     print(f"post-deploy verification — target: {label}")
     print(f"  connecting as '{user}' to {host}\n")
 
+    # Learn the application's real role BEFORE the red team runs, so the
+    # trigger-disable attack can be judged against the app rather than against
+    # this admin connection.
+    app_url = ""
+    if "--app-url" in sys.argv:
+        i = sys.argv.index("--app-url")
+        app_url = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+    app_url = app_url or os.getenv("RAILWAY_APP_URL", "") or ""
+    app_role = _app_identity(app_url) if app_url else None
+    if app_role:
+        env["REDTEAM_APP_ROLE"] = app_role
+
     stages = [("secrets", "app.core.secret_health"),
               ("invariants", "scripts.verify_invariants"),
               ("red team", "scripts.red_team")]
@@ -104,6 +192,8 @@ def main() -> int:
             for line in output.strip().splitlines()[-14:]:
                 print(f"        {line}")
         print()
+
+    _report_connected_roles(dsn)
 
     if failures:
         print(f"FAILED: {', '.join(failures)}")
