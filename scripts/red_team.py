@@ -312,13 +312,19 @@ def attack_disable_control(cur) -> None:
         disabled = False
 
     if disabled:
-        stopped_by = "NOTHING at the database layer"
-        detail = (f"the app connects as '{role}' "
+        stopped_by = "NOTHING at the database layer for THIS role"
+        detail = (f"this run connects as '{role}' "
                   f"({'superuser' if is_super else 'table owner'}), so no DB "
-                  "privilege can bind it. The HMAC still blocks assertion and "
-                  "verify_invariants detects it after the fact, but the control "
-                  "itself is switchable. Fix: apply sql/app_role.sql and point "
-                  "DB_DSN at crm_app.")
+                  "privilege binds it.\n"
+                  "                  NOTE: that is the role THIS CHECK used, "
+                  "not necessarily the one the application uses. Post-deploy "
+                  "verification runs on an ADMIN dsn by design — the harness "
+                  "needs owner rights — so this result is EXPECTED there and "
+                  "says nothing about the app.\n"
+                  "                  What the app connects as is readable only "
+                  "from the running app: `database.connected_as` on /health. "
+                  "Whether the app ROLE is safe is covered by the "
+                  "privilege-separation invariants in scripts.verify_invariants.")
     else:
         stopped_by = "object ownership — the app role owns nothing"
         detail = (f"connected as '{role}' (superuser={is_super}, owns "

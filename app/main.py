@@ -30,6 +30,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -1801,9 +1802,40 @@ async def health():
         _ha = {"role": leader.role(), "runs_singletons": leader.is_leader()}
     except Exception:
         _ha = {"role": "unknown"}
-    return {
-        "status":  "healthy",
+    # DOES THE DATABASE ACTUALLY ANSWER?
+    #
+    # This endpoint reported "healthy" unconditionally: it checked that eleven
+    # LangGraph objects had been constructed in memory and nothing else. When
+    # DATABASE_URL was pointed at a role whose password did not match, /health
+    # returned 200 "healthy" while every data request failed with
+    # `password authentication failed`. Railway's health check passed, so the
+    # broken deploy was rolled out and marked good.
+    #
+    # A health check that cannot fail is not a health check. This one runs a
+    # real query, and the endpoint returns 503 when it cannot — which is what
+    # makes a platform stop the rollout instead of completing it.
+    _db: Dict[str, Any] = {"ok": False}
+    try:
+        from app.core.database import get_connection
+        _conn = get_connection()
+        try:
+            with _conn.cursor() as _cur:
+                _cur.execute("SELECT current_user, 1")
+                _who, _ = _cur.fetchone()
+            # Which role the app ACTUALLY connects as — the one fact that
+            # cannot be established from outside the running process, and the
+            # thing privilege separation lives or dies on.
+            _db = {"ok": True, "connected_as": _who}
+        finally:
+            _conn.close()
+    except Exception as exc:                                  # noqa: BLE001
+        _db = {"ok": False, "error": str(exc).splitlines()[0][:180]}
+
+    _status = "healthy" if _db["ok"] else "degraded"
+    _payload = {
+        "status":  _status,
         "version": "2.2.0",
+        "database": _db,
         "ha": _ha,   # leader | follower | standalone — which process runs the background singletons (#7)
         "home_index": {"endpoint": "GET /home-index", "sp": "sp_home_index"},
         "agents": {
@@ -1834,6 +1866,11 @@ async def health():
             ],
         },
     }
+    if not _db["ok"]:
+        # 503, not 200-with-a-sad-field. A platform health check reads the
+        # STATUS CODE; a body saying "degraded" behind a 200 is decoration.
+        return JSONResponse(status_code=503, content=jsonable_encoder(_payload))
+    return _payload
 
 
 @app.delete("/sessions/{session_id}")
