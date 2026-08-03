@@ -16,7 +16,14 @@ httpx>=0.27.0
 apscheduler>=3.10,<4
 ddgs>=9.0.0
 trafilatura>=1.12.0
-mcp>=1.0
+# PINNED BELOW 2.0. mcp 2.0.0 removed `mcp.server.fastmcp` (the class moved
+# under `mcp.server.mcpserver`), so `mcp>=1.0` silently resolved to a release
+# that cannot import app/mcp_server.py. CI had been red since 2026-08-01 for
+# this reason alone — an unpinned major range is a scheduled outage whose date
+# is chosen by someone else.
+# Migrating to the 2.x API is real work and needs testing against a live MCP
+# client; that is a separate change, not a dependency bump.
+mcp>=1.0,<2
 PyMuPDF>=1.24          # kb_ingest: PDF text extraction (import fitz)
 python-multipart>=0.0.9  # kb_ingest: FastAPI file-upload route
 audioop-lts>=0.2; python_version >= "3.13"  # voice_stream: audioop left stdlib in 3.13
