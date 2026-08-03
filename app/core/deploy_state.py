@@ -65,6 +65,7 @@ REQUIRED_MIGRATIONS: List[str] = [
     "memory_observability.sql",
     "app_role.sql",
     "erasure_authorization.sql",
+    "erasure_log_retention.sql",
 ]
 
 # The parameters that decide what an agent may SAY. A difference in any of these

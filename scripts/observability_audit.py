@@ -42,8 +42,17 @@ PROBE_GENERATOR = "obsaudit/probe"
 
 
 def read_metrics() -> Dict[str, Any]:
+    """VALUE AND DETAIL, because some metrics carry no value at all.
+
+    `lifecycle.decay_distribution` reports {'volatile': 177, 'episodic': 671}
+    with a value of None, and `roster.reviewers` is detail-only too. A diff that
+    compared values alone could never see either move, so both were reported as
+    having no negative control when in fact they had no observable surface.
+    A metric that cannot be compared cannot be monitored."""
     from app.core.memory_observability import snapshot
-    return snapshot(persist=False)["metrics"]
+    snap = snapshot(persist=False)
+    metrics, detail = snap["metrics"], snap.get("detail", {})
+    return {k: (v, detail.get(k)) for k, v in metrics.items()}
 
 
 def _delta(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Tuple]:
@@ -223,6 +232,96 @@ def probe_indexed_record(cur) -> List[str]:
     return [f"embedding:{row[0]}"] if row else []
 
 
+
+_SHADOW_PAIRS: List[str] = []
+
+
+def probe_shadow_pair_reviewed(cur) -> List[str]:
+    """A captured shadow pair, then a human verdict on it.
+
+    Six shadow.* metrics gate the autonomy decision — whether the system may
+    ever answer without a human — and none had been shown capable of moving.
+    A readiness signal that cannot change is a permanent 'not ready', which is
+    safe, and a permanent 'ready' if it ever inverts, which is not.
+    """
+    from app.core import shadow_eval as SH
+    cur.execute("SELECT entity_type, entity_id::text FROM customer_memories "
+                "WHERE status='active' LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        return []
+    et, eid = row
+    rec = SH.capture_pair(et, eid, "observability audit probe",
+                          lambda mems: "probe answer " + ("with" if mems else "without"),
+                          audience="internal", channel="observability_audit")
+    pid = rec.get("pair_id")
+    if not pid:
+        return []
+    _SHADOW_PAIRS.append(pid)
+    SH.review_pair(pid, "accepted", reviewed_by="obs-audit")
+    return []
+
+
+def undo_shadow_pair(cur) -> None:
+    if not _SHADOW_PAIRS:
+        return
+    cur.execute("SET app.repair_key = 'observability-audit:shadow'")
+    for pid in _SHADOW_PAIRS:
+        # Shadow arms are rows in agent_utterances, not a table of their own.
+        cur.execute("DELETE FROM agent_utterances WHERE pair_id = %s::uuid", (pid,))
+    cur.execute("RESET app.repair_key")
+    _SHADOW_PAIRS.clear()
+
+
+def probe_shadow_unsafe_and_identical(cur) -> List[str]:
+    """A HARMFUL verdict, and a pair whose two arms are identical.
+
+    shadow.unsafe is the metric that must veto autonomy, and
+    shadow.identical_rate is the one that says memory changed nothing. Neither
+    had ever been observed at a non-constant value, so neither was known to be
+    capable of objecting."""
+    from app.core import shadow_eval as SH
+    cur.execute("SELECT entity_type, entity_id::text FROM customer_memories "
+                "WHERE status='active' LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        return []
+    et, eid = row
+    # Identical arms: the answer ignores the memory list entirely.
+    rec = SH.capture_pair(et, eid, "observability audit unsafe probe",
+                          lambda mems: "identical regardless of memory",
+                          audience="internal", channel="observability_audit")
+    pid = rec.get("pair_id")
+    if not pid:
+        return []
+    _SHADOW_PAIRS.append(pid)
+    SH.review_pair(pid, "harmful", reviewed_by="obs-audit")
+    return []
+
+
+def probe_eval_label(cur) -> List[str]:
+    """A recorded reviewer label. labels.count and labels.double_labelled feed
+    the inter-rater agreement that decides whether any eval number is
+    trustworthy; both sat at a constant."""
+    cur.execute("""SELECT memory_id::text FROM customer_memories
+                    WHERE status='active' LIMIT 1""")
+    row = cur.fetchone()
+    if not row:
+        return []
+    for who in ("obs-audit-r1", "obs-audit-r2"):     # two -> double_labelled
+        cur.execute("""INSERT INTO memory_eval_labels
+              (memory_id, labelled_by, topic_correct, actor_correct,
+               cluster_coherent, useful, instrument_version)
+              VALUES (%s::uuid, %s, true, true, true, true, 2)
+              ON CONFLICT DO NOTHING""", (row[0], who))
+    return []
+
+
+def undo_eval_label(cur) -> None:
+    cur.execute("DELETE FROM memory_eval_labels "
+                "WHERE labelled_by LIKE 'obs-audit-r%'")
+
+
 def defect_erased_audit_trail(cur) -> List[str]:
     """The sanctioned GDPR path used as a cover-up."""
     mids = defect_forged_verified(cur)
@@ -257,6 +356,12 @@ DEFECTS: List[Tuple[str, Callable, Tuple[str, ...], Optional[Callable]]] = [
      ("trust.mean_reliability", "trust.reliability_measured_share"), None),
     ("a newly indexed record",      probe_indexed_record,
      ("corpus.indexed_records",), None),
+    ("a reviewed shadow pair",      probe_shadow_pair_reviewed,
+     ("shadow.pairs", "shadow.reviewed", "shadow.accepted"), undo_shadow_pair),
+    ("two reviewer labels",         probe_eval_label,
+     ("labels.count", "labels.double_labelled"), undo_eval_label),
+    ("an unsafe, identical pair",   probe_shadow_unsafe_and_identical,
+     ("shadow.unsafe", "shadow.identical_rate"), undo_shadow_pair),
 ]
 
 
@@ -293,7 +398,25 @@ def main() -> int:
     cur = conn.cursor()
 
     _cleanup(cur)                       # start from a known state
+
+    # THE AUDIT'S OWN NEGATIVE CONTROL.
+    #
+    # Read twice, change nothing. Anything that differs is nondeterministic —
+    # `eval.count_consistency` and `eval.evidence_resolvable` carry sampled
+    # detail that varies per call — and would otherwise be counted as "moved"
+    # under every probe, manufacturing negative controls that do not exist.
+    #
+    # This is the same failure the mutation harness already had with stale
+    # bytecode: an instrument reporting more coverage than it measured. It is
+    # the direction that feels safe and is not.
     baseline = read_metrics()
+    unstable = set(_delta(baseline, read_metrics()))
+    if unstable:
+        print(f"  UNSTABLE — differ between two identical reads, so they cannot "
+              f"serve as a signal at all:")
+        for k in sorted(unstable):
+            print(f"    {k}")
+        print()
     print(f"OBSERVABILITY NEGATIVE CONTROLS — {len(baseline)} metrics\n")
 
     blind, unwatched = [], []
@@ -311,6 +434,7 @@ def main() -> int:
             undo(cur)
         _cleanup(cur)
 
+        moved = {k: v for k, v in moved.items() if k not in unstable}
         ever_moved.update(moved)
         responded = [k for k in expect if k in moved]
         if not moved:
@@ -321,13 +445,17 @@ def main() -> int:
             verdict = "*** BLIND ***"
         else:
             verdict = "RESPONDED"
-        movers = ", ".join(f"{k} {moved[k][0]}->{moved[k][1]}"
+        movers = ", ".join(f"{k} {moved[k][0][0]}->{moved[k][1][0]}"
                            for k in sorted(moved)[:3]) or "nothing moved"
         print(f"  {verdict:14} {name}")
         print(f"                 {movers[:110]}")
 
     restored = read_metrics()
-    drift = _delta(baseline, restored)
+    # Unstable metrics differ between any two reads by definition; including
+    # them would report residue on every clean run and train the reader to
+    # ignore the line that matters.
+    drift = {k: v for k, v in _delta(baseline, restored).items()
+             if k not in unstable}
     print(f"\n  restored cleanly: {not drift}"
           + ("" if not drift else f"  LEFTOVER: {sorted(drift)}"))
 
