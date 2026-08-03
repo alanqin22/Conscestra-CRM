@@ -28,7 +28,9 @@ thing it measures.
 
 from __future__ import annotations
 
+import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -259,7 +261,10 @@ def probe_shadow_pair_reviewed(cur) -> List[str]:
     if not pid:
         return []
     _SHADOW_PAIRS.append(pid)
-    SH.review_pair(pid, "accepted", reviewed_by="obs-audit")
+    # A reviewer name unique to this run. Reusing a name that is already in
+    # the roster leaves roster.reviewers unchanged, so the metric looks
+    # unguarded when it is really just being handed a value it already has.
+    SH.review_pair(pid, "accepted", reviewed_by=f"obs-audit-{uuid.uuid4().hex[:8]}")
     return []
 
 
@@ -323,6 +328,94 @@ def undo_eval_label(cur) -> None:
                 "WHERE labelled_by LIKE 'obs-audit-r%'")
 
 
+_EVAL_SAVED: Dict[str, Any] = {}
+
+
+def _first_sampled(cur, extra: str = "") -> Optional[str]:
+    """The row the eval sample is GUARANTEED to include.
+
+    The eval measures take `ORDER BY md5(memory_id::text) LIMIT 300` over ~848
+    active memories, so a freshly inserted probe row lands in the sample only
+    about a third of the time. A probe that works intermittently is worse than
+    none: it reports 'no negative control' at random. Mutating the first row in
+    that same ordering removes the coin flip."""
+    cur.execute(f"""SELECT memory_id::text FROM customer_memories
+                     WHERE status='active'
+                       AND left(generator, 7) <> 'pytest/'
+                       AND left(generator, 6) <> 'probe/' {extra}
+                     ORDER BY md5(memory_id::text) LIMIT 1""")
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def probe_count_inconsistency(cur) -> List[str]:
+    """`occurrences` no longer equals the occasions actually cited.
+
+    This is the 385-vs-22 incident in miniature: a sentence a human reads
+    asserting a number the evidence does not support."""
+    mid = _first_sampled(cur, "AND NOT truncated AND evidence_count > 0")
+    if not mid:
+        return []
+    cur.execute("SELECT occurrences FROM customer_memories WHERE memory_id=%s::uuid", (mid,))
+    _EVAL_SAVED["count"] = (mid, cur.fetchone()[0])
+    cur.execute("UPDATE customer_memories SET occurrences = occurrences + 97 "
+                "WHERE memory_id=%s::uuid", (mid,))
+    return []
+
+
+def undo_count_inconsistency(cur) -> None:
+    st = _EVAL_SAVED.pop("count", None)
+    if st:
+        cur.execute("UPDATE customer_memories SET occurrences=%s "
+                    "WHERE memory_id=%s::uuid", (st[1], st[0]))
+
+
+def probe_unresolvable_evidence(cur) -> List[str]:
+    """A memory citing a source that no longer exists — the retention hole that
+    let a claim keep its number after its evidence was deleted."""
+    mid = _first_sampled(cur, "AND evidence_count > 0")
+    if not mid:
+        return []
+    cur.execute("SELECT evidence FROM customer_memories WHERE memory_id=%s::uuid", (mid,))
+    ev = cur.fetchone()[0]
+    _EVAL_SAVED["evidence"] = (mid, json.dumps(ev) if not isinstance(ev, str) else ev)
+    cur.execute("""UPDATE customer_memories
+                      SET evidence = evidence || '[{"source_type":"activity",
+                          "source_id":"obsaudit-does-not-exist"}]'::jsonb
+                    WHERE memory_id=%s::uuid""", (mid,))
+    return []
+
+
+def undo_unresolvable_evidence(cur) -> None:
+    st = _EVAL_SAVED.pop("evidence", None)
+    if st:
+        cur.execute("UPDATE customer_memories SET evidence=%s::jsonb "
+                    "WHERE memory_id=%s::uuid", (st[1], st[0]))
+
+
+def probe_misattributed_record(cur) -> List[str]:
+    """A record whose observed direction contradicts what the rule infers.
+
+    actor_accuracy withholds `direction` from actor_for and then compares, so a
+    row carrying outbound direction with customer-speech wording is a genuine
+    disagreement — the shape of the 14 wrong third-party attributions."""
+    cur.execute("""INSERT INTO content_embeddings
+        (source_type, source_id, content_hash, snippet, visibility, occurred_at,
+         embedding, model, dims, contact_id, account_id, party_key, direction)
+        SELECT 'activity', 'obsaudit-attr-' || substr(md5(random()::text),1,8),
+               md5(random()::text),
+               'The customer said they would call us back about the invoice.',
+               'internal', now(), embedding, model, dims,
+               contact_id, account_id, party_key, 'outbound'
+          FROM content_embeddings LIMIT 1""")
+    return []
+
+
+def undo_misattributed_record(cur) -> None:
+    cur.execute("DELETE FROM content_embeddings "
+                "WHERE source_id LIKE 'obsaudit-attr-%'")
+
+
 def defect_erased_audit_trail(cur) -> List[str]:
     """The sanctioned GDPR path used as a cover-up."""
     mids = defect_forged_verified(cur)
@@ -364,6 +457,12 @@ DEFECTS: List[Tuple[str, Callable, Tuple[str, ...], Optional[Callable]]] = [
      ("labels.count", "labels.double_labelled"), undo_eval_label),
     ("an unsafe, identical pair",   probe_shadow_unsafe_and_identical,
      ("shadow.unsafe", "shadow.identical_rate"), undo_shadow_pair),
+    ("a miscounted memory",         probe_count_inconsistency,
+     ("eval.count_consistency",), undo_count_inconsistency),
+    ("evidence that no longer exists", probe_unresolvable_evidence,
+     ("eval.evidence_resolvable",), undo_unresolvable_evidence),
+    ("a misattributed record",      probe_misattributed_record,
+     ("eval.actor_accuracy",), undo_misattributed_record),
 ]
 
 
@@ -465,7 +564,12 @@ def main() -> int:
     # Reporting that as residue would make "restored cleanly: False" the normal
     # outcome, and a warning that is always on is one nobody reads. It is
     # excluded and named, not silently dropped.
-    MONOTONIC = {"ops.undeclared_erasures"}
+    MONOTONIC = {"ops.undeclared_erasures",
+                 # 24h-windowed counts of deletions. This audit deletes probe
+                 # rows, so it legitimately raises them and they only fall when
+                 # the window rolls — never within a run.
+                 "ops.undeclared_deletions_24h",
+                 "ops.undeclared_deletion_txns_24h"}
 
     restored = read_metrics()
     # Unstable metrics differ between any two reads by definition; including

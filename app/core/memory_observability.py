@@ -324,9 +324,30 @@ def _compose() -> Dict[str, Tuple[Optional[float], Any]]:
 
     rh = safely("roster", lambda: MA.roster_health(7))
     if rh:
-        for k in ("unreviewed", "reviewers"):
+        for k in ("unreviewed",):
             if k in rh:
                 out[f"roster.{k}"] = (_num(rh[k]), None)
+
+        # `reviewers` IS A LIST, and _num() cannot float a list.
+        #
+        # It returned None, and the detail slot was hardcoded None too, so this
+        # metric reported nothing at all — no value, no detail, in every
+        # snapshot ever taken. It was not merely lacking a negative control; it
+        # was incapable of carrying information, and looked like an ordinary
+        # metric that happened to be null.
+        #
+        # The reviewer COUNT is the number that matters: a review queue with no
+        # reviewers can never earn autonomy, and roster_health already warns
+        # about exactly that. The names go in the detail.
+        reviewers = rh.get("reviewers")
+        if isinstance(reviewers, list):
+            out["roster.reviewers"] = (
+                float(len(reviewers)),
+                {"who": [r.get("who") for r in reviewers if isinstance(r, dict)],
+                 "roster_size_configured": rh.get("roster_size"),
+                 "warning": rh.get("warning")})
+        elif reviewers is not None:
+            out["roster.reviewers"] = (_num(reviewers), None)
 
     return out
 
