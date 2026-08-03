@@ -90,6 +90,48 @@ def _corpus_shape() -> Dict[str, Tuple[Optional[float], Any]]:
                          "no evidence source carries a confidence score; "
                          "reliability is not measured, and is NOT 0.70"})
 
+            # NULL CERTAINTY IS INVISIBLE TO AN AVERAGE.
+            #
+            # `avg(certainty)` skips NULLs, so a theme with no certainty at all
+            # leaves trust.mean_certainty untouched — correct arithmetic, and
+            # silent about the one state that matters most: the gate FAILS
+            # CLOSED on absent certainty, so such a theme can never be
+            # asserted. A population of them would be permanently unusable
+            # while every trust metric looked healthy.
+            #
+            # Mirrors trust.reliability_measured_share, which exists for the
+            # same reason on the same table.
+            cur.execute("""SELECT count(*) FILTER (WHERE certainty IS NOT NULL),
+                                  count(*)
+                             FROM customer_memories WHERE status='active'""")
+            measured, total = cur.fetchone()
+            out["trust.certainty_measured_share"] = (
+                round((measured or 0) / (total or 1), 4),
+                {"measured": measured, "unmeasured": (total or 0) - (measured or 0),
+                 "note": "a theme with NULL certainty is refused by the gate "
+                         "and reported by no average"})
+
+            # ARE THE DELETION LOGS STILL ARMED?
+            #
+            # Disabling a deletion-log trigger does not raise a number — it
+            # LOWERS one. Deletions stop being recorded, so
+            # ops.undeclared_deletions_24h goes quiet and the dashboard reads
+            # calmer than before. The one action an attacker takes to hide bulk
+            # deletion also silences the metric that would report it.
+            #
+            # A control that can be switched off needs a metric that counts it
+            # as ON, not a metric that counts its output.
+            cur.execute("""SELECT count(*) FROM pg_trigger t
+                             JOIN pg_class c ON c.oid = t.tgrelid
+                            WHERE t.tgname LIKE '%_deletion_log'
+                              AND NOT t.tgisinternal
+                              AND t.tgenabled IN ('O','A')""")
+            armed = cur.fetchone()[0]
+            out["ops.deletion_logs_armed"] = (
+                float(armed),
+                {"note": "count of ENABLED deletion-log triggers; a drop means "
+                         "deletions stopped being recorded, not that they stopped"})
+
             cur.execute("""SELECT decay_class, count(*) FROM customer_memories
                             WHERE status='active' GROUP BY 1""")
             out["lifecycle.decay_distribution"] = (None, dict(cur.fetchall()))
