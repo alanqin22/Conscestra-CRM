@@ -1159,16 +1159,45 @@ def _derive_trust(cur, members: List[Dict[str, Any]],
         cur.connection.rollback()           # unknown evidence trust → keep default
         logger.debug(f"[memory] evidence reliability lookup skipped: {exc}")
 
-    # (n_templates - 1) / 2 → one wording scores 0.0, two 0.5, three or more
-    # 1.0. The zero is the point: it is not a small discount, it is the
-    # statement that a repeated sentence adds no corroboration however widely
-    # it is spread.
-    breadth = min(1.0,
-                  _W_DAYS * min(1.0, len(days) / 6.0)
-                  + _W_SOURCES * min(1.0, len(src_types) / 3.0)
-                  + _W_WORDINGS * min(1.0, max(0, n_templates - 1) / 2.0))
-    certainty = round(min(0.95, 0.35 + 0.6 * breadth), 3)
+    breadth = breadth_of(len(days), len(src_types), n_templates)
+    certainty = certainty_from_breadth(breadth)
     return (round(reliability, 3) if reliability is not None else None), certainty
+
+
+# ── The trust arithmetic, as functions rather than expressions ───────────────
+#
+# These were inline here AND copied verbatim into app/core/memory_bench.py, the
+# regression gate whose entire purpose is to notice when this arithmetic moves.
+# Because the gate carried its own copy of the literals, changing the formula
+# here left every benchmark metric identical and the gate green: it was
+# regression-testing itself. Verified by mutation — 0.35 -> 0.40 moved
+# mean_certainty by exactly nothing.
+#
+# The same defect, for the fifth time in this file's history: two
+# implementations of one rule. A duplicated constant does not diverge loudly,
+# it diverges silently and keeps reporting success.
+
+CERTAINTY_FLOOR = 0.35      # a lone, once-seen observation
+CERTAINTY_SPAN  = 0.60      # what breadth can add on top of it
+CERTAINTY_CAP   = 0.95      # derivation never asserts certainty
+
+
+def breadth_of(n_days: int, n_sources: int, n_templates: int) -> float:
+    """How WIDELY a theme is corroborated, in [0, 1].
+
+    (n_templates - 1) / 2 → one wording scores 0.0, two 0.5, three or more 1.0.
+    The zero is the point: it is not a small discount, it is the statement that
+    a repeated sentence adds no corroboration however widely it is spread."""
+    return min(1.0,
+               _W_DAYS * min(1.0, n_days / 6.0)
+               + _W_SOURCES * min(1.0, n_sources / 3.0)
+               + _W_WORDINGS * min(1.0, max(0, n_templates - 1) / 2.0))
+
+
+def certainty_from_breadth(breadth: float) -> float:
+    """Breadth → certainty. Capped below 1.0 because a derivation may never
+    claim the confidence that only a human verification confers."""
+    return round(min(CERTAINTY_CAP, CERTAINTY_FLOOR + CERTAINTY_SPAN * breadth), 3)
 
 
 def _valid_until(last_observed):

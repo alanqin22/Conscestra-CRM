@@ -72,11 +72,29 @@ def main() -> int:      # noqa: C901
     check("erasure function exists", cur.fetchone()[0] is not None)
 
     # 3. Deletion logging is armed on every governed table.
-    cur.execute("""SELECT c.relname FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
+    # ARMED means ENABLED, not merely present.
+    #
+    # This asked pg_trigger whether the row exists. `ALTER TABLE ... DISABLE
+    # TRIGGER` does not delete the row — it sets tgenabled='D' — so the check
+    # reported "deletion log armed" on a table whose deletion log had been
+    # switched off. Verified by mutation: disabling the trigger on
+    # content_embeddings left this suite exiting 0.
+    #
+    # That is the same class of defect as the health endpoint that could not
+    # fail, in the tool whose entire job is to notice.
+    #
+    # tgenabled: 'O' origin, 'A' always, 'D' disabled, 'R' replica-only (never
+    # fires on a primary, so it is disabled for our purposes).
+    cur.execute("""SELECT c.relname, t.tgenabled
+                     FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
                     WHERE t.tgname LIKE '%_deletion_log' AND NOT t.tgisinternal""")
-    armed = {r[0] for r in cur.fetchall()}
+    state = dict(cur.fetchall())
     for tbl in ("customer_memories", "content_embeddings", "agent_utterances"):
-        check(f"deletion log armed: {tbl}", tbl in armed)
+        st = state.get(tbl)
+        check(f"deletion log armed: {tbl}", st in ("O", "A"),
+              "" if st in ("O", "A") else
+              ("trigger absent" if st is None else
+               f"trigger present but tgenabled={st!r} — it does not fire"))
 
     # 4. An ordinary delete is recoverable; an erasure is not.
     cur.execute("""INSERT INTO customer_memories
