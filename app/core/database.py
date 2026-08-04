@@ -166,6 +166,33 @@ def _pool_for(dsn: str, schema: str):
     return pool
 
 
+def pool_utilisation() -> Dict[str, Any]:
+    """How close this PROCESS is to its connection ceiling.
+
+    Pools are per process. `uvicorn --workers 4` means 4 x POOL_MAX against a
+    server-wide `max_connections` that other services also draw on — the
+    multiplication is easy to forget and expensive to discover, because
+    exhaustion arrives as every service failing at once rather than this one
+    slowing down.
+
+    `in_use` is derived from the semaphore, which is the same thing the bound
+    is enforced with, so this cannot drift from the limit it reports."""
+    out: Dict[str, Any] = {"pool_max": POOL_MAX, "pools": len(_POOLS),
+                           "timeout_s": POOL_TIMEOUT, "in_use": None}
+    slots = list(_POOL_SLOTS.values())
+    if slots:
+        # BoundedSemaphore has no public counter; _value is the free count.
+        free = sum(getattr(s, "_value", 0) for s in slots)
+        capacity = POOL_MAX * len(slots)
+        out["in_use"] = capacity - free
+        out["utilisation"] = round((capacity - free) / capacity, 4) if capacity else None
+        out["process_ceiling"] = capacity
+        out["cluster_ceiling_hint"] = (
+            f"x WEB_CONCURRENCY workers; check against the server's "
+            f"max_connections before raising either")
+    return out
+
+
 def close_all_pools() -> None:
     """Release every pooled connection. For shutdown hooks and test teardown."""
     with _POOL_LOCK:

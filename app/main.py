@@ -1913,6 +1913,12 @@ async def health():
 
     # Background jobs: reported, never fatal. A follower legitimately runs none,
     # and an HTTP node that cannot schedule can still serve reads correctly.
+    try:
+        from app.core.database import pool_utilisation
+        _pool = pool_utilisation()
+    except Exception:                                     # noqa: BLE001
+        _pool = None
+
     _sched = {"running": getattr(app.state, "scheduler_running", None),
               "jobs": getattr(app.state, "scheduler_jobs", 0)}
     if getattr(app.state, "scheduler_error", None):
@@ -1924,6 +1930,7 @@ async def health():
         "version": "2.2.0",
         "database": _db,
         "scheduler": _sched,
+        "connections": _pool,
         "ha": _ha,   # leader | follower | standalone — which process runs the background singletons (#7)
         "home_index": {"endpoint": "GET /home-index", "sp": "sp_home_index"},
         "agents": {
