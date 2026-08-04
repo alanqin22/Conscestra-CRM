@@ -50,10 +50,26 @@ a query and asking how many survive the window:
 | 2,000 | 29.3% | **0 of 5** |
 | 1,000 | 14.7% | 0 of 5 |
 
-**MEASURED.** It is a cliff, not a slope. At today's volume the cap already
-drops one of the five best answers; at roughly **2× this data** a search returns
-nothing relevant while still returning confident-looking results. This binds at
-~15k records — long before any capacity limit.
+**CORRECTED 2026-08-03.** The original table was a single query, and its five
+"best" results were five copies of one boilerplate template — so it measured
+one temporal cluster, not retrieval in general. Re-run across six queries,
+counting how many of each true top-5 survive the window:
+
+| Window | Coverage | recall@5 (6 queries) | Range |
+|---|---|---|---|
+| 4,000 (current) | 58.6% | **77%** | 3–5 of 5 |
+| 2,000 | 29.3% | **27%** | 0–5 of 5 |
+| 1,000 | 14.7% | 10% | 0–2 of 5 |
+
+The cliff **generalises** — it is not an artefact of one query. Two caveats
+that the single-query version hid: several queries return only 2–3 *distinct*
+texts among their top 5, so part of the apparent loss is duplicate answers; and
+one query kept 5/5 even at 29% coverage, so the loss is query-dependent rather
+than uniform.
+
+Severity is therefore lower than first stated, and the direction is confirmed:
+at today's volume roughly a quarter of the best results are already unreachable,
+and this binds well before any capacity limit.
 
 ### 2.2 Query latency — **dominated by the embedding call**
 
@@ -72,22 +88,41 @@ EXTRAPOLATED from 15 µs fetch + 39 µs rank per candidate, assuming linear cost
 | 100,000 | 5.5 s | 205 MB |
 | 1,000,000 | 55 s | 2.0 GB |
 
-Lifting the cap is not an option at any tier. The cap is load-bearing, which is
-why §2.1 has to be solved by indexing rather than by raising it.
+**CORRECTED 2026-08-03.** The first version said "lifting the cap is not an
+option at any tier". That is wrong at the current tier and was not measured
+before being asserted. Measured:
+
+| Cap | Coverage | Fetch + rank |
+|---|---|---|
+| 4,000 (current) | 55% | 151 ms |
+| 8,000 | **100%** | **263 ms** |
+| 20,000 | 100% | 266 ms |
+
+**Full coverage costs 263 ms today.** Raising the cap restores 100% recall for
+about 110 ms of added latency on a 668 ms search, and needs no migration. At
+~33 µs/candidate it stays viable to roughly **15–20k records**, so it buys
+2–3× headroom rather than a permanent answer — but it is the correct FIRST
+action, and ANN is what it buys time for.
 
 ### 2.4 Consolidation throughput — binds ~1M records
 
-MEASURED 252 ms for a 737-record entity. At avg 16.8 records/entity,
-EXTRAPOLATED entity counts and a full pass, single-threaded:
+**CORRECTED 2026-08-03.** The first version of this table used "est. 30 ms per
+entity", a figure with no measurement behind it. Measured across 8 randomly
+chosen entities of 5–40 records: **median 5.1 ms**, not 30. The original table
+overstated consolidation cost by ~6× and mis-ranked this constraint.
 
-| Records | Entities | Full pass (est. 30 ms/entity) |
+MEASURED: 252 ms for a 737-record entity; median 5.1 ms for an average one.
+
+| Records | Entities | Full pass (5.1 ms/entity median) |
 |---|---|---|
-| 100k | ~6k | ~3 min |
-| 1M | ~60k | ~30 min |
-| 10M | ~600k | ~5 h |
-| 100M | ~6M | **~50 h** |
+| 100k | ~6k | ~30 s |
+| 1M | ~60k | ~5 min |
+| 10M | ~600k | ~51 min |
+| 100M | ~6M | **~8.5 h** |
 
-A nightly full pass stops fitting in a night between 1M and 10M.
+A nightly full pass stops fitting in a night between **10M and 100M**, not
+between 1M and 10M. Incremental consolidation is therefore a 10M+ concern, and
+the sequencing in §10 is corrected accordingly.
 
 ### 2.5 Storage — binds last
 
@@ -297,12 +332,20 @@ Stated up front so the gates are meaningful:
 
 ## 10. Sequence
 
-1. **Now** — query-embedding cache (largest latency win, tier-independent) and
-   the `search.reachable_share` metric, so §2.1 is visible while it is still
-   mild.
-2. **Before 15k records** — pgvector + HNSW, retire `MAX_CANDIDATES`. This is
-   urgent on *quality* grounds, not capacity; §2.1 already costs one of five
-   best answers.
-3. **Before 1M** — incremental consolidation watermark; concurrent soak.
-4. **Before 10M** — monthly partitioning; read replica.
-5. **Before 100M** — tenant isolation, then sharding. Not before.
+**CORRECTED 2026-08-03** after measuring the two figures the original sequence
+depended on.
+
+1. **Now, today** — raise `CONTENT_INDEX_MAX_CANDIDATES` to 8,000. Restores
+   100% recall for ~110 ms, no migration, reversible by an environment
+   variable. The original plan skipped this because it asserted the cap could
+   not be raised, without measuring it.
+2. **Now** — query-embedding cache (450 ms of 668 ms, tier-independent) and the
+   `search.reachable_share` metric.
+3. **Before ~20k records** — pgvector + HNSW, retire the cap. Still urgent on
+   quality grounds; step 1 buys the time to do it properly rather than
+   removing the need.
+4. **Before 1M** — concurrent soak. Pooling has one suite run behind it.
+5. **Before 10M** — monthly partitioning; read replica; incremental
+   consolidation watermark (moved later: measured cost is 6× lower than the
+   original estimate).
+6. **Before 100M** — tenant isolation, then sharding. Not before.
