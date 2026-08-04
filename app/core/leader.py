@@ -30,6 +30,7 @@ import logging
 import os
 import socket
 import time
+from typing import Callable, List
 import threading
 
 logger = logging.getLogger("leader")
@@ -56,6 +57,71 @@ _state = {"leader": False, "elected": False}
 _hold_conn = None            # dedicated connection holding the advisory lock
 _lock = threading.Lock()
 _WHO = f"{socket.gethostname()}:{os.getpid()}"
+
+
+# Callbacks run when a FOLLOWER later becomes leader. Registered by whoever
+# owns the background singletons — leader.py deliberately knows nothing about
+# schedulers or pollers.
+_promote_callbacks: List[Callable[[], None]] = []
+# How often a follower re-asks for the lock. Sets the recovery-time objective
+# after a leader dies: RTO <= this. 10s meets the stated <=10s objective at a
+# cost of one cheap query per follower per interval.
+WATCH_INTERVAL = float(os.getenv("HA_WATCH_INTERVAL", "10"))
+
+
+def on_promotion(fn: Callable[[], None]) -> None:
+    """Run `fn` if this process is later promoted to leader.
+
+    Registering after promotion has already happened runs it immediately, so a
+    caller never has to reason about ordering."""
+    if _state.get("leader"):
+        fn()
+        return
+    _promote_callbacks.append(fn)
+
+
+def _watch_for_promotion() -> None:
+    """A follower keeps asking for the lock, forever.
+
+    WHY THIS EXISTS. The leader held the lock for process life and nothing ever
+    asked again. Kill the leader and the lock is released, every survivor stays
+    a follower, and the scheduler, IMAP poller and agent-bus stop — with HTTP
+    still healthy on every node, so nothing alerts. MEASURED in a chaos test:
+    3 workers, leader killed, 0 survivors claimed leadership after 18 seconds.
+
+    The startup retry in begin() closes the ROLLING DEPLOY race. This closes
+    the LEADER DEATH case, which the retry cannot: by then the process has been
+    a follower for hours.
+    """
+    global _hold_conn
+    from app.core.database import get_connection
+    while True:
+        time.sleep(WATCH_INTERVAL)
+        if _state.get("leader"):
+            return
+        try:
+            conn = get_connection()
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (_LOCK_KEY,))
+                won = bool(cur.fetchone()[0])
+            if not won:
+                conn.close()
+                continue
+            _hold_conn = conn
+            _state["leader"] = True
+            logger.warning(
+                f"[HA] PROMOTED to leader ({_WHO}) — the previous holder is "
+                f"gone. Starting background singletons.")
+            for fn in list(_promote_callbacks):
+                try:
+                    fn()
+                except Exception as exc:                      # noqa: BLE001
+                    logger.error(f"[HA] promotion callback failed: {exc}",
+                                 exc_info=True)
+            return
+        except Exception as exc:                              # noqa: BLE001
+            logger.debug(f"[HA] promotion watch: {exc}")
 
 
 def _worker_count() -> int:
@@ -136,6 +202,8 @@ def begin() -> bool:
                 logger.info(f"[HA] LEADER ({_WHO}) — running scheduler / IMAP poller / agent-bus")
             else:
                 _state["leader"] = False
+                threading.Thread(target=_watch_for_promotion, daemon=True,
+                                 name="ha-promotion-watch").start()
                 logger.warning(
                     f"[HA] follower ({_WHO}) — another process held the singleton "
                     f"lock for the whole {ELECTION_RETRY_SECONDS:g}s election "

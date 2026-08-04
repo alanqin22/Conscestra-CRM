@@ -1080,35 +1080,14 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             misfire_grace_time=86400,
         )
-        if not _run_bg:
-            # Follower: the scheduler object is built but NOT started — only the
-            # leader fires the daily jobs (HA singleton, #7).
-            logger.info("[Scheduler] built but not started (HA follower)")
-            _scheduler = None
-        else:
+        def _start_scheduler_now():
+            """Start the built scheduler and record that it is live.
+
+            Extracted so a FOLLOWER can call it on promotion. Previously the
+            decision was made once at startup: a follower set _scheduler = None
+            and had no way to ever start it, so a leader dying mid-life stopped
+            all background work until a human restarted something."""
             _scheduler.start()
-            # A DEAD SCHEDULER MUST NOT LOOK LIKE A LIVE ONE.
-            #
-            # A single typo — `scheduler.add_job` for `_scheduler.add_job` —
-            # raised NameError partway through setup. The broad handler below
-            # logged it and the app carried on serving happily, so 22 of 28 jobs
-            # never registered and start() never ran. Nightly order advancement,
-            # quote expiry, activity sweeps, agent-bus emission and the
-            # supervisor tick had simply not fired, and nothing anywhere said so.
-            #
-            # The count is recorded and reported on /health, so "the scheduler is
-            # running" becomes a claim that can be contradicted.
-            # A HEARTBEAT, BECAUSE SILENCE WAS INVISIBLE FOR TEN DAYS.
-            #
-            # Background work stopped on 2026-07-24 and was found on 2026-08-04.
-            # Nothing alerted, because every signal that existed described
-            # whether the process was SERVING, and it was. What nobody could
-            # see was whether the scheduler had actually FIRED.
-            #
-            # Recording the last execution makes the failure detectable by one
-            # HTTP call, and detection covers the failures nobody predicted —
-            # which is most of them. Re-election fixes one cause; this catches
-            # the next one.
             from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 
             def _tick(event):
@@ -1123,9 +1102,17 @@ async def lifespan(app: FastAPI):
             _scheduler.add_listener(_tick, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
             app.state.scheduler_started_at = _dt.datetime.now(
                 _dt.timezone.utc).isoformat(timespec="seconds")
-
             app.state.scheduler_jobs = len(_scheduler.get_jobs())
             app.state.scheduler_running = True
+
+        if not _run_bg:
+            # Follower: the scheduler is BUILT and held, not started. If this
+            # process is later promoted it starts the jobs itself.
+            logger.info("[Scheduler] built but not started (HA follower) — "
+                        "will start on promotion")
+            leader.on_promotion(_start_scheduler_now)
+        else:
+            _start_scheduler_now()
             logger.info(
                 "[Scheduler] Started (America/New_York) — "
             "opps advance 22:00 ET | orders advance 22:05 ET | "
