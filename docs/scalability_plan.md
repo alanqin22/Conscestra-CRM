@@ -339,6 +339,46 @@ this volume — customer audience 486 rows, cases 148, conversation messages 167
 commitments 10. `search.reachable_share` implied broad degradation and has been
 replaced by `search.worst_case_coverage`, labelled as the ceiling it is.
 
+## 8c. ANN measured, and the process model — 2026-08-04
+
+pgvector 0.8.6 became available, so ANN moved from modelled to MEASURED.
+Backfill 1,960 rows/s (100k ~1 min, 1M ~6 min); HNSW build 0.8 s on 7,543
+vectors; index 17 MB, matching the 2.2 KB/vector estimate.
+
+**Recall: the filtered-ANN trap was real and the predicted mitigation works.**
+At the default ef_search=40, recall@10 was 60% unfiltered and 31.7% on the
+customer path. The exact top-10 were all TIED at one distance — a template
+cluster — and HNSW was missing it outright, not tie-breaking differently. At
+**ef_search=100, recall is 100%** by both ID overlap and distance equivalence.
+
+**The binding constraint was the single-process deployment.** `main.py` runs
+uvicorn with no `workers=`. Same 16 concurrent requests, same index, same
+database:
+
+    1 process x 16 threads   p95 588 ms    44/s   FAIL
+    4 processes x 4 threads  p95 181 ms   223/s   PASS
+
+Throughput scales 8.42x to 8 processes with p95 flat at 167-198 ms. PostgreSQL
+is nowhere near saturated.
+
+**But processes alone are NOT sufficient — this refutes the previous entry.**
+Measured across processes at 4 threads each, against the p95 <= 250 ms SLO:
+
+| Concurrency | EXACT p95 | ANN p95 (ef=100) |
+|---|---|---|
+| 4 | 108 ms PASS | 68 ms PASS |
+| 8 | 127 ms PASS | 168 ms PASS |
+| 16 | **286 ms FAIL** | 154 ms PASS |
+| 32 | **395 ms FAIL** | 214 ms PASS |
+
+Exact search fails at 16+ concurrent however many processes it is given,
+because each request still ships 4,000 rows. ANN passes everywhere tested and
+delivers ~2x the throughput at every process count.
+
+**Both changes are required.** The prior recommendation — "processes first, ANN
+becomes nice-to-have" — is REFUTED by measurement. The resident numpy matrix is
+no longer needed and its erasure and staleness costs are not worth paying.
+
 ## 9. What would invalidate this plan
 
 Stated up front so the gates are meaningful:
