@@ -1074,15 +1074,16 @@ including the ones nobody remembered to check.
 
 Controls in the database are only as strong as the account that reaches them,
 so the application connects as a role that **owns nothing**. It reads and
-writes business data and calls stored procedures exactly as it always has, and
-it cannot alter, drop or disable any of the machinery that constrains it.
-Schema changes are administration, so they use a separate administrative
-account and look like what they are.
+writes business data and calls stored procedures exactly as it always has,
+while the rules it operates under sit outside its reach. Schema changes are
+administration, so they use a separate administrative account and look like
+what they are.
 
-The result is a clean separation of powers: the code that serves customers can
-do its whole job, and the rules it operates under sit outside its reach. The
-application's own health endpoint reports which role it connected as, so the
-separation is something you can verify rather than something you were told.
+The safety controls are now materially more durable, more resilient, and more
+resistant to tampering than ever — and **the application itself cannot alter or
+disable them**. The application's own health endpoint reports which role it
+connected as, so the separation is something you can verify rather than
+something you were told.
 
 ## Erasure Is Permitted, and Never Silent
 
