@@ -133,6 +133,13 @@ MUTATIONS: List[Tuple[str, str, Path, str, str]] = [
     ("trust weights reweighted", "app.core.memory_bench", CONSOLIDATION,
      "_W_DAYS, _W_SOURCES, _W_WORDINGS = 0.40, 0.25, 0.35",
      "_W_DAYS, _W_SOURCES, _W_WORDINGS = 0.50, 0.25, 0.25"),
+    # eval.determinism re-consolidates an entity twice and compares evidence
+    # hashes. Non-determinism there silently un-verifies human approvals,
+    # because evidence_hash is what invalidates a verification. It cannot be
+    # probed by planting DATA — only by making the code non-deterministic — so
+    # it lives here rather than in the observability audit.
+    ("evidence hash order-dependent", "app.core.memory_bench", CONSOLIDATION,
+     "def _evidence_hash(", "def _evidence_hash_unsorted("),
     ("one wording starts corroborating", "app.core.memory_bench", CONSOLIDATION,
      "+ _W_WORDINGS * min(1.0, max(0, n_templates - 1) / 2.0))",
      "+ _W_WORDINGS * min(1.0, max(0, n_templates) / 2.0))"),

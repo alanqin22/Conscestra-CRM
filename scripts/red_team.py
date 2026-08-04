@@ -97,11 +97,24 @@ def _cleanup_seeded(cur) -> None:
         return
     cur.execute("SET app.repair_key = 'redteam:seed-cleanup'")
     for mid in _SEEDED:
+        _declare_harness_erasure(cur)
         cur.execute("SELECT erase_memory_verifications(ARRAY[%s]::uuid[])", (mid,))
         cur.execute("DELETE FROM customer_memories WHERE memory_id=%s::uuid", (mid,))
         cur.execute("DELETE FROM governed_deletions WHERE row_pk=%s", (mid,))
     cur.execute("RESET app.repair_key")
     _SEEDED.clear()
+
+
+def _declare_harness_erasure(cur) -> None:
+    """Label this run's erasures so the permanent register can tell them apart.
+
+    The erasure register is append-only by design and cannot be cleaned. This
+    harness wrote 48 rows into Railway's register with NO declared reason,
+    which reads exactly like 48 real subject-erasure requests performed by an
+    administrator. Nothing can remove them; the only remedy is to say what they
+    were, before making them.
+    """
+    cur.execute("SET app.erasure_reason = 'red-team:harness-revert'")
 
 
 def _victim(cur):
@@ -162,6 +175,7 @@ def attack_forge_assertable(cur) -> None:
 
     # Revert.
     cur.execute("SET app.repair_key='redteam:revert'")
+    _declare_harness_erasure(cur)
     cur.execute("SELECT erase_memory_verifications(ARRAY[%s]::uuid[])", (mid,))
     cur.execute("""UPDATE customer_memories SET kind='theme', verified_by=NULL,
         verified_actor=false, verified_claim_hash=NULL,
@@ -242,6 +256,7 @@ def attack_self_approval(cur) -> None:
            "dual approval counts DISTINCT performed_by",
            f"second attempt: {second.get('note') or second.get('error') or 'PROMOTED'}")
     cur.execute("SET app.repair_key='redteam:revert'")
+    _declare_harness_erasure(cur)
     cur.execute("SELECT erase_memory_verifications(ARRAY[%s]::uuid[])", (mid,))
     # `verify()` pins certainty to 1.0 and clears valid_until. Reverting only
     # kind/verified_by left a row above the 0.95 cap that a test found hours

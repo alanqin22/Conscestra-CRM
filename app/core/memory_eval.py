@@ -186,10 +186,23 @@ def measure_evidence_resolvable(sample: int = 300) -> Dict[str, Any]:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            # DETERMINISTIC SAMPLE, not a random one.
+            #
+            # `ORDER BY random()` made this metric un-trendable: two runs
+            # against identical data drew different rows, so a fall from 1.00
+            # to 0.98 could be a regression or could be the sample. Measured —
+            # consecutive reads reported n=2700 then n=2614 with nothing
+            # changed. A number that moves on its own cannot be alerted on, and
+            # an alert nobody can trust is one nobody reads.
+            #
+            # Hashing the primary key gives a stable pseudo-random subset: the
+            # same rows every run, and a DIFFERENT subset only when the corpus
+            # itself changes — which is the one time the sample should move.
             cur.execute(f"""SELECT evidence FROM customer_memories
                             WHERE status='active' AND evidence_count > 0
                               AND {EXCLUDED_GENERATORS}
-                            ORDER BY random() LIMIT %s""", (int(sample),))
+                            ORDER BY md5(memory_id::text) LIMIT %s""",
+                        (int(sample),))
             rows = cur.fetchall()
             total = resolved = 0
             for (evidence,) in rows:
@@ -213,10 +226,11 @@ def measure_count_consistency(sample: int = 300) -> Dict[str, Any]:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            # Deterministic sample — see measure_evidence_resolvable.
             cur.execute(f"""SELECT occurrences, evidence_count, truncated
                              FROM customer_memories
                             WHERE status='active' AND {EXCLUDED_GENERATORS}
-                            ORDER BY random() LIMIT %s""",
+                            ORDER BY md5(memory_id::text) LIMIT %s""",
                         (int(sample),))
             rows = cur.fetchall()
     finally:

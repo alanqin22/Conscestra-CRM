@@ -132,6 +132,27 @@ def _corpus_shape() -> Dict[str, Tuple[Optional[float], Any]]:
                 {"note": "count of ENABLED deletion-log triggers; a drop means "
                          "deletions stopped being recorded, not that they stopped"})
 
+            # ERASURES WITH NO STATED REASON.
+            #
+            # The register is append-only and permanent, so an erasure recorded
+            # without `app.erasure_reason` is indistinguishable from a genuine
+            # subject request — forever. 48 such rows were written to production
+            # by the verification harness itself before anyone looked.
+            #
+            # Requiring a reason in the database would be stronger, and would
+            # also break the app's legitimate erasure path the first time a
+            # caller forgot. Making them visible costs nothing and cannot cause
+            # an outage; a number that climbs is a question someone can ask.
+            cur.execute("""SELECT count(*) FILTER (WHERE declared_by IS NULL),
+                                  count(*)
+                             FROM memory_erasure_log""")
+            undeclared, total = cur.fetchone()
+            out["ops.undeclared_erasures"] = (
+                float(undeclared or 0),
+                {"total_erasure_events": total,
+                 "note": "erasures with no declared reason are "
+                         "indistinguishable from real subject requests"})
+
             cur.execute("""SELECT decay_class, count(*) FROM customer_memories
                             WHERE status='active' GROUP BY 1""")
             out["lifecycle.decay_distribution"] = (None, dict(cur.fetchall()))
@@ -303,9 +324,30 @@ def _compose() -> Dict[str, Tuple[Optional[float], Any]]:
 
     rh = safely("roster", lambda: MA.roster_health(7))
     if rh:
-        for k in ("unreviewed", "reviewers"):
+        for k in ("unreviewed",):
             if k in rh:
                 out[f"roster.{k}"] = (_num(rh[k]), None)
+
+        # `reviewers` IS A LIST, and _num() cannot float a list.
+        #
+        # It returned None, and the detail slot was hardcoded None too, so this
+        # metric reported nothing at all — no value, no detail, in every
+        # snapshot ever taken. It was not merely lacking a negative control; it
+        # was incapable of carrying information, and looked like an ordinary
+        # metric that happened to be null.
+        #
+        # The reviewer COUNT is the number that matters: a review queue with no
+        # reviewers can never earn autonomy, and roster_health already warns
+        # about exactly that. The names go in the detail.
+        reviewers = rh.get("reviewers")
+        if isinstance(reviewers, list):
+            out["roster.reviewers"] = (
+                float(len(reviewers)),
+                {"who": [r.get("who") for r in reviewers if isinstance(r, dict)],
+                 "roster_size_configured": rh.get("roster_size"),
+                 "warning": rh.get("warning")})
+        elif reviewers is not None:
+            out["roster.reviewers"] = (_num(reviewers), None)
 
     return out
 

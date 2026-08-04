@@ -896,6 +896,44 @@ ownerless accounts. The safe fixes arrive as governed, fully **reversible**
 proposals — every change records its before-state — while anything that
 moves money or history stays a human decision. Garbage in, governed out.
 
+## Every Control Is Proven by Breaking It
+
+A control that has never been tested against the thing it is meant to stop is a
+belief, not a control. Conscestra proves its safeguards the way it proves its
+features: by planting the exact defect each one claims to detect and confirming
+it turns red.
+
+A forged verification. An invalid signature. A disabled audit trigger. A memory
+whose supporting evidence no longer exists. An erased trail. Each is created
+deliberately, the safeguard is checked, and the system is restored. A safeguard
+that stays quiet under its own defect is reported for repair — it is never
+recorded as a pass.
+
+The same discipline applies to measurement. Where a metric depends on sampling,
+the sample is deterministic, so a number that moves has moved for a reason and
+can be trended with confidence. And before any result counts, the test harness
+proves that the change it made is the change actually running — an instrument
+is only useful once you know it is measuring what you think it is.
+
+## Verification Runs Where the System Actually Lives
+
+Continuous integration establishes what a build server is well suited to
+establish: that every module imports cleanly, and that the memory derivation
+pipeline still produces identical results against a frozen corpus, so any
+change in clustering, attribution or trust scoring is caught before it ships.
+
+The database-layer guarantees are then proven where the schema and the secrets
+actually exist. A single command runs against a deployed environment and gates
+on the result: the guarded secrets are confirmed strong and distinct, the
+database invariants are asserted directly in SQL, and a red team executes live
+attacks — forging an assertable claim, replaying a signature, approving its own
+work twice, attempting to erase the audit trail or disable a control — to
+confirm each one is refused.
+
+It reports what the system actually did. An attack that could not be exercised
+is reported as such rather than counted as blocked, so a passing result means
+every control was genuinely engaged and genuinely held.
+
 ## Is the Platform Itself Healthy Right Now?
 
 Every module in Conscestra reports on the *business*. None of them answered
@@ -1025,6 +1063,46 @@ gates, so private data neither leaks into prompts nor out of them.
 
 Security is not a feature layered onto the platform. **Security is the
 architecture.**
+
+## The Application Cannot Switch Off Its Own Controls
+
+Every database-layer guarantee in Conscestra — the assertion gate that stops an
+unverified claim reaching a customer, the append-only verification trail, the
+undo log behind every governed deletion — is enforced by a trigger inside
+PostgreSQL. That is the right place for a control: it applies to every path,
+including the ones nobody remembered to check.
+
+Controls in the database are only as strong as the account that reaches them,
+so the application connects as a role that **owns nothing**. It reads and
+writes business data and calls stored procedures exactly as it always has,
+while the rules it operates under sit outside its reach. Schema changes are
+administration, so they use a separate administrative account and look like
+what they are.
+
+The safety controls are now materially more durable, more resilient, and more
+resistant to tampering than ever — and **the application itself cannot alter or
+disable them**. The application's own health endpoint reports which role it
+connected as, so the separation is something you can verify rather than
+something you were told.
+
+## Erasure Is Permitted, and Never Silent
+
+A customer asks to be forgotten. The law requires the data to go, and the same
+law requires you to be able to demonstrate that you handled the request
+properly. Conscestra satisfies both by keeping the **event** and destroying the
+**content**.
+
+Every erasure records who performed it, when, for which record, how many rows,
+and under what declared reason. The statements, the evidence and the personal
+detail are genuinely gone. The fact that an erasure occurred is retained
+permanently and cannot be removed by anyone — the register refuses deletion
+outright, so the compliance history stays complete and gap-free.
+
+A permanent register of erasure requests would, left alone, become a permanent
+index of who asked to be forgotten. So identifiers age out: after two years an
+automatic monthly pass strips the personal link and keeps everything else.
+Nothing is ever removed from the register, and it stops being a list of people.
+Accountability and data minimisation, both honoured, on the same record.
 
 ## One Model Provider Should Not Be a Single Point of Failure
 
@@ -1331,6 +1409,14 @@ crm_agent/
 ├── requirements.txt
 ├── .env                           ← Single config file for all agents
 ├── sp/                            ← PostgreSQL stored procedures
+├── scripts/                       ← Verification tooling — run against a live database
+│   ├── migrate.py                 ← Ordered migration manifest, applied idempotently
+│   ├── verify_invariants.py       ← Database-layer controls, asserted directly in SQL
+│   ├── red_team.py                ← Attacks EXECUTED against the live system
+│   ├── postdeploy_verify.py       ← Secrets → invariants → red team, as one gate
+│   ├── mutation_audit.py          ← Breaks the code to prove each gate can fail
+│   ├── observability_audit.py     ← Plants a defect per metric; reports any that stay green
+│   └── test_guards.py             ← Wrong-DSN and orphaned-row guards for the suite
 ├── *-mgmt.html                    ← One frontend per agent (incl. orchestrator-mgmt.html)
 ├── case-mgmt.html                 ← Case queue, lifecycle actions, field history
 ├── customer-portal.html           ← Customer's own record (orders/invoices/cases/quotes)
@@ -1450,6 +1536,29 @@ python main.py
 # or
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+### Verifying a deployment
+
+CI checks what a build server can check — that every module imports, and that
+the derivation pipeline still produces identical output against a frozen
+corpus. It has no database and no secrets, so it cannot exercise a single
+database-layer control. The evidence comes from the deployed environment:
+
+```bash
+# Secrets, invariants and the red team, gated as one result
+python -m scripts.postdeploy_verify --target railway        --app-url https://your-app.example.com
+
+# Prove each gate can still fail (breaks the code on purpose, then restores it)
+python -m scripts.mutation_audit
+
+# Plant a defect per metric; report any that stay green
+python -m scripts.observability_audit
+```
+
+Pass `--app-url` so the check reads the application's own report of which
+database role it connected as. That is what lets the red team judge the
+running application rather than the administrative connection the harness
+itself uses.
 
 ---
 
