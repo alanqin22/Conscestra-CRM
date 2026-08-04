@@ -244,8 +244,50 @@ def get_connection():
                     f"the caller holding connections — opening more would move "
                     f"the failure onto the database itself.")
             try:
-                raw = pool.getconn()
-                raw.set_client_encoding('UTF8')
+                # VALIDATE ON CHECKOUT. A pooled connection whose server has
+                # restarted is not "closed" — psycopg2 only finds out when it
+                # tries to use it. After a database restart or failover the pool
+                # therefore hands out corpses, and each one fails a real user
+                # request before being discarded on return: up to POOL_MAX
+                # failures, multiplied by every worker. Observed in production
+                # after a Postgres restart — /health reported
+                # "SSL SYSCALL error: EOF detected" and recovered only once the
+                # dead connections had each broken something.
+                #
+                # A round trip costs ~0.03 ms against a ~65 ms search. Paying it
+                # to convert a user-visible error into a silent retry is not a
+                # close call.
+                raw = None
+                for _ in range(max(2, POOL_MAX // 4)):
+                    raw = pool.getconn()
+                    try:
+                        raw.set_client_encoding('UTF8')
+                        with raw.cursor() as _c:
+                            _c.execute("SELECT 1")
+                        # END THE PROBE'S TRANSACTION.
+                        #
+                        # psycopg2 is not autocommit by default, so the probe
+                        # leaves the connection IN a transaction. Roughly a
+                        # hundred call sites then do `conn.autocommit = True`,
+                        # which psycopg2 refuses inside one — the validation
+                        # would hand back a connection that fails on its first
+                        # real use, which is precisely the failure it exists to
+                        # prevent.
+                        raw.rollback()
+                        break
+                    except Exception:
+                        # Dead. Drop it rather than return it to the pool, and
+                        # take the next one.
+                        try:
+                            pool.putconn(raw, close=True)
+                        except Exception:
+                            pass
+                        raw = None
+                if raw is None:
+                    raise PoolExhausted(
+                        "every pooled connection failed validation — the "
+                        "database is unreachable or was restarted and the pool "
+                        "could not be refreshed")
                 return _Pooled(raw, pool, slots)
             except Exception:
                 slots.release()

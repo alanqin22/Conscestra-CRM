@@ -24,6 +24,7 @@ v2.2.0 — Added Store module (CRM Commerce View).
   • Frontend: store-home.html
 """
 
+import datetime as _dt
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -1097,6 +1098,32 @@ async def lifespan(app: FastAPI):
             #
             # The count is recorded and reported on /health, so "the scheduler is
             # running" becomes a claim that can be contradicted.
+            # A HEARTBEAT, BECAUSE SILENCE WAS INVISIBLE FOR TEN DAYS.
+            #
+            # Background work stopped on 2026-07-24 and was found on 2026-08-04.
+            # Nothing alerted, because every signal that existed described
+            # whether the process was SERVING, and it was. What nobody could
+            # see was whether the scheduler had actually FIRED.
+            #
+            # Recording the last execution makes the failure detectable by one
+            # HTTP call, and detection covers the failures nobody predicted —
+            # which is most of them. Re-election fixes one cause; this catches
+            # the next one.
+            from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
+
+            def _tick(event):
+                app.state.scheduler_last_tick = _dt.datetime.now(
+                    _dt.timezone.utc).isoformat(timespec="seconds")
+                app.state.scheduler_last_job = getattr(event, "job_id", None)
+                if event.code == EVENT_JOB_ERROR:
+                    app.state.scheduler_last_error = (
+                        f"{getattr(event, 'job_id', '?')}: "
+                        f"{str(getattr(event, 'exception', ''))[:120]}")
+
+            _scheduler.add_listener(_tick, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+            app.state.scheduler_started_at = _dt.datetime.now(
+                _dt.timezone.utc).isoformat(timespec="seconds")
+
             app.state.scheduler_jobs = len(_scheduler.get_jobs())
             app.state.scheduler_running = True
             logger.info(
@@ -1920,7 +1947,21 @@ async def health():
         _pool = None
 
     _sched = {"running": getattr(app.state, "scheduler_running", None),
-              "jobs": getattr(app.state, "scheduler_jobs", 0)}
+              "jobs": getattr(app.state, "scheduler_jobs", 0),
+              "started_at": getattr(app.state, "scheduler_started_at", None),
+              "last_tick": getattr(app.state, "scheduler_last_tick", None),
+              "last_job": getattr(app.state, "scheduler_last_job", None)}
+    # Age is what an alert can threshold on. A timestamp needs a human to do
+    # arithmetic; seconds since the last fire does not.
+    if _sched["last_tick"]:
+        try:
+            _sched["seconds_since_tick"] = int(
+                (_dt.datetime.now(_dt.timezone.utc)
+                 - _dt.datetime.fromisoformat(_sched["last_tick"])).total_seconds())
+        except Exception:                                     # noqa: BLE001
+            pass
+    if getattr(app.state, "scheduler_last_error", None):
+        _sched["last_error"] = app.state.scheduler_last_error
     if getattr(app.state, "scheduler_error", None):
         _sched["error"] = app.state.scheduler_error
 
