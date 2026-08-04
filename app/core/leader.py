@@ -50,6 +50,22 @@ _lock = threading.Lock()
 _WHO = f"{socket.gethostname()}:{os.getpid()}"
 
 
+def _worker_count() -> int:
+    """How many application processes are expected to exist.
+
+    WEB_CONCURRENCY is the variable both uvicorn and gunicorn read, and Railway
+    sets it. Unset means one process, which is the deployment this code was
+    written for and the one where failing open is right."""
+    for var in ("WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS"):
+        try:
+            n = int(os.getenv(var, "") or 0)
+            if n > 0:
+                return n
+        except ValueError:
+            continue
+    return 1
+
+
 def begin() -> bool:
     """Elect this process. Returns True if it is the cluster leader (should run
     the background singletons), False if it is a follower (HTTP only). Idempotent;
@@ -81,11 +97,34 @@ def begin() -> bool:
                 logger.info(f"[HA] follower ({_WHO}) — another process holds the singleton lock")
             return _state["leader"]
         except Exception as exc:
-            # DB not reachable at election time: fail OPEN (leader) so a normal
-            # single-process deploy never silently loses its background jobs.
-            logger.warning(f"[HA] election failed ({exc}); assuming leader (fail-open)")
-            _state["leader"] = True
-            return True
+            # FAIL-OPEN IS CORRECT FOR ONE PROCESS AND DANGEROUS FOR SEVERAL.
+            #
+            # A single-process deploy that cannot reach the database at startup
+            # should still run its schedulers once the database returns —
+            # silently losing every background job is the worse failure.
+            #
+            # Under `uvicorn --workers N` that reasoning inverts. MEASURED: with
+            # the database unreachable, four processes each assumed leadership —
+            # four schedulers, four IMAP pollers, four agent-bus consumers.
+            # That is duplicate dunning emails, duplicate reminders and
+            # duplicate consolidations, caused by a transient blip during a
+            # rolling restart when all workers elect at once.
+            #
+            # So the tie-break depends on how many processes exist. WEB_CONCURRENCY
+            # is the variable uvicorn and gunicorn both honour; when it says more
+            # than one, an unreachable database means FOLLOWER. A cluster that
+            # briefly runs no background jobs recovers on the next restart. A
+            # cluster that sends every email four times does not.
+            multi = _worker_count() > 1
+            _state["leader"] = not multi
+            logger.warning(
+                f"[HA] election failed ({exc}); "
+                + (f"assuming FOLLOWER — WEB_CONCURRENCY={_worker_count()} means "
+                   f"several processes would each fail open and duplicate every "
+                   f"background job"
+                   if multi else
+                   "assuming leader (fail-open, single process)"))
+            return _state["leader"]
 
 
 def is_leader() -> bool:
