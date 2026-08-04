@@ -132,6 +132,57 @@ def _corpus_shape() -> Dict[str, Tuple[Optional[float], Any]]:
                 {"note": "count of ENABLED deletion-log triggers; a drop means "
                          "deletions stopped being recorded, not that they stopped"})
 
+            # WORST-CASE SEARCH COVERAGE, and only that.
+            #
+            # The first version divided the cap by the whole corpus and called
+            # the result "the fraction a search can rank". Measured, that is
+            # not what any search experiences: every filtered shape is COMPLETE
+            # at this volume — customer audience 486 rows, cases 148,
+            # commitments 10 — and only the UNFILTERED internal search is
+            # truncated. Reporting 0.55 implied broad degradation when one
+            # query shape was affected.
+            #
+            # So this reports the widest realistic population, labelled as the
+            # worst case, with the counts that make it interpretable. A metric
+            # that overstates its own scope produces the same wasted
+            # investigation as one that understates it.
+            from app.core.content_index import MAX_CANDIDATES
+            cur.execute("""SELECT count(*) FILTER (WHERE visibility='internal'),
+                                  count(*) FILTER (WHERE visibility='customer'),
+                                  count(*) FROM content_embeddings""")
+            n_int, n_cust, n_all = cur.fetchone()
+            worst = min(MAX_CANDIDATES, n_int) / n_int if n_int else 1.0
+            out["search.worst_case_coverage"] = (
+                round(worst, 4),
+                {"population": "visibility=internal, unfiltered — the widest "
+                               "search shape and the only one truncated here",
+                 "internal_records": n_int, "customer_records": n_cust,
+                 "indexed_total": n_all, "candidate_cap": MAX_CANDIDATES,
+                 "note": "filtered searches (source_type, speech_act, customer "
+                         "audience) are complete at this volume; this is the "
+                         "ceiling, not the typical case"})
+
+            # A CACHE NOBODY MEASURES IS A CACHE NOBODY KNOWS IS WORKING.
+            #
+            # Query embedding is the largest remaining component of search
+            # latency — MEASURED 433-471 ms per novel query, and unaffected by
+            # any index. The cache removes it for repeats, so its hit rate is
+            # the difference between a 65 ms search and a 500 ms one.
+            #
+            # Per PROCESS, so a fresh worker starts cold and several replicas
+            # each keep their own. A low rate here means either genuinely
+            # diverse queries or a process that keeps restarting; both are
+            # worth knowing and neither is visible any other way.
+            try:
+                from app.core.embeddings import embedding_cache_stats
+                st = embedding_cache_stats()
+                out["search.embedding_cache_hit_rate"] = (
+                    st.get("hit_rate"),
+                    {**st, "note": "per process; a miss costs ~450 ms of "
+                                   "search latency that no index can recover"})
+            except Exception as exc:                          # noqa: BLE001
+                logger.debug(f"[observability] embedding cache stats: {exc}")
+
             # ERASURES WITH NO STATED REASON.
             #
             # The register is append-only and permanent, so an erasure recorded

@@ -24,6 +24,7 @@ v2.2.0 — Added Store module (CRM Commerce View).
   • Frontend: store-home.html
 """
 
+import datetime as _dt
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -1079,26 +1080,39 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             misfire_grace_time=86400,
         )
-        if not _run_bg:
-            # Follower: the scheduler object is built but NOT started — only the
-            # leader fires the daily jobs (HA singleton, #7).
-            logger.info("[Scheduler] built but not started (HA follower)")
-            _scheduler = None
-        else:
+        def _start_scheduler_now():
+            """Start the built scheduler and record that it is live.
+
+            Extracted so a FOLLOWER can call it on promotion. Previously the
+            decision was made once at startup: a follower set _scheduler = None
+            and had no way to ever start it, so a leader dying mid-life stopped
+            all background work until a human restarted something."""
             _scheduler.start()
-            # A DEAD SCHEDULER MUST NOT LOOK LIKE A LIVE ONE.
-            #
-            # A single typo — `scheduler.add_job` for `_scheduler.add_job` —
-            # raised NameError partway through setup. The broad handler below
-            # logged it and the app carried on serving happily, so 22 of 28 jobs
-            # never registered and start() never ran. Nightly order advancement,
-            # quote expiry, activity sweeps, agent-bus emission and the
-            # supervisor tick had simply not fired, and nothing anywhere said so.
-            #
-            # The count is recorded and reported on /health, so "the scheduler is
-            # running" becomes a claim that can be contradicted.
+            from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
+
+            def _tick(event):
+                app.state.scheduler_last_tick = _dt.datetime.now(
+                    _dt.timezone.utc).isoformat(timespec="seconds")
+                app.state.scheduler_last_job = getattr(event, "job_id", None)
+                if event.code == EVENT_JOB_ERROR:
+                    app.state.scheduler_last_error = (
+                        f"{getattr(event, 'job_id', '?')}: "
+                        f"{str(getattr(event, 'exception', ''))[:120]}")
+
+            _scheduler.add_listener(_tick, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
+            app.state.scheduler_started_at = _dt.datetime.now(
+                _dt.timezone.utc).isoformat(timespec="seconds")
             app.state.scheduler_jobs = len(_scheduler.get_jobs())
             app.state.scheduler_running = True
+
+        if not _run_bg:
+            # Follower: the scheduler is BUILT and held, not started. If this
+            # process is later promoted it starts the jobs itself.
+            logger.info("[Scheduler] built but not started (HA follower) — "
+                        "will start on promotion")
+            leader.on_promotion(_start_scheduler_now)
+        else:
+            _start_scheduler_now()
             logger.info(
                 "[Scheduler] Started (America/New_York) — "
             "opps advance 22:00 ET | orders advance 22:05 ET | "
@@ -1181,6 +1195,29 @@ app = FastAPI(
 # themselves) becomes the real HTTP status — 401 anonymous (frontend auth shim
 # opens the sign-in modal) / 403 signed-in viewer — instead of a generic 500.
 from app.core.write_guard import WritePermissionError
+
+
+# SATURATION IS NOT A FAULT, and must not look like one.
+#
+# PoolExhausted means every pooled connection is busy — the bound working as
+# designed, keeping load off the database. Surfaced as a 500 it is
+# indistinguishable from a crash: alerting pages someone for a bug that does
+# not exist, load balancers keep sending traffic to a node that is merely full,
+# and clients retry immediately instead of backing off.
+#
+# 503 with Retry-After is the honest answer. It is the one status that says
+# "correct, temporarily out of capacity, come back".
+from app.core.database import PoolExhausted                  # noqa: E402
+
+
+@app.exception_handler(PoolExhausted)
+async def _pool_exhausted_handler(request: Request, exc: PoolExhausted):
+    logger.warning(f"[db] saturated, shedding request to {request.url.path}")
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "1"},
+        content={"detail": "The service is at capacity. Please retry shortly.",
+                 "reason": "database_connections_saturated"})
 
 
 @app.exception_handler(WritePermissionError)
@@ -1890,8 +1927,28 @@ async def health():
 
     # Background jobs: reported, never fatal. A follower legitimately runs none,
     # and an HTTP node that cannot schedule can still serve reads correctly.
+    try:
+        from app.core.database import pool_utilisation
+        _pool = pool_utilisation()
+    except Exception:                                     # noqa: BLE001
+        _pool = None
+
     _sched = {"running": getattr(app.state, "scheduler_running", None),
-              "jobs": getattr(app.state, "scheduler_jobs", 0)}
+              "jobs": getattr(app.state, "scheduler_jobs", 0),
+              "started_at": getattr(app.state, "scheduler_started_at", None),
+              "last_tick": getattr(app.state, "scheduler_last_tick", None),
+              "last_job": getattr(app.state, "scheduler_last_job", None)}
+    # Age is what an alert can threshold on. A timestamp needs a human to do
+    # arithmetic; seconds since the last fire does not.
+    if _sched["last_tick"]:
+        try:
+            _sched["seconds_since_tick"] = int(
+                (_dt.datetime.now(_dt.timezone.utc)
+                 - _dt.datetime.fromisoformat(_sched["last_tick"])).total_seconds())
+        except Exception:                                     # noqa: BLE001
+            pass
+    if getattr(app.state, "scheduler_last_error", None):
+        _sched["last_error"] = app.state.scheduler_last_error
     if getattr(app.state, "scheduler_error", None):
         _sched["error"] = app.state.scheduler_error
 
@@ -1901,6 +1958,7 @@ async def health():
         "version": "2.2.0",
         "database": _db,
         "scheduler": _sched,
+        "connections": _pool,
         "ha": _ha,   # leader | follower | standalone — which process runs the background singletons (#7)
         "home_index": {"endpoint": "GET /home-index", "sp": "sp_home_index"},
         "agents": {

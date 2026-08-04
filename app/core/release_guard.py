@@ -212,8 +212,70 @@ def _check_secret_strength() -> Dict[str, Any]:
             "message": f"guarded secrets configured and distinct ({fps})"}
 
 
+def _check_configuration_integrity() -> Dict[str, Any]:
+    """Configuration that changes CORRECTNESS, validated at startup.
+
+    Three settings can each produce a silent, customer-visible failure while
+    every other signal reports health. They were previously documented as
+    deployment notes, which is the weakest possible control: a note cannot fail
+    a deploy.
+
+      WEB_CONCURRENCY      Leader election fails CLOSED under multiple workers
+                           and OPEN under one. Unset while running several
+                           workers means every worker assumes leadership on a
+                           database blip — four schedulers, four IMAP pollers,
+                           duplicate dunning email. MEASURED: 4 workers, DB
+                           unreachable, 4 leaders.
+
+      HA_LEADER_ELECTION   Set to 0, every worker runs the singletons
+                           unconditionally. MEASURED: 4 workers, 4 leaders.
+
+      MEMORY_ANN_EF_SEARCH hnsw.ef_search is per SESSION. At the pgvector
+                           default of 40 this corpus returned 31.7% recall on
+                           the CUSTOMER channel — degraded retrieval presented
+                           as a normal answer. MEASURED: 100% at 100.
+
+    Reported, not fatal, for the same reason the rest of this module reports:
+    refusing to start a laptop over a deployment variable gets the check
+    deleted. In a DEPLOYED environment the first two are blocking, because
+    duplicate outbound email cannot be undone.
+    """
+    problems, blocking = [], False
+    workers = 0
+    for var in ("WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS"):
+        try:
+            workers = max(workers, int(os.getenv(var, "") or 0))
+        except ValueError:
+            pass
+
+    if not _flag("HA_LEADER_ELECTION", "1"):
+        problems.append("HA_LEADER_ELECTION=0 — every worker runs the "
+                        "scheduler, IMAP poller and agent-bus consumer")
+        blocking = workers > 1
+
+    if workers > 1 and not (os.getenv("WEB_CONCURRENCY") or "").strip():
+        problems.append(f"{workers} workers configured but WEB_CONCURRENCY is "
+                        f"unset — leader election cannot tell it is running "
+                        f"multi-process and will fail OPEN on a database blip")
+        blocking = True
+
+    ef = (os.getenv("MEMORY_ANN_EF_SEARCH", "") or "").strip()
+    if ef and int(ef or 0) < 100:
+        problems.append(f"MEMORY_ANN_EF_SEARCH={ef} — below 100 this corpus "
+                        f"measured 31.7% recall on the customer channel")
+
+    if problems:
+        return {"control": "configuration_integrity", "ok": False,
+                "severity": "blocking" if blocking else "advisory",
+                "message": "; ".join(problems)}
+    return {"control": "configuration_integrity", "ok": True, "severity": "ok",
+            "message": f"correctness-affecting configuration validated "
+                       f"(workers={workers or 1}, leader_election=on)"}
+
+
 CHECKS = (_check_calendar_feed, _check_api_auth, _check_admin_token,
-          _check_training_ack, _check_secret_strength)
+          _check_training_ack, _check_secret_strength,
+          _check_configuration_integrity)
 
 
 def audit() -> Dict[str, Any]:

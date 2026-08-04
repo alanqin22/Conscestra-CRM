@@ -171,11 +171,19 @@ def probe_genuinely_assertable(cur) -> List[str]:
     evidence-backed memory and puts every field back afterwards.
     """
     from app.core import memory_consolidation as MC
+    # The subject must be able to PASS the gate, not merely have the most
+    # evidence. Selecting by evidence_count alone picked a memory whose
+    # certainty was 0.440 — below the assertion floor — so dual approval
+    # completed and the metric still read 0, and the probe reported the metric
+    # blind when the metric was right. A negative control that depends on
+    # ambient data selection is a negative control that fails at random.
+    from app.core.memory_consolidation import ASSERT_FLOOR
     cur.execute("""SELECT memory_id::text, visibility, kind, certainty
                      FROM customer_memories
                     WHERE status='active' AND evidence_count > 0
-                      AND generator LIKE 'memory_consolidation%'
-                    ORDER BY evidence_count DESC LIMIT 1""")
+                      AND certainty >= %s
+                      AND generator LIKE 'memory_consolidation%%'
+                    ORDER BY evidence_count DESC LIMIT 1""", (ASSERT_FLOOR,))
     row = cur.fetchone()
     if not row:
         return []

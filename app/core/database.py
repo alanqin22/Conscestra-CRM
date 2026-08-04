@@ -66,10 +66,14 @@ class _Pooled:
     read-only would fail the next writer for no visible reason.
     """
 
-    __slots__ = ("_conn", "_pool", "_done")
+    __slots__ = ("_conn", "_pool", "_done", "_slot")
 
-    def __init__(self, conn, pool):
+    def __init__(self, conn, pool, slot=None):
         self._conn, self._pool, self._done = conn, pool, False
+        # The semaphore slot this checkout holds. Released exactly once, in
+        # close(), whatever else happens — a leaked slot is a permanent
+        # reduction in pool capacity and looks like a slow leak in throughput.
+        self._slot = slot
 
     def __getattr__(self, name):
         return getattr(self._conn, name)
@@ -85,17 +89,24 @@ class _Pooled:
             return
         self._done = True
         try:
-            self._conn.reset()
-        except Exception:           # poisoned — drop it, do not hand it on
             try:
-                self._pool.putconn(self._conn, close=True)
+                self._conn.reset()
+            except Exception:       # poisoned — drop it, do not hand it on
+                try:
+                    self._pool.putconn(self._conn, close=True)
+                except Exception:
+                    pass
+                return
+            try:
+                self._pool.putconn(self._conn)
             except Exception:
                 pass
-            return
-        try:
-            self._pool.putconn(self._conn)
-        except Exception:
-            pass
+        finally:
+            if self._slot is not None:
+                try:
+                    self._slot.release()
+                except ValueError:
+                    pass            # already released; never double-count
 
 
 _POOLS: Dict[tuple, Any] = {}
@@ -105,6 +116,35 @@ POOL_ENABLED = os.getenv("DB_POOL_ENABLED", "1").strip().lower() not in (
     "0", "false", "no", "off")
 POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
 POOL_MAX = int(os.getenv("DB_POOL_MAX", "16"))
+
+# How long a caller waits for a pooled connection before giving up.
+#
+# EXHAUSTION AND UNAVAILABILITY ARE DIFFERENT FAILURES, and the first version
+# of this module treated them the same: any exception from getconn() fell
+# through to a direct psycopg2.connect(). Measured at 32 concurrent against
+# POOL_MAX=16, sixteen requests logged "pool unavailable, falling back direct"
+# and opened their own connections — with no errors, which is precisely the
+# problem. Under sustained load that turns a queueing limit into
+# max_connections pressure on PostgreSQL, taking down every other service on
+# the same database rather than slowing one endpoint.
+#
+# A pool that cannot be BUILT (bad DSN, server down at startup) still falls
+# back, because refusing to start helps nobody. A pool that is merely BUSY now
+# makes the caller wait, and then fail honestly.
+POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "10"))
+
+# Bounds concurrent checkouts. psycopg2's getconn() raises immediately when the
+# pool is at maxconn rather than waiting, so the queueing has to live here.
+_POOL_SLOTS: Dict[tuple, Any] = {}
+
+
+class PoolExhausted(RuntimeError):
+    """Every pooled connection is busy and the wait expired.
+
+    Raised instead of silently opening an unpooled connection. A caller seeing
+    this is a capacity signal; a database refusing all connections is an
+    outage, and the whole point of the bound is to keep the first from becoming
+    the second."""
 
 
 def _pool_for(dsn: str, schema: str):
@@ -122,7 +162,35 @@ def _pool_for(dsn: str, schema: str):
             pool = psycopg2.pool.ThreadedConnectionPool(
                 POOL_MIN, POOL_MAX, dsn, **kw)
             _POOLS[key] = pool
+            _POOL_SLOTS[key] = threading.BoundedSemaphore(POOL_MAX)
     return pool
+
+
+def pool_utilisation() -> Dict[str, Any]:
+    """How close this PROCESS is to its connection ceiling.
+
+    Pools are per process. `uvicorn --workers 4` means 4 x POOL_MAX against a
+    server-wide `max_connections` that other services also draw on — the
+    multiplication is easy to forget and expensive to discover, because
+    exhaustion arrives as every service failing at once rather than this one
+    slowing down.
+
+    `in_use` is derived from the semaphore, which is the same thing the bound
+    is enforced with, so this cannot drift from the limit it reports."""
+    out: Dict[str, Any] = {"pool_max": POOL_MAX, "pools": len(_POOLS),
+                           "timeout_s": POOL_TIMEOUT, "in_use": None}
+    slots = list(_POOL_SLOTS.values())
+    if slots:
+        # BoundedSemaphore has no public counter; _value is the free count.
+        free = sum(getattr(s, "_value", 0) for s in slots)
+        capacity = POOL_MAX * len(slots)
+        out["in_use"] = capacity - free
+        out["utilisation"] = round((capacity - free) / capacity, 4) if capacity else None
+        out["process_ceiling"] = capacity
+        out["cluster_ceiling_hint"] = (
+            f"x WEB_CONCURRENCY workers; check against the server's "
+            f"max_connections before raising either")
+    return out
 
 
 def close_all_pools() -> None:
@@ -158,14 +226,72 @@ def get_connection():
         # Measured before pooling: consolidation opened one connection per
         # entity at ~121 ms each — 3.4 hours for a 100k-contact pass, almost
         # all of it TCP + TLS + auth rather than work.
+        # Building the pool and borrowing from it fail for different reasons
+        # and must be handled differently — see POOL_TIMEOUT.
         try:
             pool = _pool_for(dsn, schema)
-            raw = pool.getconn()
-            raw.set_client_encoding('UTF8')
-            return _Pooled(raw, pool)
+            slots = _POOL_SLOTS[(dsn, schema)]
         except Exception as exc:
-            # A pool that cannot be built must never take the app down with it.
+            # Cannot be BUILT: bad DSN, server unreachable at startup. Falling
+            # back keeps the app serving, and there is no pool to overwhelm.
             logger.warning(f"[db] pool unavailable, falling back direct: {exc}")
+        else:
+            # BUSY: wait for a slot rather than opening an unpooled connection.
+            if not slots.acquire(timeout=POOL_TIMEOUT):
+                raise PoolExhausted(
+                    f"all {POOL_MAX} pooled connections busy for "
+                    f"{POOL_TIMEOUT:g}s. Raise DB_POOL_MAX, shed load, or find "
+                    f"the caller holding connections — opening more would move "
+                    f"the failure onto the database itself.")
+            try:
+                # VALIDATE ON CHECKOUT. A pooled connection whose server has
+                # restarted is not "closed" — psycopg2 only finds out when it
+                # tries to use it. After a database restart or failover the pool
+                # therefore hands out corpses, and each one fails a real user
+                # request before being discarded on return: up to POOL_MAX
+                # failures, multiplied by every worker. Observed in production
+                # after a Postgres restart — /health reported
+                # "SSL SYSCALL error: EOF detected" and recovered only once the
+                # dead connections had each broken something.
+                #
+                # A round trip costs ~0.03 ms against a ~65 ms search. Paying it
+                # to convert a user-visible error into a silent retry is not a
+                # close call.
+                raw = None
+                for _ in range(max(2, POOL_MAX // 4)):
+                    raw = pool.getconn()
+                    try:
+                        raw.set_client_encoding('UTF8')
+                        with raw.cursor() as _c:
+                            _c.execute("SELECT 1")
+                        # END THE PROBE'S TRANSACTION.
+                        #
+                        # psycopg2 is not autocommit by default, so the probe
+                        # leaves the connection IN a transaction. Roughly a
+                        # hundred call sites then do `conn.autocommit = True`,
+                        # which psycopg2 refuses inside one — the validation
+                        # would hand back a connection that fails on its first
+                        # real use, which is precisely the failure it exists to
+                        # prevent.
+                        raw.rollback()
+                        break
+                    except Exception:
+                        # Dead. Drop it rather than return it to the pool, and
+                        # take the next one.
+                        try:
+                            pool.putconn(raw, close=True)
+                        except Exception:
+                            pass
+                        raw = None
+                if raw is None:
+                    raise PoolExhausted(
+                        "every pooled connection failed validation — the "
+                        "database is unreachable or was restarted and the pool "
+                        "could not be refreshed")
+                return _Pooled(raw, pool, slots)
+            except Exception:
+                slots.release()
+                raise
 
     if schema and schema != "public":
         conn = psycopg2.connect(dsn, options=f"-c search_path={schema},public")
