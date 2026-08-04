@@ -300,8 +300,11 @@ _LAST_COVERAGE: Dict[str, Any] = {"searches": 0, "truncated": 0,
                                   "last_ratio": None, "last_matched": None}
 
 
+# One COUNT(*) per this many truncated searches.
+TRUNCATION_SAMPLE = int(os.getenv("CONTENT_INDEX_TRUNCATION_SAMPLE", "20"))
+
+
 def _record_truncation(considered: int, matched: int) -> None:
-    _LAST_COVERAGE["truncated"] += 1
     _LAST_COVERAGE["last_matched"] = matched
     _LAST_COVERAGE["last_ratio"] = round(considered / matched, 4) if matched else None
     if matched and considered / matched < 0.5:
@@ -806,11 +809,20 @@ def search(query: str,
                 # The number is recorded so the degradation is observable
                 # before it is severe, rather than inferred afterwards from
                 # complaints that answers "got worse".
+                # SAMPLED, not per request. Establishing how much was missed
+                # needs a COUNT(*), which is a sequential scan — measured 0.9 ms
+                # alone, and it contends with every other search doing the same
+                # scan under concurrency. Instrumentation that degrades the path
+                # it observes buys visibility with the thing it is watching.
+                #
+                # Coverage moves with corpus size, not per query, so one reading
+                # every SAMPLE searches is the same signal at 1/20th the cost.
                 if len(rows) >= MAX_CANDIDATES:
-                    cur.execute("SELECT count(*) FROM content_embeddings "
-                                f"WHERE {' AND '.join(where)}", args)
-                    matched = cur.fetchone()[0]
-                    _record_truncation(len(rows), matched)
+                    _LAST_COVERAGE["truncated"] += 1
+                    if _LAST_COVERAGE["truncated"] % TRUNCATION_SAMPLE == 1:
+                        cur.execute("SELECT count(*) FROM content_embeddings "
+                                    f"WHERE {' AND '.join(where)}", args)
+                        _record_truncation(len(rows), cur.fetchone()[0])
         finally:
             conn.close()
     except Exception as exc:

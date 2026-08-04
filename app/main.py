@@ -1183,6 +1183,29 @@ app = FastAPI(
 from app.core.write_guard import WritePermissionError
 
 
+# SATURATION IS NOT A FAULT, and must not look like one.
+#
+# PoolExhausted means every pooled connection is busy — the bound working as
+# designed, keeping load off the database. Surfaced as a 500 it is
+# indistinguishable from a crash: alerting pages someone for a bug that does
+# not exist, load balancers keep sending traffic to a node that is merely full,
+# and clients retry immediately instead of backing off.
+#
+# 503 with Retry-After is the honest answer. It is the one status that says
+# "correct, temporarily out of capacity, come back".
+from app.core.database import PoolExhausted                  # noqa: E402
+
+
+@app.exception_handler(PoolExhausted)
+async def _pool_exhausted_handler(request: Request, exc: PoolExhausted):
+    logger.warning(f"[db] saturated, shedding request to {request.url.path}")
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "1"},
+        content={"detail": "The service is at capacity. Please retry shortly.",
+                 "reason": "database_connections_saturated"})
+
+
 @app.exception_handler(WritePermissionError)
 async def _write_permission_handler(request: Request, exc: WritePermissionError):
     return JSONResponse(status_code=exc.http_status, content={"detail": str(exc)})
