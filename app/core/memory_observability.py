@@ -132,6 +132,30 @@ def _corpus_shape() -> Dict[str, Tuple[Optional[float], Any]]:
                 {"note": "count of ENABLED deletion-log triggers; a drop means "
                          "deletions stopped being recorded, not that they stopped"})
 
+            # CAN A SEARCH STILL SEE THE WHOLE CORPUS?
+            #
+            # Semantic search ranks the most recent CONTENT_INDEX_MAX_CANDIDATES
+            # rows that match its filters. While that window holds most of the
+            # corpus, ranking inside it is a search. Once it does not, it
+            # becomes "search recent" — and measured on this corpus the failure
+            # is a cliff, not a slope: a window covering 59% still reached 4 of
+            # the 5 best results for a query, and a window covering 29% reached
+            # none of them, while still returning confident-looking answers.
+            #
+            # This is a pure function of corpus size and the cap, so it moves
+            # predictably as data grows and gives warning well before anyone
+            # notices that answers "got worse".
+            from app.core.content_index import MAX_CANDIDATES
+            cur.execute("SELECT count(*) FROM content_embeddings")
+            indexed = cur.fetchone()[0] or 0
+            reachable = min(MAX_CANDIDATES, indexed) / indexed if indexed else 1.0
+            out["search.reachable_share"] = (
+                round(reachable, 4),
+                {"indexed_records": indexed, "candidate_cap": MAX_CANDIDATES,
+                 "note": "fraction of the corpus a single search can rank; "
+                         "below ~0.5 the best matches start falling outside "
+                         "the window"})
+
             # ERASURES WITH NO STATED REASON.
             #
             # The register is append-only and permanent, so an erasure recorded

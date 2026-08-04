@@ -293,6 +293,28 @@ BATCH = int(os.getenv("CONTENT_INDEX_BATCH", "128"))      # embedded per pass
 MIN_CHARS = int(os.getenv("CONTENT_INDEX_MIN_CHARS", "25"))
 MAX_CANDIDATES = int(os.getenv("CONTENT_INDEX_MAX_CANDIDATES", "4000"))
 
+# Last observed search coverage, for the observability surface. A search that
+# ranked every matching row is complete; one that hit the cap ranked only the
+# newest slice, and the ratio says how much of the corpus it could reach.
+_LAST_COVERAGE: Dict[str, Any] = {"searches": 0, "truncated": 0,
+                                  "last_ratio": None, "last_matched": None}
+
+
+def _record_truncation(considered: int, matched: int) -> None:
+    _LAST_COVERAGE["truncated"] += 1
+    _LAST_COVERAGE["last_matched"] = matched
+    _LAST_COVERAGE["last_ratio"] = round(considered / matched, 4) if matched else None
+    if matched and considered / matched < 0.5:
+        logger.warning(
+            f"[content_index] search ranked {considered} of {matched} matching "
+            f"records ({considered/matched:.0%}) — results are drawn from the "
+            f"most recent slice only, and better matches may exist outside it")
+
+
+def search_coverage() -> Dict[str, Any]:
+    """What fraction of matching records recent searches could actually rank."""
+    return dict(_LAST_COVERAGE)
+
 INTERNAL, CUSTOMER = "internal", "customer"
 
 
@@ -756,6 +778,7 @@ def search(query: str,
     qv = E.embed_one(query.strip())
     if not qv:
         return []
+    _LAST_COVERAGE["searches"] += 1
 
     sql = (f"SELECT source_type, source_id, embedding, dims, snippet, "
            f"visibility, occurred_at, speech_act FROM content_embeddings "
@@ -768,6 +791,26 @@ def search(query: str,
             with conn.cursor() as cur:
                 cur.execute(sql, args)
                 rows = cur.fetchall()
+                # HOW MUCH OF THE CORPUS COULD THIS SEARCH EVEN SEE?
+                #
+                # Candidates are the MOST RECENT `MAX_CANDIDATES` rows matching
+                # the filters, and relevance is then ranked inside that window.
+                # While the window holds most of the corpus that is a search.
+                # Once it does not, it quietly becomes "search recent", and the
+                # failure is not gradual: measured on this corpus, a window
+                # covering 59% still reached 4 of the 5 best results, and a
+                # window covering 29% reached NONE of them. Results still come
+                # back — worse ones — with nothing to say the best were never
+                # candidates.
+                #
+                # The number is recorded so the degradation is observable
+                # before it is severe, rather than inferred afterwards from
+                # complaints that answers "got worse".
+                if len(rows) >= MAX_CANDIDATES:
+                    cur.execute("SELECT count(*) FROM content_embeddings "
+                                f"WHERE {' AND '.join(where)}", args)
+                    matched = cur.fetchone()[0]
+                    _record_truncation(len(rows), matched)
         finally:
             conn.close()
     except Exception as exc:
