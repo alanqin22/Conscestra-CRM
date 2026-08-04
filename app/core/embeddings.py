@@ -38,6 +38,8 @@ import json
 import logging
 import os
 import struct
+import threading
+from collections import OrderedDict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("embeddings")
@@ -204,11 +206,62 @@ def rank(query_vec: Sequence[float],
         return [t for t in out[:max(int(limit), 1)] if t[1] >= min_sim]
 
 
+# Query-embedding cache.
+#
+# MEASURED: a novel query costs 433-471 ms, and re-embedding the SAME query
+# seconds later cost 467 ms — there was no cache of any kind. After ranking was
+# vectorised this became the largest remaining component of search latency by a
+# wide margin, and unlike everything else in the path it is unaffected by
+# indexes, hardware or corpus size.
+#
+# Keyed on (model, dims, exact text). The embedding of a string is deterministic
+# for a given model, so there is nothing to invalidate and no TTL: a changed
+# model changes the key. Whitespace is normalised because "billing  error" and
+# "billing error" are the same question asked twice.
+#
+# FAILURES ARE NOT CACHED. Storing a None would convert one transient API error
+# into a permanently dead query, which is a far worse failure than paying for
+# the call again.
+_EMBED_CACHE: "OrderedDict[Tuple[str, int, str], List[float]]" = OrderedDict()
+_EMBED_CACHE_LOCK = threading.Lock()
+# 512 floats ≈ 2 KB, so 20k entries ≈ 40 MB — bounded, and far more than the
+# distinct-query volume any support corpus produces in a day.
+EMBED_CACHE_MAX = int(os.getenv("EMBED_CACHE_MAX", "20000"))
+_EMBED_STATS = {"hits": 0, "misses": 0}
+
+
+def embedding_cache_stats() -> Dict[str, Any]:
+    """Hit rate, for the observability surface. A cache nobody measures is a
+    cache nobody knows is working."""
+    with _EMBED_CACHE_LOCK:
+        h, m = _EMBED_STATS["hits"], _EMBED_STATS["misses"]
+        return {"hits": h, "misses": m, "entries": len(_EMBED_CACHE),
+                "capacity": EMBED_CACHE_MAX,
+                "hit_rate": round(h / (h + m), 4) if (h + m) else None}
+
+
 def embed_one(text: str, model: Optional[str] = None,
               dims: Optional[int] = None) -> Optional[List[float]]:
+    key = (model or MODEL, int(dims or DIMS), " ".join((text or "").split()))
+    if not key[2]:
+        return None
+    with _EMBED_CACHE_LOCK:
+        hit = _EMBED_CACHE.get(key)
+        if hit is not None:
+            _EMBED_CACHE.move_to_end(key)       # LRU
+            _EMBED_STATS["hits"] += 1
+            return list(hit)
+        _EMBED_STATS["misses"] += 1
+
     vecs = embed([text], model, dims)
-    return vecs[0] if vecs else None
+    vec = vecs[0] if vecs else None
+    if vec:
+        with _EMBED_CACHE_LOCK:
+            _EMBED_CACHE[key] = list(vec)
+            while len(_EMBED_CACHE) > EMBED_CACHE_MAX:
+                _EMBED_CACHE.popitem(last=False)
+    return vec
 
 
 __all__ = ["MODEL", "DIMS", "index_key", "encode", "decode", "embed",
-           "embed_one", "rank"]
+           "embed_one", "rank", "embedding_cache_stats"]

@@ -162,6 +162,27 @@ def _corpus_shape() -> Dict[str, Tuple[Optional[float], Any]]:
                          "audience) are complete at this volume; this is the "
                          "ceiling, not the typical case"})
 
+            # A CACHE NOBODY MEASURES IS A CACHE NOBODY KNOWS IS WORKING.
+            #
+            # Query embedding is the largest remaining component of search
+            # latency — MEASURED 433-471 ms per novel query, and unaffected by
+            # any index. The cache removes it for repeats, so its hit rate is
+            # the difference between a 65 ms search and a 500 ms one.
+            #
+            # Per PROCESS, so a fresh worker starts cold and several replicas
+            # each keep their own. A low rate here means either genuinely
+            # diverse queries or a process that keeps restarting; both are
+            # worth knowing and neither is visible any other way.
+            try:
+                from app.core.embeddings import embedding_cache_stats
+                st = embedding_cache_stats()
+                out["search.embedding_cache_hit_rate"] = (
+                    st.get("hit_rate"),
+                    {**st, "note": "per process; a miss costs ~450 ms of "
+                                   "search latency that no index can recover"})
+            except Exception as exc:                          # noqa: BLE001
+                logger.debug(f"[observability] embedding cache stats: {exc}")
+
             # ERASURES WITH NO STATED REASON.
             #
             # The register is append-only and permanent, so an erasure recorded

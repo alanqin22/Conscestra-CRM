@@ -66,10 +66,14 @@ class _Pooled:
     read-only would fail the next writer for no visible reason.
     """
 
-    __slots__ = ("_conn", "_pool", "_done")
+    __slots__ = ("_conn", "_pool", "_done", "_slot")
 
-    def __init__(self, conn, pool):
+    def __init__(self, conn, pool, slot=None):
         self._conn, self._pool, self._done = conn, pool, False
+        # The semaphore slot this checkout holds. Released exactly once, in
+        # close(), whatever else happens — a leaked slot is a permanent
+        # reduction in pool capacity and looks like a slow leak in throughput.
+        self._slot = slot
 
     def __getattr__(self, name):
         return getattr(self._conn, name)
@@ -85,17 +89,24 @@ class _Pooled:
             return
         self._done = True
         try:
-            self._conn.reset()
-        except Exception:           # poisoned — drop it, do not hand it on
             try:
-                self._pool.putconn(self._conn, close=True)
+                self._conn.reset()
+            except Exception:       # poisoned — drop it, do not hand it on
+                try:
+                    self._pool.putconn(self._conn, close=True)
+                except Exception:
+                    pass
+                return
+            try:
+                self._pool.putconn(self._conn)
             except Exception:
                 pass
-            return
-        try:
-            self._pool.putconn(self._conn)
-        except Exception:
-            pass
+        finally:
+            if self._slot is not None:
+                try:
+                    self._slot.release()
+                except ValueError:
+                    pass            # already released; never double-count
 
 
 _POOLS: Dict[tuple, Any] = {}
@@ -105,6 +116,35 @@ POOL_ENABLED = os.getenv("DB_POOL_ENABLED", "1").strip().lower() not in (
     "0", "false", "no", "off")
 POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
 POOL_MAX = int(os.getenv("DB_POOL_MAX", "16"))
+
+# How long a caller waits for a pooled connection before giving up.
+#
+# EXHAUSTION AND UNAVAILABILITY ARE DIFFERENT FAILURES, and the first version
+# of this module treated them the same: any exception from getconn() fell
+# through to a direct psycopg2.connect(). Measured at 32 concurrent against
+# POOL_MAX=16, sixteen requests logged "pool unavailable, falling back direct"
+# and opened their own connections — with no errors, which is precisely the
+# problem. Under sustained load that turns a queueing limit into
+# max_connections pressure on PostgreSQL, taking down every other service on
+# the same database rather than slowing one endpoint.
+#
+# A pool that cannot be BUILT (bad DSN, server down at startup) still falls
+# back, because refusing to start helps nobody. A pool that is merely BUSY now
+# makes the caller wait, and then fail honestly.
+POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "10"))
+
+# Bounds concurrent checkouts. psycopg2's getconn() raises immediately when the
+# pool is at maxconn rather than waiting, so the queueing has to live here.
+_POOL_SLOTS: Dict[tuple, Any] = {}
+
+
+class PoolExhausted(RuntimeError):
+    """Every pooled connection is busy and the wait expired.
+
+    Raised instead of silently opening an unpooled connection. A caller seeing
+    this is a capacity signal; a database refusing all connections is an
+    outage, and the whole point of the bound is to keep the first from becoming
+    the second."""
 
 
 def _pool_for(dsn: str, schema: str):
@@ -122,6 +162,7 @@ def _pool_for(dsn: str, schema: str):
             pool = psycopg2.pool.ThreadedConnectionPool(
                 POOL_MIN, POOL_MAX, dsn, **kw)
             _POOLS[key] = pool
+            _POOL_SLOTS[key] = threading.BoundedSemaphore(POOL_MAX)
     return pool
 
 
@@ -158,14 +199,30 @@ def get_connection():
         # Measured before pooling: consolidation opened one connection per
         # entity at ~121 ms each — 3.4 hours for a 100k-contact pass, almost
         # all of it TCP + TLS + auth rather than work.
+        # Building the pool and borrowing from it fail for different reasons
+        # and must be handled differently — see POOL_TIMEOUT.
         try:
             pool = _pool_for(dsn, schema)
-            raw = pool.getconn()
-            raw.set_client_encoding('UTF8')
-            return _Pooled(raw, pool)
+            slots = _POOL_SLOTS[(dsn, schema)]
         except Exception as exc:
-            # A pool that cannot be built must never take the app down with it.
+            # Cannot be BUILT: bad DSN, server unreachable at startup. Falling
+            # back keeps the app serving, and there is no pool to overwhelm.
             logger.warning(f"[db] pool unavailable, falling back direct: {exc}")
+        else:
+            # BUSY: wait for a slot rather than opening an unpooled connection.
+            if not slots.acquire(timeout=POOL_TIMEOUT):
+                raise PoolExhausted(
+                    f"all {POOL_MAX} pooled connections busy for "
+                    f"{POOL_TIMEOUT:g}s. Raise DB_POOL_MAX, shed load, or find "
+                    f"the caller holding connections — opening more would move "
+                    f"the failure onto the database itself.")
+            try:
+                raw = pool.getconn()
+                raw.set_client_encoding('UTF8')
+                return _Pooled(raw, pool, slots)
+            except Exception:
+                slots.release()
+                raise
 
     if schema and schema != "public":
         conn = psycopg2.connect(dsn, options=f"-c search_path={schema},public")
