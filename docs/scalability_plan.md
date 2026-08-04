@@ -311,6 +311,34 @@ Notes that matter more than the totals:
 
 ---
 
+## 8b. Review board findings — 2026-08-03
+
+Three claims failed when measured under conditions closer to production. All
+three changed a recommendation.
+
+**Throughput is capped at ~8 searches/second and does not improve with
+concurrency.** MEASURED: 1 worker 6.6/s, 32 workers 8.3/s, while p50 latency
+rose 150 ms → 3,084 ms. Adding concurrency adds only queueing. This ceiling is
+independent of corpus size and was not in the original plan at all — it is
+likely to bind before data volume does, and no tier gate covered it.
+
+**Raising the cap to 8,000 costs 43% of throughput.** The "implement now,
+110 ms" recommendation was measured SERIALLY. Under 16-way concurrency:
+8.4/s → 4.8/s, p50 1,683 ms → 3,224 ms. It buys recall by spending capacity,
+which is a real trade rather than a free win.
+
+**The connection pool fails open into unbounded connections.** At 32 concurrent
+against `POOL_MAX=16`, sixteen requests logged "pool unavailable, falling back
+direct" and opened their own connections. No errors, which is the problem: under
+sustained load this converts a queueing limit into `max_connections` pressure on
+PostgreSQL — a database-wide outage rather than a slow endpoint.
+
+**And the recall problem is narrower than stated.** MEASURED: only the
+UNFILTERED internal search is truncated. Every filtered shape is complete at
+this volume — customer audience 486 rows, cases 148, conversation messages 167,
+commitments 10. `search.reachable_share` implied broad degradation and has been
+replaced by `search.worst_case_coverage`, labelled as the ceiling it is.
+
 ## 9. What would invalidate this plan
 
 Stated up front so the gates are meaningful:
