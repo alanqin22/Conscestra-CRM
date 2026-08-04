@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import time
 import threading
 
 logger = logging.getLogger("leader")
@@ -39,6 +40,13 @@ def _flag(name: str, default: str = "1") -> bool:
 
 
 ENABLED = _flag("HA_LEADER_ELECTION", "1")
+
+# How long a losing process keeps trying before accepting follower for life.
+# Sized for a rolling deploy: the outgoing container releases its lock when it
+# exits, typically within seconds. Long enough to outlast that, short enough
+# not to delay startup on a genuine multi-instance deployment.
+ELECTION_RETRY_SECONDS = float(os.getenv("HA_ELECTION_RETRY_SECONDS", "45"))
+ELECTION_RETRY_INTERVAL = float(os.getenv("HA_ELECTION_RETRY_INTERVAL", "3"))
 try:
     _LOCK_KEY = int(os.getenv("HA_LOCK_KEY", "871123"))
 except ValueError:
@@ -87,14 +95,53 @@ def begin() -> bool:
             with conn.cursor() as cur:
                 cur.execute("SELECT pg_try_advisory_lock(%s)", (_LOCK_KEY,))
                 won = bool(cur.fetchone()[0])
+            if not won:
+                # THE DEPLOY RACE THAT SILENTLY STOPPED BACKGROUND WORK FOR 10 DAYS.
+                #
+                # During a rolling deploy the NEW container starts while the OLD
+                # one still holds the lock. A single try loses, this process
+                # accepts follower for life, the old container then exits, and
+                # the lock is orphaned — nobody runs the scheduler, IMAP poller
+                # or agent-bus again until someone restarts by hand. Measured on
+                # production: last scheduled run 2026-07-24, discovered 2026-08-04.
+                #
+                # The old container leaves within seconds, so retrying briefly
+                # converts the race into a non-event. This does NOT cover a
+                # leader that dies later in life — that needs promotion of a
+                # running follower, which is a separate change.
+                conn.close()
+                deadline = time.monotonic() + ELECTION_RETRY_SECONDS
+                attempt = 0
+                while time.monotonic() < deadline:
+                    time.sleep(ELECTION_RETRY_INTERVAL)
+                    attempt += 1
+                    try:
+                        conn = get_connection()
+                        conn.autocommit = True
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT pg_try_advisory_lock(%s)", (_LOCK_KEY,))
+                            won = bool(cur.fetchone()[0])
+                        if won:
+                            logger.info(f"[HA] acquired leadership on retry "
+                                        f"{attempt} after {_WHO} lost the first "
+                                        f"attempt — the previous holder exited")
+                            break
+                        conn.close()
+                    except Exception as exc:                  # noqa: BLE001
+                        logger.debug(f"[HA] retry {attempt} failed: {exc}")
+
             if won:
                 _hold_conn = conn          # keep open → hold the lock for process life
                 _state["leader"] = True
                 logger.info(f"[HA] LEADER ({_WHO}) — running scheduler / IMAP poller / agent-bus")
             else:
-                conn.close()
                 _state["leader"] = False
-                logger.info(f"[HA] follower ({_WHO}) — another process holds the singleton lock")
+                logger.warning(
+                    f"[HA] follower ({_WHO}) — another process held the singleton "
+                    f"lock for the whole {ELECTION_RETRY_SECONDS:g}s election "
+                    f"window. If this is a single-instance deploy, background "
+                    f"work is NOT running: check for an orphaned holder of "
+                    f"advisory lock {_LOCK_KEY}.")
             return _state["leader"]
         except Exception as exc:
             # FAIL-OPEN IS CORRECT FOR ONE PROCESS AND DANGEROUS FOR SEVERAL.

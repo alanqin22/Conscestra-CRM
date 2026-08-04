@@ -179,3 +179,7 @@ deploy_html.ps1
 deploy_sp.ps1
 submit_indexnow.py
 task.json
+
+# RLS state captures from production diagnostics — contain no secrets but are
+# operational snapshots, not source.
+rls_state_railway_*.json
