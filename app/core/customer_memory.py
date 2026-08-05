@@ -360,6 +360,10 @@ def recall_relevant(entity_type: str, entity_id: str, topic: str,
         return []
     try:
         from app.core import content_index
+        # Retrieval FAILING and retrieval finding NOTHING are different answers
+        # and are handled separately below. Until a degraded-mode policy is
+        # chosen, an outage returns no memories — but says so, loudly, instead
+        # of implying the customer has no history.
         return content_index.search(
             query=topic,
             audience=audience or content_index.CUSTOMER,   # None → restrictive
@@ -369,6 +373,13 @@ def recall_relevant(entity_type: str, entity_id: str, topic: str,
             party_key=f"{entity_type}:{entity_id}",
             limit=limit,
         )
+    except content_index.RetrievalUnavailable as exc:
+        # Explicit, logged, and separable from "no history". A degraded-mode
+        # policy (keyword fallback / cache-only / refuse) plugs in here; none is
+        # chosen yet, so the safe answer is no memories rather than wrong ones.
+        logger.error(f"[memory] SEMANTIC RETRIEVAL UNAVAILABLE — returning no "
+                     f"memories rather than a partial answer: {exc}")
+        return []
     except Exception as exc:
         logger.debug(f"[memory] semantic recall skipped: {exc}")
         return []

@@ -293,6 +293,21 @@ BATCH = int(os.getenv("CONTENT_INDEX_BATCH", "128"))      # embedded per pass
 MIN_CHARS = int(os.getenv("CONTENT_INDEX_MIN_CHARS", "25"))
 MAX_CANDIDATES = int(os.getenv("CONTENT_INDEX_MAX_CANDIDATES", "4000"))
 
+
+class RetrievalUnavailable(RuntimeError):
+    """Retrieval could not run — distinct from "retrieval found nothing".
+
+    search() returned [] for both, so a caller could not tell "this customer has
+    no matching history" from "the embedding provider is down". The comments in
+    this module claim the caller falls back to keyword/recency retrieval; traced,
+    no caller does, because none could see the difference to act on.
+
+    Raising makes the failure decidable. It does NOT choose the policy — whether
+    to degrade to keyword search, serve from cache, or refuse the request is a
+    business decision. It makes that decision implementable, and until one is
+    made it converts a silent wrong answer into a logged, visible one.
+    """
+
 # Last observed search coverage, for the observability surface. A search that
 # ranked every matching row is complete; one that hit the cap ranked only the
 # newest slice, and the ratio says how much of the corpus it could reach.
@@ -780,7 +795,13 @@ def search(query: str,
 
     qv = E.embed_one(query.strip())
     if not qv:
-        return []
+        # The embedding provider is the only unmitigated single point of failure
+        # in the retrieval path: every search calls it, and unlike chat
+        # completion there is no configured failover.
+        raise RetrievalUnavailable(
+            "could not embed the query — the embedding provider is unreachable "
+            "or returned nothing. Semantic retrieval is unavailable; this is "
+            "NOT an empty result set.")
     _LAST_COVERAGE["searches"] += 1
 
     sql = (f"SELECT source_type, source_id, embedding, dims, snippet, "
