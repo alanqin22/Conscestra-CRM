@@ -2379,6 +2379,22 @@ environments.**
   passes. **Both changes are required.**
 - pgvector HNSW: `ef_search=40` gives 31.7% recall on the customer path;
   **100% at 100**. Backfill 1,960 rows/s; index 17 MB per 7.5k vectors.
+
+**CORRECTED 2026-08-05 against PRODUCTION data — the local cliff overstated it.**
+Production (3,058 internal vectors, 47.9% unique snippets) degrades far more
+gracefully than the local synthetic corpus:
+
+    coverage   local recall@5    production recall@5
+      ~65%          —                  96.7%
+      ~59%         77%                   —
+      ~33%          —                  80.0%
+      ~29%         27%                   —
+
+At 3,058 vectors production is BELOW the 4,000 cap: 100% coverage, 100% recall
+today. The local cliff came from a template cluster concentrated in one date
+range; production's duplicates are spread across time. **pgvector is therefore
+NOT urgent** — raise the cap when the corpus passes ~4,000 and re-measure.
+Fourth case of local evidence failing to describe production.
 - Resident numpy matrix rejected: erasure cannot reach an in-process copy.
 
 ### Still open (2026-08-04)
