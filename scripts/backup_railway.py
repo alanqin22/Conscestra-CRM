@@ -53,15 +53,31 @@ BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(ROOT / "backups")))
 KEEP = int(os.getenv("BACKUP_KEEP", "14"))
 SCRATCH_DB = os.getenv("BACKUP_SCRATCH_DB", "restore_drill")
 
-# Tables whose counts must match after a restore. Not every table — a
-# representative spread across business data, audit trail and derived state, so
-# a partial restore cannot pass by matching one of them.
-VERIFY_TABLES = ("accounts", "contacts", "opportunities", "orders", "activities",
-                 "cases", "audit_log", "content_embeddings",
-                 "record_field_history", "memory_erasure_log")
+# EVERY table is verified, not a sample.
+#
+# The first version checked ten representative tables and printed only those,
+# which read as though ten tables were the entire backup. Sampling was also the
+# weaker choice: a restore that drops one obscure table passes a ten-table spot
+# check, and 223 exact counts cost one round trip per side when they are issued
+# as a single UNION ALL rather than 223 separate queries.
+#
+# These few are printed individually because a human reading the output wants to
+# see business data, audit trail and derived state named. The PASS/FAIL is
+# decided across all of them.
+HIGHLIGHT = ("accounts", "contacts", "opportunities", "orders", "activities",
+             "cases", "audit_log", "content_embeddings",
+             "record_field_history", "memory_erasure_log")
 
 
-PG_IMAGE = os.getenv("BACKUP_PG_IMAGE", "postgres:18")
+# THE RESTORE TARGET MUST CARRY PRODUCTION'S EXTENSIONS.
+#
+# With plain postgres:18 the restore silently lost the `items` table: it uses
+# the `vector` type, CREATE EXTENSION vector failed in the container, and the
+# dependent table never landed. 223 tables restored against 224 in production,
+# and a ten-table spot check called it verified.
+#
+# pgvector/pgvector is the same postgres image with the extension present.
+PG_IMAGE = os.getenv("BACKUP_PG_IMAGE", "pgvector/pgvector:pg18")
 
 
 def _server_major(dsn: str) -> int:
@@ -107,21 +123,43 @@ def _tool(name: str) -> str:
                      f"them to PATH.")
 
 
-def _counts(dsn: str) -> dict:
+def _counts(dsn: str, tables=None) -> dict:
+    """Exact row counts for every ordinary table in `public`, in one round trip.
+
+    reltuples would be cheaper and is an ESTIMATE — useless for deciding whether
+    a restore reproduced the data. A generated UNION ALL gives exact counts for
+    all 223 tables at the cost of a single query."""
     import psycopg2
-    out = {}
     conn = psycopg2.connect(dsn)
     try:
         with conn.cursor() as cur:
-            for t in VERIFY_TABLES:
-                try:
-                    cur.execute(f"SELECT count(*) FROM {t}")
-                    out[t] = cur.fetchone()[0]
-                except Exception:
-                    conn.rollback()          # table absent in this schema
+            if tables is None:
+                cur.execute("""SELECT c.relname FROM pg_class c
+                                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                                WHERE n.nspname = 'public' AND c.relkind = 'r'
+                                ORDER BY 1""")
+                tables = [r[0] for r in cur.fetchall()]
+            if not tables:
+                return {}
+            # A table present in production but ABSENT here is the failure this
+            # exists to catch, so it must be reported rather than raised.
+            cur.execute("""SELECT c.relname FROM pg_class c
+                             JOIN pg_namespace n ON n.oid = c.relnamespace
+                            WHERE n.nspname='public' AND c.relkind='r'""")
+            present = {r[0] for r in cur.fetchall()}
+            missing = [t for t in tables if t not in present]
+            tables = [t for t in tables if t in present]
+            if not tables:
+                return {t: None for t in missing}
+            union = " UNION ALL ".join(
+                f'SELECT {chr(39)}{t}{chr(39)} AS t, count(*) AS n FROM public."{t}"'
+                for t in tables)
+            cur.execute(union)
+            out = {r[0]: r[1] for r in cur.fetchall()}
+            out.update({t: None for t in missing})   # None = table not present
+            return out
     finally:
         conn.close()
-    return out
 
 
 def main() -> int:
@@ -137,8 +175,22 @@ def main() -> int:
     dump = BACKUP_DIR / f"railway-{stamp}.dump"
 
     # ── dump ────────────────────────────────────────────────────────────────
+    # COUNT BEFORE DUMPING, NOT AFTER.
+    #
+    # pg_dump takes a consistent snapshot at its START, and this dump runs for
+    # ~200s over the public proxy while the scheduler keeps indexing. Comparing
+    # the restore against production AFTER the dump therefore compares a
+    # snapshot with a moving source: content_embeddings read 3,570 restored
+    # against 3,698 live and the run failed, with nothing actually wrong.
+    #
+    # The correct assertion is that a restore contains AT LEAST what existed
+    # when the dump began. Anything written during the window is legitimately
+    # absent; anything MISSING is data loss.
     major = _server_major(src)
     print(f"  production is PostgreSQL {major}; using {PG_IMAGE} client tools")
+    before = _counts(src)
+    print(f"  production before dump: {len(before)} tables, "
+          f"{sum(v for v in before.values() if v):,} rows")
     t0 = time.perf_counter()
     r = _docker("pg_dump", src, "-Fc", "--no-owner", "--no-acl",
                 "-f", f"/backup/{dump.name}", mount=BACKUP_DIR)
@@ -222,12 +274,20 @@ def main() -> int:
         print(f"  restored {landed:4} tables in {restore_s:6.1f}s  <-- THIS IS THE RTO")
 
         target = f"postgresql://postgres:drill@127.0.0.1:55432/{SCRATCH_DB}"
-        want, got = _counts(src), _counts(target)
+        want = _counts(src)                       # every table in production
+        got = _counts(target, list(want))         # the same list, restored
         bad = [t for t in want if want[t] != got.get(t)]
+        print(f"\ncomparing ALL {len(want)} tables; showing the main ones:")
         print(f"\n{'table':24} {'production':>11} {'restored':>10}")
-        for t in sorted(want):
-            flag = "" if want[t] == got.get(t) else "   <-- MISMATCH"
-            print(f"  {t:24} {want[t]:11} {got.get(t, 0):10}{flag}")
+        for t in sorted(HIGHLIGHT):
+            if t in want:
+                flag = "" if want[t] == got.get(t) else "   <-- MISMATCH"
+                print(f"  {t:24} {want[t]:11} {got.get(t, 0):10}{flag}")
+        for t in sorted(bad):                     # never hide a mismatch
+            if t not in HIGHLIGHT:
+                g = got.get(t)
+                shown = "ABSENT" if g is None else str(g)
+                print(f"  {t:24} {want[t]:11} {shown:>10}   <-- MISMATCH")
     finally:
         subprocess.run(["docker", "rm", "-f", cname], capture_output=True)
 
