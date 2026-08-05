@@ -166,25 +166,60 @@ def main() -> int:
 
     bad, restore_s = [], 0.0
     try:
-        for _ in range(60):
+        # READINESS: pg_isready IS NOT ENOUGH.
+        #
+        # The postgres image starts a temporary server on a unix socket to run
+        # initdb, then RESTARTS it. pg_isready succeeds against that temporary
+        # server, so a check that trusts it proceeds against a server about to
+        # bounce — createdb fails, pg_restore fails, and (before this was fixed)
+        # the script printed "restored in 0.2s <-- THIS IS THE RTO" for a restore
+        # that never happened.
+        #
+        # A real TCP connection from the host, twice a second apart, is the only
+        # signal that the final server is accepting work.
+        import psycopg2
+        probe = f"postgresql://postgres:drill@127.0.0.1:55432/postgres"
+        ready = 0
+        for _ in range(90):
             time.sleep(1)
-            if subprocess.run(["docker", "exec", cname, "pg_isready", "-U", "postgres"],
-                              capture_output=True).returncode == 0:
-                break
+            try:
+                psycopg2.connect(probe, connect_timeout=2).close()
+                ready += 1
+                if ready >= 2:
+                    break
+            except Exception:
+                ready = 0
         else:
-            raise SystemExit("restore container never became ready")
+            raise SystemExit("restore container never accepted TCP connections")
 
-        subprocess.run(["docker", "exec", cname, "createdb", "-U", "postgres",
-                        SCRATCH_DB], capture_output=True)
+        r = subprocess.run(["docker", "exec", cname, "createdb", "-U", "postgres",
+                            SCRATCH_DB], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SystemExit(f"createdb failed — the restore did NOT run:\n"
+                             f"{r.stderr[-400:]}")
+
         t0 = time.perf_counter()
-        subprocess.run(
+        r = subprocess.run(
             ["docker", "exec", cname, "pg_restore", "-U", "postgres", "-d",
              SCRATCH_DB, "--no-owner", "--no-acl", "-j", "4",
              f"/backup/{dump.name}"], capture_output=True, text=True)
         restore_s = time.perf_counter() - t0
-        # pg_restore warns about extensions and roles it cannot recreate. Those
-        # are expected; row counts decide whether the data landed.
-        print(f"  restored          in {restore_s:6.1f}s  <-- THIS IS THE RTO")
+
+        # pg_restore exits non-zero for WARNINGS too (extensions and roles it
+        # cannot recreate), so the exit code alone cannot decide. What settles it
+        # is whether tables actually landed — checked before any timing is
+        # reported as an RTO, because a number attached to a failed restore is
+        # worse than no number.
+        chk = subprocess.run(
+            ["docker", "exec", cname, "psql", "-U", "postgres", "-d", SCRATCH_DB,
+             "-tAc", "SELECT count(*) FROM information_schema.tables "
+                     "WHERE table_schema='public'"],
+            capture_output=True, text=True)
+        landed = int((chk.stdout or "0").strip() or 0)
+        if landed == 0:
+            raise SystemExit(f"pg_restore produced NO tables — the restore "
+                             f"failed:\n{r.stderr[-600:]}")
+        print(f"  restored {landed:4} tables in {restore_s:6.1f}s  <-- THIS IS THE RTO")
 
         target = f"postgresql://postgres:drill@127.0.0.1:55432/{SCRATCH_DB}"
         want, got = _counts(src), _counts(target)
