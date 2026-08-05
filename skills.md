@@ -2325,6 +2325,83 @@ employee; prompt injection; poisoned CRM data; replay; migration rollback;
 replica inconsistency. **Standing gap: the app connects as a PostgreSQL
 superuser, so no DB privilege can bind it** (see Deferred items above).
 
+
+---
+
+## PHASE 7–8 REVIEW RECORD (2026-08-03/04) — measured, not asserted
+
+**Read this before optimising or re-auditing anything below.** Every line is
+from measurement against a named environment. Where local and production
+disagreed, production won — three times.
+
+### The pattern that produced every serious finding
+
+A signal that could not fail. `/health` returned "healthy" without touching the
+database. The regression gate recomputed the formula it guarded. A dashboard
+metric counted forged rows as verified. An alert labelled "24h" reported an
+all-time total. `search()` returned `[]` for both "no matches" and "provider
+down". None were found by reading code; all by breaking something on purpose.
+
+**Corollary discovered four times: comments are claims, not evidence.** The
+keyword-fallback control existed only in three comments.
+
+### Fixed and verified in production
+- Privilege separation: app runs as `crm_app`, owns nothing, cannot disable its
+  own triggers. Attacked and refused.
+- Erasure authorised + registered; register refuses DELETE/TRUNCATE.
+- `rank()` vectorised: 101 ms -> 5 ms, 9.2/s -> 573/s, identical results.
+- Pool bounded (semaphore + timeout) and validated on checkout.
+- Query-embedding cache: 467 ms -> 0 ms on hit.
+- Leader election: startup retry closes the deploy race; promotion closes
+  leader death (RTO 2 s measured, 10 s default).
+- `/health` reports database, `connected_as`, scheduler jobs + heartbeat,
+  connection utilisation, ha role.
+
+### THE PRODUCTION OUTAGE — root cause, do not reintroduce
+Background work stopped **2026-07-24**, found **2026-08-04**. Cause: the HA
+leader election of `009dd0d` plus a rolling-deploy race — the new container
+starts while the old holds the advisory lock, elects follower FOR LIFE, the old
+exits, the lock is orphaned. A `scheduler.add_job` typo (`7d403af`) was a
+second, independent break four days later. Nothing alerted because HTTP was
+fine. **`seconds_since_tick` on /health is now the detector.**
+
+### RLS: production and local were different
+36 tables had RLS enabled with **0 policies** on Railway — deny-all. Invisible
+while the app ran as superuser; every query returned 0 rows the moment it ran
+as `crm_app`. Local had none. **Never generalise a schema fact across
+environments.**
+
+### Phase 7 conclusions (measured)
+- Bottleneck order: **retrieval quality** (recall 77% at the 4,000 cap) ->
+  **GIL/process model** -> per-request DB work. NOT capacity.
+- Single-process ceiling ~8/s; 4 processes give p95 588 ms -> 181 ms, 223/s.
+- Exact search FAILS p95<=250 ms at >=16 concurrent at any process count; ANN
+  passes. **Both changes are required.**
+- pgvector HNSW: `ef_search=40` gives 31.7% recall on the customer path;
+  **100% at 100**. Backfill 1,960 rows/s; index 17 MB per 7.5k vectors.
+- Resident numpy matrix rejected: erasure cannot reach an in-process copy.
+
+### Still open (2026-08-04)
+| Item | Owner | Blocking |
+|---|---|---|
+| **No PITR** (`archive_mode=off`) — RPO undefined | You + Railway | Enterprise |
+| Embedding provider is an unmitigated SPOF | You (policy) | — |
+| Alerting on `seconds_since_tick` | You | — |
+| Tenant isolation (0 RLS policies) | You | Customer #2 |
+| DSAR export (GDPR Art. 15/20) | Eng | Enterprise |
+| ISO 42001 | You | Enterprise |
+| 5 controls deployed but unexercised in production | Eng | — |
+
+### Method notes worth keeping
+- Five harness artefacts this session, incl. one that leaked the advisory lock
+  it was testing and reported "leader election is broken".
+- Serial measurements failed under concurrency; single-process ones failed
+  multi-process. **Measure under the conditions you will run under.**
+- Classify every control on two axes: implementation (designed/implemented/
+  tested/verified) AND deployment (not deployed/staging/deployed/production
+  verified/continuously monitored). Single-axis reporting hid five controls
+  that are deployed but never exercised in production.
+
 ### Phase 7 — Scalability validation
 100k → 1M → 10M → 100M. Indexing, ANN migration, sharding, partitioning,
 batching, incremental consolidation, caching, latency and cost. Current
