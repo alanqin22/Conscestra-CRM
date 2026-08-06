@@ -204,14 +204,59 @@ def _save_state(d: Dict[str, Any]) -> None:
         print(f"  could not persist state: {exc}", file=sys.stderr)
 
 
+class _Tee:
+    """Write to stdout AND the log file.
+
+    The scheduled task used to be `cmd /c ... >> health.log`, and cmd exists in
+    that command ONLY to perform the redirection — which costs a console window
+    flashing on the desktop every fifteen minutes. Owning the log here means the
+    task can run under pythonw.exe, which has no console at all.
+
+    It is also the better shape: a script whose record of what it did depends on
+    how it happened to be invoked has no record when someone invokes it
+    differently."""
+
+    def __init__(self, stream, path: Path):
+        self._stream, self._path = stream, path
+
+    def write(self, text: str) -> int:
+        try:
+            self._stream.write(text)
+        except Exception:                                       # noqa: BLE001
+            pass                       # no console under pythonw.exe
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._path, "a", encoding="utf-8") as fh:
+                fh.write(text)
+        except Exception:                                       # noqa: BLE001
+            pass                       # a failed log must not fail the check
+        return len(text)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:                                       # noqa: BLE001
+            pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Alert when /health stops being true")
     ap.add_argument("--url", default=os.getenv("HEALTH_URL", "").strip())
     ap.add_argument("--force", action="store_true", help="email regardless of state")
+    ap.add_argument("--no-log", action="store_true",
+                    help="do not append to the log file (it is written by "
+                         "default so the scheduled task needs no shell "
+                         "redirection, and therefore no console window)")
     ap.add_argument("--test-email", action="store_true",
                     help="send a test alert and exit — proves the path works "
                          "BEFORE you need it")
     a = ap.parse_args()
+
+    if not a.no_log:
+        log = Path(os.getenv("HEALTH_LOG_FILE",
+                             str(ROOT / "backups" / "health.log")))
+        sys.stdout = _Tee(sys.stdout, log)          # type: ignore[assignment]
+        sys.stderr = _Tee(sys.stderr, log)          # type: ignore[assignment]
 
     if a.test_email:
         ok = _send("Conscestra health watch — TEST",

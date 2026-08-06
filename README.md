@@ -962,6 +962,35 @@ says which it is.
 
 **A platform that can act on its own must be able to tell you when it can't.**
 
+## Fast Because It Was Measured, Not Because It Feels Fast
+
+Performance work here starts with a number and ends with a number. Semantic
+search — the path behind agent recall, the knowledge base and the store
+assistant — was profiled under realistic concurrency rather than in a loop on an
+idle machine, and rewritten on what the profile showed.
+
+Ranking candidate vectors was decoding them one at a time in Python. Replacing
+that with a single vectorised decode over one contiguous buffer took a search
+from **101 ms to 5 ms** single-threaded, and — because the old path held
+Python's interpreter lock the whole way — from **9.2 to 573 searches per second
+across sixteen concurrent threads**. Same inputs, byte-identical results, one
+change. Query embeddings are cached, so a repeated question costs a dictionary
+lookup instead of a model call.
+
+Connections are pooled and **bounded**. When every slot is busy a request waits
+and then fails clearly, rather than opening an unbounded number of connections
+until the database refuses everyone — the failure mode where a slow minute turns
+into an outage. Every borrowed connection is validated before use, so a
+connection the server closed during a restart is replaced rather than handed to
+a caller.
+
+The scalability plan reaches to a hundred million records and labels every line
+as **measured**, **extrapolated**, or **estimated**. Approximate-nearest-neighbour
+indexing was evaluated against the workload rather than adopted because it is
+fashionable, and the honest conclusion — at the current data volume the exact
+search is already faster than the index would be, and the threshold where that
+reverses is written down — is recorded with the numbers behind it.
+
 ## Governance Before Autonomy
 
 Powerful AI demands responsible governance.
