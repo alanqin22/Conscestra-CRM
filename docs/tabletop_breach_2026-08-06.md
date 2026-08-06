@@ -110,11 +110,17 @@ it, and nothing alerts as the date approaches.
 
 Containment, RROSH assessment, and drafting the notification are all Alan. The
 technical answers arrive in 0.32 s; the decisions take hours and have no second
-opinion. Legal counsel is still unidentified — and the moment counsel is needed
-is the moment there is least time to find one.
+opinion. At the time of the exercise no legal counsel was identified — and the
+moment counsel is needed is the moment there is least time to find one.
 
-*Not fixed. Not fixable by code.* Identifying a lawyer in advance is a 30-minute
-task that has to happen before it is needed.
+*Partly closed 2026-08-06.* **INQ Law** retained for privacy, DSAR and breach
+response; Osler Startup Group for contracts and certification. The runbook now
+says which to call and, more usefully, which NOT to.
+
+Still open: neither firm has been briefed on this system, and there is no
+out-of-hours contact recorded. Knowing a name is not the same as having a
+working relationship — the first call should not also be the first
+introduction.
 
 ### F5 — The notification path could be part of the incident
 
@@ -140,8 +146,9 @@ it has never been exercised.
 ## Verdict
 
 The **mechanics** are ready: the data needed for an OPC report can be assembled
-in under a minute. The **judgement and communication** paths are not: one person,
-no counsel, no tested out-of-band notification, no countdown on the deadline.
+in under a minute. The **judgement and communication** paths are weaker: one
+person deciding, counsel identified but never briefed, no tested out-of-band
+notification, no countdown on the deadline.
 
 That is an honest place to be, and it is the opposite of where this started —
 the mechanics were the unknown, and they turned out to be the strong part.
@@ -153,7 +160,7 @@ the mechanics were the unknown, and they turned out to be the strong part.
 | F1 | `application_name` on every connection | — | **done 2026-08-06** |
 | F2 | Baseline connected-role counts in the watchdog | Alan | open |
 | F3 | Daily job alerting on approaching breach deadlines | Alan | open |
-| F4 | Identify legal counsel **before** it is needed | Alan | open |
+| F4 | Identify legal counsel **before** it is needed | Alan | **partly done** — INQ Law retained; not yet briefed, no out-of-hours number |
 | F5 | Test an out-of-band notification path for 129 people | Alan | open |
 
 Re-run this exercise annually, or after any change to the privilege model.

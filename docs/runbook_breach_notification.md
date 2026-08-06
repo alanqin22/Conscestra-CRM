@@ -8,6 +8,19 @@ privacy@agentorc.ca. This is the name that goes on the OPC report (s.10.1(3)(g))
 and in the notification letter. Configured as `PRIVACY_CONTACT_NAME` and
 `COMPLIANCE_CONTACT`.
 
+**External counsel — call INQ Law, not Osler.** Two firms are retained and they
+are not interchangeable:
+
+| Firm | Scope | Call them |
+|---|---|---|
+| **INQ Law** | privacy, DSAR, breach response | **in an incident**, at §2 when the RROSH call is genuinely uncertain, and before any OPC report you are unsure of |
+| Osler Startup Group | SaaS contracts, SLAs, certification | never during an incident — SOC 2 / ISO work and customer commitments |
+
+Reaching for the wrong one costs hours you do not have. The RROSH assessment is
+a legal judgement, not an engineering one, and the point at which you want
+advice is the point at which the clock is already running — so call early, on a
+maybe, rather than late on a certainty.
+
 **Jurisdiction:** the controller operates from Ontario, Canada. **PIPEDA applies
 to every breach.** GDPR applies additionally *only* if any affected individual is
 in the EU/EEA. Most incidents here are PIPEDA-only, and PIPEDA is the one people
@@ -222,7 +235,8 @@ defensible only if the reasoning existed at the time and was written down.
 - **Named privacy contact: Alan Qin** (recorded 2026-08-06). No DPO is
   appointed; GDPR Art. 37 does not require one here, but if EU processing grows
   the question returns.
-- **No legal counsel identified.** The RROSH judgement is a legal one, and the
-  point at which you need advice is the point at which you have least time.
+- **Counsel identified 2026-08-06: INQ Law** (privacy/DSAR/breach). Not yet
+  briefed on this system, and there is no retainer or out-of-hours number on
+  file — "we know who to call" is weaker than "we have called them once".
 - **No cyber-insurance notification path.** Most policies require notice within
   a fixed window, and missing it can void cover.
