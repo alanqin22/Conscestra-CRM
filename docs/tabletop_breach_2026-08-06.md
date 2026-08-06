@@ -83,11 +83,26 @@ queries; **the connections opened by our own scripts had an empty
 The single query incident response depends on most could not separate our tools
 from an attacker.
 
-*Fixed the same day:* `database.py` now sets `application_name` (default
-`conscestra-crm`, overridable via `PG_APPLICATION_NAME`). Note there were **two**
-connect sites in that module and nearly every real connection comes from the
-pooled one — patching only the direct path left every production session
+*Fixed the same day, in two rounds.*
+
+`database.py` now sets `application_name` (default `conscestra-crm`). There were
+**two** connect sites in that module and nearly every real connection comes from
+the pooled one — patching only the direct path left every production session
 anonymous while the change looked complete.
+
+Verified after the deploy, and the check found the fix was still partial: the
+app identified itself, and the eight scripts in `scripts/` that call
+`psycopg2.connect()` directly did not. The session running the verification was
+itself anonymous — the fix had been confirmed by a connection the fix did not
+cover.
+
+Closed with `PGAPPNAME=crm-tooling` in `.env`. libpq reads it for every
+connection, so all eight scripts are covered without editing any of them, and
+because `database.py` passes `application_name` explicitly it wins — the
+application and the tooling stay **distinguishable**, which is the point.
+
+Measured on production after both rounds: five sessions, **zero anonymous** —
+`conscestra-crm` (app, x2), `crm-tooling` (scripts), `pgAdmin 4` (x2).
 
 ### F2 — No baseline for "normal"
 
@@ -157,7 +172,7 @@ the mechanics were the unknown, and they turned out to be the strong part.
 
 | # | Action | Owner | Status |
 |---|---|---|---|
-| F1 | `application_name` on every connection | — | **done 2026-08-06** |
+| F1 | `application_name` on every connection | — | **done 2026-08-06** — verified on production, 0 anonymous sessions |
 | F2 | Baseline connected-role counts in the watchdog | Alan | open |
 | F3 | Daily job alerting on approaching breach deadlines | Alan | open |
 | F4 | Identify legal counsel **before** it is needed | Alan | **partly done** — INQ Law retained; not yet briefed, no out-of-hours number |

@@ -962,6 +962,35 @@ says which it is.
 
 **A platform that can act on its own must be able to tell you when it can't.**
 
+## Fast Because It Was Measured, Not Because It Feels Fast
+
+Performance work here starts with a number and ends with a number. Semantic
+search — the path behind agent recall, the knowledge base and the store
+assistant — was profiled under realistic concurrency rather than in a loop on an
+idle machine, and rewritten on what the profile showed.
+
+Ranking candidate vectors was decoding them one at a time in Python. Replacing
+that with a single vectorised decode over one contiguous buffer took a search
+from **101 ms to 5 ms** single-threaded, and — because the old path held
+Python's interpreter lock the whole way — from **9.2 to 573 searches per second
+across sixteen concurrent threads**. Same inputs, byte-identical results, one
+change. Query embeddings are cached, so a repeated question costs a dictionary
+lookup instead of a model call.
+
+Connections are pooled and **bounded**. When every slot is busy a request waits
+and then fails clearly, rather than opening an unbounded number of connections
+until the database refuses everyone — the failure mode where a slow minute turns
+into an outage. Every borrowed connection is validated before use, so a
+connection the server closed during a restart is replaced rather than handed to
+a caller.
+
+The scalability plan reaches to a hundred million records and labels every line
+as **measured**, **extrapolated**, or **estimated**. Approximate-nearest-neighbour
+indexing was evaluated against the workload rather than adopted because it is
+fashionable, and the honest conclusion — at the current data volume the exact
+search is already faster than the index would be, and the threshold where that
+reverses is written down — is recorded with the numbers behind it.
+
 ## Governance Before Autonomy
 
 Powerful AI demands responsible governance.
@@ -1103,6 +1132,80 @@ index of who asked to be forgotten. So identifiers age out: after two years an
 automatic monthly pass strips the personal link and keeps everything else.
 Nothing is ever removed from the register, and it stops being a list of people.
 Accountability and data minimisation, both honoured, on the same record.
+
+## Everything We Hold About You, Returnable On Request
+
+A person is entitled to a copy of their data — GDPR Article 15, Article 20 for
+portability, and the equivalent right under Canada's PIPEDA. Conscestra answers
+that in one command, and the interesting part is not the export. It is how the
+export knows it is complete.
+
+**The manifest is checked against the live database, not trusted.** Every table
+carrying a subject link — a contact, an account, a lead, an email address — must
+be declared as either included or excluded-with-a-reason. A table nobody has
+declared does not get quietly skipped: the export **refuses to run** and names
+it. Adding a table that holds personal data therefore breaks the export loudly
+today, instead of silently narrowing what a person receives for months. It has
+already stopped two exports within minutes of a new table appearing.
+
+**Other people's data stays out of it.** Several contacts can share one company
+account, so account-level records are released only when the requester is the
+sole contact on that account. Otherwise those sections are withheld and the
+withholding is *reported inside the export*, with the reason — Article 15(4)
+protects the rights of others, and a copy that quietly included a colleague's
+details would breach it while looking generous.
+
+Subjects can ask for themselves from the portal. That request records the
+arrival time and starts a visible thirty-day clock; identity comes from the
+signed-in session and never from the request, so nobody can open a request
+against someone else. Every export that is actually released is written to an
+append-only register the application cannot edit.
+
+## A Backup That Proves Itself Every Night
+
+Most backup systems tell you a file was written. That is a hypothesis, not a
+recovery plan — the only proof a dump restores is restoring it.
+
+So every night Conscestra dumps production, **restores that dump into a
+throwaway database, and compares all two hundred tables row by row** against the
+source. The elapsed restore time is reported as a measured number rather than an
+estimate, and re-measured on every run. If any table disagrees, the run fails
+and says which — a dump that exists but does not reproduce production is worse
+than no dump, because it looks like protection.
+
+The verified copy is then mirrored to a second physical device, and the run
+reports the age of that mirror, because a mirror that stopped updating is the
+thing you need to hear about. Success is also announced to an external
+dead-man's-switch service: if a backup ever silently stops running — the machine
+is off, a container is down, the job was removed — **the absence of that
+announcement is itself the alert.** No status check can detect a job that never
+started; only a missing heartbeat can.
+
+The restore path is rehearsed rather than documented. Restoring over a populated
+database costs roughly twice what restoring into an empty one does, and the
+privilege grants must be re-applied afterwards — both facts were established by
+running it, and both are written down as steps rather than warnings.
+
+## Ready for the Day Something Goes Wrong
+
+Incident response is written for the jurisdiction the business is actually in.
+PIPEDA applies to every breach and requires a record of **all** of them — kept
+for twenty-four months, including the ones judged not notifiable, because a
+decision not to notify is only defensible if the reasoning was written down at
+the time. The GDPR seventy-two-hour clock applies additionally, and only where a
+European individual is affected.
+
+That register is enforced by the database: a breach record may be revised as
+more is learned, because that is how investigations actually go, but the dates
+every statutory deadline is measured from cannot be moved and the record cannot
+be deleted.
+
+The procedure is **exercised, not just written**. In a timed exercise against
+production, every forensic question a regulator asks — how many individuals, how
+many reachable directly, what categories of data, what changed during the window
+— was answered in under a second, and the exercise found and fixed a real gap
+the same day. The exercise record expires after twelve months, so readiness that
+has gone stale reports itself.
 
 ## One Model Provider Should Not Be a Single Point of Failure
 
@@ -1545,20 +1648,35 @@ corpus. It has no database and no secrets, so it cannot exercise a single
 database-layer control. The evidence comes from the deployed environment:
 
 ```bash
-# Secrets, invariants and the red team, gated as one result
-python -m scripts.postdeploy_verify --target railway        --app-url https://your-app.example.com
+# One gated result: secrets, DB invariants, executed red-team attacks,
+# data-subject export coverage, runtime-DDL audit, and schema drift
+python -m scripts.postdeploy_verify --target railway \
+       --app-url https://your-app.example.com/health
 
 # Prove each gate can still fail (breaks the code on purpose, then restores it)
 python -m scripts.mutation_audit
 
 # Plant a defect per metric; report any that stay green
 python -m scripts.observability_audit
+
+# Dump, restore, and compare every table — the RTO is measured, not estimated
+python -m scripts.backup_railway
+
+# Kill the leader; measure how long until a survivor takes over
+python -m scripts.chaos_leader
 ```
 
 Pass `--app-url` so the check reads the application's own report of which
-database role it connected as. That is what lets the red team judge the
-running application rather than the administrative connection the harness
-itself uses.
+database role it connected as. That is what lets the red team judge the running
+application rather than the administrative connection the harness itself uses —
+and if the URL is given but does not answer, the run **fails** rather than
+skipping, because every check downstream would otherwise be measuring the wrong
+subject.
+
+`schema drift` compares the live schemas of your working database and the deploy
+target directly. It deliberately ignores the migration ledger: a ledger is only
+as good as the discipline of whoever last applied a migration by hand, and
+comparing what the two databases actually contain needs no discipline at all.
 
 ---
 

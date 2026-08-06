@@ -67,11 +67,17 @@ def _clear_bytecode() -> None:
 
 
 def run_signal(module: str) -> int:
-    """Exit code of a signal, guaranteed to reflect the source on disk."""
+    """Exit code of a signal, guaranteed to reflect the source on disk.
+
+    `module` may carry arguments ("app.core.dsar --coverage"). Several signals
+    are only a signal in a particular mode — the DSAR manifest check reports
+    nothing useful without --coverage — and a mutation harness that could only
+    invoke the bare module would be unable to reach them."""
     _clear_bytecode()
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    proc = subprocess.run([sys.executable, "-B", "-m", module],
+    parts = module.split()
+    proc = subprocess.run([sys.executable, "-B", "-m", *parts],
                           cwd=str(ROOT), capture_output=True, text=True, env=env)
     return proc.returncode
 
@@ -143,6 +149,42 @@ MUTATIONS: List[Tuple[str, str, Path, str, str]] = [
     ("one wording starts corroborating", "app.core.memory_bench", CONSOLIDATION,
      "+ _W_WORDINGS * min(1.0, max(0, n_templates - 1) / 2.0))",
      "+ _W_WORDINGS * min(1.0, max(0, n_templates) / 2.0))"),
+
+    # ── Phase 8 controls ────────────────────────────────────────────────────
+    # Added 2026-08-06. Every defect this phase produced was the same shape as
+    # the ones above — a signal that could not fail — but in checks the audit
+    # did not cover, so it kept reporting green while they were found by hand.
+    # A mutation harness that only guards yesterday's controls is itself a
+    # signal that cannot fail.
+
+    # The DSAR manifest is checked against the live schema so an undeclared
+    # table makes the export REFUSE rather than under-disclose. Undeclaring a
+    # table must therefore turn --coverage red. This caught dsar_requests and
+    # dsar_subject_requests in real life, minutes after each was created.
+    ("dsar manifest stops covering a table", "app.core.dsar --coverage",
+     ROOT / "app" / "core" / "dsar.py",
+     '"dsar_requests":              ("subject_id",),',
+     '"dsar_requests_UNDECLARED":   ("subject_id",),'),
+
+    # promotions must not answer "no such coupon" when the lookup FAILED. The
+    # red team executes that attack; restoring the swallow must breach it. This
+    # is the 15-day silent-outage defect, wired so it cannot come back quietly.
+    # One line, not the whole return: a multi-line literal here is fragile to
+    # reformatting, and this single string is what the red team compares. If a
+    # failed lookup starts answering with the same wording as a genuine miss,
+    # the two are indistinguishable again — which was the whole defect.
+    ("promotions swallow returns", "scripts.red_team",
+     ROOT / "app" / "core" / "promotions.py",
+     '"reason": "coupon lookup unavailable"}',
+     '"reason": "no such coupon"}'),
+
+    # The runtime-DDL audit finds lazy CREATEs by scanning source. If its regex
+    # stops matching it finds nothing — and "nothing to check" must not read as
+    # "all clear", which is why that script treats zero findings as an error.
+    ("runtime-ddl scanner stops matching", "scripts.verify_runtime_ddl",
+     ROOT / "scripts" / "verify_runtime_ddl.py",
+     r'r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS',
+     r'r"CREATE\s+TABLE\s+IF\s+NEVER\s+EXISTS'),
 ]
 
 
