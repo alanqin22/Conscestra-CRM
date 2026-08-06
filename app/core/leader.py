@@ -124,6 +124,117 @@ def _watch_for_promotion() -> None:
             logger.debug(f"[HA] promotion watch: {exc}")
 
 
+_demote_callbacks: List[Callable[[], None]] = []
+
+
+def on_demotion(fn: Callable[[], None]) -> None:
+    """Run `fn` if this process stops being leader. Registered by whoever owns
+    the background singletons, so they can be stopped."""
+    _demote_callbacks.append(fn)
+
+
+def _holds_lock() -> bool:
+    """Does THIS process's hold-connection still own the advisory lock?
+
+    Asks the database rather than memory. `_state['leader']` records what we
+    decided at startup; it is not evidence about now."""
+    if _hold_conn is None:
+        return False
+    try:
+        with _hold_conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+                        "AND objid = %s AND pid = pg_backend_pid()", (_LOCK_KEY,))
+            return cur.fetchone()[0] > 0
+    except Exception:                                         # noqa: BLE001
+        return False        # a dead connection holds nothing
+
+
+def _watch_lock_retention() -> None:
+    """A leader keeps PROVING it is the leader.
+
+    FOUND IN PRODUCTION 2026-08-05. /health reported role=leader and
+    runs_singletons=true while `pg_locks` showed zero holders of the advisory
+    key: the hold-connection had been dropped (idle reaping, a blip, a Postgres
+    restart) and nothing re-checked. `_watch_for_promotion` cannot cover this —
+    its first line returns when `_state['leader']` is true, because it was
+    written for followers.
+
+    With one replica the symptom is invisible: the process keeps running the
+    singletons and the work still happens. The danger is the free lock. The next
+    replica to start — a rolling deploy, a scale-up — acquires it and becomes a
+    SECOND leader, and then dunning email goes out twice and meetings are
+    double-booked. "At most one leader" was not violated yet; it was violated
+    in waiting, which is worse, because nothing was wrong to look at.
+
+    Re-acquire when the lock is merely lost. Step down when someone else holds
+    it — two leaders is the outcome this exists to prevent, and staying is the
+    one choice that guarantees it."""
+    global _hold_conn
+    from app.core.database import get_connection
+    while True:
+        time.sleep(WATCH_INTERVAL)
+        if not _state.get("leader"):
+            return
+        if _holds_lock():
+            _state["lock_verified_at"] = time.time()
+            continue
+
+        logger.error(f"[HA] LEADER WITHOUT LOCK ({_WHO}) — this process believes "
+                     f"it runs the singletons but no longer holds advisory lock "
+                     f"{_LOCK_KEY}. Re-acquiring.")
+        try:
+            if _hold_conn is not None:
+                try:
+                    _hold_conn.close()
+                except Exception:                             # noqa: BLE001
+                    pass
+                _hold_conn = None
+            conn = get_connection()
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (_LOCK_KEY,))
+                won = bool(cur.fetchone()[0])
+            if won:
+                _hold_conn = conn
+                _state["lock_verified_at"] = time.time()
+                logger.warning(f"[HA] lock re-acquired by {_WHO}; leadership "
+                               f"is intact and no longer claimed on trust")
+                continue
+            conn.close()
+            # Someone else holds it. Two leaders is the failure mode; step down.
+            _state["leader"] = False
+            logger.error(f"[HA] DEMOTED ({_WHO}) — another process now holds "
+                         f"lock {_LOCK_KEY}. Stopping background singletons to "
+                         f"avoid duplicate scheduled work.")
+            for fn in list(_demote_callbacks):
+                try:
+                    fn()
+                except Exception as exc:                      # noqa: BLE001
+                    logger.error(f"[HA] demotion callback failed: {exc}",
+                                 exc_info=True)
+            threading.Thread(target=_watch_for_promotion, daemon=True,
+                             name="ha-promotion-watch").start()
+            return
+        except Exception as exc:                              # noqa: BLE001
+            logger.error(f"[HA] lock re-acquisition failed: {exc}")
+
+
+def status() -> dict:
+    """What /health should report. `lock_held` is asked of the database.
+
+    The old payload reported `runs_singletons` from memory, which is what let a
+    leader with no lock look perfectly healthy for hours."""
+    verified = _state.get("lock_verified_at")
+    return {
+        "role": role(),
+        "runs_singletons": is_leader(),
+        "lock_held": _holds_lock() if _state.get("leader") else None,
+        "lock_verified_secs_ago": (round(time.time() - verified, 1)
+                                   if verified else None),
+        "lock_key": _LOCK_KEY,
+    }
+
+
 def _worker_count() -> int:
     """How many application processes are expected to exist.
 
@@ -199,6 +310,11 @@ def begin() -> bool:
             if won:
                 _hold_conn = conn          # keep open → hold the lock for process life
                 _state["leader"] = True
+                _state["lock_verified_at"] = time.time()
+                # Holding a connection is not the same as holding the lock.
+                # Verify it for as long as we claim to be leader.
+                threading.Thread(target=_watch_lock_retention, daemon=True,
+                                 name="ha-lock-retention").start()
                 logger.info(f"[HA] LEADER ({_WHO}) — running scheduler / IMAP poller / agent-bus")
             else:
                 _state["leader"] = False

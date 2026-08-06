@@ -4,10 +4,17 @@ answer discount questions HONESTLY from real data (never an invented offer).
 Data model: sql/promotions_coupons.sql (coupons, coupon_redemptions,
 price_match_requests). Design + authority tiers: docs/promotions_coupons_design.md.
 
-Everything here degrades gracefully: if the tables aren't deployed yet, reads
-return "nothing" and validation returns a clean "no such coupon" — the agent
-then falls back to the honest promo/price-match/specialist handoff. Nothing
-raises into a customer turn.
+Everything here degrades gracefully — nothing raises into a customer turn — but
+a degraded read is never dressed up as a real answer. A failed lookup returns
+`lookup_failed=True` with its own reason, distinct from a code that genuinely
+does not exist, and is logged at WARNING and counted in promotions_health().
+
+That distinction is not cosmetic. Between 2026-07-21 and 2026-08-05 the coupons
+tables were missing from production; every lookup raised, every raise was
+swallowed into "no such coupon" at DEBUG level, and every customer who typed a
+valid code was told it did not exist. Nothing alerted, because a rejection is
+what a wrong code looks like. An outage that returns a plausible answer is more
+expensive than one that returns an error.
 
 Authority (enforced by callers, documented here):
   AUTOMATIC  active published Promo price (product_pricing) + a VALID coupon
@@ -20,11 +27,37 @@ Authority (enforced by callers, documented here):
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from app.core.database import get_connection
 
 logger = logging.getLogger("promotions")
+
+# Lookup failures, so "the promotions layer is broken" is a value something can
+# read rather than a line in a log nobody tails. Process-local and unbounded in
+# neither direction: four counters, no history.
+_FAILURES: Dict[str, Dict[str, Any]] = {}
+
+
+def _lookup_failed(fn: str, exc: BaseException) -> None:
+    """Record an infrastructure failure. WARNING, not DEBUG — the caller is
+    about to return an answer that looks like a normal negative result."""
+    slot = _FAILURES.setdefault(fn, {"count": 0, "last_error": None, "last_at": None})
+    slot["count"] += 1
+    slot["last_error"] = f"{type(exc).__name__}: {exc}"
+    slot["last_at"] = time.time()
+    logger.warning(f"[promotions] {fn} lookup FAILED (not a negative result): {exc}")
+
+
+def promotions_health() -> Dict[str, Any]:
+    """Whether the promotions layer is answering from data or from exceptions.
+
+    ok=False means at least one lookup has failed this process. A caller that
+    sees ok=False should not report "no coupons" as a fact."""
+    total = sum(s["count"] for s in _FAILURES.values())
+    return {"ok": total == 0, "total_failures": total,
+            "by_function": {k: dict(v) for k, v in _FAILURES.items()}}
 
 
 # ============================================================================
@@ -35,7 +68,20 @@ def active_public_coupons(product: Optional[Dict[str, Any]] = None,
                           limit: int = 5) -> List[Dict[str, Any]]:
     """Live, advertisable coupons the agent may mention unprompted. Filters to
     the viewed product's scope when a product is given (all / its category /
-    itself). Never raises — returns [] when the table is missing or empty."""
+    itself). Never raises — returns [] when the table is missing or empty.
+
+    [] is ambiguous by construction. Callers that need to tell "no offers" from
+    "could not look" must use _checked() below; this signature is kept because
+    the ambiguity is harmless to anyone who only wants something to display."""
+    return _active_public_coupons_checked(product, limit)[0]
+
+
+def _active_public_coupons_checked(
+        product: Optional[Dict[str, Any]] = None,
+        limit: int = 5) -> tuple[List[Dict[str, Any]], bool]:
+    """(coupons, lookup_succeeded). The second value is the whole point: an
+    empty list with ok=False means we do not know what offers exist, which is
+    a different sentence to a shopper than "there are none"."""
     category_id = (product or {}).get("category_id")
     product_id = (product or {}).get("product_id")
     try:
@@ -57,12 +103,14 @@ def active_public_coupons(product: Optional[Dict[str, Any]] = None,
                         LIMIT %(lim)s""",
                     {"cat": category_id, "pid": product_id, "lim": limit})
                 cols = [d[0] for d in cur.description]
-                return [dict(zip(cols, r)) for r in cur.fetchall()]
+                return [dict(zip(cols, r)) for r in cur.fetchall()], True
         finally:
             conn.close()
     except Exception as exc:
-        logger.debug(f"[promotions] active_public_coupons skipped: {exc}")
-        return []
+        # Still empty — the agent must not raise mid-turn — but paired with
+        # ok=False so the emptiness cannot pass for "this product has no offers".
+        _lookup_failed("active_public_coupons", exc)
+        return [], False
 
 
 def _coupon_line(c: Dict[str, Any]) -> str:
@@ -77,14 +125,34 @@ def _coupon_line(c: Dict[str, Any]) -> str:
     return f"code {c['code']} — {amt}{cond}"
 
 
+# What the model is told when we could not read the offer table. It is phrased
+# as an instruction because the consuming prompt renders an empty block as
+# "None available." — an assertion we have no basis for during an outage. The
+# shopper hears "I can't confirm", never "there are none".
+_OFFERS_UNKNOWN = (
+    "UNKNOWN — the promotions lookup failed, so we do not know what offers "
+    "exist right now.\n"
+    "Do NOT say there are no discounts, nothing is on sale, or that you "
+    "checked — any of those may be false.\n"
+    "Say you can't confirm current promotions this moment, and offer to "
+    "connect the shopper with a specialist who can.")
+
+
 def summarize_for_agent(product: Optional[Dict[str, Any]] = None) -> str:
-    """One short block of REAL advertisable coupons for the agent prompt, or ''
-    when there are none (agent then offers price-match / specialist handoff)."""
-    coupons = active_public_coupons(product)
-    if not coupons:
-        return ""
-    return "Active coupons the shopper can use now:\n" + "\n".join(
-        f"- {_coupon_line(c)}" for c in coupons)
+    """One short block for the agent prompt: the REAL advertisable coupons,
+    or '' when there genuinely are none, or an explicit UNKNOWN when the
+    lookup failed.
+
+    The three cases were previously two. '' meant both "no offers" and "the
+    query raised", and the caller renders '' as "[ACTIVE PROMOTIONS] None
+    available." — so a failed read put a false statement into the prompt and
+    the model repeated it to the shopper with full confidence. An agent that
+    cannot distinguish silence from ignorance will assert the first one."""
+    coupons, ok = _active_public_coupons_checked(product)
+    if coupons:
+        return "Active coupons the shopper can use now:\n" + "\n".join(
+            f"- {_coupon_line(c)}" for c in coupons)
+    return "" if ok else _OFFERS_UNKNOWN
 
 
 # ============================================================================
@@ -127,8 +195,13 @@ def validate_coupon(code: str, subtotal: float = 0.0,
         finally:
             conn.close()
     except Exception as exc:
-        logger.debug(f"[promotions] validate_coupon skipped: {exc}")
-        return {"ok": False, "reason": "no such coupon", "code": code}
+        # THE bug this module exists to not repeat. A missing table, a dropped
+        # connection and a revoked grant all land here, and none of them mean
+        # the customer's code is wrong. Saying "no such coupon" would be a
+        # false statement about their coupon, not a description of our outage.
+        _lookup_failed("validate_coupon", exc)
+        return {"ok": False, "lookup_failed": True, "code": code,
+                "reason": "coupon lookup unavailable"}
 
     # ── rule checks ──
     from datetime import datetime, timezone
@@ -242,8 +315,9 @@ def apply_coupon_to_order(order_id: str, code: str,
             conn.rollback()
         except Exception:
             pass
-        logger.warning(f"[promotions] apply_coupon_to_order failed: {exc}")
-        return {"applied": False, "reason": "could not apply coupon"}
+        _lookup_failed("apply_coupon_to_order", exc)
+        return {"applied": False, "lookup_failed": True, "code": code,
+                "reason": "could not apply coupon"}
 
 
 # ============================================================================
@@ -298,5 +372,8 @@ def create_price_match_request(product: Dict[str, Any],
             conn.close()
         return {"ok": True, "request_id": rid, "governance_ref": gov_ref}
     except Exception as exc:
-        logger.warning(f"[promotions] create_price_match_request failed: {exc}")
-        return {"ok": False}
+        # {"ok": False} alone read as "we declined the request". It never was:
+        # the ask was lost. Callers get a reason they can act on.
+        _lookup_failed("create_price_match_request", exc)
+        return {"ok": False, "lookup_failed": True,
+                "reason": "price-match request could not be recorded"}

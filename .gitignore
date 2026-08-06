@@ -183,3 +183,6 @@ task.json
 # RLS state captures from production diagnostics — contain no secrets but are
 # operational snapshots, not source.
 rls_state_railway_*.json
+
+# Database dumps — full copies of production customer data. Never committed.
+backups/
