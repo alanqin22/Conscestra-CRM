@@ -392,12 +392,27 @@ def posture() -> Dict[str, Any]:
          "detail": "AI-specific controls exist in the product (governance queue, "
                    "human approval floors, guardrails, per-call model metering) "
                    "but are not organised as a management system."},
-        {"area": "Certification",
-         "control": "Personal data breach notification readiness",
+        {"area": "Incident response",
+         "control": "Breach notification procedure and register",
+         "status": _live_status(_db_object("breach_register")),
+         "detail": "docs/runbook_breach_notification.md covers PIPEDA — the "
+                   "obligation that applies to an Ontario controller on EVERY "
+                   "breach — and GDPR Art. 33/34, which applies only where an "
+                   "EU/EEA individual is affected. breach_register implements "
+                   "PIPEDA s.10.3: a record of every breach including those "
+                   "judged not notifiable, retained 24 months. Revisions are "
+                   "allowed because a breach record legitimately grows as more "
+                   "is learned; deletion is refused, and the dates every "
+                   "deadline is measured from are immutable."},
+        {"area": "Incident response",
+         "control": "Breach procedure exercised",
          "status": "not_implemented",
-         "detail": "Art. 33 allows 72 hours from awareness. No notification "
-                   "template or decision procedure exists; drafting would start "
-                   "from nothing against a running clock."},
+         "detail": "No tabletop and no dry run. Unlike the restore path this "
+                   "cannot be rehearsed against a scratch copy, so the first "
+                   "use will be the first test. Named privacy contact: "
+                   + (_env("PRIVACY_CONTACT_NAME") or "NOT SET") + ". Legal "
+                   "counsel and the cyber-insurance notification window remain "
+                   "undecided — see the runbook's gaps section."},
     ]
 
     return {

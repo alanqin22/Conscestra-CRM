@@ -134,11 +134,22 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
     age = _age_minutes(sched.get("last_tick"))
     facts["last_tick_age_min"] = round(age, 1) if age is not None else None
 
+    started_age = _age_minutes(sched.get("started_at"))
+    facts["started_min_ago"] = round(started_age, 1) if started_age is not None else None
+
     if ha.get("role") in ("leader", "standalone", None):
         if sched.get("running") is False:
             problems.append("scheduler is not running on the leader")
         if age is None and sched.get("running"):
-            problems.append("scheduler has never ticked (last_tick absent)")
+            # A freshly restarted scheduler has not ticked YET, and most jobs
+            # here are nightly — after a 03:30 deploy the first fires at 22:00.
+            # Alerting on that pages after every deploy and teaches the reader
+            # to ignore this check, which is worse than not having it.
+            if started_age is None or started_age > MAX_TICK_AGE_MIN:
+                problems.append(
+                    f"scheduler has not ticked since it started "
+                    f"{'?' if started_age is None else f'{started_age:.0f} min'} "
+                    f"ago (threshold {MAX_TICK_AGE_MIN:.0f} min)")
         elif age is not None and age > MAX_TICK_AGE_MIN:
             problems.append(f"scheduler last ticked {age:.0f} min ago "
                             f"(threshold {MAX_TICK_AGE_MIN:.0f}) — background "
