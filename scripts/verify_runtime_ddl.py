@@ -68,7 +68,46 @@ def scan() -> Dict[str, List[Tuple[str, str]]]:
     return found
 
 
+def self_test() -> List[str]:
+    """Do the scanner's own patterns still match what they claim to?
+
+    Found by the mutation audit on 2026-08-06. Breaking TABLE_RE — so it found
+    zero tables — did NOT turn this script red: INDEX_RE still matched three
+    indexes, `objects` was therefore non-empty, all three existed, and the run
+    exited 0. Half the scanner was blind and the report was green.
+
+    The existing "zero findings is suspicious" guard only fires when EVERYTHING
+    stops matching. That is the weaker half of the property. This asserts each
+    pattern against a canonical example instead, so it cannot drift with the
+    contents of the tree: if the codebase legitimately stops using lazy CREATEs
+    the self-test still passes, and if a pattern rots it fails immediately."""
+    problems: List[str] = []
+    if not TABLE_RE.findall(
+            "CREATE TABLE IF NOT EXISTS public.example_table (id int);"):
+        problems.append("TABLE_RE no longer matches a canonical "
+                        "CREATE TABLE IF NOT EXISTS")
+    if not INDEX_RE.findall(
+            "CREATE INDEX IF NOT EXISTS idx_example ON t (c);"):
+        problems.append("INDEX_RE no longer matches a canonical "
+                        "CREATE INDEX IF NOT EXISTS")
+    if not INDEX_RE.findall(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_u ON t (c);"):
+        problems.append("INDEX_RE no longer matches CREATE UNIQUE INDEX")
+    return problems
+
+
 def main() -> int:
+    broken = self_test()
+    if broken:
+        print("SCANNER SELF-TEST FAILED — this script cannot see what it "
+              "claims to check:", file=sys.stderr)
+        for b in broken:
+            print(f"    {b}", file=sys.stderr)
+        print("\nA scanner that matches nothing reports nothing, and nothing "
+              "reads as clean. Fix the pattern before trusting any result "
+              "below.", file=sys.stderr)
+        return 1
+
     dsn = (os.getenv("DATABASE_URL") or os.getenv("DB_DSN") or "").strip()
     if not dsn:
         print("no DATABASE_URL or DB_DSN configured", file=sys.stderr)

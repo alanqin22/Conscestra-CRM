@@ -248,6 +248,26 @@ def main() -> int:
     if app_role:
         env["REDTEAM_APP_ROLE"] = app_role
 
+    # AN EXPLICITLY REQUESTED CHECK THAT CANNOT RUN IS A FAILURE, NOT A SKIP.
+    #
+    # This used to continue when identity could not be learned. The red team
+    # then judged the ADMIN connection this script opens rather than the
+    # application's role, and reported a breach that says nothing about the app
+    # — while the run ended in a failure that LOOKED like the expected admin-DSN
+    # artefact. A `/health/health` typo hid behind that for the entire life of
+    # the flag.
+    #
+    # Not passing --app-url is a choice and stays a skip. Passing one that does
+    # not answer is a broken invocation, and the checks downstream of it are
+    # then measuring something other than what the operator asked for.
+    early_fail: List[str] = []
+    if app_url and not app_role:
+        print("  FAIL  app identity — --app-url was given and did not yield the "
+              "app's database role.\n        Everything downstream would judge "
+              "THIS admin connection instead, so the\n        red-team result "
+              "below would be about the wrong subject.\n")
+        early_fail.append("app identity")
+
     stages = [("secrets", "app.core.secret_health", ()),
               ("invariants", "scripts.verify_invariants", ()),
               ("red team", "scripts.red_team", ()),
@@ -262,7 +282,7 @@ def main() -> int:
               # production and silent about it.
               ("runtime ddl", "scripts.verify_runtime_ddl", ())]
 
-    failures = []
+    failures = list(early_fail)
     for name, module, args in stages:
         stage, code, output = _run(name, module, env, args)
         ok = code == 0
