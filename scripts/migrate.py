@@ -57,9 +57,33 @@ def main() -> int:
                          "idempotent and edited in place. NEVER the answer in "
                          "production: there, an applied migration is immutable "
                          "and a change is a NEW file.")
+    ap.add_argument("--target", choices=["railway"],
+                    help="apply to Railway instead of the configured DSN. "
+                         "Explicit and opt-in — production is never a default.")
     args = ap.parse_args()
 
-    conn = psycopg2.connect(get_settings().db_dsn)
+    # WHY THIS OPTION EXISTS. This tool records every migration it applies, with
+    # a checksum, and can therefore answer "has X been applied here?". It could
+    # only ever talk to the local database, so every production migration went
+    # through pgAdmin instead — which applies the SQL perfectly and records
+    # nothing. A correct path that is harder to take than the incorrect one does
+    # not get taken.
+    import os
+    if args.target == "railway":
+        dsn = (os.getenv("RAILWAY_DB_URL") or "").strip()
+        if not dsn:
+            raise SystemExit("RAILWAY_DB_URL is not set")
+        if "sslmode" not in dsn.lower():
+            raise SystemExit(
+                "RAILWAY_DB_URL has no sslmode. libpq defaults to 'prefer', "
+                "which silently downgrades to plaintext. Append ?sslmode=require.")
+        print(f"TARGET: RAILWAY ({dsn.split('@')[-1].split('/')[0]})")
+        if not (args.check or args.dry_run):
+            print("  applying migrations to PRODUCTION.")
+    else:
+        dsn = get_settings().db_dsn
+
+    conn = psycopg2.connect(dsn)
     conn.autocommit = True
     applied, changed, adopt, missing_files = [], [], [], []
     try:

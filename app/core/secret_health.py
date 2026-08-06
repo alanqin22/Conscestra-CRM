@@ -81,9 +81,39 @@ def _assess(name: str, why: str, min_len: int) -> Dict[str, Any]:
             "problems": problems, "ok": not problems}
 
 
+def duplicate_env_keys() -> List[str]:
+    """Keys defined more than once in .env, where the LAST one silently wins.
+
+    A duplicated key is not a style problem. On 2026-08-06 `.env` gained a
+    second APP_URL — the first said http://localhost:8000, the second the
+    Railway URL — and release_guard treats a non-localhost APP_URL as proof of a
+    deployed environment. The local server then refused to start, correctly, on
+    behalf of a production it was not running. Nothing warned; the file simply
+    had one line more than anyone remembered.
+
+    Reports names only, never values: a duplicated key is very often a secret.
+    """
+    from pathlib import Path
+    env = Path(__file__).resolve().parents[2] / ".env"
+    seen: Dict[str, int] = {}
+    try:
+        for raw in env.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip()
+            if key:
+                seen[key] = seen.get(key, 0) + 1
+    except Exception:                                           # noqa: BLE001
+        return []
+    return [f"{k} defined {n}x — the last wins" for k, n in sorted(seen.items())
+            if n > 1]
+
+
 def report() -> Dict[str, Any]:
     """Full state. Never contains a secret value — only length and fingerprint."""
     findings = [_assess(n, why, ln) for n, (why, ln) in _GUARDED.items()]
+    dupes = duplicate_env_keys()
 
     # Two secrets serving one purpose is a rotation trap: changing either one
     # breaks the other, so in practice neither ever gets rotated.
@@ -99,8 +129,9 @@ def report() -> Dict[str, Any]:
 
     return {"secrets": findings,
             "shared_values": shared,
+            "duplicate_env_keys": dupes,
             "weak": [f["name"] for f in findings if not f["ok"]],
-            "ok": all(f["ok"] for f in findings) and not shared}
+            "ok": all(f["ok"] for f in findings) and not shared and not dupes}
 
 
 def log_report(logger) -> None:

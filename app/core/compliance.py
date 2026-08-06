@@ -115,6 +115,33 @@ def _newest_mirror_age_hours() -> float:
         return -1.0
 
 
+def _tabletop_within_months(months: int) -> bool:
+    """Was a breach tabletop recorded recently enough to still count?
+
+    Readiness expires. An exercise from three years ago says the procedure was
+    once walked through, against a system that has since changed — which is why
+    an auditor asks WHEN, not WHETHER. Filenames carry the date
+    (docs/tabletop_breach_YYYY-MM-DD.md), so this needs no register of its own,
+    and the control goes red by itself when the exercise goes stale."""
+    import re as _re, datetime as _dt
+    from pathlib import Path as _P
+    docs = _P(__file__).resolve().parents[2] / "docs"
+    newest = None
+    try:
+        for f in docs.glob("tabletop_breach_*.md"):
+            m = _re.search(r"(\d{4})-(\d{2})-(\d{2})", f.name)
+            if not m:
+                continue
+            d = _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            if newest is None or d > newest:
+                newest = d
+    except Exception:                                           # noqa: BLE001
+        return False
+    if newest is None:
+        return False
+    return (_dt.date.today() - newest).days <= months * 31
+
+
 def _db_object(name: str) -> bool:
     """Does this table/function actually exist? A live catalog lookup.
 
@@ -392,12 +419,31 @@ def posture() -> Dict[str, Any]:
          "detail": "AI-specific controls exist in the product (governance queue, "
                    "human approval floors, guardrails, per-call model metering) "
                    "but are not organised as a management system."},
-        {"area": "Certification",
-         "control": "Personal data breach notification readiness",
-         "status": "not_implemented",
-         "detail": "Art. 33 allows 72 hours from awareness. No notification "
-                   "template or decision procedure exists; drafting would start "
-                   "from nothing against a running clock."},
+        {"area": "Incident response",
+         "control": "Breach notification procedure and register",
+         "status": _live_status(_db_object("breach_register")),
+         "detail": "docs/runbook_breach_notification.md covers PIPEDA — the "
+                   "obligation that applies to an Ontario controller on EVERY "
+                   "breach — and GDPR Art. 33/34, which applies only where an "
+                   "EU/EEA individual is affected. breach_register implements "
+                   "PIPEDA s.10.3: a record of every breach including those "
+                   "judged not notifiable, retained 24 months. Revisions are "
+                   "allowed because a breach record legitimately grows as more "
+                   "is learned; deletion is refused, and the dates every "
+                   "deadline is measured from are immutable."},
+        {"area": "Incident response",
+         "control": "Breach procedure exercised",
+         "status": _live_status(_tabletop_within_months(12)),
+         "detail": "Recorded as docs/tabletop_breach_YYYY-MM-DD.md and re-run "
+                   "annually; this reports the newest one's age. The 2026-08-06 "
+                   "exercise ran all nine forensic queries against production "
+                   "(0.32s, every one answered) and found our own tooling was "
+                   "indistinguishable from an intruder in pg_stat_activity — "
+                   "fixed the same day. Still open: no baseline for normal "
+                   "connections, no countdown on breach deadlines, no legal "
+                   "counsel identified, no tested out-of-band notification "
+                   "path. Named privacy contact: "
+                   + (_env("PRIVACY_CONTACT_NAME") or "NOT SET") + "."},
     ]
 
     return {

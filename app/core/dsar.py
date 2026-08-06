@@ -108,6 +108,13 @@ DIRECT: Dict[str, Tuple[str, ...]] = {
     # check the moment the register was created, which is the check earning its
     # keep on the very first table added after it was written.
     "dsar_requests":              ("subject_id",),
+    # Their own requests, for the same reason as dsar_requests: answering an
+    # access request is itself processing carried out on the subject. Caught by
+    # the coverage check within minutes of the table existing — the second time
+    # that check has stopped an export the moment a new subject-linked table
+    # appeared, which is the whole argument for checking the manifest against
+    # the schema rather than trusting it.
+    "dsar_subject_requests":      ("subject_id",),
 }
 
 # Tables carrying an entity_id/memory_id that can hold ANY entity type. Matched

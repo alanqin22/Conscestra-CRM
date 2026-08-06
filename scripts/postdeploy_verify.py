@@ -145,7 +145,20 @@ def _app_identity(app_url: str) -> Optional[str]:
     """
     import json as _json
     import urllib.request
-    url = app_url.rstrip("/") + "/health"
+    # Accept a base URL OR a full /health URL.
+    #
+    # This appended "/health" unconditionally, so the documented invocation —
+    # `--app-url https://<app>/health`, which is what the runbooks, the PR
+    # template and every instruction in this repository say — produced
+    # `/health/health`, a 404, and a silent SKIP. The app role was then never
+    # learned, so the red team judged the ADMIN connection this script uses and
+    # reported a breach that says nothing about the application.
+    #
+    # The check reported "skipped" the whole time, which is honest and easy to
+    # read past. Nobody noticed because the run still ended in a failure that
+    # LOOKED like the expected admin-DSN artefact.
+    base = app_url.rstrip("/")
+    url = base if base.endswith("/health") else base + "/health"
     try:
         with urllib.request.urlopen(url, timeout=25) as r:
             body = _json.loads(r.read().decode("utf-8"))

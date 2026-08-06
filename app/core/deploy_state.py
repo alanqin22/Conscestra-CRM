@@ -144,23 +144,26 @@ def ensure_table() -> bool:
 
 
 def ledger_health() -> Dict[str, Any]:
-    """How much of the migration history this ledger actually knows about.
+    """Does the ledger account for every DECLARED migration?
 
-    Measured 2026-08-05: 25 recorded rows against 194 files in sql/, and three
-    migrations reported as missing from production that ARE applied there. The
-    cause is not a bug in record_migration — it is that migrations are applied
-    by hand in pgAdmin, which never calls it. A ledger populated only by the
-    code path nobody uses will always be wrong.
+    CORRECTED 2026-08-06. The first version compared the ledger against every
+    *.sql file in sql/ — 196 of them — and reported 12.8% coverage and
+    reliable=False. That was a false alarm from the wrong denominator: most of
+    sql/ is stored procedures, seeds and one-off fixes, never meant to be
+    tracked. The ledger tracks REQUIRED_MIGRATIONS, and both databases hold all
+    25 of them.
 
-    Wrong in both directions is worse than absent, because absent prompts you to
-    go and look. So this reports its own coverage, and `reliable` is false until
-    the ledger genuinely tracks the files. Anything deciding whether a migration
-    has been applied should compare the LIVE SCHEMA instead — that is what
-    scripts/postdeploy_verify.py does."""
-    from pathlib import Path
-    root = Path(__file__).resolve().parents[2]
-    files = {p.name for p in (root / "sql").glob("*.sql")}
+    Two lessons, kept because they were expensive. A coverage metric is only as
+    good as the set it divides by — a wrong denominator produces a confident
+    number pointing at nothing. And I wrote that check while hunting misleading
+    signals and made one, so this now names its own denominator in the output.
+
+    What WAS real: migrations applied by hand in pgAdmin never call
+    record_migration(), so the ledger can miss rows for migrations that ARE
+    applied. That is a process gap, not a coverage gap, and the compensating
+    control is the live schema comparison in scripts/postdeploy_verify.py."""
     recorded: set = set()
+    files = set(REQUIRED_MIGRATIONS)
     try:
         conn = get_connection()
         try:
@@ -174,18 +177,17 @@ def ledger_health() -> Dict[str, Any]:
         return {"readable": False, "reliable": False, "error": str(exc)[:120]}
 
     unrecorded = sorted(files - recorded)
-    phantom = sorted(recorded - files)
     coverage = (len(recorded & files) / len(files)) if files else 0.0
     return {
         "readable": True,
-        "sql_files": len(files),
+        "denominator": "REQUIRED_MIGRATIONS (declared), not every file in sql/",
+        "declared_migrations": len(files),
         "recorded_rows": len(recorded),
         "coverage": round(coverage, 3),
-        "unrecorded_count": len(unrecorded),
-        "phantom_count": len(phantom),
-        # Deliberately strict. Anything short of complete coverage means a
-        # reader cannot use this to answer "has X been applied?"
-        "reliable": not unrecorded and not phantom,
+        "unrecorded": unrecorded,
+        # Extra rows are fine and expected: a migration applied by hand and then
+        # recorded appears here without being in the declared list.
+        "reliable": not unrecorded,
         "authoritative_alternative": "compare live schemas — "
                                      "scripts/postdeploy_verify.py",
     }
