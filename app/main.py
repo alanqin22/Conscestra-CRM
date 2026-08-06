@@ -1578,6 +1578,34 @@ app.include_router(embed_public_router)
 from app.core.compliance import router as compliance_router
 app.include_router(compliance_router)
 
+# ── Data-subject requests (GDPR Art. 15/20, PIPEDA s.8) ─────────────────────
+#
+# TWO ROUTERS, TWO GATES. They cannot share one, because they are not the same
+# kind of endpoint:
+#
+#   /dsar/export, /dsar/requests   ADMIN. /dsar/export returns everything held
+#                                  about a person. Behind _ADMIN, exactly like
+#                                  the other privileged command routers.
+#   /dsar/request                  NOT admin — a signed-in CUSTOMER asks for
+#                                  their own data. Admin-gating it would make
+#                                  the subject-facing channel unreachable by
+#                                  subjects, which is the entire point of it.
+#
+# The subject endpoint is safe without _ADMIN because it returns NO DATA: it
+# records that a request arrived and starts the 30-day clock. Its identity comes
+# from the server-validated session and never from the request body. Mounting
+# these two the same way would either expose the export or hide the request
+# form; the split is deliberate.
+from app.core.dsar_api import router as _dsar_router
+from fastapi import APIRouter as _APIRouter
+
+_dsar_admin = _APIRouter()
+_dsar_public = _APIRouter()
+for _r in _dsar_router.routes:
+    (_dsar_public if _r.path == "/dsar/request" else _dsar_admin).routes.append(_r)
+app.include_router(_dsar_admin, dependencies=_ADMIN)
+app.include_router(_dsar_public)
+
 # -- Testing at Scale: synthetic-utterance regression suite + pre-deploy gate
 #    (blindspot #9). Admin-gated on-demand runs; also a CLI CI gate
 #    (python -m app.core.eval_suite).

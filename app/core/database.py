@@ -156,7 +156,13 @@ def _pool_for(dsn: str, schema: str):
     with _POOL_LOCK:
         pool = _POOLS.get(key)
         if pool is None:
-            kw = {}
+            # Same application_name as the direct path below. There are TWO
+            # connect sites in this module and almost every connection comes
+            # from this one — patching only the fallback left every real
+            # session anonymous in pg_stat_activity while the change looked
+            # done.
+            kw = {"application_name": (os.getenv("PG_APPLICATION_NAME")
+                                       or "conscestra-crm")[:63]}
             if schema and schema != "public":
                 kw["options"] = f"-c search_path={schema},public"
             pool = psycopg2.pool.ThreadedConnectionPool(
@@ -293,10 +299,23 @@ def get_connection():
                 slots.release()
                 raise
 
+    # application_name is forensics, not decoration.
+    #
+    # A breach tabletop on 2026-08-06 asked "who is connected as postgres right
+    # now?" against production and got six sessions back. pgAdmin identified
+    # itself, Railway's data browser tagged its queries, and the connections
+    # opened by our own scripts showed `application_name` empty — which is
+    # exactly what an intruder's session looks like. The one query an operator
+    # runs first in an incident could not separate our tooling from an attacker.
+    #
+    # Costs nothing and is visible in pg_stat_activity for the life of the
+    # session. APP_NAME overrides it so a script can say what it is.
+    app_name = (os.getenv("PG_APPLICATION_NAME") or "conscestra-crm")[:63]
     if schema and schema != "public":
-        conn = psycopg2.connect(dsn, options=f"-c search_path={schema},public")
+        conn = psycopg2.connect(dsn, application_name=app_name,
+                                options=f"-c search_path={schema},public")
     else:
-        conn = psycopg2.connect(dsn)
+        conn = psycopg2.connect(dsn, application_name=app_name)
     conn.set_client_encoding('UTF8')
     return conn
 
