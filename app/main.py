@@ -1086,7 +1086,17 @@ async def lifespan(app: FastAPI):
             Extracted so a FOLLOWER can call it on promotion. Previously the
             decision was made once at startup: a follower set _scheduler = None
             and had no way to ever start it, so a leader dying mid-life stopped
-            all background work until a human restarted something."""
+            all background work until a human restarted something.
+
+            RESUME, not start, when the scheduler is already running: a process
+            that was demoted and is promoted again holds a PAUSED scheduler, and
+            start() on it raises SchedulerAlreadyRunningError — which would make
+            re-promotion fail at exactly the moment it matters."""
+            if _scheduler.running:
+                _scheduler.resume()
+                app.state.scheduler_running = True
+                logger.warning("[Scheduler] RESUMED after re-promotion")
+                return
             _scheduler.start()
             from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 
@@ -1104,6 +1114,34 @@ async def lifespan(app: FastAPI):
                 _dt.timezone.utc).isoformat(timespec="seconds")
             app.state.scheduler_jobs = len(_scheduler.get_jobs())
             app.state.scheduler_running = True
+
+        def _pause_scheduler_now():
+            """Stop firing jobs because this process is no longer the leader.
+
+            The mirror image of _start_scheduler_now, and the half that was
+            missing. leader.py can now detect that it has lost the advisory lock
+            to another process — but detecting it and continuing to run the jobs
+            anyway is the same outcome as not detecting it: two processes firing
+            the same schedule, so dunning email goes out twice.
+
+            PAUSE, not shutdown. A paused scheduler keeps its 32 job definitions
+            and can be resumed by _start_scheduler_now if this process is later
+            promoted again; a shutdown one cannot be restarted."""
+            try:
+                if _scheduler is not None and _scheduler.running:
+                    _scheduler.pause()
+                app.state.scheduler_running = False
+                logger.error("[Scheduler] PAUSED — this process was demoted and "
+                             "another holds the singleton lock. Background jobs "
+                             "now run there.")
+            except Exception as exc:                          # noqa: BLE001
+                logger.error(f"[Scheduler] pause on demotion failed: {exc}",
+                             exc_info=True)
+
+        # Register both directions regardless of the starting role: a leader can
+        # be demoted and a follower promoted, and either may happen more than
+        # once in a process's life.
+        leader.on_demotion(_pause_scheduler_now)
 
         if not _run_bg:
             # Follower: the scheduler is BUILT and held, not started. If this
@@ -1893,7 +1931,10 @@ async def health():
     from app.agents.store.graph         import get_graph as gstore
     try:
         from app.core import leader
-        _ha = {"role": leader.role(), "runs_singletons": leader.is_leader()}
+        # leader.status() asks the DATABASE whether the lock is still held.
+        # The previous payload reported runs_singletons from memory, which let a
+        # leader that had silently lost its lock look healthy indefinitely.
+        _ha = leader.status()
     except Exception:
         _ha = {"role": "unknown"}
     # DOES THE DATABASE ACTUALLY ANSWER?

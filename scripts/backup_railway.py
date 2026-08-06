@@ -16,13 +16,19 @@ WHAT THIS IS AND IS NOT
 It is a LOGICAL backup: RPO equals the interval between runs. Everything written
 since the last dump is lost in a disaster.
 
-It is NOT point-in-time recovery. Railway's managed Postgres cannot do PITR:
-`archive_mode` has context=postmaster so it needs a server restart, and the only
-persistent storage is the same volume that holds the data — archiving WAL beside
-the data means losing the volume loses both. Shipping WAL off-host needs wal-g
-or pgbackrest inside the Postgres container, which the managed image does not
-allow. If contractual PITR is required, that is a platform move, not a config
-change.
+It is NOT point-in-time recovery, so RPO is the interval between runs.
+
+CORRECTION (2026-08-05): this docstring previously claimed Railway's managed
+Postgres CANNOT do PITR, reasoning from archive_mode being context=postmaster
+and WAL living on the same volume as the data. That reasoning was sound about
+self-managed WAL archiving and wrong about the actual question. Railway sells
+Backups and PITR on the Pro plan (Postgres service -> Backups tab). Closing the
+RPO gap is a billing decision, not a re-platform.
+
+Kept as a correction rather than deleted: the original claim was confident,
+specific, technically literate, and would have sent someone to migrate a
+database to solve a problem a plan upgrade solves. Checking what the vendor
+sells is not the same as inferring it from pg_settings.
 
 WHERE THE DUMPS GO
 ------------------
@@ -37,6 +43,7 @@ them somewhere else if the data justifies it.
 from __future__ import annotations
 
 import os
+import shutil
 import re
 import subprocess
 import sys
@@ -301,10 +308,85 @@ def main() -> int:
         print(f"\nRESTORE VERIFICATION FAILED on: {', '.join(bad)}")
         print("  The dump exists but does not reproduce production. Do not")
         print("  treat it as a backup until this is explained.")
+        _ping(False, f"restore verification failed on: {', '.join(bad)}")
         return 1
     print(f"\nverified: every checked table matches production")
     print(f"  RPO = time since this ran.  RTO = {restore_s:.0f}s + provisioning.")
+
+    _mirror(dump)
+    _ping(True, f"verified {len(want)} tables; restore {restore_s:.1f}s")
     return 0
+
+
+def _ping(ok: bool, detail: str = "") -> None:
+    """Tell a dead-man's-switch service this run finished, and how.
+
+    The backup verifies itself thoroughly and then tells nobody. Every failure
+    mode that matters is SILENT from outside: the machine is off, Docker is not
+    running, the script raised, the task was deleted. In each case the outcome
+    is identical — no backup — and the only evidence is a log file on the
+    machine that did not run it.
+
+    A dead-man's switch inverts that. Success must be actively reported, so the
+    absence of a report IS the alert. That is the property a status check cannot
+    have: it can only tell you about runs that happened.
+
+    Never raises. A monitoring call that can break a backup is a bad trade."""
+    base = os.getenv("BACKUP_PING_URL", "").strip()
+    if not base:
+        return
+    url = base.rstrip("/") + ("" if ok else "/fail")
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            url, data=detail.encode("utf-8")[:9000] if detail else None,
+            headers={"User-Agent": "backup_railway"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"  pinged monitor ({'ok' if ok else 'FAIL'}): {resp.getcode()}")
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"  monitor ping failed (backup itself is unaffected): "
+              f"{type(exc).__name__}: {exc}")
+
+
+def _mirror(dump_path: Path) -> None:
+    """Copy the verified dump to a second physical device.
+
+    Only VERIFIED dumps are mirrored — copying one that failed verification
+    would propagate a bad backup and, worse, make the off-site copy look
+    healthier than the primary.
+
+    A missing drive is reported but never fails the run. An external disk that
+    happens to be unplugged is a normal Tuesday; turning that into a backup
+    failure would train someone to ignore backup failures. The staleness is
+    what matters, so the age of the newest mirrored copy is always printed —
+    'the mirror is 9 days old' is the sentence that needs to reach a human.
+    """
+    target = os.getenv("BACKUP_MIRROR_DIR", "").strip()
+    if not target:
+        return
+    dest = Path(target)
+    try:
+        if not dest.parent.exists():
+            print(f"\nMIRROR SKIPPED — {dest.parent} not available "
+                  f"(external drive not connected?). The off-site copy is NOT "
+                  f"up to date.")
+            return
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dump_path, dest / dump_path.name)
+        # Mirror the retention policy too, or the second copy grows forever.
+        old = sorted(dest.glob("railway-*.dump"))[:-KEEP] if KEEP else []
+        for f in old:
+            f.unlink()
+        copies = sorted(dest.glob("railway-*.dump"))
+        newest = max((f.stat().st_mtime for f in copies), default=0)
+        age_h = (time.time() - newest) / 3600 if newest else -1
+        print(f"\nmirrored to {dest}  ({len(copies)} dump(s) there, "
+              f"newest {age_h:.1f}h old)")
+        if old:
+            print(f"  pruned {len(old)} old mirror copy/copies")
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"\nMIRROR FAILED — the off-site copy is NOT up to date: "
+              f"{type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":                                   # pragma: no cover

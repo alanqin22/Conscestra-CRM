@@ -300,6 +300,46 @@ def attack_poison_attribution(cur) -> None:
            f"outbound webchat containing customer-speech cues -> {as_outbound}")
 
 
+def attack_degraded_lookup_lies(cur) -> None:
+    """Break the promotions store and see whether the system tells a customer
+    a falsehood about THEIR property rather than reporting our outage.
+
+    Not every attacker is a person. This one ran for fifteen days without one:
+    sql/promotions_coupons.sql was applied locally on 2026-07-21 and never to
+    Railway, every lookup raised, and the handler returned "no such coupon" at
+    DEBUG. Valid codes were refused, and a refusal is exactly what a wrong code
+    produces, so nothing looked wrong from either side.
+
+    The control is that a failed lookup must be DISTINGUISHABLE from a genuine
+    miss. Same failure, same customer, different sentence."""
+    from app.core import promotions
+    real = promotions.get_connection
+    try:
+        promotions.get_connection = lambda *a, **k: (_ for _ in ()).throw(
+            Exception('relation "coupons" does not exist'))
+        broke = promotions.validate_coupon("SAVE10", subtotal=500.0)
+        # The prompt block is the customer-facing half. sdr.py renders an empty
+        # block as "None available." — so returning '' during an outage puts a
+        # fabricated fact in front of the model, which repeats it confidently.
+        outage_block = promotions.summarize_for_agent(None)
+    finally:
+        promotions.get_connection = real
+    miss = promotions.validate_coupon("NO-SUCH-CODE-XYZ", subtotal=500.0)
+
+    # Two ways to lie: to the caller, and to the model composing the reply.
+    lied_to_caller = (not broke.get("lookup_failed")
+                      or broke.get("reason") == miss.get("reason"))
+    lied_to_model = outage_block.strip() == ""
+    record("degraded promotions lookup asserts the customer's coupon is invalid",
+           "no attacker — an unapplied migration, dropped connection or revoked grant",
+           not (lied_to_caller or lied_to_model),
+           "lookup_failed flag + distinct reason + explicit UNKNOWN prompt block",
+           f"outage said {broke.get('reason')!r}, genuine miss said "
+           f"{miss.get('reason')!r}, prompt block "
+           f"{'EMPTY -> renders None available.' if lied_to_model else 'states UNKNOWN'}, "
+           f"health_ok={promotions.promotions_health()['ok']}")
+
+
 def attack_disable_control(cur) -> None:
     """Turn a control off, the way a migration rollback would.
 
@@ -540,7 +580,8 @@ def main() -> int:
                attack_self_approval, attack_prompt_injection,
                attack_poison_attribution, attack_erase_the_evidence,
                attack_erase_via_sanctioned_path,
-               attack_silent_bulk_delete, attack_disable_control):
+               attack_silent_bulk_delete, attack_degraded_lookup_lies,
+               attack_disable_control):
         try:
             fn(cur)
         except Exception as exc:                          # noqa: BLE001

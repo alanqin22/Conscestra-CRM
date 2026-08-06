@@ -594,15 +594,27 @@ def _store_agent_reply(product: Dict[str, Any], user_text: str,
     facts_block = "\n".join(facts)
 
     # ACTIVE PROMOTIONS — real advertisable coupons for a discount/coupon ask.
-    # Empty when none exist or the promotions tables aren't deployed → the agent
-    # falls back to the honest promo/price-match/specialist handoff.
-    promo_block = ""
+    #
+    # Three states, not two. This block is rendered into the prompt below, and
+    # rendering "nothing" as "None available." states a fact about our offers.
+    # We are only entitled to that sentence when we actually read the table and
+    # it was empty. Not asked and could-not-read are both "we didn't check".
+    _NOT_CHECKED = ("Not checked — the shopper did not ask about discounts. "
+                    "Do not volunteer or rule out promotions.")
+    _UNKNOWN = ("UNKNOWN — the promotions lookup is unavailable. Do NOT say "
+                "there are no discounts; say you can't confirm current "
+                "promotions right now and offer a specialist.")
+    promo_block = _NOT_CHECKED
     if _DISCOUNT_RE.search(user_text):
         try:
             from app.core import promotions
-            promo_block = promotions.summarize_for_agent(product)
+            promo_block = promotions.summarize_for_agent(product) or "None available."
         except Exception as exc:
-            logger.debug(f"[sdr] promotions lookup skipped: {exc}")
+            # summarize_for_agent handles its own DB errors; reaching here means
+            # the module itself is unusable, which is still not evidence that
+            # the shopper has no discounts available.
+            logger.warning(f"[sdr] promotions module unavailable: {exc}")
+            promo_block = _UNKNOWN
 
     # APPROVED POLICY — pull real published policy from the KB for policy-type
     # questions (returns/shipping/warranty/payment/pickup/order changes).
@@ -632,7 +644,7 @@ def _store_agent_reply(product: Dict[str, Any], user_text: str,
         from app.core.graph_utils import _get_llm
         from app.core import privacy
         content = (f"[STORE FACTS]\n{facts_block}\n\n"
-                   f"[ACTIVE PROMOTIONS]\n{promo_block or 'None available.'}\n\n"
+                   f"[ACTIVE PROMOTIONS]\n{promo_block}\n\n"
                    f"[APPROVED KNOWLEDGE BASE]\n{kb_block or 'None retrieved.'}\n\n"
                    f"[SHOPPER ASKED]\n{privacy.mask(user_text)[:300]}\n\n"
                    f"[WEB RESEARCH]\n{web[:1500] if web else 'None available.'}")

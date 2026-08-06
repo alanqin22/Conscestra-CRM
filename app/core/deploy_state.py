@@ -93,6 +93,26 @@ SAFETY_SECRETS: List[str] = ["MEMORY_SIGNING_KEY"]
 
 
 def ensure_table() -> bool:
+    """Ensure the two deploy-state tables are USABLE. Returns True when they are.
+
+    The original version conflated two outcomes that need opposite responses:
+
+      * the tables exist and this role may not CREATE  -> perfectly fine
+      * the tables are genuinely missing               -> a deployment fault
+
+    Under the privilege separation `crm_app` has USAGE but not CREATE, and
+    PostgreSQL checks CREATE permission BEFORE the IF NOT EXISTS short-circuit —
+    so the statement fails with 'permission denied for schema public' even when
+    the table is right there. The old code logged that at warning and returned
+    False, which read as 'no deploy state available'. replica_attestations then
+    silently recorded nothing from 2026-08-03 until it was noticed on 08-05.
+
+    Returning False when the tables are present and writable is the bug. The
+    inability to CREATE something that already exists is not a failure."""
+    missing = _missing_objects()
+    if not missing:
+        return True                       # present and usable; CREATE not needed
+
     try:
         conn = get_connection()
         try:
@@ -115,8 +135,78 @@ def ensure_table() -> bool:
         finally:
             conn.close()
     except Exception as exc:
-        logger.warning(f"[deploy] state tables unavailable: {exc}")
+        # Genuinely absent AND uncreatable. This is a real deployment fault:
+        # apply the migration. Named explicitly so the fix is obvious.
+        logger.error(f"[deploy] MISSING and uncreatable by this role: "
+                     f"{', '.join(missing)} — apply the migration that declares "
+                     f"them. ({str(exc).splitlines()[0][:100]})")
         return False
+
+
+def ledger_health() -> Dict[str, Any]:
+    """How much of the migration history this ledger actually knows about.
+
+    Measured 2026-08-05: 25 recorded rows against 194 files in sql/, and three
+    migrations reported as missing from production that ARE applied there. The
+    cause is not a bug in record_migration — it is that migrations are applied
+    by hand in pgAdmin, which never calls it. A ledger populated only by the
+    code path nobody uses will always be wrong.
+
+    Wrong in both directions is worse than absent, because absent prompts you to
+    go and look. So this reports its own coverage, and `reliable` is false until
+    the ledger genuinely tracks the files. Anything deciding whether a migration
+    has been applied should compare the LIVE SCHEMA instead — that is what
+    scripts/postdeploy_verify.py does."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    files = {p.name for p in (root / "sql").glob("*.sql")}
+    recorded: set = set()
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT filename FROM public.schema_migrations")
+                recorded = {r[0] for r in cur.fetchall()}
+        finally:
+            conn.close()
+    except Exception as exc:                                    # noqa: BLE001
+        logger.warning(f"[deploy] ledger unreadable: {exc}")
+        return {"readable": False, "reliable": False, "error": str(exc)[:120]}
+
+    unrecorded = sorted(files - recorded)
+    phantom = sorted(recorded - files)
+    coverage = (len(recorded & files) / len(files)) if files else 0.0
+    return {
+        "readable": True,
+        "sql_files": len(files),
+        "recorded_rows": len(recorded),
+        "coverage": round(coverage, 3),
+        "unrecorded_count": len(unrecorded),
+        "phantom_count": len(phantom),
+        # Deliberately strict. Anything short of complete coverage means a
+        # reader cannot use this to answer "has X been applied?"
+        "reliable": not unrecorded and not phantom,
+        "authoritative_alternative": "compare live schemas — "
+                                     "scripts/postdeploy_verify.py",
+    }
+
+
+def _missing_objects() -> List[str]:
+    """Which of this module's tables are absent. Cheap catalog lookup."""
+    out: List[str] = []
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                for t in ("schema_migrations", "replica_attestations"):
+                    cur.execute("SELECT to_regclass(%s)", (f"public.{t}",))
+                    if cur.fetchone()[0] is None:
+                        out.append(t)
+        finally:
+            conn.close()
+    except Exception as exc:                                    # noqa: BLE001
+        logger.warning(f"[deploy] could not check state tables: {exc}")
+    return out
 
 
 def record_migration(filename: str, applied_by: str = "manual",

@@ -272,6 +272,12 @@ def _checkout_node(state: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, A
             if coupon_result.get("applied"):
                 logger.info(f"Checkout Step B2 OK — coupon {coupon_result.get('code')} "
                             f"applied -${coupon_result.get('discount_amount')}")
+            elif coupon_result.get("lookup_failed"):
+                # The customer was charged full price because WE broke, not
+                # because their code was bad. That is an incident, not an INFO.
+                logger.warning(f"Checkout Step B2 — coupon {coupon_code} NOT applied "
+                               f"due to a promotions failure (customer charged full "
+                               f"price): {coupon_result.get('reason')}")
             else:
                 logger.info(f"Checkout Step B2 — coupon not applied: "
                             f"{coupon_result.get('reason') or coupon_result}")

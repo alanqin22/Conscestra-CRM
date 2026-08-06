@@ -16,6 +16,9 @@ WHAT IT RUNS
   secret_health      are the guarded secrets real, strong and distinct
   verify_invariants  the DB-layer controls, asserted in SQL against live schema
   red_team           attacks executed, not enumerated
+  dsar --coverage    can a data subject actually be given everything we hold
+  runtime ddl        do the objects the app creates lazily already exist
+  schema drift       does the target have every table the working schema has
 
 EXIT CODE is what a deploy pipeline should gate on: 0 means every control was
 exercised and held. Anything else means a control is missing, disabled, or was
@@ -69,10 +72,64 @@ def _target_dsn(argv) -> tuple[str, str]:
     return "configured DSN", dsn
 
 
-def _run(label: str, module: str, env: dict) -> tuple[str, int, str]:
-    proc = subprocess.run([sys.executable, "-m", module], cwd=str(ROOT),
+def _run(label: str, module: str, env: dict,
+         args: tuple = ()) -> tuple[str, int, str]:
+    proc = subprocess.run([sys.executable, "-m", module, *args], cwd=str(ROOT),
                           env=env, capture_output=True, text=True)
     return label, proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def _schema_drift(target_dsn: str) -> Optional[str]:
+    """Tables present in the working schema but missing from the deploy target.
+
+    This check exists because of a real fifteen-day outage. sql/promotions_
+    coupons.sql was applied locally on 2026-07-21 and never to Railway; the
+    store agent caught the missing-table error and answered "no such coupon",
+    which is exactly what a wrong code produces, so every valid coupon a
+    customer typed was refused and nothing looked wrong from either side.
+
+    The migration ledger did not catch it and could not: schema_migrations held
+    25 rows against 194 files in sql/, because migrations applied by hand in
+    pgAdmin never call record_migration(). It also reported three migrations as
+    missing from production that were in fact applied there. Wrong in both
+    directions is worse than absent — so this compares the LIVE SCHEMAS and
+    ignores the ledger entirely.
+
+    Returns None when it cannot run (one DSN, or both pointing at the same
+    database). 'Could not compare' is reported as skipped, never as clean."""
+    import psycopg2
+
+    working = (os.getenv("DB_DSN") or "").strip()
+    if not working or working == target_dsn:
+        return None
+
+    def tables(dsn: str) -> set:
+        conn = psycopg2.connect(dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT c.relname FROM pg_class c
+                                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                                WHERE n.nspname='public' AND c.relkind='r'""")
+                return {r[0] for r in cur.fetchall()}
+        finally:
+            conn.close()
+
+    try:
+        here, there = tables(working), tables(target_dsn)
+    except Exception as exc:                                    # noqa: BLE001
+        return f"SKIPPED — could not compare schemas: {type(exc).__name__}: {exc}"
+
+    missing = sorted(here - there)
+    extra = sorted(there - here)
+    if not missing and not extra:
+        return f"OK — {len(here)} public tables, identical on both"
+    parts = []
+    if missing:
+        parts.append("MISSING FROM TARGET (code may reference these): "
+                     + ", ".join(missing))
+    if extra:
+        parts.append("present on target only: " + ", ".join(extra))
+    return " | ".join(parts)
 
 
 def _app_identity(app_url: str) -> Optional[str]:
@@ -178,13 +235,23 @@ def main() -> int:
     if app_role:
         env["REDTEAM_APP_ROLE"] = app_role
 
-    stages = [("secrets", "app.core.secret_health"),
-              ("invariants", "scripts.verify_invariants"),
-              ("red team", "scripts.red_team")]
+    stages = [("secrets", "app.core.secret_health", ()),
+              ("invariants", "scripts.verify_invariants", ()),
+              ("red team", "scripts.red_team", ()),
+              # A subject-linked table nobody declared makes every Art. 15
+              # export silently narrower than it claims to be. --coverage exits
+              # 1 in exactly that case, so a migration that adds one is caught
+              # at deploy rather than at the next access request.
+              ("dsar coverage", "app.core.dsar", ("--coverage",)),
+              # Objects the app creates lazily cannot be created by the app's
+              # own role any more. They exist today only because they predate
+              # the privilege separation; the next one added will be inert in
+              # production and silent about it.
+              ("runtime ddl", "scripts.verify_runtime_ddl", ())]
 
     failures = []
-    for name, module in stages:
-        stage, code, output = _run(name, module, env)
+    for name, module, args in stages:
+        stage, code, output = _run(name, module, env, args)
         ok = code == 0
         print(f"  {'PASS' if ok else 'FAIL'}  {stage}")
         if not ok:
@@ -192,6 +259,16 @@ def main() -> int:
             for line in output.strip().splitlines()[-14:]:
                 print(f"        {line}")
         print()
+
+    drift = _schema_drift(dsn)
+    if drift is not None:
+        verdict = drift.startswith("OK")
+        skipped = drift.startswith("SKIPPED")
+        print(f"  {'PASS' if verdict else 'SKIP' if skipped else 'FAIL'}  "
+              f"schema drift")
+        print(f"        {drift}\n")
+        if not verdict and not skipped:
+            failures.append("schema drift")
 
     _report_connected_roles(dsn)
 

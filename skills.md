@@ -2435,3 +2435,67 @@ conversion, retention, efficiency? Separate engineering correctness from
 business outcome; name anything sophisticated but low-value and simplify.
 **Requires real production evidence. Do not simulate it** — inventing
 production numbers is the exact failure eleven rounds went to eliminate.
+
+---
+
+## Phase 8 progress — 2026-08-05
+
+Closed this session, with the evidence that closed each one.
+
+| Item | Evidence |
+|---|---|
+| Backup + tested restore | daily 23:00 task, catch-up on missed runs, RTO **3.6 s** measured, all 200 tables verified |
+| DSAR export (Art. 15/20) | `app/core/dsar.py`, manifest checked against live schema, 34 subject-linked tables declared |
+| DSAR register | `dsar_requests`, append-only trigger verified on Railway (UPDATE and DELETE both refused) |
+| Four runbooks | restore, leader failure, incident escalation, credential rotation |
+| n8n retirement | 47 tables → `n8n_legacy`, 59 on both databases |
+| Schema drift | local 145 vs Railway 141 closed; now a `postdeploy_verify` gate |
+| Promotions truthfulness | outage no longer answers "no such coupon"; mutation-tested both halves |
+
+### Controls that moved from "verified locally" to "verified in production"
+
+- **Erasure retention** — `anonymise_old_erasure_log(30)` refused on Railway:
+  the 365-day floor holds where it matters.
+- **Leader election** — advisory lock 871123 held by exactly 1 session.
+- **Pool checkout validation** — 4 checkout/autocommit/query cycles against the
+  production database; a dropped connection is not handed out.
+- **Privilege separation** — `pg_stat_activity` shows `crm_app` connections, not
+  `postgres`.
+
+Still unverified in production: leader **promotion** (a follower taking over
+without a restart), and release attestation (`replica_attestations` is 0 rows —
+the table could not be created until today because `crm_app` has no CREATE).
+
+### Tenant isolation — exercised for the first time
+
+`MULTI_TENANT_ENABLED=1` locally. Four probes, all fail closed:
+unknown tenant, SQL injection in the tenant id, suspended tenant, and a
+**poisoned registry row** (`schema_name = 'public; DROP TABLE accounts'`)
+rejected by `_valid_schema` before it can reach `search_path`. That last one is
+the one that matters: it means a compromised control plane cannot inject.
+
+Not yet evidence of *data* isolation between two populated tenants — there is
+still only one tenant. Fail-closed resolution is proven; cross-tenant leakage is
+not yet testable.
+
+### The recurring lesson, three more instances
+
+1. `schema_migrations` reported 3 migrations missing from Railway that **were**
+   applied, while omitting 169 that exist. Wrong in both directions. The live
+   schema diff is the only trustworthy check.
+2. `compliance.posture()` reported 13/16 green while no DSAR export existed —
+   it never asked. A report listing only controls you built always looks
+   finished.
+3. I "verified" an append-only trigger by DELETEing from an empty table. A row
+   trigger cannot fire on zero rows. The check passed because it could not run.
+
+Also this session: the promotions prompt block rendered `""` as
+`"None available."`, converting *we did not look* into a positive factual claim
+the model then repeated to shoppers. Absence of data is not evidence of absence.
+
+### Remaining
+
+KMS + asymmetric signing (`MEMORY_SIGNING_KEY` is HMAC — verification implies
+forgery); ISO 42001 groundwork; data isolation between two live tenants;
+leader promotion and attestation in production; an uptime checker on `/health`
+— every runbook written today opens with "check /health", and nothing does.
