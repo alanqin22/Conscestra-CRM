@@ -156,16 +156,30 @@ def _check_voice() -> Dict[str, Any]:
 
 
 def _check_telephony() -> Dict[str, Any]:
-    twilio = bool(os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN"))
-    telnyx = bool(os.getenv("TELNYX_API_KEY"))
-    ok = twilio or telnyx
-    carrier = "Twilio" if twilio else ("Telnyx" if telnyx else None)
+    """Report the carrier that is actually LIVE, and whether IT has keys.
+
+    This used to answer "are any carrier credentials present?" and label the
+    result "Twilio" whenever Twilio credentials existed — so an account
+    running on Telnyx, with both credential sets configured, was told its
+    carrier was Twilio. Worse, leftover credentials for the carrier you are
+    NOT using reported "ok" while the live one had no keys at all, which is
+    precisely the state a readiness check exists to catch."""
+    from app.core.telephony import _provider
+    live = _provider()
+    name = "Telnyx" if live == "telnyx" else "Twilio"
+    env = ("TELNYX_API_KEY" if live == "telnyx"
+           else "TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN")
+    ok = (bool(os.getenv("TELNYX_API_KEY")) if live == "telnyx"
+          else bool(os.getenv("TWILIO_ACCOUNT_SID")
+                    and os.getenv("TWILIO_AUTH_TOKEN")))
     return _item("telephony", "SMS / voice carrier", "optional",
                  "ok" if ok else "not_configured",
-                 f"{carrier} configured." if ok
-                 else "No carrier keys — SMS and outbound calls are unavailable (all other channels still work).",
-                 None if ok else {"label": "Add Twilio or Telnyx keys (optional)",
-                                  "env": "TWILIO_ACCOUNT_SID / TELNYX_API_KEY"})
+                 f"{name} configured (TELEPHONY_PROVIDER={live})." if ok
+                 else (f"TELEPHONY_PROVIDER={live} but no {name} keys — SMS "
+                       f"and outbound calls are unavailable (all other "
+                       f"channels still work)."),
+                 None if ok else {"label": f"Add {name} keys (optional)",
+                                  "env": env})
 
 
 CHECKS: List[Callable[[], Dict[str, Any]]] = [

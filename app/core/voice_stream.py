@@ -118,20 +118,14 @@ def _azure_pair(lang: str) -> Tuple[str, str]:
     return _AZURE_BY_LANG.get(lang or "en", _AZURE_BY_LANG["en"])
 
 
-# The opening keypad menu, and the confirmation after a choice. Each line is
-# spoken by ITS OWN language's voice — an English engine reading "中文服务，
-# 请按 3" is unintelligible to the one caller who needs that option.
-# Deliberately terse. The full-sentence version of these four options ran 10.4
-# seconds, on top of an 11-second greeting — 22 seconds before the caller could
-# say anything, which gives back exactly the latency this transport buys. Every
-# option still names its language in its own language, which is the part that
-# has to survive: it is the only cue a caller who speaks no English can use.
-_MENU_PROMPT = {
-    "en": "English, press 1.",
-    "fr": "Français, 2.",
-    "zh": "中文，3。",
-    "es": "Español, 4.",
-}
+# The menu WORDING comes from sdr._LANG_MENU_TEXT, the same table the <Gather>
+# path speaks, so the two transports cannot drift into telling callers to press
+# different keys — or saying it differently in one place and not the other.
+# This module kept its own terse copy for a while to save a couple of seconds
+# at call open; the saving was not worth a second source of truth, and the
+# shortened Chinese ("中文，3。") read as clipped rather than brief.
+# Each option is spoken by ITS OWN language's voice: an English engine reading
+# "中文服务，请按 3" is unintelligible to the one caller who needs that option.
 _RETRY = {
     "en": "Sorry, I didn't catch that. Could you say it again?",
     "fr": "Désolé, je n'ai pas bien entendu. Pouvez-vous répéter ?",
@@ -158,9 +152,11 @@ def menu_audio() -> bytes:
     μ-law), so the bytes simply play in sequence."""
     global _MENU_AUDIO
     if _MENU_AUDIO is None:
+        from app.core.sdr import _LANG_MENU_ORDER, _LANG_MENU_TEXT
         parts = []
-        for code in ("en", "fr", "zh", "es"):
-            clip = synthesize(_MENU_PROMPT[code], code)
+        for digit in _LANG_MENU_ORDER:
+            code, text = _LANG_MENU_TEXT[digit]
+            clip = synthesize(text, code)
             if clip:
                 parts.append(clip)
         _MENU_AUDIO = b"".join(parts)
@@ -542,6 +538,7 @@ class _Call:
         self.lang = "en"                    # recognition + voice move together
         self.pending = bytearray()          # speech heard while busy (never
                                             # dropped — see _finish_utterance)
+        self.call_control_id = ""           # carrier handle for a live transfer
         self.words = 0                      # transcribed words heard
         self.speech_ms = 0.0                # caller speech duration
 
@@ -571,6 +568,14 @@ class _Call:
         # of the reply to the current one — the barge-in cancelled a player
         # that had not been created yet, so it cancelled nothing.
         epoch = self.epoch
+        # Speak the language of the WORDS, not the language of the question.
+        # Detection had been reading the caller's utterance only, so "can you
+        # speak Chinese?" — asked in English — left the voice on English while
+        # the model answered in Mandarin, and an English engine reading Han
+        # characters is exactly the half-switch this module exists to prevent.
+        # language.detect needs real signal (two Han characters, or two scoring
+        # function words), so a product name or a stray accent cannot flip it.
+        self._adopt_reply_lang(text)
         audio = await asyncio.to_thread(synthesize, text, self.lang)
         if epoch != self.epoch:
             logger.info(f"[stream] dropped a stale reply for "
@@ -732,9 +737,64 @@ class _Call:
         # and is read aloud by the English voice — the half-switch this module
         # exists to prevent, arriving from the brain's side instead of ours.
         self._adopt_brain_lang()
+        if nxt == "dial":
+            return await self._transfer_to_human()
         self.mode = nxt
         await self.say(say, then_hangup=(nxt == "hangup"))
         return True
+
+    async def _transfer_to_human(self) -> bool:
+        """Hand the live call to a person via Call Control.
+
+        The brain decided a human is warranted; <Dial> is not available on this
+        transport, so the carrier API does it instead. A FAILED transfer must
+        not drop the caller — it degrades to the same tracked callback the
+        Gather path produces when nobody answers. Hanging up on someone who
+        just asked for help is the one outcome worse than never offering."""
+        from app.core import telephony, voice_support as vs
+        say_line = vs._CONNECTING.get(self.lang, vs._CONNECTING["en"])
+        await self.say(say_line)
+        # Let "connecting you now" actually reach the caller before the carrier
+        # tears this leg down. ~14 characters per second of speech.
+        await asyncio.sleep(min(len(say_line) / 14.0, 6.0))
+        res = await asyncio.to_thread(
+            telephony.transfer_call, self.call_control_id,
+            vs.transfer_number(), vs._transfer_caller_id(),
+            vs.TRANSFER_TIMEOUT)
+        if res.get("ok"):
+            logger.info(f"[stream] call {self.call_sid[:12]} transferred to a "
+                        f"human ({res.get('to')})")
+            self.closing = True
+            return True
+        logger.warning(f"[stream] transfer failed for {self.call_sid[:12]}: "
+                       f"{res.get('error')} — taking a message instead")
+        window = vs.transfer_window()
+        apology = vs.no_answer_message(self.lang, window)
+        try:
+            vs.open_callback_obligation(
+                conversation_id=None, handle=self.from_number, channel="voice",
+                heard=f"transfer failed ({res.get('error')})", window=window)
+        except Exception as exc:
+            logger.error(f"[stream] could not record the callback: {exc}")
+        await self.say(apology, then_hangup=True)
+        return True
+
+    def _adopt_reply_lang(self, text: str) -> None:
+        """Switch to the language we are about to SPEAK, if it is one we serve.
+
+        Moves BOTH halves via set_lang: if the assistant just answered in
+        Mandarin, the caller's next sentence will very likely be Mandarin too,
+        and leaving the recogniser on English would make their reply
+        unintelligible one turn later."""
+        try:
+            from app.core import language
+            code = language.detect(text or "")
+        except Exception:
+            return
+        if code and code != self.lang and code in _AZURE_BY_LANG:
+            logger.info(f"[stream] call {self.call_sid[:12]} replying in "
+                        f"{code} — switching voice and recogniser to match")
+            self.set_lang(code)
 
     def _adopt_brain_lang(self) -> None:
         try:
@@ -833,6 +893,12 @@ async def voice_stream_ws(ws: WebSocket, line: str, sid: str = "",
                 call.sid_key = ("stream_id" if ("stream_id" in data
                                                 or "stream_id" in start)
                                 else "streamSid")
+                # The only place the carrier hands us a handle on the LIVE
+                # call. Without it this transport cannot transfer to a human
+                # at all: <Dial> answers a webhook, and there is no webhook
+                # left to answer once the media stream is open.
+                call.call_control_id = (start.get("call_control_id")
+                                        or data.get("call_control_id") or "")
                 if not greeted:
                     greeted = True
                     say, nxt = await _brain_greet(line, sid, frm)
@@ -842,8 +908,11 @@ async def voice_stream_ws(ws: WebSocket, line: str, sid: str = "",
                     # switching transports quietly turned a four-language line
                     # into an English-only one. Appended as pre-rendered audio
                     # rather than a second turn, so it costs no extra round trip.
-                    menu = b"" if nxt == "hangup" else \
-                        await asyncio.to_thread(menu_audio)
+                    # Offered on every tier, staff included: the greeting names
+                    # the four languages, so suppressing the menu for one tier
+                    # would advertise a choice that tier cannot make.
+                    menu = b"" if nxt == "hangup" \
+                        else await asyncio.to_thread(menu_audio)
                     await call.say(say, then_hangup=(nxt == "hangup"),
                                    append=menu)
             elif event == "media":
