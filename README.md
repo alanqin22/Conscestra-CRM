@@ -505,14 +505,20 @@ is active, the database layer refuses every general query outright — the
 caller can only reach explicitly account-scoped lookups, and the tier is
 decided by deterministic code before any language model runs.
 
-An optional real-time mode (off by default) takes the same line further:
-audio streams both ways over the carrier's WebSocket, speech is recognized
-as the caller finishes a sentence, replies are synthesized in a natural
-voice, and the caller can **interrupt the agent mid-sentence** and be heard.
-Same brain, same tiers, same audit trail. It is a deliberate switch rather
-than the default, because the streaming path and the turn-based path are
-genuinely different call flows — the multilingual and takeover behavior
-below belongs to the turn-based one.
+A real-time mode takes the same line further: audio streams both ways over
+the carrier's WebSocket, speech is recognized as the caller finishes a
+sentence, replies are synthesized in a natural voice, and the caller can
+**interrupt the agent mid-sentence** and be heard. Same brain, same tiers,
+same audit trail — and now the same four languages, the same keypad menu and
+the same live handover to a person, so choosing the faster call flow no
+longer costs a caller anything.
+
+The line waits for a **finished thought**, not merely for silence. Ordinary
+speech has pauses in it — *"tell me… the refund policy"* — and a pause is not
+the end of a question. If the rest of a sentence arrives while an answer is
+already being composed, the half-formed reply is abandoned and the two halves
+are rejoined, so the caller is answered once, on what they actually asked,
+rather than twice on fragments of it.
 
 The line also **senses how a call felt**, not just what was said: a caller
 who repeatedly talks over the agent or speaks fast and long reads as urgent,
@@ -536,12 +542,36 @@ detecting the language from the transcript is circular — the words come back
 already filtered through the wrong language. Text channels can detect
 silently because the customer's own characters arrive intact. Voice cannot,
 so it asks. Once chosen, the choice holds for the whole call; an unclear
-"okay" never flips the accent mid-sentence.
+"okay" never flips the accent mid-sentence. The keypad is what makes that
+work at all: a tone carries no accent, so it is understood even while the
+recognizer is still committed to the wrong language — which is precisely the
+moment a caller needs to be understood.
+
+There is one exception, and it is the honest one. If the assistant answers in
+a language the caller did not declare — someone asks *in English* whether it
+speaks Mandarin, and it replies in Mandarin — the voice follows **the words
+being spoken**, not the question that prompted them. An English engine
+reading Chinese characters is the same broken half-switch in a different
+disguise, and it is not fixed by asking the caller again.
+
+Nothing here is a translation layer. The knowledge base is written once, in
+English, and a Mandarin question reaches the English article that answers it
+because retrieval compares **meaning**, not words. Approve an article once
+and it serves all four languages the same minute.
 
 When a human takes the call over from the console, the AI **stands down** —
 it stops answering, plays a hold message in the caller's language, and keeps
 the line open for the person joining. The customer is never talking to two
 agents at once.
+
+And when a caller simply asks for a person, they get one. Inside business
+hours the call is **transferred to a real phone** and rings until it is
+answered; the person picking up hears who is calling before the lines join,
+so a transfer never arrives as an unexplained call. Outside those hours — or
+if nobody answers — the promise does not evaporate into a sentence. It
+becomes a **callback obligation with an owner**, recorded against the
+customer, because a line that offers a human and then quietly hangs up is
+worse than one that never offered.
 
 **Every call is a conversation with the whole CRM, in the caller's own
 language, on exactly the terms each caller has earned.**

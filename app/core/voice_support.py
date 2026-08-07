@@ -465,15 +465,23 @@ _LINES: Dict[str, Dict[str, str]] = {
     # the streaming transport exists to win. The sentence that was dropped
     # ("if you ask about your account I'll verify you first") was redundant:
     # _kb_answer already appends exactly that as `hint` on the first answer.
+    # The opening a caller hears before any language is chosen, so it names
+    # the assistant and the languages on offer. The non-English versions are
+    # only reached AFTER a language is selected, where re-listing the choices
+    # would be noise — they stay short and just get out of the way.
     "greeting": {
-        "en": "Hi, you've reached Conscestra customer support. How can I help?",
-        "fr": "Bonjour, vous avez joint le service client de Conscestra. "
-              "Comment puis-je vous aider ?",
-        "es": "Hola, ha contactado con el servicio de atención al cliente de "
-              "Conscestra. ¿En qué puedo ayudarle?",
-        "de": "Hallo, Sie haben den Conscestra-Kundenservice erreicht. Wie "
-              "kann ich helfen?",
-        "zh": "您好，这里是 Conscestra 客户服务。请问有什么可以帮您？",
+        "en": "Thank you for calling Conscestra Support. I'm Sarah, your AI "
+              "support assistant. I can help you with Conscestra products and "
+              "services in English, French, Mandarin, or Spanish. How may I "
+              "help you today?",
+        "fr": "Merci d'appeler le service client de Conscestra. Je suis Sarah, "
+              "votre assistante IA. Comment puis-je vous aider aujourd'hui ?",
+        "es": "Gracias por llamar al servicio de atención al cliente de "
+              "Conscestra. Soy Sarah, su asistente de IA. ¿En qué puedo "
+              "ayudarle hoy?",
+        "de": "Danke für Ihren Anruf beim Conscestra-Kundenservice. Ich bin "
+              "Sarah, Ihre KI-Assistentin. Wie kann ich Ihnen heute helfen?",
+        "zh": "您好，感谢您致电 Conscestra 客户服务。请问有什么可以帮您？",
     },
     # Said once, then the call ENDS. A support line that cannot hear the caller
     # must hang up and say so; the alternative it replaced was repeating
@@ -886,7 +894,11 @@ def _gather_digits(prompt_inner: str) -> str:
 # LEVEL 0 — KB-grounded wording (no tools, no CRM; script fallback)
 # ============================================================================
 
-def _kb_answer(sess: Dict[str, Any], heard: str) -> str:
+def _kb_answer(sess: Dict[str, Any], heard: str,
+               audience: Optional[str] = "public") -> str:
+    """audience=None lets the OPERATOR tier see internal articles too — staff
+    on a known number are the audience that tier exists for. Customer-facing
+    callers keep the public tier, which is the reach invariant."""
     lang = _lang_of(sess)
     hint = "" if sess["asked_hint"] else _line("hint", lang)
     sess["asked_hint"] = True
@@ -903,7 +915,8 @@ def _kb_answer(sess: Dict[str, Any], heard: str) -> str:
         # question next to the English article that answers it. A translation
         # hop would buy no recall and would add a whole LLM round trip to the
         # one turn where the caller is listening to silence.
-        kb = knowledge.rag_block("", heard, gap_channel="voice")
+        kb = knowledge.rag_block("", heard, gap_channel="voice",
+                                 audience=audience)
         resp = _get_llm(tier="lite").invoke(
             [
                 {"role": "system", "content":
@@ -954,7 +967,29 @@ async def _operator_answer(sess: Dict[str, Any], heard: str) -> str:
     if _SMS_FOLLOWUP_RE.match(heard or "") and sess.get("last_agent"):
         path = sess["last_agent"]
     else:
-        path = (await aroute(heard)).endpoint
+        decision = await aroute(heard)
+        # ── Knowledge questions do not belong to any record agent ───────────
+        # This tier routed EVERY question into the CRM, so "what is our return
+        # and refund policy" was handed to the activities agent and came back
+        # as accounts-receivable exposure — confidently, and after 26 seconds
+        # of stored-procedure work. Staff ask published-policy questions at
+        # least as often as customers do, and the KB is where those answers
+        # live.
+        #
+        # The router already tells us when it is guessing: `via == "keyword"`
+        # means the LLM would not name an agent above INTENT_LLM_MIN and we
+        # fell back to word matching. Use its own hedge as the trigger rather
+        # than inventing a second classifier, and only spend the retrieval
+        # when it fires — a confident CRM route is untouched and unslowed.
+        if decision.via == "keyword":
+            from app.core import knowledge
+            hits = await asyncio.to_thread(knowledge.retrieve, "", heard, None)
+            if hits:
+                logger.info(f"[voice] operator asked a knowledge question "
+                            f"(router hedged) — answering from the KB: "
+                            f"{heard[:60]!r}")
+                return await asyncio.to_thread(_kb_answer, sess, heard, None)
+        path = decision.endpoint
         sess["last_agent"] = path
     logger.info(f"[voice] operator call from {sess['from']} → {path}")
     try:
@@ -973,7 +1008,16 @@ async def _operator_answer(sess: Dict[str, Any], heard: str) -> str:
         if "read-only" in detail.lower():
             return ("I can look things up by phone, but I can't create, edit "
                     "or delete records here — use the web app for changes.")
-        return "Nothing came back from the CRM for that — try rephrasing?"
+        # The CRM had nothing, but the question may not have been a CRM
+        # question at all. This tier routes STRAIGHT to the record agents and
+        # never consulted the knowledge base, so an operator asking "what's our
+        # return policy" — a question every other tier answers — got "nothing
+        # came back". Staff know less about the published policies than
+        # customers do, not more, so falling back to the KB here is the
+        # obvious behaviour, not a special case.
+        logger.info(f"[voice] operator question had no CRM answer — trying the "
+                    f"knowledge base: {heard[:60]!r}")
+        return await asyncio.to_thread(_kb_answer, sess, heard, None)
     if raw.lstrip().startswith("### ERROR") or "Validation failed for sp_" in raw:
         logger.warning(f"[voice] agent error for {sess['from']}: {raw[:200]}")
         return ("That didn't come back cleanly — try asking with a name, for "
@@ -1581,11 +1625,19 @@ public_router = APIRouter(tags=["voice-support-public"])
 
 
 def _greeting(sess: Dict[str, Any], lang: str = "en") -> str:
-    if sess["tier"] == "operator":
-        # Operators are our own staff on a known number — the internal line
-        # stays English deliberately, and never sees the language menu.
-        return ("Hello — operator line. Ask me anything in the CRM; "
-                "lookups only, no changes by phone.")
+    """The same welcome for every caller.
+
+    The operator tier used to answer with its own terse, English-only line.
+    That was a mistake twice over. A greeting's job — say who you reached,
+    invite them to speak — is identical whether the caller is staff or a
+    customer; the tier governs what the agent may DO, not how it says hello.
+    And because the two greetings lived in different branches, every change to
+    the customer welcome silently missed the internal one, so a caller on a
+    staff number kept hearing wording that had already been replaced.
+
+    The operator tier keeps everything that actually distinguishes it: live
+    CRM reach, no OTP, and the write restriction stated in plain words at the
+    moment someone tries to change something."""
     return _line("greeting", lang)
 
 
@@ -1630,6 +1682,54 @@ async def take_turn(call_sid: str, heard: str) -> Tuple[str, str]:
         sess["transcript"].append(("agent", bye))
         _close_call(sess, "max turns reached")
         return bye, "hangup"
+    # ── "I'd like to talk to a person" ──────────────────────────────────────
+    # Checked BEFORE the tier ladder: once the caller has asked for a human,
+    # an answer — however good — is the wrong response.
+    #
+    # This whole feature LIVED here (transfer_window, dial_twiml,
+    # transfer_message, open_callback_obligation are all defined in this file)
+    # and was only ever CALLED from sdr.py. So the support line owned the
+    # transfer code and never ran it: pointing the number at /voice/support
+    # silently dropped human transfer, and every VOICE_TRANSFER_* setting
+    # stopped having any effect on the line that answers.
+    #
+    # Detection reuses U1's escalation.detect() rather than a second regex,
+    # because two detectors for the same intent drift and the weaker one wins.
+    if not sess.get("transfer_tried"):
+        try:
+            from app.core import escalation
+            if escalation.detect(heard) == "customer_requested_human":
+                sess["transfer_tried"] = True
+                window = transfer_window()
+                logger.info(f"[voice] call {call_sid[:8]} asked for a human — "
+                            f"window open={window['open']} "
+                            f"({window.get('reason') or window.get('local_time')})")
+                if window["open"]:
+                    sess["transcript"].append(
+                        ("agent", _CONNECTING.get(lang, _CONNECTING["en"])))
+                    return "", "dial"          # the transport places the call
+                # Closed, unconfigured or disabled: say when we open, and make
+                # the callback an obligation with an owner rather than a
+                # sentence that evaporates when the call ends.
+                spoken = transfer_message(lang, window)
+                sess["transcript"].append(("agent", spoken))
+                try:
+                    from app.core import channel_adapters
+                    conv = channel_adapters.capture_voice(
+                        sess.get("from") or f"session:{call_sid}",
+                        f"caller: {heard}\nagent: {spoken}")
+                    conv_id = (conv or {}).get("conversation_id")
+                except Exception:
+                    conv_id = None
+                open_callback_obligation(
+                    conversation_id=conv_id, handle=sess.get("from"),
+                    channel="voice", heard=heard, window=window)
+                _close_call(sess, "caller asked for a human, outside hours")
+                return spoken, "hangup"
+        except Exception as exc:
+            logger.error(f"[voice] transfer check failed, continuing with the "
+                         f"AI: {exc}")
+
     if _BYE_RE.search(heard):
         bye = _line("bye", lang)
         sess["transcript"].append(("agent", bye))
@@ -1695,7 +1795,8 @@ async def _verified(request: Request) -> Optional[Dict[str, str]]:
     return await telephony.verified_form(request)
 
 
-def _next_twiml(say: str, nxt: str, lang: str = "en") -> Response:
+def _next_twiml(say: str, nxt: str, lang: str = "en",
+                caller: str = "") -> Response:
     """Map a brain decision to Gather-transport TwiML, in the caller's
     language. Recognition language and TTS voice are switched TOGETHER —
     switching one without the other is worse than switching neither."""
@@ -1703,6 +1804,11 @@ def _next_twiml(say: str, nxt: str, lang: str = "en") -> Response:
         return _twiml(_say(say, lang) + "<Hangup/>")
     if nxt == "digits":
         return _twiml(_gather_digits(_say(say, lang)))
+    if nxt == "dial":
+        # dial_twiml speaks its own "connecting you now" line, so `say` is
+        # deliberately unused here.
+        return _twiml(dial_twiml(lang, "/voice/support/transfer-result",
+                                 caller=caller))
     return _twiml(_gather_speech(_say(say, lang), lang))
 
 
@@ -1732,7 +1838,11 @@ async def voice_support_inbound(request: Request):
     sess = open_call(call_sid, from_number)
     greet = _greeting(sess, _lang_of(sess))
     sess["transcript"].append(("agent", greet))
-    if LANG_MENU and VOICE_MULTILINGUAL and sess["tier"] != "operator":
+    # Offered to every caller, including staff: the greeting now promises four
+    # languages, so withholding the menu from one tier would promise something
+    # that tier cannot take up. A caller who wants none of it talks straight
+    # over it — the Gather accepts speech and DTMF at once.
+    if LANG_MENU and VOICE_MULTILINGUAL:
         # Greeting INSIDE the menu Gather, options after it, then fall through
         # to an ordinary speech Gather with no further prompt — the greeting
         # already ended with "How can I help?", so nothing more is spoken and
@@ -1827,7 +1937,54 @@ async def voice_support_turn(request: Request):
     # is already decided — read it, don't re-detect. (It was detected HERE,
     # after the reply was built, which is why every fixed line in that reply
     # was chosen with the language still unknown.)
-    return _next_twiml(say, nxt, _lang_of(_CALLS.get(call_sid)))
+    return _next_twiml(say, nxt, _lang_of(_CALLS.get(call_sid)),
+                       caller=(_CALLS.get(call_sid) or {}).get('from', ''))
+
+
+@public_router.post("/voice/support/transfer-result")
+async def voice_support_transfer_result(request: Request):
+    """Where <Dial> lands when the human's phone stops ringing.
+
+    'completed' means the two of them spoke and there is nothing left to do.
+    Anything else — no answer, busy, failed — means we offered a person and
+    did not produce one, so it degrades to the same tracked callback as
+    calling out of hours. An unanswered transfer must never be a silent
+    disconnect: that is worse than never having offered."""
+    params = await _verified(request)
+    if params is None:
+        return Response("invalid signature", status_code=403)
+    call_sid = params.get("CallSid") or ""
+    sess = _CALLS.get(call_sid) or {}
+    lang = _lang_of(sess)
+    status = (params.get("DialCallStatus") or params.get("dial_call_status")
+              or "").strip().lower()
+    if status in ("completed", "answered"):
+        logger.info(f"[voice] call {call_sid[:8]} transfer {status}")
+        if sess:
+            _close_call(sess, f"transferred to a human ({status})")
+        return _twiml("<Hangup/>")
+
+    window = transfer_window()
+    logger.info(f"[voice] call {call_sid[:8]} transfer not connected "
+                f"(DialCallStatus={status!r}) — taking a message")
+    apology = no_answer_message(lang, window)
+    conv_id = None
+    if sess:
+        sess["transcript"].append(("agent", apology))
+    try:
+        from app.core import channel_adapters
+        conv = channel_adapters.capture_voice(
+            sess.get("from") or f"session:{call_sid}",
+            f"agent: {apology}")
+        conv_id = (conv or {}).get("conversation_id")
+    except Exception:
+        pass
+    open_callback_obligation(
+        conversation_id=conv_id, handle=sess.get("from"), channel="voice",
+        heard=f"transfer unanswered ({status or 'unknown'})", window=window)
+    if sess:
+        _close_call(sess, "transfer unanswered — callback owed")
+    return _twiml(_say(apology, lang) + "<Hangup/>")
 
 
 @public_router.post("/voice/support/verify")
@@ -1844,7 +2001,8 @@ async def voice_support_verify(request: Request):
     # so a Mandarin caller who asked about their account dropped back to an
     # English voice AND an en-US recogniser for the rest of the call — the
     # sticky-language guarantee silently broken by an omitted argument.
-    return _next_twiml(say, nxt, _lang_of(_CALLS.get(call_sid)))
+    return _next_twiml(say, nxt, _lang_of(_CALLS.get(call_sid)),
+                       caller=(_CALLS.get(call_sid) or {}).get('from', ''))
 
 
 # ============================================================================

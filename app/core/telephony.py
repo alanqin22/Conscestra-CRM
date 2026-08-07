@@ -23,6 +23,23 @@ signatures, and a TeXML application + webhook URL for calls. Everything above
 the adapter (governance, critic checks, activity logging, KB-grounded
 replies, PII masking, the SDR loop) is provider-agnostic and unchanged.
 
+NAMING — "TwiML" here does NOT mean "Twilio only". Telnyx TeXML is deliberately
+Twilio-compatible XML: the same <Say>/<Gather>/<Dial>/<Connect> verbs, the same
+form-encoded callbacks, the same parameter names (CallSid, From, SpeechResult).
+So helpers named *twiml* (`_twiml_escape`, `_say_document`, `_next_twiml`) build
+the documents BOTH carriers consume, and they are on the live path for Telnyx
+users. Do not read the name as dead Twilio code and delete it.
+
+The differences that DO matter are per-carrier and are marked at each site:
+Telnyx needs a numeric `speechTimeout` (it rejects "auto"), and bidirectional
+`<Stream>` needs `bidirectionalMode`/`bidirectionalCodec`, which are Telnyx
+attributes Twilio does not define. Both are gated on `_provider()`.
+
+An XML rule bites regardless of carrier: attribute values must be escaped. A
+URL with a query string carries a bare `&`, which is not legal XML, and an
+unescaped one makes the whole document unparseable — the carrier rejects the
+response and the call fails in a way that looks like a network problem.
+
 TRIAL NOTES: a Twilio trial only reaches VERIFIED numbers and prefixes
 messages with "Sent from your Twilio trial account". A funded Telnyx account
 reaches any number. Rotate secrets after sharing them anywhere.
@@ -37,7 +54,10 @@ KB-grounded, PII-masked customer reply that never touches the database.
 Empty allowlist (the default) = nobody gets CRM data — KB for all.
 
 CONFIG (env)
-  TELEPHONY_PROVIDER   twilio   twilio | telnyx (which carrier is live)
+  TELEPHONY_PROVIDER   telnyx   telnyx | twilio (which carrier is live).
+                                An unrecognised value is logged at ERROR and
+                                falls back to the default rather than being
+                                silently treated as the other carrier.
   SMS_AUTOSEND    0   1 = really send SMS/calls; else draft as owner tasks
   SMS_AUTOREPLY   1   inbound webhook replies with the LLM/KB answer
   SMS_OPERATOR_NUMBERS  ''  comma-separated E.164 staff numbers that may
@@ -85,8 +105,39 @@ def _flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+_PROVIDERS = ("telnyx", "twilio")
+_DEFAULT_PROVIDER = "telnyx"
+_provider_warned: set = set()      # warn once per bad value, not once per call
+
+
 def _provider() -> str:
-    return os.getenv("TELEPHONY_PROVIDER", "twilio").strip().lower()
+    """Which carrier is live. Defaults to Telnyx, and says so when the value
+    is missing or unrecognised.
+
+    This defaulted to "twilio", which made an absent or misspelled
+    TELEPHONY_PROVIDER fail in three silent ways at once on a Telnyx account:
+    webhook signatures verified with Twilio's HMAC (so every carrier request
+    401s), no sender number (the Twilio branch reads TWILIO_FROM_NUMBER), and
+    speechTimeout="auto", which Telnyx rejects so the Gather never completes.
+    None of those announce themselves — the phone line simply stops working.
+
+    A default cannot prevent a typo, so an unrecognised value is logged at
+    ERROR rather than quietly treated as Twilio. _provider() is called on
+    every TeXML build, so the warning is emitted once per distinct value."""
+    raw = os.getenv("TELEPHONY_PROVIDER", "").strip().lower()
+    if not raw:
+        return _DEFAULT_PROVIDER
+    if raw not in _PROVIDERS:
+        if raw not in _provider_warned:
+            _provider_warned.add(raw)
+            logger.error(
+                "[telephony] TELEPHONY_PROVIDER=%r is not one of %s — using "
+                "%r. Fix the variable: a wrong carrier means webhook "
+                "signatures, sender numbers and speech timeouts are all "
+                "chosen for the wrong provider.",
+                raw, "/".join(_PROVIDERS), _DEFAULT_PROVIDER)
+        return _DEFAULT_PROVIDER
+    return raw
 
 
 # ── Twilio creds ──
@@ -359,6 +410,47 @@ def send_sms(to: str, body: str, *, lead_id=None, account_id=None,
     return {"ok": True, "sent": True, "to": to_n, "sid": sid,
             "status": (payload.get("data") or {}).get("status") if prov == "telnyx"
                       else payload.get("status")}
+
+
+def transfer_call(call_control_id: str, to: str, from_number: str = "",
+                  timeout_secs: int = 25) -> Dict[str, Any]:
+    """Transfer a LIVE call to another number via Telnyx Call Control.
+
+    The <Dial> verb is a TeXML answer to a webhook, and a media-stream call has
+    no webhook left to answer — the carrier is holding a WebSocket open, not
+    waiting for XML. So the streaming transport cannot transfer the way the
+    Gather transport does, and without this a caller on the streaming path who
+    asked for a person simply could not be given one.
+
+    `call_control_id` arrives in the stream's `start` event. Returns
+    {"ok": bool, ...}; never raises, because failing to transfer must degrade
+    to taking a message rather than dropping the call."""
+    key = _telnyx_key()
+    if not key:
+        return {"ok": False, "error": "TELNYX_API_KEY not set"}
+    if not call_control_id:
+        return {"ok": False, "error": "no call_control_id for this call"}
+    to_n = normalize_phone(to) or to
+    body: Dict[str, Any] = {"to": to_n, "timeout_secs": int(timeout_secs)}
+    frm = normalize_phone(from_number) if from_number else ""
+    if frm:
+        body["from"] = frm
+    try:
+        import requests
+        r = requests.post(
+            f"{_TELNYX_API}/calls/{call_control_id}/actions/transfer",
+            headers={"Authorization": f"Bearer {key}"},
+            json=body, timeout=15)
+        if r.status_code >= 300:
+            logger.warning(f"[telephony] transfer failed {r.status_code}: "
+                           f"{r.text[:200]}")
+            return {"ok": False, "error": f"HTTP {r.status_code}",
+                    "detail": r.text[:300]}
+        logger.info(f"[telephony] transferred call to {to_n}")
+        return {"ok": True, "to": to_n}
+    except Exception as exc:
+        logger.warning(f"[telephony] transfer error: {exc}")
+        return {"ok": False, "error": str(exc)[:200]}
 
 
 def _twiml_escape(s: str) -> str:
