@@ -7,7 +7,7 @@ sdr's state machine), the signature-verified webhooks, the OTP flow and the
 customer-scope security model are all unchanged:
 
     carrier ──<Connect><Stream>──►  WS /voice/stream/{line}?sid&frm&t
-        8 kHz μ-law frames in  ──►  VAD (energy, ~650 ms end-of-speech)
+        8 kHz μ-law frames in  ──►  VAD (energy, ~900 ms end-of-speech)
         utterance WAV          ──►  STT   Azure REST (short-audio) →
                                           OpenAI Whisper fallback
         text                   ──►  the SAME brain (support | sdr)
@@ -34,8 +34,19 @@ CONFIG (env)
   VOICE_STREAM_PUBLIC_BASE  ''    public https base for the wss URL
                                   (falls back to TELNYX_PUBLIC_BASE/APP_URL)
   VOICE_STREAM_VAD_RMS      300   speech energy threshold (16-bit RMS)
-  VOICE_STREAM_SILENCE_MS   650   end-of-utterance silence
-  VOICE_TTS_VOICE           en-US-JennyNeural   Azure neural voice
+  VOICE_STREAM_SILENCE_MS   900   end-of-utterance silence
+  VOICE_STREAM_PLAY_LEAD    0.85  outbound pacing, as a fraction of real time
+  VOICE_STREAM_BIDI_MODE    rtp   Telnyx <Stream> playback format (rtp | mp3)
+  VOICE_STREAM_BIDI_CODEC   PCMU  playback codec (rtp mode only)
+  VOICE_TTS_VOICE           en-US-JennyNeural   Azure neural voice (English)
+  VOICE_TTS_VOICE_FR/ZH/ES/DE     per-language Azure voices
+
+LANGUAGE: recognition locale and TTS voice switch TOGETHER (_AZURE_BY_LANG),
+and the choice is pushed into the BRAIN's session too, so the words, the voice
+that speaks them and the recogniser that hears the reply all agree. The caller
+picks with the keypad — accepted at any point in the call, not just during the
+opening menu, because DTMF still works when the recogniser is on the wrong
+language, which is precisely when they need it.
 """
 
 from __future__ import annotations
@@ -76,14 +87,104 @@ def _flag(name: str, default: str = "0") -> bool:
 
 ENABLED = _flag("VOICE_STREAM_ENABLED") and audioop is not None
 VAD_RMS = int(os.getenv("VOICE_STREAM_VAD_RMS", "300"))
-SILENCE_MS = int(os.getenv("VOICE_STREAM_SILENCE_MS", "650"))
+# End-of-utterance silence. 650 ms cut people off mid-sentence: natural speech
+# has pauses ("tell me … the refund policy", "can you, uh, …"), and every pause
+# longer than this ended the utterance and started a new one. The evidence was
+# in the transcripts — a caller asking about the refund policy reached the
+# brain as "Tell me." Raising it costs a little response latency on every turn
+# and buys back the second half of the question, which is a good trade.
+SILENCE_MS = int(os.getenv("VOICE_STREAM_SILENCE_MS", "900"))
 TTS_VOICE = os.getenv("VOICE_TTS_VOICE", "en-US-JennyNeural").strip()
+
+# ── Language, on the streaming path ─────────────────────────────────────────
+# The <Gather> path switches recognition language and TTS voice together; this
+# path did neither — STT was pinned to en-US and TTS to one English voice — so
+# turning streaming on silently made a four-language line English-only. Both
+# halves move together here for the same reason they do there: an English
+# recogniser on Mandarin audio returns confident nonsense.
+#
+# (recognition locale, Azure neural voice). English keeps JennyNeural, the
+# voice already in use, so enabling this changes nothing for English callers.
+_AZURE_BY_LANG = {
+    "en": ("en-US", TTS_VOICE or "en-US-JennyNeural"),
+    "fr": ("fr-CA", os.getenv("VOICE_TTS_VOICE_FR", "fr-CA-SylvieNeural")),
+    "zh": ("zh-CN", os.getenv("VOICE_TTS_VOICE_ZH", "zh-CN-XiaoxiaoNeural")),
+    "es": ("es-MX", os.getenv("VOICE_TTS_VOICE_ES", "es-MX-DaliaNeural")),
+    "de": ("de-DE", os.getenv("VOICE_TTS_VOICE_DE", "de-DE-KatjaNeural")),
+}
+
+
+def _azure_pair(lang: str) -> Tuple[str, str]:
+    return _AZURE_BY_LANG.get(lang or "en", _AZURE_BY_LANG["en"])
+
+
+# The opening keypad menu, and the confirmation after a choice. Each line is
+# spoken by ITS OWN language's voice — an English engine reading "中文服务，
+# 请按 3" is unintelligible to the one caller who needs that option.
+# Deliberately terse. The full-sentence version of these four options ran 10.4
+# seconds, on top of an 11-second greeting — 22 seconds before the caller could
+# say anything, which gives back exactly the latency this transport buys. Every
+# option still names its language in its own language, which is the part that
+# has to survive: it is the only cue a caller who speaks no English can use.
+_MENU_PROMPT = {
+    "en": "English, press 1.",
+    "fr": "Français, 2.",
+    "zh": "中文，3。",
+    "es": "Español, 4.",
+}
+_RETRY = {
+    "en": "Sorry, I didn't catch that. Could you say it again?",
+    "fr": "Désolé, je n'ai pas bien entendu. Pouvez-vous répéter ?",
+    "zh": "抱歉，我没有听清楚。您可以再说一遍吗？",
+    "es": "Perdón, no le entendí. ¿Puede repetirlo?",
+    "de": "Entschuldigung, das habe ich nicht verstanden.",
+}
+_SWITCHED = {
+    "en": "Great — how can I help you today?",
+    "fr": "Parfait — comment puis-je vous aider ?",
+    "zh": "好的，请问有什么可以帮您？",
+    "es": "Perfecto — ¿en qué puedo ayudarle?",
+    "de": "Gut — wie kann ich Ihnen helfen?",
+}
+# Synthesized once per process, not per call: four TTS round trips at the top
+# of every call would hand back the latency this transport exists to remove.
+_MENU_AUDIO: Optional[bytes] = None
+
+
+def menu_audio() -> bytes:
+    """μ-law of the four options, each in its own voice, concatenated.
+
+    Concatenation is valid because every clip is the same format (8 kHz mono
+    μ-law), so the bytes simply play in sequence."""
+    global _MENU_AUDIO
+    if _MENU_AUDIO is None:
+        parts = []
+        for code in ("en", "fr", "zh", "es"):
+            clip = synthesize(_MENU_PROMPT[code], code)
+            if clip:
+                parts.append(clip)
+        _MENU_AUDIO = b"".join(parts)
+        logger.info(f"[stream] language menu cached ({len(_MENU_AUDIO)} bytes, "
+                    f"{len(_MENU_AUDIO) / 8000:.1f}s)")
+    return _MENU_AUDIO
+
+# Telnyx <Stream> playback format. These must describe the bytes synthesize()
+# returns; a mismatch is SILENT — the carrier drops the frames and the caller
+# just hears nothing. Overridable so a codec change is config, not a deploy.
+BIDI_MODE = os.getenv("VOICE_STREAM_BIDI_MODE", "rtp").strip()
+BIDI_CODEC = os.getenv("VOICE_STREAM_BIDI_CODEC", "PCMU").strip()
+BIDI_RATE = os.getenv("VOICE_STREAM_BIDI_RATE", "8000").strip()
 
 _FRAME_MS = 20                # carrier frames are 20 ms of 8 kHz μ-law
 _MAX_UTTER_MS = 25_000        # hard cap per utterance
 _MIN_UTTER_MS = 240           # shorter than this = noise blip, not speech
 _START_FRAMES = 2             # voiced frames before "speech started"
 _CHUNK_BYTES = 3200           # 400 ms per outbound media message
+_CHUNK_SECS = _CHUNK_BYTES / 8000.0        # μ-law 8 kHz = 8000 bytes/second
+# Fraction of real time to sleep between chunks. <1 keeps a small lead so the
+# carrier never starves; the smaller the lead, the less audio is buffered
+# ahead and the sooner a barge-in actually goes quiet.
+_PLAY_LEAD = float(os.getenv("VOICE_STREAM_PLAY_LEAD", "0.85"))
 _STT_TIMEOUT = 20.0
 _TTS_TIMEOUT = 20.0
 
@@ -136,10 +237,37 @@ def stream_twiml(line: str, call_sid: str, from_number: str) -> Optional[str]:
     if not base:
         return None
     from urllib.parse import quote
+
+    from app.core.telephony import _provider, _twiml_escape
     url = (f"{base}/voice/stream/{line}?sid={quote(call_sid)}"
            f"&frm={quote(from_number)}"
            f"&t={stream_token(line, call_sid, from_number)}")
-    return f'<Connect><Stream url="{url}"/></Connect>'
+    # ── Bidirectional playback ──────────────────────────────────────────────
+    # Telnyx will happily fork the caller's audio TO us with no extra
+    # attributes, which is why inbound worked (speech arrived, STT ran) while
+    # the caller heard nothing at all: bidirectionalMode defaults to "mp3", and
+    # we send raw base64 PCMU μ-law. Telnyx discarded every outbound frame as
+    # malformed MP3 — silently, because a stream that plays nothing is not an
+    # error from the carrier's point of view. "rtp" is the mode that matches
+    # what synthesize() actually produces (PCMU, 8 kHz — both Telnyx defaults,
+    # sent explicitly so a default change cannot silence the line again).
+    #
+    # Telnyx-only: these attributes are not part of Twilio's <Stream>, so they
+    # are emitted only for the provider that defines them.
+    extra = ""
+    if _provider() == "telnyx":
+        extra = (f' bidirectionalMode="{BIDI_MODE}"'
+                 f' bidirectionalCodec="{BIDI_CODEC}"'
+                 f' bidirectionalSamplingRate="{BIDI_RATE}"')
+
+    # XML-escape the URL before it goes into an ATTRIBUTE. A query string has
+    # a bare '&' between parameters, and a bare '&' is not legal XML — so this
+    # document did not parse AT ALL, and the carrier rejected the whole
+    # response rather than dialling the stream. That is indistinguishable, from
+    # the outside, from "the carrier cannot reach the server": the call fails
+    # the moment streaming is enabled and works again the moment it is turned
+    # off, because the <Gather> fallback path builds no query string.
+    return f'<Connect><Stream url="{_twiml_escape(url)}"{extra}/></Connect>'
 
 
 # ============================================================================
@@ -185,14 +313,14 @@ def _azure_key_region() -> Tuple[str, str]:
             getattr(s, "azure_speech_region", "") or "eastus")
 
 
-def _stt_azure(wav: bytes) -> Optional[str]:
+def _stt_azure(wav: bytes, lang: str = "en") -> Optional[str]:
     key, region = _azure_key_region()
     if not key:
         return None
     r = httpx.post(
         f"https://{region}.stt.speech.microsoft.com/speech/recognition/"
         "conversation/cognitiveservices/v1",
-        params={"language": "en-US", "format": "simple"},
+        params={"language": _azure_pair(lang)[0], "format": "simple"},
         headers={"Ocp-Apim-Subscription-Key": key,
                  "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=8000"},
         content=wav, timeout=_STT_TIMEOUT)
@@ -203,33 +331,36 @@ def _stt_azure(wav: bytes) -> Optional[str]:
     return (j.get("DisplayText") or "").strip()
 
 
-def _stt_whisper(wav: bytes) -> Optional[str]:
+def _stt_whisper(wav: bytes, lang: str = "en") -> Optional[str]:
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
         return None
     r = httpx.post(
         "https://api.openai.com/v1/audio/transcriptions",
         headers={"Authorization": f"Bearer {key}"},
-        data={"model": "whisper-1", "language": "en"},
+        # Was pinned to "en", so the fallback transcriber ALSO could not hear
+        # any other language — a second English-only choke point behind the
+        # first. Whisper takes a bare ISO-639-1 code, not Azure's locale.
+        data={"model": "whisper-1", "language": (lang or "en")[:2]},
         files={"file": ("utterance.wav", wav, "audio/wav")},
         timeout=_STT_TIMEOUT)
     r.raise_for_status()
     return (r.json().get("text") or "").strip()
 
 
-def transcribe(pcm16_8k: bytes) -> str:
+def transcribe(pcm16_8k: bytes, lang: str = "en") -> str:
     """Utterance PCM → text ('' when nothing recognizable). Azure first,
     Whisper fallback — mirrors the ddgs→Tavily pattern: never raises."""
     wav = wav_from_pcm16(pcm16_8k)
     try:
-        text = _stt_azure(wav)
+        text = _stt_azure(wav, lang)
         if text is not None:
             _stats["stt_azure"] += 1
             return text
     except Exception as exc:
         logger.warning(f"[stream] azure STT failed: {exc}")
     try:
-        text = _stt_whisper(wav)
+        text = _stt_whisper(wav, lang)
         if text is not None:
             _stats["stt_whisper"] += 1
             return text
@@ -243,12 +374,13 @@ def transcribe(pcm16_8k: bytes) -> str:
 # TTS — Azure REST emits 8 kHz μ-law natively; OpenAI PCM fallback
 # ============================================================================
 
-def _tts_azure(text: str) -> Optional[bytes]:
+def _tts_azure(text: str, lang: str = "en") -> Optional[bytes]:
     key, region = _azure_key_region()
     if not key:
         return None
-    ssml = (f'<speak version="1.0" xml:lang="en-US">'
-            f'<voice name="{TTS_VOICE}">'
+    locale, voice = _azure_pair(lang)
+    ssml = (f'<speak version="1.0" xml:lang="{locale}">'
+            f'<voice name="{voice}">'
             + (text.replace("&", "&amp;").replace("<", "&lt;")
                    .replace(">", "&gt;"))
             + "</voice></speak>")
@@ -277,14 +409,14 @@ def _tts_openai(text: str) -> Optional[bytes]:
     return pcm16_to_ulaw(resample_pcm16(r.content, 24000, 8000))
 
 
-def synthesize(text: str) -> bytes:
+def synthesize(text: str, lang: str = "en") -> bytes:
     """Reply text → 8 kHz μ-law (b'' on total failure — the call then just
     stays silent for that turn rather than dying)."""
     text = (text or "").strip()
     if not text:
         return b""
     try:
-        audio = _tts_azure(text)
+        audio = _tts_azure(text, lang)
         if audio:
             _stats["tts_azure"] += 1
             return audio
@@ -405,17 +537,54 @@ class _Call:
         self.worker: Optional[asyncio.Task] = None
         self.closing = False
         self.n_barge = 0                    # this call's barge-in count
+        self.epoch = 0                      # bumped whenever the caller speaks
+                                            # — invalidates in-flight synthesis
+        self.lang = "en"                    # recognition + voice move together
+        self.pending = bytearray()          # speech heard while busy (never
+                                            # dropped — see _finish_utterance)
         self.words = 0                      # transcribed words heard
         self.speech_ms = 0.0                # caller speech duration
 
     # ── outbound audio ──────────────────────────────────────────────────────
-    async def say(self, text: str, then_hangup: bool = False) -> None:
-        audio = await asyncio.to_thread(synthesize, text)
+    async def _stop_player(self) -> None:
+        """Cancel the current playback and WAIT for it to actually stop.
+
+        Cancelling without awaiting is not enough: the task keeps running until
+        the event loop next schedules it, and if a second player is created in
+        the meantime BOTH loops send media frames into the same stream. The
+        carrier plays exactly what it receives, so the caller hears two voices
+        talking over each other."""
+        p = self.player
+        self.player = None
+        if p and not p.done():
+            p.cancel()
+            try:
+                await p
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def say(self, text: str, then_hangup: bool = False,
+                  append: bytes = b"") -> None:
+        # Snapshot the interrupt epoch BEFORE synthesis, which is slow enough
+        # (a network round trip) for the caller to start a new sentence inside
+        # it. Without this the reply to the PREVIOUS utterance is played on top
+        # of the reply to the current one — the barge-in cancelled a player
+        # that had not been created yet, so it cancelled nothing.
+        epoch = self.epoch
+        audio = await asyncio.to_thread(synthesize, text, self.lang)
+        if epoch != self.epoch:
+            logger.info(f"[stream] dropped a stale reply for "
+                        f"{self.call_sid[:12]} (caller spoke while it was "
+                        f"being synthesized)")
+            return
         if not audio:
             logger.warning(f"[stream] no TTS audio for {self.call_sid[:12]}")
             if then_hangup:
                 await self._close()
             return
+        if append:
+            audio += append          # same format (8 kHz mono mu-law) -> concat
+        await self._stop_player()       # never two players on one stream
         self.player = asyncio.create_task(self._play(audio, then_hangup))
 
     async def _play(self, ulaw: bytes, then_hangup: bool) -> None:
@@ -425,9 +594,16 @@ class _Call:
                     "event": "media", self.sid_key: self.stream_id,
                     "media": {"payload":
                               base64.b64encode(ulaw[i:i + _CHUNK_BYTES]).decode()}}))
-                # slightly faster than real time; the pause keeps barge-in
-                # cancellation responsive without starving the carrier buffer
-                await asyncio.sleep(0.2)
+                # Pace just under real time. This used to push a 400 ms chunk
+                # every 200 ms — 2x real time — on the theory that running
+                # ahead kept barge-in responsive. It does the opposite: every
+                # chunk sent early is a chunk sitting in the CARRIER's buffer,
+                # and cancelling our sender cannot un-play what the carrier has
+                # already queued. Telnyx documents no "clear" verb (that is a
+                # Twilio convention), so buffered audio is audio the caller
+                # WILL hear after interrupting. A small lead keeps the stream
+                # from starving; anything more just makes barge-in worse.
+                await asyncio.sleep(_CHUNK_SECS * _PLAY_LEAD)
             await self.ws.send_text(json.dumps({
                 "event": "mark", self.sid_key: self.stream_id,
                 "mark": {"name": "eot"}}))
@@ -471,6 +647,11 @@ class _Call:
             self.silent = 0
             if not self.in_speech and self.voiced >= _START_FRAMES:
                 self.in_speech = True
+                # Bump the epoch on EVERY speech start, not only when something
+                # is playing: a reply may be mid-synthesis with no player yet,
+                # and that reply is already stale the moment the caller starts
+                # a new sentence. _barge_in only handles audio already flowing.
+                self.epoch += 1
                 await self._barge_in()          # caller talked over us
             if self.in_speech:
                 self.utter.extend(ulaw_to_pcm16(ulaw))
@@ -492,26 +673,123 @@ class _Call:
         if len(pcm) / 16 < _MIN_UTTER_MS:       # 16 bytes per ms at 8 kHz s16
             return
         if self.worker and not self.worker.done():
-            return                              # one utterance at a time
+            # Do NOT discard what the caller just said. A natural mid-sentence
+            # pause ends one utterance and starts another, and dropping the
+            # second half is why "tell me the refund policy" reached the brain
+            # as "Tell me." — the agent answered the fragment it got, the
+            # caller heard a reply that ignored the question, and the words
+            # carrying the actual question were never transcribed at all.
+            self.pending.extend(pcm)
+            # The reply being composed answers only the fragment, so abandon
+            # it: one question deserves one answer, not a confused reply to
+            # half a sentence followed by the real one. Bumping the epoch also
+            # stops any already-synthesized audio for it from being played.
+            self.epoch += 1
+            self.worker.cancel()
+            logger.info(f"[stream] {self.call_sid[:12]}: sentence continued "
+                        f"after a pause — re-asking with the whole thing")
+            return
+        if self.pending:                        # continuation of a split
+            pcm = bytes(self.pending) + pcm     # sentence — rejoin the halves
+            self.pending.clear()
         _stats["utterances"] += 1
         self.worker = asyncio.create_task(self._respond(pcm))
 
     async def _respond(self, pcm: bytes) -> None:
+        delivered = False
+        try:
+            delivered = await self._respond_once(pcm)
+        finally:
+            # Speech that arrived while this reply was in flight is a real
+            # question waiting for an answer, not noise. Drain it here, once
+            # the caller has stopped talking, so a split sentence still gets
+            # answered instead of vanishing. If this turn was ABANDONED
+            # mid-flight (a continuation arrived), its audio never got an
+            # answer — so put it back in front of the continuation and ask
+            # the whole sentence as one.
+            if self.pending and not self.in_speech and not self.closing:
+                head = b"" if delivered else pcm
+                held = head + bytes(self.pending)
+                self.pending.clear()
+                self.worker = asyncio.create_task(self._respond(held))
+
+    async def _respond_once(self, pcm: bytes) -> bool:
+        """True when a reply was actually handed to the caller."""
         t0 = time.time()
-        heard = await asyncio.to_thread(transcribe, pcm)
+        heard = await asyncio.to_thread(transcribe, pcm, self.lang)
         if not heard:
-            await self.say("Sorry, I didn't catch that. Could you say it again?")
-            return
+            await self.say(_RETRY.get(self.lang, _RETRY["en"]))
+            return True
         self.speech_ms += len(pcm) / 16     # 16 bytes per ms at 8 kHz s16
         self.words += len(heard.split())
         logger.info(f"[stream] {self.line} {self.call_sid[:12]} heard "
                     f"({time.time() - t0:.1f}s): {heard[:80]!r}")
         say, nxt = await _brain_turn(self.line, self.call_sid, heard,
                                      self.from_number)
+        # The brain may have decided the language FROM the caller's words
+        # (voice_support._note_lang / sdr._call_lang), which the keypad never
+        # touched. Adopt it before speaking, or the reply comes back in French
+        # and is read aloud by the English voice — the half-switch this module
+        # exists to prevent, arriving from the brain's side instead of ours.
+        self._adopt_brain_lang()
         self.mode = nxt
         await self.say(say, then_hangup=(nxt == "hangup"))
+        return True
+
+    def _adopt_brain_lang(self) -> None:
+        try:
+            if self.line == "support":
+                from app.core import voice_support as vs
+                code = (vs._CALLS.get(self.call_sid) or {}).get("lang")
+            else:
+                from app.core.sdr import _VOICE_LANG
+                code = _VOICE_LANG.get(self.call_sid)
+        except Exception:
+            return
+        if code and code != self.lang and code in _AZURE_BY_LANG:
+            # set_lang() would write straight back to the brain; harmless, but
+            # this direction is brain -> transport, so only move our half.
+            self.lang = code
+            logger.info(f"[stream] call {self.call_sid[:12]} adopting language "
+                        f"{code} detected from speech")
+
+    def set_lang(self, code: str) -> None:
+        """Pin this call's language and tell the BRAIN about it too.
+
+        The brain composes the words (voice_support reads sess['lang'] to pick
+        its fixed lines and the reply-language directive) while this module
+        speaks and hears them. Setting one without the other gives a Mandarin
+        answer in an English voice, or the reverse."""
+        if code not in _AZURE_BY_LANG or code == self.lang:
+            return
+        self.lang = code
+        try:
+            if self.line == "support":
+                from app.core import voice_support as vs
+                sess = vs._CALLS.get(self.call_sid)
+                if sess is not None:
+                    sess["lang"] = code
+            else:
+                from app.core.sdr import set_call_lang
+                set_call_lang(self.call_sid, code)
+        except Exception as exc:
+            logger.debug(f"[stream] brain language sync skipped: {exc}")
+        logger.info(f"[stream] call {self.call_sid[:12]} language → {code}")
 
     async def on_dtmf(self, digit: str) -> None:
+        # A language keypress is accepted at ANY time, not only during the
+        # opening menu: DTMF is signalling, so it works even when the caller is
+        # stuck behind a recogniser committed to the wrong language — which is
+        # exactly when they need it. Checked BEFORE the OTP branch would
+        # swallow it, and only outside digit entry so an OTP containing 1-4 is
+        # never mistaken for a language choice.
+        if self.mode != "digits" and digit:
+            from app.core.sdr import _LANG_MENU
+            code = _LANG_MENU.get(digit.strip()[:1])
+            if code:
+                self.set_lang(code)
+                await self.say(_SWITCHED.get(code, _SWITCHED["en"]))
+                return
         if self.mode != "digits" or not digit:
             return
         self.digits += digit.strip()[:1]
@@ -558,7 +836,16 @@ async def voice_stream_ws(ws: WebSocket, line: str, sid: str = "",
                 if not greeted:
                     greeted = True
                     say, nxt = await _brain_greet(line, sid, frm)
-                    await call.say(say, then_hangup=(nxt == "hangup"))
+                    # The keypad language menu, which the <Gather> path plays
+                    # and this one silently skipped — the inbound webhook
+                    # returns the <Stream> before it ever reaches the menu, so
+                    # switching transports quietly turned a four-language line
+                    # into an English-only one. Appended as pre-rendered audio
+                    # rather than a second turn, so it costs no extra round trip.
+                    menu = b"" if nxt == "hangup" else \
+                        await asyncio.to_thread(menu_audio)
+                    await call.say(say, then_hangup=(nxt == "hangup"),
+                                   append=menu)
             elif event == "media":
                 await call.on_media((data.get("media") or {}).get("payload", ""))
             elif event == "dtmf":

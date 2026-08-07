@@ -16,6 +16,7 @@ Adding a new agent
 from __future__ import annotations
 
 import json
+import os
 import re
 import logging
 from typing import Any, Dict, List, Optional, TypedDict
@@ -36,10 +37,29 @@ logger = logging.getLogger(__name__)
 # for these the parameter must be omitted rather than passed as 0.1.
 _OPENAI_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
 
+# GPT-5 deliberates before it answers, and at the default effort that thinking
+# is a large share of the wall clock on the turns we actually serve: short,
+# factual, RAG-grounded replies where there is nothing to reason ABOUT because
+# the answer is already sitting in the retrieved text. 'minimal' keeps the same
+# model and the same grounding and skips the deliberation — the cheapest
+# latency win available on the standard tier (voice's Level-0 brain runs on the
+# lite tier, gpt-4o-mini, which has no reasoning parameter at all).
+#
+# Env-overridable, and an EMPTY value omits the parameter entirely, so an
+# unsupported value is a config fix rather than a deploy — the same escape
+# hatch the voice STT codes use, for the same reason: "documented" is not the
+# same as "works on our account".
+_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "minimal").strip()
+
 
 def _openai_chat_kwargs(model: str) -> Dict[str, Any]:
     m = (model or "").lower()
     if m.startswith(_OPENAI_REASONING_PREFIXES):
+        # 'minimal' is a GPT-5-family value. The o-series accepts only
+        # low/medium/high and rejects 'minimal', so it must never be sent
+        # there — hence the narrower prefix test than the one above.
+        if _REASONING_EFFORT and m.startswith("gpt-5"):
+            return {"reasoning_effort": _REASONING_EFFORT}
         return {}
     return {"temperature": 0.1}
 

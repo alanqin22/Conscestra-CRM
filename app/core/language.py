@@ -40,6 +40,12 @@ _FR = {
     "commande", "facture", "livraison", "compte", "aide", "problème", "besoin",
     "voudrais", "pouvez", "puis", "cette", "ce", "cet", "sur", "dans", "mais",
     "donc", "très", "bien", "jour", "à", "aussi", "faire", "quel", "quelle",
+    # Farewells and other very short utterances. detect() needs TWO signals to
+    # leave English, and a goodbye is often only two or three words long — so
+    # "merci, au revoir" scored 1 (merci) and came back English, which then
+    # picked the English farewell. The words that end a conversation have to
+    # be in the table, or the conversation ends in the wrong language.
+    "revoir", "bientôt", "salut", "désolé", "entreprise", "société",
 }
 _ES = {
     "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "que", "y",
@@ -47,12 +53,14 @@ _ES = {
     "factura", "cuenta", "ayuda", "necesito", "quiero", "dónde", "cuándo",
     "cómo", "porque", "está", "estoy", "muy", "pero", "señor", "buenos",
     "días", "puedo", "quisiera", "tengo",
+    "adiós", "adios", "luego", "hasta", "chao", "empresa", "compañía",
 }
 _DE = {
     "der", "die", "das", "und", "ist", "ich", "sie", "ein", "eine", "nicht",
     "mit", "für", "auf", "haben", "hallo", "danke", "bestellung", "rechnung",
     "konto", "hilfe", "brauche", "möchte", "wann", "wo", "wie", "warum",
     "sehr", "aber", "bitte", "guten", "kann", "meine", "mein",
+    "tschüss", "wiederhören", "auf", "unternehmen", "firma",
 }
 _EN = {
     "the", "a", "an", "and", "is", "are", "to", "of", "you", "your", "i", "we",
@@ -167,7 +175,16 @@ def detect(text: str) -> str:
     en_score = scores.get("en", 0)
     # Require real signal AND at least parity with English to leave 'en'. This
     # keeps an English sentence that happens to contain 'a'/'de'/'la' English.
-    if best_score >= 2 and best_score >= en_score:
+    #
+    # The bar SCALES with length, because a fixed bar of 2 is unreachable for
+    # the short utterances that matter most: "au revoir" and "adios" are two
+    # words and one word, can never score 2, and so were answered in English —
+    # the goodbye is exactly where a wrong language is most visible. A long
+    # sentence still needs two independent signals; parity with English is
+    # required either way, so a short ENGLISH message cannot be flipped by one
+    # shared word.
+    need = 1 if len(words) <= 3 else 2
+    if best_score >= need and best_score >= en_score:
         return best
     return "en"
 
@@ -198,6 +215,48 @@ def directive(code: str) -> str:
         f"URLs exactly as given. Do not mention translation or that you switched "
         f"languages." + extra
     )
+
+
+def intent_re(en_src: str, latin=(), cjk=()) -> "re.Pattern":
+    """Build an intent regex that fires in every language we answer in.
+
+    Lives here, not in a voice module, because BOTH phone lines (sdr.py and
+    voice_support.py) need it and a second copy of an intent list is a second
+    thing to forget to update — the way "au revoir" ended a call on one line
+    and ran it to the turn limit on the other.
+
+    Two mechanisms, because two writing systems:
+      latin  fr/es/de alternates, kept \\b-anchored like the English source.
+      cjk    plain substrings. Chinese is written WITHOUT spaces, so \\b never
+             matches between Han characters — a \\b-anchored Chinese
+             alternative does not merely match less, it never fires at all,
+             and it fails silently. That is how this class of bug survives.
+
+    Speech transcripts vary the apostrophe, so every ' also accepts ’."""
+    parts = [f"(?:{en_src})"]
+    if latin:
+        alts = "|".join(re.escape(t).replace("'", "['’]") for t in latin)
+        parts.append(r"\b(?:" + alts + r")\b")
+    if cjk:
+        parts.append("(?:" + "|".join(re.escape(t) for t in cjk) + ")")
+    return re.compile("|".join(parts), re.IGNORECASE | re.UNICODE)
+
+
+# "Stop talking" is a request to END THE CALL, and it was in neither line's
+# goodbye pattern — a caller who said it got a cheerful "of course!" and then
+# more talking. Shared so both lines honour it identically.
+STOP_LATIN = ["au revoir", "c'est tout", "rien d'autre", "j'ai terminé",
+              "raccrocher", "arrêtez", "arrête", "taisez-vous", "ça suffit",
+              "adiós", "adios", "eso es todo", "nada más", "nada mas",
+              "hasta luego", "colgar", "basta", "ya basta", "cállate",
+              "cállese", "auf wiederhören", "tschüss", "das war's",
+              "das wars", "sonst nichts", "hör auf", "aufhören", "sei still"]
+STOP_CJK = ["再见", "再見", "拜拜", "就这样", "就這樣", "没有了", "沒有了",
+            "没别的", "沒別的", "挂了", "掛了", "结束通话", "結束通話",
+            "别说了", "別說了", "闭嘴", "閉嘴", "够了", "夠了", "不用了"]
+# English phrases that mean "stop", added to both lines' goodbye patterns.
+STOP_EN = (r"stop talking|please stop|stop it|shut up|be quiet|"
+           r"that'?s enough|never ?mind")
 
 
 def respond_in(text: str) -> str:

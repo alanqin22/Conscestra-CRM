@@ -46,6 +46,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -75,10 +76,42 @@ RAG_MIN_TERMS = 2        # distinct query terms an article must match
                          # (1 when the query itself has ≤2 salient terms)
 MIN_ANSWER_CHARS = 40    # publish refuses answers shorter than this
 
+# Words that carry no topic. The second group is CONVERSATIONAL FILLER, and
+# leaving it out was a real retrieval bug rather than a missed optimisation:
+# `need` (how many query terms an article must match) is derived from the
+# COUNT of salient terms, so filler inflated the count and raised the bar the
+# answer had to clear. "company" retrieved the company article; "tell me about
+# your company" retrieved nothing — Postgres ranked the right article first
+# and our own filter then discarded it for matching "only" 1 of 3 terms.
+# Politeness made the search stricter, which is exactly backwards, and it hit
+# every language: a spoken question is almost always the padded form.
 _STOPWORDS = {"the", "and", "for", "with", "your", "from", "this", "that",
               "have", "has", "are", "was", "can", "cant", "cannot", "you",
               "our", "not", "how", "what", "why", "need", "help", "please",
-              "hello", "thanks", "hi", "dear", "regards"}
+              "hello", "thanks", "hi", "dear", "regards",
+              # conversational filler
+              "tell", "about", "know", "like", "want", "give", "say", "said",
+              "ask", "asking", "explain", "describe", "introduce", "some",
+              "something", "anything", "more", "little", "bit", "could",
+              "would", "should", "does", "did", "get", "got", "there",
+              "here", "just", "really", "maybe", "wondering", "curious",
+              # Non-English filler. The list was English-only, so the same
+              # bug reappeared one language over: "parlez-moi de votre
+              # entreprise" scored 4 salient terms, needed 2 matches, and the
+              # company article matched only "entreprise" — discarded. Only
+              # LATIN-script languages appear here; Chinese produces no ASCII
+              # terms at all, so it never reaches this filter and depends
+              # entirely on the semantic leg.
+              "parlez", "parler", "moi", "votre", "vos", "une", "des", "les",
+              "pouvez", "puis", "quel", "quelle", "quels", "quelles", "est",
+              "sur", "pour", "avec", "dites", "dire", "peu", "plus", "bonjour",
+              "merci", "que", "qui", "quoi", "comment", "pourquoi",
+              "hablame", "háblame", "sobre", "puede", "puedo", "cual", "cuál",
+              "como", "cómo", "que", "por", "para", "con", "los", "las",
+              "una", "unos", "unas", "hola", "gracias", "decir", "digame",
+              "sagen", "sie", "mir", "ihre", "ihr", "eine", "einen", "kann",
+              "koennen", "können", "was", "wie", "warum", "ueber", "über",
+              "hallo", "danke", "bitte", "etwas"}
 
 
 # ============================================================================
@@ -257,13 +290,8 @@ def _fuse(fts: List[Dict[str, Any]], sem: List[Dict[str, Any]],
     return [rows[u] for u in order[:top]]
 
 
-def retrieve(subject: str, body: str, audience: Optional[str] = "public",
-             top: int = 2) -> List[Dict[str, Any]]:
-    """Hybrid retrieval core (FTS term-precision + embedding similarity,
-    rank-fused) — pure and side-effect free, so the evals can measure it.
-    Default audience='public': the tier every customer channel must pass;
-    audience=None lets internal callers see the agent-only tier too."""
-    query = f"{subject or ''} {str(body or '')[:200]}"
+def _fts_hits(query: str, audience: Optional[str]) -> List[Dict[str, Any]]:
+    """The keyword half of hybrid retrieval, term-precision ordered."""
     terms = _salient_terms(query)
     need = 1 if len(terms) <= 2 else RAG_MIN_TERMS
     fts = [h for h in search(query, limit=4, min_rank=RAG_MIN_RANK,
@@ -271,9 +299,36 @@ def retrieve(subject: str, body: str, audience: Optional[str] = "public",
            if _matched_terms(terms, h) >= need]
     # Precision order: how many of the ASKER's terms an article matches beats
     # raw ts_rank (which rewards repeated generic words like 'call'/'text').
-    fts = sorted(fts, key=lambda h: (_matched_terms(terms, h),
-                                     float(h["rank"])), reverse=True)
-    return _fuse(fts, _semantic_hits(query, audience=audience), top=top)
+    return sorted(fts, key=lambda h: (_matched_terms(terms, h),
+                                      float(h["rank"])), reverse=True)
+
+
+def retrieve(subject: str, body: str, audience: Optional[str] = "public",
+             top: int = 2) -> List[Dict[str, Any]]:
+    """Hybrid retrieval core (FTS term-precision + embedding similarity,
+    rank-fused) — pure and side-effect free, so the evals can measure it.
+    Default audience='public': the tier every customer channel must pass;
+    audience=None lets internal callers see the agent-only tier too.
+
+    The two halves run CONCURRENTLY. They are independent — one is a Postgres
+    round trip, the other an OpenAI embedding round trip — but they used to run
+    back to back, so every retrieval paid the SUM of two network latencies. The
+    embedding call alone measured ~450-500ms, which on a phone call is dead air
+    the caller hears. Fusing the results is unchanged, so ranking is identical;
+    only the waiting overlaps. get_connection() is connect-per-call, so each
+    thread gets its own connection and there is no shared-cursor hazard."""
+    query = f"{subject or ''} {str(body or '')[:200]}"
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            sem_future = pool.submit(_semantic_hits, query, 4, audience)
+            fts = _fts_hits(query, audience)
+            sem = sem_future.result()
+    except Exception as exc:
+        # A thread-pool failure must never cost us retrieval itself — fall back
+        # to the original sequential path rather than returning nothing.
+        logger.debug(f"[knowledge] parallel retrieve fell back to serial: {exc}")
+        fts, sem = _fts_hits(query, audience), _semantic_hits(query, 4, audience)
+    return _fuse(fts, sem, top=top)
 
 
 REWRITE_ENABLED = _flag("KB_REWRITE_ENABLED", "1")
