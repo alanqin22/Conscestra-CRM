@@ -34,6 +34,7 @@ import logging
 import math
 import os
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -54,6 +55,22 @@ REFRESH_SECS = int(os.getenv("SEM_REFRESH_SECS", "300"))
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
 _EMBED_BATCH = 16          # max articles embedded per lazy refresh pass
+
+# "Decisive winner" fallback (see search()). DECISIVE_MIN is a hard noise
+# floor — below it nothing is ever accepted, whatever the margin. Setting
+# DECISIVE_MARGIN above 1.0 disables the rule entirely.
+DECISIVE_MIN = float(os.getenv("SEM_DECISIVE_MIN", "0.25"))
+DECISIVE_MARGIN = float(os.getenv("SEM_DECISIVE_MARGIN", "0.10"))
+
+# ── Query-vector cache ───────────────────────────────────────────────────────
+# Support questions repeat constantly across callers ("where is my order",
+# "what's your refund policy"), and embedding the same string twice costs the
+# same ~450ms network round trip every time. Keyed by (model, query) because a
+# vector from a different model is not comparable — the same trap ensure_index
+# already guards against on the article side. Bounded FIFO: no eviction policy
+# cleverness is warranted for a few hundred short strings.
+_QCACHE_MAX = int(os.getenv("SEM_QUERY_CACHE", "256"))
+_QCACHE: "OrderedDict[Tuple[str, str], List[float]]" = OrderedDict()
 
 # { article_uuid: (vector, l2norm) } — the whole KB fits in memory with room
 # to spare (1536 floats × tens of articles).
@@ -118,7 +135,7 @@ def ensure_index(force: bool = False) -> Dict[str, Any]:
     """Bring kb_embeddings + the in-process cache up to date with the ACTIVE
     article set. Cheap when nothing changed; embeds at most _EMBED_BATCH new/
     edited articles per pass (the next pass catches the rest). Never raises."""
-    global _LAST_REFRESH
+    global _LAST_REFRESH, _VECTORS
     if not force and _VECTORS and time.time() - _LAST_REFRESH < REFRESH_SECS:
         return {"ok": True, "cached": len(_VECTORS), "refreshed": False}
     out = {"ok": False, "cached": len(_VECTORS), "refreshed": False}
@@ -169,7 +186,12 @@ def ensure_index(force: bool = False) -> Dict[str, Any]:
                     embedded = len(batch)
         conn.commit()
 
-        _VECTORS.clear()
+        # Build the new index in a SEPARATE dict and swap it in atomically.
+        # Clearing the live one in place left a window — now widened, because
+        # retrieval calls this from a worker thread — in which a concurrent
+        # search saw a half-populated index and silently returned fewer hits,
+        # or none. A rebind is atomic; readers hold the old dict until it is.
+        fresh: Dict[str, Tuple[List[float], float]] = {}
         wrong_model = 0
         for u, (_h, emb, mdl) in stored.items():
             if u not in active:
@@ -183,7 +205,8 @@ def ensure_index(force: bool = False) -> Dict[str, Any]:
                 continue
             vec = emb if isinstance(emb, list) else json.loads(emb)
             norm = math.sqrt(sum(x * x for x in vec)) or 1.0
-            _VECTORS[u] = (vec, norm)
+            fresh[u] = (vec, norm)
+        _VECTORS = fresh                      # atomic swap (see above)
         if wrong_model:
             logger.info(f"[semantic] {wrong_model} article vector(s) are on a "
                         f"previous model — excluded until re-embedded")
@@ -214,20 +237,47 @@ def search(query: str, limit: int = 4,
     ensure_index()
     if not _VECTORS:
         return []
-    qv = _embed([query.strip()[:2000]])
-    if not qv:
-        return []
-    q = qv[0]
+    qtext = query.strip()[:2000]
+    ckey = (EMBED_MODEL, qtext)
+    q = _QCACHE.get(ckey)
+    if q is None:
+        qv = _embed([qtext])
+        if not qv:
+            return []
+        q = qv[0]
+        _QCACHE[ckey] = q
+        while len(_QCACHE) > _QCACHE_MAX:
+            _QCACHE.popitem(last=False)
     qnorm = math.sqrt(sum(x * x for x in q)) or 1.0
     floor = MIN_SIM if min_sim is None else min_sim
     sims = []
     for u, (vec, norm) in _VECTORS.items():
         dot = sum(a * b for a, b in zip(q, vec))
-        sim = dot / (qnorm * norm)
-        if sim >= floor:
-            sims.append({"article_uuid": u, "sim": round(sim, 4)})
+        sims.append({"article_uuid": u, "sim": round(dot / (qnorm * norm), 4)})
     sims.sort(key=lambda h: h["sim"], reverse=True)
-    return sims[:limit]
+    kept = [h for h in sims if h["sim"] >= floor]
+
+    # ── Decisive winner ──────────────────────────────────────────────────────
+    # A single absolute floor asks one number to mean the same thing for every
+    # query, and it does not. Measured: the article that ANSWERS a vaguer or
+    # non-Latin question often lands just under 0.33 while still leading its
+    # runner-up clearly — "你们的产品多少钱？" put the pricing article top at
+    # 0.281 against 0.247. Meanwhile a genuine miss produces a FLAT spread:
+    # the two noise cases measured 0.296 vs 0.295 and 0.310 vs 0.308.
+    #
+    # So the shape of the distribution separates a real answer from noise where
+    # the absolute value cannot. When nothing clears the floor, accept the top
+    # hit only if it is BOTH above a hard noise floor and clearly ahead of the
+    # next one. This matters most for Chinese, which contributes no FTS terms
+    # at all, so the vector leg is the only signal it has.
+    if not kept and sims and sims[0]["sim"] >= DECISIVE_MIN:
+        best = sims[0]["sim"]
+        second = sims[1]["sim"] if len(sims) > 1 else 0.0
+        if best > 0 and (best - second) / best >= DECISIVE_MARGIN:
+            logger.debug(f"[semantic] decisive winner {best:.3f} over "
+                         f"{second:.3f} (floor {floor})")
+            kept = [sims[0]]
+    return kept[:limit]
 
 
 # ============================================================================
@@ -241,6 +291,7 @@ router = APIRouter(tags=["semantic"])
 def semantic_status():
     return {"enabled": ENABLED, "model": EMBED_MODEL, "min_sim": MIN_SIM,
             "indexed": len(_VECTORS),
+            "query_cache": len(_QCACHE), "query_cache_max": _QCACHE_MAX,
             "last_refresh_age_s": (int(time.time() - _LAST_REFRESH)
                                    if _LAST_REFRESH else None)}
 

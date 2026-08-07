@@ -88,8 +88,15 @@ _COMPANY_RE = re.compile(
     r"company is|from)\s+([A-Z][\w&.' -]{2,40})", re.IGNORECASE)
 _YES_RE = re.compile(r"\b(yes|yeah|yep|sure|ok(?:ay)?|book|schedule|"
                      r"sounds good|let'?s do it|please do)\b", re.IGNORECASE)
-_BYE_RE = re.compile(r"\b(bye|goodbye|that'?s all|no thanks|not now|"
-                     r"hang up|end call)\b", re.IGNORECASE)
+from app.core.language import (STOP_CJK, STOP_EN, STOP_LATIN,  # noqa: E402
+                               intent_re as _intent_re)
+
+# Was English-only, so "au revoir" / "再见" ran the call to the turn limit, and
+# "stop talking" was answered with more talking. Same table as the support
+# line — one list, both lines.
+_BYE_RE = _intent_re(
+    r"\b(bye|goodbye|that'?s all|no thanks|not now|hang up|end call|"
+    + STOP_EN + r")\b", latin=STOP_LATIN, cjk=STOP_CJK)
 # Shopper product intent — only consulted when a product page_context is
 # present, so it can never hijack the marketing-site lead-gen chat.
 # _SHOP_RE = price/market (triggers the live web market check);
@@ -376,7 +383,11 @@ def _llm_reply(state: Dict[str, Any], history: List[Dict[str, str]],
                  + language.respond_in(user_text)}]
         msgs += history[-6:]
         msgs.append({"role": "user", "content": privacy.mask(user_text)[:_MAX_MSG]})
-        resp = _get_llm(tier="lite").invoke(msgs)
+        # "≤60 words" is a request the model rounds up on, and generation time
+        # scales with tokens produced — on a phone call that overrun is dead
+        # air. This is the ceiling it cannot exceed. Sized for Chinese, which
+        # needs more tokens per word than English.
+        resp = _get_llm(tier="lite").invoke(msgs, max_tokens=220)
         text = (resp.content if hasattr(resp, "content") else str(resp)).strip()
         if text:
             # Outbound guard: a blocked LLM reply falls back to the scripted
@@ -1025,10 +1036,32 @@ def converse(session_id: str, user_text: str, channel: str = "chat",
         "awaiting_email", "awaiting_code")
     if _BYE_RE.search(user_text):
         sess["verify"] = None                  # abort any pending verification
-        reply = ("Thanks for stopping by! "
-                 + ("We'll follow up at " + state["email"] + ". "
+        # Every OTHER reply on this path goes through the LLM with
+        # language.respond_in(), so it comes back in the caller's language.
+        # This one is a fixed string that never touched the model — which is
+        # why "再见再见" was answered "Thanks for stopping by! Have a great
+        # day." and then spoken by a Mandarin voice. Detecting the goodbye in
+        # five languages while replying in one is a half-done switch.
+        from app.core import language
+        _code = language.detect(user_text)
+        _bye = {
+            "en": ("Thanks for stopping by!", "We'll follow up at {e}.",
+                   "Have a great day."),
+            "fr": ("Merci de votre visite !", "Nous vous recontacterons à {e}.",
+                   "Bonne journée."),
+            "es": ("¡Gracias por su visita!", "Le contactaremos en {e}.",
+                   "Que tenga un buen día."),
+            "de": ("Danke für Ihren Besuch!", "Wir melden uns unter {e}.",
+                   "Einen schönen Tag noch."),
+            "zh": ("感谢您的咨询！", "我们会通过 {e} 与您联系。", "祝您生活愉快，再见。"),
+        }.get(_code, None) or {
+            "en": ("Thanks for stopping by!", "We'll follow up at {e}.",
+                   "Have a great day.")}["en"]
+        _open, _mail, _close = _bye
+        reply = (_open + " "
+                 + ((_mail.format(e=state["email"]) + " ")
                     if state["email"] else "")
-                 + "Have a great day.")
+                 + _close)
         done = True
     elif SHOPPING_ASSIST and channel == "chat" and _otp_active:
         # Mid-verification: the shopper's message is the email or the 6-digit
@@ -1343,6 +1376,12 @@ def _gather(prompt_inner: str, lang: str = "en") -> str:
 # silence at the end — a digit pressed DURING the menu barges in immediately.
 LANG_MENU_TIMEOUT = os.getenv("SDR_LANG_MENU_TIMEOUT", "3").strip() or "3"
 
+# Consecutive no-speech callbacks before the line gives up and hangs up, and
+# the per-call counter behind it. Keyed by CallSid and cleared on any heard
+# turn, so only an UNBROKEN run of silence ends the call.
+NO_SPEECH_MAX = int(os.getenv("SDR_NO_SPEECH_MAX", "3"))
+_NO_SPEECH: Dict[str, int] = {}
+
 
 def lang_menu_gather(greeting_inner: str) -> str:
     """DTMF-ONLY Gather for the language menu.
@@ -1532,14 +1571,34 @@ async def sdr_voice_turn(request: Request):
     if not heard:
         # Log the callback keys so a provider param mismatch is diagnosable
         # from the server log rather than a silent "didn't catch that" loop.
-        logger.info(f"[sdr] voice turn: no speech; callback keys="
-                    f"{sorted(params.keys())}")
+        # BOUNDED: this returned a fresh Gather indefinitely, so a call whose
+        # speech was never recognised looped forever — the assistant never
+        # stopped talking and never hung up. Same defect, same fix as the
+        # support line (voice_support.NO_SPEECH_MAX).
+        n = _NO_SPEECH.get(call_sid, 0) + 1
+        _NO_SPEECH[call_sid] = n
+        logger.info(f"[sdr] voice turn: no speech ({n}/{NO_SPEECH_MAX}); "
+                    f"callback keys={sorted(params.keys())}")
+        if n >= NO_SPEECH_MAX:
+            _NO_SPEECH.pop(call_sid, None)
+            bye = {"en": "I'm having trouble hearing you. Please call back. "
+                         "Goodbye.",
+                   "fr": "J'ai du mal à vous entendre. Veuillez rappeler. "
+                         "Au revoir.",
+                   "es": "Tengo problemas para escucharle. Por favor, vuelva "
+                         "a llamar. Adiós.",
+                   "de": "Ich kann Sie leider nicht verstehen. Bitte rufen Sie "
+                         "erneut an. Auf Wiederhören.",
+                   "zh": "抱歉，我听不清您说话。请稍后再拨。再见。"}.get(
+                       lang, "I'm having trouble hearing you. Goodbye.")
+            return _twiml(_say(bye, lang) + "<Hangup/>")
         retry = {"en": "Sorry, I didn't catch that. Could you say it again?",
                  "fr": "Désolé, je n'ai pas bien entendu. Pouvez-vous répéter ?",
                  "es": "Perdón, no le entendí. ¿Puede repetirlo?",
                  "de": "Entschuldigung, das habe ich nicht verstanden.",
                  "zh": "抱歉，我没有听清楚。您可以再说一遍吗？"}.get(lang)
         return _twiml(_gather(_say(retry, lang), lang))
+    _NO_SPEECH.pop(call_sid, None)   # a heard turn clears the give-up counter
 
     from app.core.telephony import normalize_phone
     frm = normalize_phone(params.get("From", "")) or None
