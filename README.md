@@ -390,20 +390,24 @@ then hand the winning scenario to the planner as a goal.
 
 ## An SDR That Never Sleeps
 
-The front door is staffed too. A prospect landing on the store can open a
-chat — or call the company number — and reach the **autonomous SDR**: it
+The support line (*The Phone Line Is a Digital Employee*, below) answers
+people who are already customers. The front door is staffed too — for **the
+people who are not customers yet**. A prospect
+landing on the store can open a chat and reach the **autonomous SDR**: it
 answers product questions from the approved knowledge base, captures who
 they are and what they need, creates the lead, and books the intro meeting
-on a real calendar slot, all in one conversation. On the phone, the same
-brain holds a spoken conversation — the caller talks, the agent answers,
-turn by turn.
+on a real calendar slot, all in one conversation. The same brain can staff a
+spoken sales line of its own, turn by turn, on a number dedicated to it.
 
-The design is deliberately conservative: a deterministic state machine —
-not the language model — owns every fact captured and every action taken.
-The model only writes the next sentence, grounded in approved knowledge,
-with no tools and no access to CRM data. Both channels sit behind their own
-on/off switches and rate limits, so the front door opens exactly as wide as
-you choose.
+The two are deliberately not the same assistant. Support earns its way to a
+customer's data by verified possession; the SDR is talking to someone it has
+no record of, so it is given **no CRM access at all** — nothing to leak,
+whatever it is asked. Its design is conservative in the same spirit: a
+deterministic state machine — not the language model — owns every fact
+captured and every action taken. The model only writes the next sentence,
+grounded in approved knowledge, with no tools. Both channels sit behind
+their own on/off switches and rate limits, so the front door opens exactly
+as wide as you choose.
 
 Chat to qualified lead to booked meeting — **before a human ever says
 hello.**
@@ -495,6 +499,12 @@ And a customer asking about *their own* account is verified first — not with
 security questions an AI could be talked out of, but by **possession**: a
 one-time code texted to the number on file, entered on the keypad, expiring
 in minutes, three attempts then a human follow-up.
+
+This is the **support** line — for people who are already customers.
+Prospects who have not bought anything meet a different assistant with
+different powers (*An SDR That Never Sleeps*, above): one that can qualify
+them and book a meeting, and that is given no access to CRM data at all. Two
+callers, two jobs, two sets of keys.
 
 A verified caller can hear their balance and open invoices, check recent
 orders, get payment help grounded in approved policy — with a payment
