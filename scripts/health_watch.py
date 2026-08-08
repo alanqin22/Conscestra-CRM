@@ -49,6 +49,7 @@ import os
 import smtplib
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -65,6 +66,33 @@ TIMEOUT = float(os.getenv("HEALTH_TIMEOUT_S", "20"))
 MAX_TICK_AGE_MIN = float(os.getenv("HEALTH_MAX_TICK_AGE_MIN", "120"))
 REPEAT_HOURS = float(os.getenv("HEALTH_REPEAT_HOURS", "12"))
 EXPECT_ROLE = os.getenv("HEALTH_EXPECT_DB_ROLE", "crm_app").strip()
+
+# Confirm before alerting. A single probe cannot distinguish "the service is
+# down" from "the service is restarting", and this one has been paging for the
+# latter: on 2026-08-07 it caught a 502 at 03:30:01 for a process that was
+# serving again by 03:30:33 — a 32-second window. An alert that fires for
+# something already fixed by the time you read it is how a monitor teaches you
+# to ignore it.
+CONFIRM_RETRIES = int(os.getenv("HEALTH_CONFIRM_RETRIES", "2"))
+CONFIRM_DELAY_S = float(os.getenv("HEALTH_CONFIRM_DELAY_S", "45"))
+
+# Blips are suppressed, not forgotten. Restarts that keep happening are a real
+# problem even when each one self-heals in under a minute, so they are counted
+# and reported once the rate stops looking like noise.
+BLIP_WINDOW_HOURS = float(os.getenv("HEALTH_BLIP_WINDOW_HOURS", "24"))
+BLIP_ALERT_COUNT = int(os.getenv("HEALTH_BLIP_ALERT_COUNT", "3"))
+
+# This script only knows what happened while it was running. It is a scheduled
+# task on a workstation that sleeps, so "no alert" has two meanings — nothing
+# was wrong, or nobody looked. The gap between checks is the only thing that
+# tells them apart, and it is reported rather than assumed away.
+MAX_GAP_MIN = float(os.getenv("HEALTH_MAX_GAP_MIN", "45"))
+
+# The overdue-job audit runs hourly; 150 min allows one missed pass plus slack
+# before its cached answer is treated as unusable.
+MAX_AUDIT_AGE_MIN = float(os.getenv("HEALTH_MAX_AUDIT_AGE_MIN", "150"))
+ALERT_ON_GAP = os.getenv("HEALTH_ALERT_ON_GAP", "0").strip().lower() in (
+    "1", "true", "yes", "on")
 
 
 # ── the checks ───────────────────────────────────────────────────────────────
@@ -140,6 +168,19 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
     if ha.get("role") in ("leader", "standalone", None):
         if sched.get("running") is False:
             problems.append("scheduler is not running on the leader")
+
+        # `running` is a flag set once at startup; `alive` is the scheduler
+        # object answering for itself. If APScheduler's thread dies, the flag
+        # stays true forever — so reading only `running` would have let the
+        # new live signal be published and ignored.
+        alive = sched.get("alive")
+        if alive is not None:
+            facts["scheduler_alive"] = alive
+            if alive is False:
+                problems.append(
+                    "scheduler.alive=false — APScheduler has stopped inside a "
+                    "process that still reports running=true; no job will fire "
+                    "until this process is restarted")
         if age is None and sched.get("running"):
             # A freshly restarted scheduler has not ticked YET, and most jobs
             # here are nightly — after a 03:30 deploy the first fires at 22:00.
@@ -154,12 +195,89 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
             problems.append(f"scheduler last ticked {age:.0f} min ago "
                             f"(threshold {MAX_TICK_AGE_MIN:.0f}) — background "
                             f"jobs are not running")
+        # last_tick says a job fired. It does not say WHICH jobs did not.
+        # Every field above was true throughout the period when the nightly
+        # order pipeline advanced nothing, because the scheduler was healthy
+        # and the work still was not happening. This is the only check that
+        # looks at the work.
+        # The overdue list is a CACHE, refreshed hourly by job_ledger_audit. If
+        # that job is itself among the casualties the cache freezes, and a
+        # frozen cache reports `[]` — "nothing overdue" — indefinitely. An
+        # absence of bad news that cannot go stale is not evidence.
+        audit_age = _age_minutes(sched.get("overdue_checked_at"))
+        if audit_age is not None:
+            facts["overdue_checked_min_ago"] = round(audit_age, 1)
+            if audit_age > MAX_AUDIT_AGE_MIN:
+                problems.append(
+                    f"the overdue-job audit last ran {audit_age:.0f} min ago "
+                    f"(threshold {MAX_AUDIT_AGE_MIN:.0f}) — scheduler."
+                    f"overdue_jobs is stale and cannot be trusted")
+
+        overdue = sched.get("overdue_jobs")
+        if overdue is None:
+            # Version skew, not health: a backend that predates the ledger has
+            # no opinion on this. Saying "0 overdue" would claim a coverage
+            # that does not exist, which is the failure mode this whole check
+            # was added to remove.
+            facts["overdue_jobs"] = "not reported by this backend"
+            overdue = []
+        else:
+            facts["overdue_jobs"] = len(overdue)
+        if overdue:
+            named = ", ".join(
+                f"{o.get('job')} ({o.get('late_min')} min late)"
+                for o in overdue[:4])
+            more = f" (+{len(overdue) - 4} more)" if len(overdue) > 4 else ""
+            problems.append(
+                f"{len(overdue)} scheduled job(s) missed their last due time: "
+                f"{named}{more}")
+        # Repairs are reported, not alerted on: the work did happen. A job that
+        # has to be caught up EVERY night is a restart problem wearing a
+        # success costume, and the count is what makes that visible to someone
+        # whose monitoring was asleep when it occurred.
+        repaired = sched.get("repaired_24h") or []
+        if repaired:
+            facts["repaired_24h"] = ", ".join(
+                f"{r.get('job')}@{r.get('at')}" for r in repaired[:4])
+
+        failed = sched.get("failed_jobs_24h") or []
+        facts["failed_jobs_24h"] = len(failed)
+        if failed:
+            named = ", ".join(f"{f.get('job')} ({f.get('status')})"
+                              for f in failed[:4])
+            problems.append(
+                f"{len(failed)} scheduled job(s) raised in the last 24h: {named}")
+
+        if sched.get("ledger"):
+            # The safety net that re-runs jobs a restart skipped is not
+            # installed. Nothing is broken yet, and nothing will report it
+            # when something is.
+            problems.append(f"job-run ledger {sched['ledger']}")
     elif ha.get("role") == "follower":
         # A follower not running the scheduler is correct. But if EVERY process
         # is a follower nobody runs it, and one probe cannot see the others.
         facts["note"] = ("this process is a follower; scheduler state not "
                          "assessed. Confirm some process reports leader.")
     return problems, facts
+
+
+def check_confirmed(url: str) -> Tuple[List[str], Dict[str, Any], int]:
+    """check(), but a failure has to survive a re-check to count.
+
+    Returns (problems, facts, attempts). The LAST attempt wins: if the retry
+    comes back clean the service is treated as healthy and the flap is recorded
+    by the caller instead of mailed.
+    """
+    problems, facts = check(url)
+    attempts = 1
+    while problems and attempts <= CONFIRM_RETRIES:
+        print(f"  {len(problems)} problem(s) on attempt {attempts} — "
+              f"re-checking in {CONFIRM_DELAY_S:.0f}s before alerting")
+        time.sleep(CONFIRM_DELAY_S)
+        problems, facts = check(url)
+        attempts += 1
+    facts["attempts"] = attempts
+    return problems, facts, attempts
 
 
 # ── alerting ─────────────────────────────────────────────────────────────────
@@ -272,8 +390,37 @@ def main() -> int:
               "(e.g. https://<app>.up.railway.app/health)", file=sys.stderr)
         return 2
 
-    problems, facts = check(url)
+    problems, facts, attempts = check_confirmed(url)
     now = datetime.now(timezone.utc)
+    state = _load_state()
+
+    # ── how long was nobody watching? ────────────────────────────────────────
+    gap = _age_minutes(state.get("checked_at"))
+    gap_note = None
+    if gap is not None:
+        facts["since_last_check_min"] = round(gap, 1)
+        if gap > MAX_GAP_MIN:
+            gap_note = (f"MONITORING GAP: no check ran for {gap:.0f} minutes "
+                        f"before this one (threshold {MAX_GAP_MIN:.0f}). "
+                        f"Nothing is known about that window.")
+            print(f"  {gap_note}")
+            if ALERT_ON_GAP:
+                problems.append(gap_note)
+
+    # ── transient failures: suppressed, counted, and eventually reported ─────
+    blips = [b for b in state.get("blips", [])
+             if (_age_minutes(b) or 1e9) <= BLIP_WINDOW_HOURS * 60]
+    if attempts > 1 and not problems:
+        blips.append(now.isoformat())
+        print(f"  transient: recovered by attempt {attempts} — not alerting")
+    facts["blips_24h"] = len(blips)
+    if len(blips) >= BLIP_ALERT_COUNT:
+        problems.append(
+            f"{len(blips)} transient failures in the last "
+            f"{BLIP_WINDOW_HOURS:.0f}h — each recovered within "
+            f"{CONFIRM_DELAY_S:.0f}s, so the service is restarting repeatedly "
+            f"rather than being down. Check the platform's restart history.")
+
     healthy = not problems
 
     print(f"health check {url}")
@@ -286,7 +433,6 @@ def main() -> int:
     else:
         print("\n  healthy")
 
-    state = _load_state()
     was_healthy = state.get("healthy")
     last_alert = _age_minutes(state.get("last_alert_at"))
     transition = (was_healthy is not None) and (was_healthy != healthy)
@@ -306,6 +452,10 @@ def main() -> int:
                       "  docs/runbook_leader_failure.md      (scheduler / leader)\n"
                       "  docs/runbook_incident_escalation.md (triage, 72h clock)\n"
                       "  docs/runbook_restore.md             (data loss)\n\n")
+        if gap_note:
+            # Carried on every email, not only gap alerts: the reader needs to
+            # know the preceding silence was unobserved rather than quiet.
+            body += gap_note + "\n\n"
         body += "Facts:\n" + "\n".join(f"  {k}: {v}" for k, v in facts.items())
         if _send(subj, body):
             state["last_alert_at"] = now.isoformat()
@@ -313,6 +463,7 @@ def main() -> int:
     state["healthy"] = healthy
     state["checked_at"] = now.isoformat()
     state["problems"] = problems
+    state["blips"] = blips[-50:]
     _save_state(state)
     return 0 if healthy else 1
 

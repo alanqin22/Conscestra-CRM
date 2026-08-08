@@ -84,6 +84,13 @@ POLICIES: List[Policy] = [
     Policy("a2a_dispatches", "at", 90,
            "agent call log — kept long enough to investigate an incident, "
            "not indefinitely"),
+    Policy("scheduled_job_runs", "started_at", 90,
+           "scheduled-job outcome log — the window in which 'did the nightly "
+           "batch run on the 3rd?' is still a question anyone asks. Same "
+           "basis and period as a2a_dispatches; both are operational exhaust "
+           "kept for incident forensics. job_ledger.prune() applies the same "
+           "90 days unconditionally, because this policy set is gated on "
+           "RETENTION_ENABLED and the table must stay bounded either way"),
     Policy("memory_retrievals", "created_at", 180,
            "retrieval grounding — the window in which a bad reply is still "
            "worth investigating"),

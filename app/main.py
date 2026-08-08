@@ -758,8 +758,23 @@ async def lifespan(app: FastAPI):
     _scheduler = None
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
-        from apscheduler.triggers.cron import CronTrigger
+        from apscheduler.triggers.cron import CronTrigger as _RawCronTrigger
         from apscheduler.triggers.interval import IntervalTrigger
+
+        def CronTrigger(**kwargs):
+            """A CronTrigger that actually honours the intended ET schedule.
+
+            BackgroundScheduler(timezone=...) only applies to triggers the
+            scheduler builds ITSELF from the "cron" alias. A pre-built
+            CronTrigger instance resolves its own timezone at construction,
+            and with none given it falls back to get_localzone() — the HOST's
+            zone. That is ET on the developer's Windows box and UTC inside the
+            Railway container, so identical code ran the whole nightly batch
+            four hours apart in the two environments (observed: order advance
+            writing at 22:05 UTC on Railway, 22:05 ET locally).
+            """
+            kwargs.setdefault("timezone", "America/New_York")
+            return _RawCronTrigger(**kwargs)
         # All daily jobs run at 10 PM US Eastern. Using the named zone (not a
         # fixed UTC offset) means the same wall-clock 22:00 ET fires correctly
         # on Railway (UTC host) AND on a local machine in any timezone, and it
@@ -822,6 +837,14 @@ async def lifespan(app: FastAPI):
             trigger=CronTrigger(hour=22, minute=25), # 10:25 PM ET — expire stale quotes
             id="expire_quotes",
             replace_existing=True,
+            # The ONLY job that was inheriting APScheduler's default
+            # misfire_grace_time of **1 second** — verified, not assumed:
+            # BackgroundScheduler()._job_defaults is
+            # {'misfire_grace_time': 1, 'coalesce': True, 'max_instances': 1}.
+            # One second of threadpool contention at 22:25, when six other
+            # nightly jobs are running, and the quote expiry is dropped with a
+            # "run time missed" log nobody reads. Matched to its neighbours.
+            misfire_grace_time=3600,
         )
         # Retention for the erasure register — monthly, not nightly. It only
         # touches rows older than two years, so running it daily would be 30
@@ -1080,6 +1103,45 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             misfire_grace_time=86400,
         )
+
+        # Ledger audit — hourly, on an INTERVAL trigger so it is not itself a
+        # catch-up candidate. Answers the one question no other signal answers:
+        # did the scheduled WORK happen? `running: true` and a fresh last_tick
+        # are both compatible with a job having silently stopped firing.
+        from app.core import job_ledger
+
+        def _run_job_ledger_audit() -> None:
+            try:
+                rep = job_ledger.audit(_scheduler)
+                if rep.get("overdue"):
+                    logger.error("[JobLedger] OVERDUE: %s", rep["overdue"])
+            except Exception as exc:                              # noqa: BLE001
+                logger.warning(f"[JobLedger] audit failed: {exc}")
+
+        _scheduler.add_job(
+            _run_job_ledger_audit,
+            trigger=IntervalTrigger(hours=1),
+            id="job_ledger_audit",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=1800,
+        )
+
+        # One pass over the built scheduler, so no future add_job call has to
+        # remember to opt in. Must run BEFORE start so the first fire is
+        # already recorded.
+        #
+        # Guarded SEPARATELY from the enclosing try. That block ends in
+        # `_scheduler = None` — so without this, a defect in the ledger would
+        # take down all 33 jobs. A safety net that can sever the thing it
+        # protects is worse than no safety net.
+        try:
+            job_ledger.instrument(_scheduler)
+        except Exception as exc:                                  # noqa: BLE001
+            logger.error(f"[JobLedger] instrument failed, continuing without "
+                         f"run recording: {exc}", exc_info=True)
+
         def _start_scheduler_now():
             """Start the built scheduler and record that it is live.
 
@@ -1096,6 +1158,15 @@ async def lifespan(app: FastAPI):
                 _scheduler.resume()
                 app.state.scheduler_running = True
                 logger.warning("[Scheduler] RESUMED after re-promotion")
+                # A demoted process fired nothing while paused. Whatever came
+                # due in that window is exactly as missed as it would be after
+                # a restart, so the same repair applies. Guarded: this runs
+                # AFTER the scheduler is live, so an exception escaping here
+                # would hit the outer handler and shut down a working scheduler.
+                try:
+                    job_ledger.catch_up_async(_scheduler)
+                except Exception as exc:                          # noqa: BLE001
+                    logger.error(f"[JobLedger] catch-up could not start: {exc}")
                 return
             _scheduler.start()
             from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
@@ -1114,6 +1185,20 @@ async def lifespan(app: FastAPI):
                 _dt.timezone.utc).isoformat(timespec="seconds")
             app.state.scheduler_jobs = len(_scheduler.get_jobs())
             app.state.scheduler_running = True
+            # Held so /health can ask the scheduler ITSELF whether it is
+            # running, instead of reporting a boolean set once at startup. If
+            # APScheduler's thread dies, the cached flag stays true forever and
+            # the field that is supposed to reveal that says everything is
+            # fine. Storing the object costs nothing and makes the answer live.
+            app.state.scheduler_obj = _scheduler
+            # Off the startup path deliberately — see catch_up_async. This is
+            # the whole point of the ledger: the in-memory jobstore recomputes
+            # every next_run_time from now, so without this a fire time that
+            # elapsed while the process was down is never made up.
+            try:
+                job_ledger.catch_up_async(_scheduler)
+            except Exception as exc:                              # noqa: BLE001
+                logger.error(f"[JobLedger] catch-up could not start: {exc}")
 
         def _pause_scheduler_now():
             """Stop firing jobs because this process is no longer the leader.
@@ -1943,9 +2028,16 @@ async def root():
     }
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    """Aggregate health check — home index + all 11 modules."""
+    """Aggregate health check — home index + all 11 modules.
+
+    HEAD is registered explicitly. Starlette adds HEAD to a GET route
+    automatically; FastAPI's APIRoute does NOT, so `HEAD /health` answered
+    **405** in production while `GET /health` answered 200. Anything that
+    liveness-probes with HEAD — uptime services default to it, because it is
+    the cheap verb — was reading a hard failure from a healthy service.
+    """
     from app.agents.accounts.graph      import get_graph as ga
     from app.agents.contacts.graph      import get_graph as gc
     from app.agents.products.graph      import get_graph as gp
@@ -2002,6 +2094,13 @@ async def health():
     except Exception:                                     # noqa: BLE001
         _pool = None
 
+    # Live, not remembered. `scheduler_running` is set once at start; the
+    # object's own `.running` reflects whether APScheduler is still alive. When
+    # they disagree, the disagreement IS the finding, so both are published
+    # rather than one silently overwriting the other.
+    _sched_obj = getattr(app.state, "scheduler_obj", None)
+    _live_running = getattr(_sched_obj, "running", None) if _sched_obj else None
+
     _sched = {"running": getattr(app.state, "scheduler_running", None),
               "jobs": getattr(app.state, "scheduler_jobs", 0),
               "started_at": getattr(app.state, "scheduler_started_at", None),
@@ -2016,10 +2115,39 @@ async def health():
                  - _dt.datetime.fromisoformat(_sched["last_tick"])).total_seconds())
         except Exception:                                     # noqa: BLE001
             pass
+    if _live_running is not None:
+        _sched["alive"] = _live_running
+        if _live_running is not bool(_sched["running"]):
+            _sched["running_disagrees"] = (
+                f"cached={_sched['running']} live={_live_running} — the "
+                f"scheduler object and the startup flag disagree")
+
     if getattr(app.state, "scheduler_last_error", None):
         _sched["last_error"] = app.state.scheduler_last_error
     if getattr(app.state, "scheduler_error", None):
         _sched["error"] = app.state.scheduler_error
+
+    # Did the WORK happen? running/jobs/last_tick all describe the machinery and
+    # were every one of them true while the order pipeline sat still for days.
+    # This reports jobs whose most recent scheduled fire time has no run behind
+    # it — served from the hourly audit's cached result, so /health stays a
+    # cheap endpoint.
+    try:
+        from app.core import job_ledger
+        _audit = job_ledger.last_audit()
+        if _audit:
+            _sched["overdue_jobs"] = _audit.get("overdue", [])
+            _sched["overdue_checked_at"] = _audit.get("checked_at")
+            # A miss that was auto-repaired overnight leaves `overdue` empty by
+            # morning. These two say it happened at all.
+            if _audit.get("repairs"):
+                _sched["repaired_24h"] = _audit["repairs"]
+            if _audit.get("failures"):
+                _sched["failed_jobs_24h"] = _audit["failures"]
+        if not job_ledger.available():
+            _sched["ledger"] = "unavailable — apply sql/job_ledger.sql"
+    except Exception:                                     # noqa: BLE001
+        pass
 
     _status = "healthy" if _db["ok"] else "degraded"
     _payload = {

@@ -32,14 +32,15 @@ $h | Select-Object status, @{n='ha';e={$_.ha.role}},
 $h.scheduler
 ```
 
-Read these four fields:
+Read these five fields:
 
 | Field | Healthy | What it means when wrong |
 |---|---|---|
 | `ha.role` | `leader` on exactly one process | `follower` **everywhere** = nobody runs the jobs. `unelected` = election never completed. `standalone` = `HA_LEADER_ELECTION=0` |
 | `scheduler.running` | `true` on the leader | started but not running = APScheduler died |
-| `scheduler.jobs` | `32` (as of 2026-08-05) | fewer means jobs failed to register |
+| `scheduler.jobs` | `33` (as of 2026-08-07) | fewer means jobs failed to register |
 | `scheduler.last_tick` | within the last hour | stale = the scheduler is present but frozen |
+| `scheduler.overdue_jobs` | `[]` | a job whose last scheduled fire time has no run behind it — see §3D |
 
 `ha.runs_singletons` is the boolean form of `ha.role == "leader"`.
 
@@ -49,7 +50,7 @@ Read these four fields:
 exists. A scheduler that is running and never ticking looks identical to a
 healthy one in every field except this.
 
-## 3. The three ways this fails
+## 3. The four ways this fails
 
 ### A. Everyone is a follower — nobody runs anything
 
@@ -89,7 +90,7 @@ the outage you are trying to fix.
 
 ### C. The scheduler never registered its jobs
 
-`scheduler.jobs` below the expected count (32 as of 2026-08-05 — recount with
+`scheduler.jobs` below the expected count (33 as of 2026-08-07 — recount with
 `grep -c '_scheduler.add_job' app/main.py` rather than trusting this number, it
 grows). A registration exception at startup skips the rest silently. This was a
 real bug: `scheduler.add_job` vs `_scheduler.add_job` meant **22 of 28 jobs
@@ -97,6 +98,43 @@ never registered** while the app reported healthy.
 
 Check the deploy logs for `[scheduler]` at startup. Fixing needs a code change,
 not a restart.
+
+### D. Everything above is healthy and a job still did not run
+
+Alert text: `N scheduled job(s) missed their last due time`.
+
+A restart is the usual cause. APScheduler's jobstore here is **in memory**, so
+every process start recomputes each `next_run_time` from *now*: a fire time that
+elapsed while the process was down is never made up, and `misfire_grace_time`
+does not apply because it forgives a late *live* scheduler, not an absent one.
+Nothing in §2 can see this — `running`, `jobs` and `last_tick` are all correct
+afterwards, because they describe the machinery rather than the work.
+
+Railway restarted this service at 03:30 UTC on 2026-08-06 and again on
+2026-08-07. Either one landing in the 21:45–23:45 nightly window would have
+skipped the whole batch for that day.
+
+**Check:**
+
+```sql
+SELECT job_id, status, started_at, detail
+  FROM scheduled_job_runs
+ WHERE started_at > now() - interval '48 hours'
+ ORDER BY started_at DESC;
+```
+
+`/health` carries the same answer under `scheduler.overdue_jobs`, refreshed
+hourly by the `job_ledger_audit` job, plus `scheduler.repaired_24h` for misses
+that were re-run automatically and `scheduler.failed_jobs_24h` for jobs that
+raised.
+
+**A job repaired every single night is a restart problem, not a success.** Look
+at the platform's restart history rather than the job.
+
+If `/health` reports `scheduler.ledger: unavailable`, the ledger table is
+missing and nothing is being recorded — apply `sql/job_ledger.sql`. The app
+cannot create it: `crm_app` has no CREATE on `public` (see
+`scripts/verify_runtime_ddl.py`).
 
 ## 4. Recover
 
@@ -110,10 +148,22 @@ curl -s https://<app>/health | ConvertFrom-Json |
     Select-Object -ExpandProperty scheduler
 ```
 
-Then catch up on what was missed. Jobs are **not** replayed automatically —
-APScheduler's `misfire_grace_time` drops runs whose window has passed. Check the
-event backlog, and remember to suppress row triggers on any bulk repair or every
-affected inbox floods:
+Then catch up on what was missed. Since 2026-08-07 the leader does this **for
+itself** at startup and on promotion: `app/core/job_ledger.py` compares each
+cron job's last recorded run to its previous fire time and re-runs what was
+skipped. Its limits are deliberate, and what falls outside them is still yours:
+
+- only misses newer than `JOB_CATCHUP_GRACE_MIN` (default 6 h) are re-run — an
+  older one acts on a stale view of the world
+- at most `JOB_CATCHUP_MAX_JOBS` (default 6) per boot, so recovering from a long
+  outage does not stampede the database
+- interval jobs are never caught up; they fire again within their own interval
+- a job the ledger has never seen records a `baseline` row **instead of
+  running**, so a first deploy does not fire all 27 cron jobs at once
+
+Anything it declined is in `scheduler.overdue_jobs` and in the log as
+`[JobLedger] catch-up`. Check the event backlog too, and remember to suppress
+row triggers on any bulk repair or every affected inbox floods:
 
 ```sql
 SET LOCAL app.suppress_events = 'notify';
@@ -130,6 +180,16 @@ SET LOCAL app.suppress_events = 'notify';
   outage.
 - Prefer stop-then-start over a rolling deploy on a single replica, which is the
   configuration that produced failure mode A.
+- `scripts/health_watch.py` confirms a failure with a re-check
+  (`HEALTH_CONFIRM_RETRIES`) before mailing, because a restart that resolves in
+  30 seconds used to page. Suppressed blips are counted, and
+  `HEALTH_BLIP_ALERT_COUNT` (default 3) in 24 h alerts on its own — repeated
+  restarts are a real problem even when each one self-heals.
+- That watcher runs as a Windows scheduled task on a workstation that sleeps, so
+  it reports `since_last_check_min` and warns above `HEALTH_MAX_GAP_MIN`. **A
+  quiet night is not evidence of a healthy night.** The ledger in §3D is what
+  covers those hours: it persists to the database and is still readable the next
+  morning.
 
 ## 6. Not verified in production
 
