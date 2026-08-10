@@ -24,7 +24,7 @@ import hashlib
 import hmac
 import logging
 import os
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
@@ -129,9 +129,232 @@ def _ensure_table(cur) -> None:
 
 
 
+# ── channel-aware consent (Axis 6 V1) ───────────────────────────────────────
+# Consent used to be email-shaped: one table keyed on an address, consulted by
+# one caller. SMS, WhatsApp and voice arrived afterwards and inherited nothing,
+# because consent modelled PER CHANNEL always lags the newest channel. This is
+# the single policy every channel asks.
+#
+# STATE MACHINE — UNKNOWN is the absence of a row, never a stored value:
+#
+#        no row ── opt_in ──► opted_in ── STOP/ARRÊT ──► opted_out
+#       (UNKNOWN)                ▲                          │
+#            │                   └──── START/UNSTOP ────────┘
+#            └──── STOP/ARRÊT ──────────────────────────────►
+#
+# WHAT UNKNOWN MEANS IS A LEGAL POSTURE, NOT AN ENGINEERING DEFAULT, so it is
+# configuration — per channel, because the honest answer differs per channel:
+#
+#   email  PERMISSIVE. This is the behaviour that exists today and is lawful
+#          today: a suppression list, where absence means mailable. Applying
+#          strict retroactively would block every commercial email in the
+#          system on deploy, since no opt-IN records exist. Changing that is a
+#          migration, not a flag flip.
+#   sms /
+#   whatsapp /
+#   voice  STRICT by default. Nothing has ever been recorded for these
+#          channels, so strict costs nothing today and is the safe side of a
+#          CASL question. Flip with CONSENT_UNKNOWN_PERMISSIVE=sms,voice.
+CHANNELS = ("sms", "email", "whatsapp", "voice")
+_PHONE_CHANNELS = ("sms", "whatsapp", "voice")
+
+UNKNOWN, OPTED_IN, OPTED_OUT = "unknown", "opted_in", "opted_out"
+
+_PERMISSIVE_DEFAULT = "email"
+
+
+def _permissive_channels() -> set:
+    raw = os.getenv("CONSENT_UNKNOWN_PERMISSIVE", _PERMISSIVE_DEFAULT)
+    return {c.strip().lower() for c in raw.split(",") if c.strip()}
+
+
+def normalize_identifier(channel: str, identifier: str) -> str:
+    """The SAME normalisation on write and on read.
+
+    A consent row that cannot be found because the number was stored as
+    +1 416 555 0123 and looked up as 4165550123 is worse than no row: it reads
+    as consent that was never given.
+    """
+    v = (identifier or "").strip()
+    if not v:
+        return ""
+    if channel == "email":
+        return v.lower()
+    try:
+        from app.core.telephony import normalize_phone
+        return normalize_phone(v) or v
+    except Exception:                                       # noqa: BLE001
+        return v
+
+
+def state(channel: str, identifier: str) -> str:
+    """opted_in | opted_out | unknown. Fails to UNKNOWN on a database error —
+    `allows()` then applies the channel's policy, which for a strict channel
+    means refusing to send. A consent lookup that fails open is how an
+    opted-out person receives a message."""
+    ident = normalize_identifier(channel, identifier)
+    if not ident:
+        return UNKNOWN
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT state FROM consent_state "
+                            "WHERE channel=%s AND identifier=%s",
+                            (channel, ident))
+                r = cur.fetchone()
+                return r[0] if r else UNKNOWN
+        finally:
+            conn.commit()
+            conn.close()
+    except Exception as exc:                                # noqa: BLE001
+        logger.error(f"[consent] state({channel}, {ident}) failed: {exc}")
+        return UNKNOWN
+
+
+def allows(channel: str, identifier: str, commercial: bool = True) -> bool:
+    """THE enforcement predicate. Every outbound chokepoint asks this one.
+
+    Transactional messages (OTP, order confirmations, an answer to a question
+    the person just asked) are not commercial electronic messages and are not
+    gated — the same carve-out send_email already makes. OPTED_OUT still blocks
+    commercial traffic regardless of channel policy; that is the whole point of
+    the record.
+    """
+    if channel not in CHANNELS:
+        logger.error(f"[consent] unknown channel {channel!r} — refusing")
+        return False
+    if not commercial:
+        return True
+    st = state(channel, identifier)
+    if st == OPTED_OUT:
+        return False
+    if st == OPTED_IN:
+        return True
+    return channel in _permissive_channels()        # UNKNOWN
+
+
+def record(channel: str, identifier: str, new_state: str,
+           reason: str = "", source: str = "unknown",
+           actor: str = "system") -> bool:
+    """Set consent and append the evidence row. Both, or neither."""
+    if channel not in CHANNELS or new_state not in (OPTED_IN, OPTED_OUT):
+        return False
+    ident = normalize_identifier(channel, identifier)
+    if not ident:
+        return False
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO consent_state "
+                "  (channel, identifier, state, reason, source) "
+                "VALUES (%s,%s,%s,%s,%s) "
+                "ON CONFLICT (channel, identifier) DO UPDATE SET "
+                "  state=EXCLUDED.state, reason=EXCLUDED.reason, "
+                "  source=EXCLUDED.source, updated_at=now()",
+                (channel, ident, new_state, reason or None, source))
+            cur.execute(
+                "INSERT INTO consent_log "
+                "  (channel, identifier, state, reason, source, actor) "
+                "VALUES (%s,%s,%s,%s,%s,%s)",
+                (channel, ident, new_state, reason or None, source, actor))
+        conn.commit()
+        logger.info(f"[consent] {channel}:{ident} -> {new_state} "
+                    f"({source})")
+        return True
+    except Exception as exc:                                # noqa: BLE001
+        conn.rollback()
+        logger.error(f"[consent] record({channel},{ident}) failed: {exc}")
+        return False
+    finally:
+        conn.close()
+
+
+def withdraw_all(identifiers: Any, reason: str = "withdraw-all",
+                 source: str = "request", actor: str = "system") -> Dict[str, Any]:
+    """One person, every channel. The global escape hatch that per-channel
+    consent needs in order to be usable: a person who says "stop contacting me"
+    should not have to say it four times.
+
+    Each identifier is applied to the channels it can actually address — an
+    email address is not a voice channel — so this never writes a row that
+    could never be matched.
+    """
+    if isinstance(identifiers, str):
+        identifiers = [identifiers]
+    out: Dict[str, Any] = {"opted_out": [], "skipped": []}
+    for raw in identifiers or []:
+        v = (raw or "").strip()
+        if not v:
+            continue
+        targets = ("email",) if "@" in v else _PHONE_CHANNELS
+        for ch in targets:
+            if record(ch, v, OPTED_OUT, reason, source, actor):
+                out["opted_out"].append(f"{ch}:{normalize_identifier(ch, v)}")
+            else:
+                out["skipped"].append(f"{ch}:{v}")
+    # Keep the legacy email list in step, so the old reader and the new one can
+    # never disagree about the same address.
+    for raw in identifiers or []:
+        if "@" in (raw or ""):
+            try:
+                suppress(raw, reason=reason, source=source)
+            except Exception:                               # noqa: BLE001
+                pass
+    return out
+
+
+# ── inbound opt-out keywords ────────────────────────────────────────────────
+# Recognised BEFORE the message reaches the assistant. Previously "STOP" was
+# treated as a question: it went to the KB-grounded responder, which composed a
+# reply and — with AUTOSEND on — sent another SMS to someone who had just asked
+# to stop.
+#
+# French matters here, not as politeness but because the product answers in
+# French: ARRÊT is the opt-out word a French-speaking recipient will send, and
+# it arrives both accented and unaccented depending on the handset.
+_STOP_WORDS = {
+    "stop", "stopall", "unsubscribe", "cancel", "end", "quit", "optout",
+    "opt-out", "arret", "arrêt", "arrête", "arrete", "desabonnement",
+    "désabonnement", "desabonner", "se desabonner",
+    "baja", "cancelar", "parar",                 # es
+    "退订", "取消订阅",                            # zh
+}
+_START_WORDS = {"start", "unstop", "yes", "subscribe", "optin", "opt-in",
+                "demarrer", "démarrer", "oui", "alta", "si", "订阅"}
+
+
+def classify_inbound(body: str) -> Optional[str]:
+    """OPTED_OUT / OPTED_IN for a recognised keyword, else None.
+
+    Deliberately strict: the WHOLE message must be the keyword (after
+    stripping punctuation and case). "stop sending me invoices at 3am" is a
+    complaint that a human should read, not an opt-out — and silently
+    unsubscribing someone who asked a question is its own failure.
+    """
+    t = (body or "").strip().lower()
+    t = t.strip(".!?,;:'\"()[]").strip()
+    if not t:
+        return None
+    if t in _STOP_WORDS:
+        return OPTED_OUT
+    if t in _START_WORDS:
+        return OPTED_IN
+    return None
+
+
 def is_suppressed(email: str) -> bool:
     """True when the address opted out. Fails OPEN on DB errors for
-    transactional continuity — commercial callers log the failure."""
+    transactional continuity — commercial callers log the failure.
+
+    Now reads BOTH stores: the legacy email_suppression list and the
+    channel-aware consent_state. Either saying "out" means out, so an address
+    suppressed through the new path is honoured by the old reader and vice
+    versa — the two cannot drift into disagreeing about the same person.
+    """
+    if state("email", email) == OPTED_OUT:
+        return True
     e = (email or "").strip().lower()
     if not e:
         return False
@@ -152,9 +375,20 @@ def is_suppressed(email: str) -> bool:
 
 def suppress(email: str, reason: str = "unsubscribed",
              source: str = "unsubscribe_link") -> bool:
+    """Unsubscribe an address. Writes BOTH stores.
+
+    `consent_state` is now the system of record — it is what `allows()` reads
+    for every channel. The legacy `email_suppression` row is still written
+    because it is declared in dsar.DIRECT and read by the HMAC unsubscribe
+    page; dropping it is a separate change. Writing one and not the other is
+    how the two would come to disagree about the same person, so this writes
+    both or reports failure.
+    """
     e = (email or "").strip().lower()
     if not e or "@" not in e:
         return False
+    record("email", e, OPTED_OUT, reason=reason, source=source,
+           actor="unsubscribe")
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -164,6 +398,27 @@ def suppress(email: str, reason: str = "unsubscribed",
                 "VALUES (%s,%s,%s) ON CONFLICT (email) DO NOTHING", (e, reason, source))
         conn.commit()
         logger.info(f"[consent] suppressed {e} ({reason} via {source})")
+        return True
+    finally:
+        conn.close()
+
+
+def unsuppress(email: str, reason: str = "resubscribed",
+               source: str = "admin") -> bool:
+    """Re-subscribe. Both stores again, in the opposite direction — without
+    this, an address could be opted back in on one store and stay blocked by
+    the other, which reads to the operator as the feature being broken."""
+    e = (email or "").strip().lower()
+    if not e or "@" not in e:
+        return False
+    record("email", e, OPTED_IN, reason=reason, source=source, actor="admin")
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            _ensure_table(cur)
+            cur.execute("DELETE FROM email_suppression WHERE email=%s", (e,))
+        conn.commit()
+        logger.info(f"[consent] unsuppressed {e} ({reason} via {source})")
         return True
     finally:
         conn.close()

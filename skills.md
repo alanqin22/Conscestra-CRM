@@ -2499,3 +2499,108 @@ KMS + asymmetric signing (`MEMORY_SIGNING_KEY` is HMAC — verification implies
 forgery); ISO 42001 groundwork; data isolation between two live tenants;
 leader promotion and attestation in production; an uptime checker on `/health`
 — every runbook written today opens with "check /health", and nothing does.
+
+---
+
+# Axis 6 — Agentforce / Data 360 round-3 (2026-08-08)
+
+> Source: salesforce.com/ca/agentforce + /ca/data (Data 360). Both 403 WebFetch;
+> fetched with our own `web_tools.fetch_page`. Filtered against the five prior
+> axes AND against the recorded out-of-scope decisions first — zero-copy/BYO
+> warehouse, 200+ connectors, Field Service, AgentExchange marketplace and full
+> multi-tenancy are DECISIONS, not blindspots, and were discarded.
+
+## Verified NON-gaps this round (checked, don't rebuild)
+
+- Segments/audiences (`marketing.resolve_segment` + campaigns), LTV and churn
+  scoring (`intelligence.py`), identity resolution, MCP both directions, voice,
+  observability, eval gate, takeover/escalation, agent versioning.
+- **Email consent is correctly enforced.** Every `send_email` caller was
+  enumerated: the 4 commercial senders (email agent compose + template,
+  marketing, quotes) all pass `commercial=True`; SDR is an OTP, agent-bus is
+  order mail, sequences only create drafts. No commercial email bypasses it.
+
+## Findings
+
+| # | Gap | Evidence class | Status |
+|---|-----|----------------|--------|
+| F-8.1 | ~~Audit immutability broke GDPR erasure~~ | **WITHDRAWN — FALSE POSITIVE** | See below |
+| F-8.3 | SMS has NO consent control: no store, no gate in `send_sms`, no opt-out | TRACED (full read of the send path) | Open |
+| F-8.4 | Inbound `STOP` is not intercepted — it reaches the LLM auto-responder, which replies with **another SMS** | TRACED | Open |
+| F-8.5 | `ARRÊT` not handled; the product ships French support | TRACED | Open |
+| F-8.6 | Consent is an opt-in CALL-SITE FLAG (`commercial=True`), not an enforced policy. Correct today at all 4 sites; unenforceable for the 5th | MEASURED | Open |
+| F-8.7 | `coverage()` is STRUCTURAL only. `events`(52), `knowledge_articles`(10), `identity_links`(7), `email_sentiment`(5) carry subject emails while it reports `complete:true` | MEASURED | Detector shipped; 4 dispositions open |
+| F-8.8 | The `contact.deleted` event retains the erased contact's email | MEASURED | Open |
+| F-8.10 | `sp_admin` mode `data_cleanup` purges `audit_log` >90d and `activities` >365d, outside the retention framework and contradicting the Trust Center's immutability claim | MEASURED | **B-i chosen** |
+
+## F-8.1 — WITHDRAWN, and why it must stay on the record
+
+**Claimed:** revoking DELETE on `audit_log` broke Art. 17 erasure, P0, production.
+**Actual:** `audit_log` is an erasure satellite with `action=RETAIN`. `erase_sp`
+does `if action == RETAIN: retained.append(t); continue` — **no SQL is issued
+against it.** Erasure was never broken. No production change was made.
+
+**The reasoning failure, recorded so it is not repeated.** A grep showed
+`_sat("governed_deletions", …, DELETE, …)`; a separate read showed `audit_log`
+in the satellite list; the DELETE was carried across without ever being
+established. It was then "confirmed" by measuring that `crm_app` cannot DELETE
+`audit_log` — true, and evidence for a privilege fact, not for the application
+requirement. Two different propositions:
+
+    crm_app lacks DELETE on audit_log          (privilege — measured, true)
+    erasure requires DELETE on audit_log       (behaviour — never tested, false)
+
+**Rule adopted:** a measurement is evidence only for the exact proposition it
+tests. Before asserting that a control breaks a workflow, trace the workflow to
+the statement it actually issues.
+
+**Second-order lesson:** the first impact analysis grepped PYTHON ONLY, and this
+system does most of its writing through stored procedures. It also checked one
+of the four tables the migration locked. The complete matrix (python × stored
+procedures × triggers × erasure plans × retention × DSAR, for all four tables)
+is what found both the truth about F-8.1 and F-8.10.
+
+## Decisions
+
+- **A — consent model: PER-CHANNEL with an explicit withdraw-all** (user,
+  2026-08-08). SMS independently enforceable; `OPTED_OUT` must be an enforcement
+  state, not merely a stored value.
+- **B-i — remove `sp_admin`'s audit-log purge** (user, 2026-08-08), conditional
+  on confirming no manual DBA reliance. Evidence: 0 application callers, and
+  765 local / 584 Railway audit rows older than 90 days survive, so the branch
+  has never executed on either database.
+- Audit-log retention: immutability stands. NOTE — "Art. 17 is not broken" does
+  NOT establish that indefinite retention is lawful; that is a separate legal
+  question and is not settled here.
+
+## Out of scope (decisions, not oversights)
+
+- Zero-copy / BYO-warehouse federation, 200+ connectors — already recorded on
+  the analytics axis; re-confirmed against Data 360 and unchanged.
+- Advertising-platform activation, Clean Rooms — not our market.
+
+## Execution log — Axis 6
+
+- **2026-08-08 — B-i EXECUTED (local).** `sql/retire_sp_admin_data_cleanup.sql`
+  replaces `sp_admin`'s `data_cleanup` branch with a `RAISE ... 
+  feature_not_supported` naming `retention.POLICIES`. Generated by surgical
+  substitution on the live definition; asserted before writing: 13/13 modes
+  intact, single diff hunk (-28/+18) confined to the branch, both DELETEs gone,
+  no other DELETE lost. Verified after deploy: the mode raises; 765 audit rows
+  >90d and 8,171 activities untouched. **Railway pending (user deploys).**
+  - Pre-check: local and Railway `sp_admin` were byte-different but
+    **semantically identical** (438 non-blank lines each, 0 differences after
+    stripping blank lines) — Railway's copy had doubled newlines. Safe to
+    replace both from one generated definition.
+  - Chose (b) over (a) because the branch aborts on its FIRST statement today,
+    leaving the ungoverned `activities` delete unreachable behind it. Removing
+    only the audit_log line would have made that delete reachable for the first
+    time — (a) was the more dangerous option, not the smaller one.
+
+- **F-8.11 (new, pre-existing, NOT caused by B-i).** 4 of 13 `sp_admin` modes
+  are broken on BOTH databases: `system_health`, `user_list`, `export_config`
+  fail with `relation "users" does not exist`; `table_stats` has a GROUP BY
+  error. Proven pre-existing by control — Railway still runs the OLD definition
+  and fails identically. Combined with 0 application callers, `sp_admin` is
+  legacy surface: 9 working modes nothing calls. Low severity; recorded, not
+  fixed. Whether it should exist at all is a separate question.

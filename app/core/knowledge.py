@@ -1088,9 +1088,18 @@ def knowledge_list(status: str = "active", limit: int = 50):
             for r in rows:
                 for k in ("last_used_at", "created_at"):
                     r[k] = r[k].isoformat() if r[k] else None
+            # `count` is len(rows) and therefore capped by `limit` — the admin
+            # page was rendering it as "Active articles" and so displayed the
+            # page size, not the library size. It read exactly 50 with 50 as
+            # the limit. Kept for compatibility; `total` is the real number.
+            cur.execute(
+                "SELECT count(*) FROM knowledge_articles WHERE status=%s",
+                (status,))
+            total = cur.fetchone()[0]
     finally:
         conn.close()
-    return {"status": status, "count": len(rows), "articles": rows,
+    return {"status": status, "count": len(rows), "total": total,
+            "articles": rows,
             "rag_enabled": RAG_ENABLED, "draft_enabled": DRAFT_ENABLED}
 
 
@@ -1111,6 +1120,163 @@ def knowledge_create(body: Dict[str, Any]):
 @router.post("/knowledge/{article_uuid}/retire")
 def knowledge_retire(article_uuid: str, reason: str = "manual"):
     return retire(article_uuid, reason)
+
+
+# ── read and edit one article ────────────────────────────────────────────────
+# /knowledge/list returns metadata only — title, source, uses, created_at — so
+# until now the ANSWER TEXT the assistants read out to customers could not be
+# seen anywhere in the product, let alone corrected. The only available action
+# was Retire: delete the article and re-ingest the document. These two routes
+# exist so a wrong sentence can be fixed as a wrong sentence.
+#
+# Path is /knowledge/article/{uuid} rather than /knowledge/{uuid} so it can
+# never shadow /knowledge/list, /search, /gaps or /documents.
+
+_AUDIENCES = ("public", "internal")
+_EDITABLE = ("title", "problem", "answer", "keywords", "audience", "category",
+             "review_after")
+
+
+def _article_row(cur, article_uuid: str) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        """SELECT article_uuid::text, title, problem, answer, keywords,
+                  source, source_ref, status, uses, last_used_at,
+                  created_by, created_at, updated_at, audience, category,
+                  review_after
+           FROM knowledge_articles WHERE article_uuid=%s::uuid""",
+        (article_uuid,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    row = dict(zip([d[0] for d in cur.description], r))
+    for k in ("last_used_at", "created_at", "updated_at", "review_after"):
+        row[k] = row[k].isoformat() if row[k] else None
+    return row
+
+
+@router.get("/knowledge/article/{article_uuid}")
+def knowledge_get(article_uuid: str):
+    """One article in full, including the answer body."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            row = _article_row(cur, article_uuid)
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="no such article")
+    return row
+
+
+@router.patch("/knowledge/article/{article_uuid}")
+def knowledge_update(article_uuid: str, body: Dict[str, Any]):
+    """Edit an article in place. PATCH semantics — absent keys are untouched.
+
+    Validation deliberately mirrors publish(). An edit path looser than the
+    create path is a hole, not a convenience: it would let an article that
+    publish() would have refused (empty answer, answer under MIN_ANSWER_CHARS)
+    exist anyway, and these articles are read out to customers.
+
+    status is NOT editable here — retire/restore own that transition, and
+    folding it in would give two routes the power to change what is served.
+    uses, created_at and provenance are not editable at all.
+    """
+    body = body or {}
+    unknown = [k for k in body if k not in _EDITABLE]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"not editable: {', '.join(sorted(unknown))}. "
+                   f"Editable fields are {', '.join(_EDITABLE)}")
+
+    sets: List[str] = []
+    args: List[Any] = []
+
+    for field in ("title", "problem", "answer"):
+        if field not in body:
+            continue
+        val = str(body.get(field) or "").strip()
+        if not val:
+            raise HTTPException(status_code=422,
+                                detail=f"{field} cannot be empty")
+        if field == "answer" and len(val) < MIN_ANSWER_CHARS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"answer too short (<{MIN_ANSWER_CHARS} chars) to be "
+                       f"useful — the same floor publish() enforces")
+        cap = {"title": 180, "problem": 2000, "answer": 4000}[field]
+        sets.append(f"{field}=%s")
+        args.append(val[:cap])
+
+    if "keywords" in body:
+        kws = body.get("keywords")
+        if isinstance(kws, str):        # "a, b, c" from a text input
+            kws = [k for k in (p.strip() for p in kws.split(",")) if k]
+        # publish() caps a NEW draft at 8 — a sensible leash on an LLM writing
+        # its own keywords. Applying that cap to an EDIT would be destructive:
+        # 5 of the seeded articles carry more, up to 29, because they hold the
+        # French, Spanish and Chinese phrasings that make cross-lingual
+        # retrieval work. Truncating to 8 on an unrelated edit would silently
+        # delete them and quietly break non-English search. The edit ceiling
+        # is therefore generous and exists only to bound the column.
+        sets.append("keywords=%s")
+        args.append([str(k)[:60] for k in (kws or [])][:40])
+
+    if "audience" in body:
+        aud = str(body.get("audience") or "").strip()
+        # Checked here, not left to the CHECK constraint, so a bad value is a
+        # 422 naming the allowed set rather than a 500 from psycopg2. This
+        # field decides whether an article reaches customers at all.
+        if aud not in _AUDIENCES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"audience must be one of {', '.join(_AUDIENCES)}")
+        sets.append("audience=%s")
+        args.append(aud)
+
+    if "category" in body:
+        cat = str(body.get("category") or "").strip()
+        sets.append("category=%s")
+        args.append(cat[:60] or None)
+
+    if "review_after" in body:
+        ra = str(body.get("review_after") or "").strip()
+        sets.append("review_after=%s")
+        args.append(ra or None)
+
+    if not sets:
+        raise HTTPException(status_code=422, detail="nothing to update")
+
+    sets.append("updated_at=now()")
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE knowledge_articles SET {', '.join(sets)} "
+                f"WHERE article_uuid=%s::uuid",
+                (*args, article_uuid))
+            if not cur.rowcount:
+                conn.rollback()
+                raise HTTPException(status_code=404, detail="no such article")
+            row = _article_row(cur, article_uuid)
+        conn.commit()
+    finally:
+        conn.close()
+
+    # search_tsv is maintained by trg_knowledge_articles_tsv, so full-text
+    # follows the edit on its own. The VECTOR index does not: kb_embeddings is
+    # keyed by a content hash, so until it is refreshed semantic search keeps
+    # matching the text that was replaced. Forced here, and never allowed to
+    # fail the edit — the article is already saved and FTS already sees it.
+    try:
+        from app.core import semantic
+        semantic.ensure_index(force=True)
+    except Exception as exc:                                  # noqa: BLE001
+        logger.warning(f"[knowledge] reindex after edit failed: {exc}")
+
+    logger.info(f"[knowledge] edited {article_uuid[:8]} "
+                f"({', '.join(k for k in body if k in _EDITABLE)})")
+    return {"ok": True, "article": row}
 
 
 @router.post("/knowledge/draft-pass")

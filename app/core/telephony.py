@@ -353,6 +353,35 @@ def send_sms(to: str, body: str, *, lead_id=None, account_id=None,
     body = (body or "").strip()
     if not body:
         return {"ok": False, "error": "empty message body"}
+
+    # ── CONSENT (Axis 6 V1) ─────────────────────────────────────────────────
+    # THE enforcement point. It sits here, above the carrier adapter, for two
+    # reasons: every one of the five callers (a2a capability, agent console,
+    # inbound auto-reply, voice support, POST /telephony/sms/send) reaches the
+    # carrier through this function, so one check covers all of them and any
+    # sixth added later; and being above the adapter it is provably identical
+    # for Telnyx and Twilio rather than duplicated per provider.
+    #
+    # `transactional` reuses the existing carve-out: an OTP the caller is
+    # waiting for, or an order update, is not a commercial electronic message.
+    # It is the same distinction send_email draws with `commercial=`.
+    try:
+        from app.core import consent
+        if not consent.allows("sms", to_n, commercial=not transactional):
+            logger.info(f"[telephony] SMS to {to_n} refused — consent "
+                        f"({consent.state('sms', to_n)})")
+            return {"ok": False, "blocked": True, "consent": False,
+                    "error": f"{to_n} has not consented to commercial SMS "
+                             f"(state: {consent.state('sms', to_n)})"}
+    except ImportError:
+        # Fail CLOSED for commercial traffic. A consent module that cannot be
+        # imported is not permission to send; it is a reason not to.
+        if not transactional:
+            logger.error("[telephony] consent module unavailable — refusing "
+                         "commercial SMS")
+            return {"ok": False, "blocked": True,
+                    "error": "consent module unavailable"}
+
     # Outbound guard (guardrail 3) — transactional bodies (OTP codes) are
     # code-built and screened too; the checks cost microseconds.
     try:
@@ -483,12 +512,33 @@ def _say_url(text: str) -> str:
 
 def place_call(to: str, say_text: str, *, lead_id=None, account_id=None,
                owner_id=None, called_by: str = "agent",
+               transactional: bool = False,
                from_number: Optional[str] = None) -> Dict[str, Any]:
     """Place a call that speaks `say_text`. Twilio: inline TwiML (no public
     URL). Telnyx: a TeXML application call pointed at a signed say URL."""
     to_n = normalize_phone(to)
     if not to_n:
         return {"ok": False, "error": f"unusable phone number {to!r}"}
+
+    # Consent, on the same predicate and in the same position as send_sms:
+    # above the carrier adapter, so Telnyx and Twilio cannot diverge. An
+    # unsolicited outbound call is a marketing call; a callback the person
+    # asked for is transactional and passes.
+    try:
+        from app.core import consent
+        if not consent.allows("voice", to_n, commercial=not transactional):
+            logger.info(f"[telephony] call to {to_n} refused — consent "
+                        f"({consent.state('voice', to_n)})")
+            return {"ok": False, "blocked": True, "consent": False,
+                    "error": f"{to_n} has not consented to marketing calls "
+                             f"(state: {consent.state('voice', to_n)})"}
+    except ImportError:
+        if not transactional:
+            logger.error("[telephony] consent module unavailable — refusing "
+                         "outbound marketing call")
+            return {"ok": False, "blocked": True,
+                    "error": "consent module unavailable"}
+
     if not configured():
         return {"ok": False, "error": f"{_provider()} not configured"}
     if not AUTOSEND:
@@ -808,6 +858,39 @@ async def _bridge_inbound_sms(sender: str, body: str,
     sender = normalize_phone(sender) or sender
     body = (body or "").strip()
 
+    # ── OPT-OUT KEYWORDS, BEFORE THE ASSISTANT SEES THE MESSAGE ─────────────
+    # Previously "STOP" was just text: it went to _compose_sms_reply, the
+    # KB-grounded responder answered it, and with AUTOSEND on the caller sent
+    # that answer — another SMS to someone who had just asked for none. The
+    # check therefore has to happen here, ahead of the LLM, not inside it.
+    #
+    # The exchange is still logged and threaded below, because a withdrawal is
+    # part of the conversation record and CASL wants it evidenced. What changes
+    # is that the function RETURNS the confirmation directly and never reaches
+    # the composer, so no LLM-authored message can follow an opt-out.
+    try:
+        from app.core import consent
+        verdict = consent.classify_inbound(body)
+    except Exception:                                       # noqa: BLE001
+        verdict = None
+    if verdict:
+        from app.core import consent
+        consent.record("sms", sender, verdict,
+                       reason=f"inbound keyword: {body[:40]}",
+                       source="inbound_sms", actor=sender)
+        _log_activity("call",
+                      f"SMS {'opt-out' if verdict == 'opted_out' else 'opt-in'}"
+                      f" from {sender}",
+                      f"Keyword '{body[:40]}' via {via}. Consent for sms set to "
+                      f"{verdict}.", direction="inbound")
+        # One confirmation, and it is transactional: confirming a withdrawal is
+        # not marketing, and CASL expects the request to be acknowledged.
+        return ("You have been unsubscribed and will receive no further "
+                "marketing texts. Reply START to resubscribe."
+                if verdict == "opted_out" else
+                "You are resubscribed and may receive messages again. "
+                "Reply STOP to unsubscribe.")
+
     # Unified Communication Layer: thread this inbound SMS into the sender's ONE
     # cross-channel conversation (best-effort; the adapter swallows any failure,
     # so this never affects the SMS reply). Threads matched AND unmatched senders.
@@ -933,7 +1016,15 @@ async def telephony_inbound(request: Request):
         # Telnyx has no inline reply — send the auto-reply as a separate msg.
         if reply and AUTOSEND:
             try:
-                send_sms(sender, reply, sent_by="auto-reply")
+                # transactional=True: this is a direct reply to a message the
+                # person just sent us, not a commercial electronic message —
+                # the same treatment the EMAIL auto-reply already gets (it
+                # never passes commercial=True). It also has to be, or the
+                # opt-out CONFIRMATION would be refused by the consent gate we
+                # just triggered, leaving a withdrawal silently unacknowledged.
+                # Answering someone who contacted you is not marketing to them.
+                send_sms(sender, reply, sent_by="auto-reply",
+                         transactional=True)
             except Exception as exc:
                 logger.warning(f"[telephony] telnyx auto-reply send failed: {exc}")
         return Response("", status_code=200)
