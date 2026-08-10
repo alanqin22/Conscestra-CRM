@@ -92,7 +92,7 @@ import json as _json
 import logging
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Request, Response
 
@@ -852,9 +852,19 @@ async def _compose_sms_reply(sender_display: str, body: str,
 
 
 async def _bridge_inbound_sms(sender: str, body: str,
-                              via: str = "provider") -> Optional[str]:
+                              via: str = "provider") -> Tuple[Optional[str], bool]:
     """Provider-agnostic core: match the sender, log the inbound activity,
-    emit sms.received, and compose the auto-reply text. Returns the reply."""
+    emit sms.received, and compose the auto-reply text.
+
+    Returns (reply, mandatory). `mandatory` marks a reply the caller must send
+    EVEN IF SMS_AUTOSEND is off — today that means a consent acknowledgement.
+    SMS_AUTOSEND exists to hold back agent-INITIATED outreach for human review;
+    an opt-out confirmation is neither initiated by us nor outreach, it is the
+    CASL-required acknowledgement of a request the person just made. Gating it
+    behind that flag meant a withdrawal went unacknowledged (F-9.8): measured
+    in production, STOP and START appeared to work only because the CARRIER
+    auto-replies to those two keywords — ARRET, which it does not recognise,
+    got nothing back from us at all."""
     sender = normalize_phone(sender) or sender
     body = (body or "").strip()
 
@@ -864,10 +874,14 @@ async def _bridge_inbound_sms(sender: str, body: str,
     # that answer — another SMS to someone who had just asked for none. The
     # check therefore has to happen here, ahead of the LLM, not inside it.
     #
-    # The exchange is still logged and threaded below, because a withdrawal is
-    # part of the conversation record and CASL wants it evidenced. What changes
-    # is that the function RETURNS the confirmation directly and never reaches
-    # the composer, so no LLM-authored message can follow an opt-out.
+    # The withdrawal is THREADED AND LOGGED before returning (F-9.9). An
+    # earlier version returned immediately and claimed in this comment that it
+    # was "logged and threaded below" — it was not: `capture_sms` sits after
+    # this branch, and `_log_activity` skips silently when it has no CRM entity
+    # (activities.related_id is NOT NULL). Measured in production: three
+    # opt-outs recorded in consent_log, zero rows in activities, nothing in the
+    # customer's conversation. The compliance record existed; an operator
+    # looking at the timeline saw nothing.
     try:
         from app.core import consent
         verdict = consent.classify_inbound(body)
@@ -878,18 +892,42 @@ async def _bridge_inbound_sms(sender: str, body: str,
         consent.record("sms", sender, verdict,
                        reason=f"inbound keyword: {body[:40]}",
                        source="inbound_sms", actor=sender)
+
+        confirmation = ("You have been unsubscribed and will receive no "
+                        "further marketing texts. Reply START to resubscribe."
+                        if verdict == "opted_out" else
+                        "You are resubscribed and may receive messages again. "
+                        "Reply STOP to unsubscribe.")
+
+        # Thread BOTH halves into the sender's one conversation, so the
+        # withdrawal and its acknowledgement appear in the timeline like any
+        # other exchange. Best-effort: a threading failure must never stop a
+        # consent record that is already written.
+        try:
+            from app.core import channel_adapters
+            channel_adapters.capture_sms(sender, body)
+            channel_adapters.capture_sms(sender, confirmation,
+                                         direction="outbound")
+        except Exception as exc:                            # noqa: BLE001
+            logger.warning(f"[telephony] consent thread skipped: {exc}")
+
+        # Resolve the sender FIRST so the activity has an entity to hang on.
+        # Without this the row is silently dropped.
+        who = _match_sender(sender) if sender else None
         _log_activity("call",
                       f"SMS {'opt-out' if verdict == 'opted_out' else 'opt-in'}"
-                      f" from {sender}",
+                      f" from {(who or {}).get('display') or sender}",
                       f"Keyword '{body[:40]}' via {via}. Consent for sms set to "
-                      f"{verdict}.", direction="inbound")
-        # One confirmation, and it is transactional: confirming a withdrawal is
-        # not marketing, and CASL expects the request to be acknowledged.
-        return ("You have been unsubscribed and will receive no further "
-                "marketing texts. Reply START to resubscribe."
-                if verdict == "opted_out" else
-                "You are resubscribed and may receive messages again. "
-                "Reply STOP to unsubscribe.")
+                      f"{verdict}.", direction="inbound",
+                      lead_id=(who or {}).get("lead_id"),
+                      account_id=(who or {}).get("account_id"),
+                      owner_id=(who or {}).get("owner_id"))
+        if not who:
+            logger.info(f"[telephony] consent {verdict} for {sender} — no CRM "
+                        f"entity, so it is in consent_log only")
+        # MANDATORY: this acknowledgement is a CASL obligation, not agent
+        # outreach, so the caller must send it even with SMS_AUTOSEND off.
+        return (confirmation, True)
 
     # Unified Communication Layer: thread this inbound SMS into the sender's ONE
     # cross-channel conversation (best-effort; the adapter swallows any failure,
@@ -940,7 +978,7 @@ async def _bridge_inbound_sms(sender: str, body: str,
                 "sms", None, f"customer: {body}\nagent: {reply}")
         except Exception as exc:
             logger.debug(f"[telephony] memory write skipped: {exc}")
-    return reply
+    return (reply, False)
 
 
 async def handle_inbound_sms(url: str, params: Dict[str, str],
@@ -950,7 +988,7 @@ async def handle_inbound_sms(url: str, params: Dict[str, str],
     (JSON body + Ed25519 + separate-message reply)."""
     if not _valid_signature(url, params, signature):
         return None
-    return await _bridge_inbound_sms(params.get("From", ""),
+    reply, _mandatory = await _bridge_inbound_sms(params.get("From", ""),
                                      params.get("Body", ""), via="Twilio")
 
 
@@ -1011,10 +1049,31 @@ async def telephony_inbound(request: Request):
         if payload.get("direction") != "inbound":
             return Response("", status_code=200)
         sender = (payload.get("from") or {}).get("phone_number", "")
-        reply = await _bridge_inbound_sms(sender, payload.get("text", ""),
-                                          via="Telnyx")
+        # WHICH OF OUR NUMBERS DID THEY TEXT? (F-9.10)
+        # Telnyx delivers `to` as a list of destinations. Without this the
+        # auto-reply falls through to _from_number(), which picks a pool member
+        # by destination country and a stable hash — so a customer texting the
+        # Toronto line (+1 289 800 4112) was answered from the Vancouver line
+        # (+1 778 907 0989). Observed 2026-08-10.
+        #
+        # It is not only confusing. Carrier opt-out state is held per
+        # (subscriber, sender number) pair, so a STOP sent to one of our
+        # numbers does not register against another — replying from a
+        # different line answers an opt-out on a channel the opt-out never
+        # touched, and leaves the texted number's own state unchanged.
+        _to = payload.get("to")
+        inbound_to = ""
+        if isinstance(_to, list) and _to:
+            inbound_to = (_to[0] or {}).get("phone_number", "") or ""
+        elif isinstance(_to, dict):
+            inbound_to = _to.get("phone_number", "") or ""
+        elif isinstance(_to, str):
+            inbound_to = _to
+
+        reply, mandatory = await _bridge_inbound_sms(
+            sender, payload.get("text", ""), via="Telnyx")
         # Telnyx has no inline reply — send the auto-reply as a separate msg.
-        if reply and AUTOSEND:
+        if reply and (AUTOSEND or mandatory):
             try:
                 # transactional=True: this is a direct reply to a message the
                 # person just sent us, not a commercial electronic message —
@@ -1023,8 +1082,19 @@ async def telephony_inbound(request: Request):
                 # opt-out CONFIRMATION would be refused by the consent gate we
                 # just triggered, leaving a withdrawal silently unacknowledged.
                 # Answering someone who contacted you is not marketing to them.
-                send_sms(sender, reply, sent_by="auto-reply",
-                         transactional=True)
+                # from_number=inbound_to: answer FROM the line they texted, so
+                # the reply lands in the same thread on the handset and the
+                # carrier's opt-out state stays attached to the right number.
+                res = send_sms(sender, reply, sent_by="auto-reply",
+                               transactional=True,
+                               from_number=inbound_to or None)
+                if not res.get("ok"):
+                    # A dropped auto-reply used to be invisible: the send
+                    # result was discarded, so a refused or failed reply looked
+                    # exactly like a delivered one from the outside.
+                    logger.error(
+                        f"[telephony] auto-reply NOT sent to {sender} "
+                        f"(mandatory={mandatory}): {res.get('error')}")
             except Exception as exc:
                 logger.warning(f"[telephony] telnyx auto-reply send failed: {exc}")
         return Response("", status_code=200)
