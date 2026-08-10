@@ -115,12 +115,23 @@ def send_email(
         pass
 
     if commercial:
-        from app.core.consent import guard_outbound
-        allowed, body_html, body_text = guard_outbound(to, body_html, body_text)
-        if not allowed:
-            logger.info(f"[send_email] SKIPPED commercial email to unsubscribed {to!r}")
+        # ONE predicate for every channel (Axis 6 V1). This used to call
+        # consent.guard_outbound directly, which was email-specific logic
+        # living beside SMS logic that did not exist — the shape that let SMS
+        # ship with no consent at all. Email now asks the same question
+        # send_sms and place_call ask, of the same store.
+        #
+        # guard_outbound still runs, for the half that IS email-specific: the
+        # CASL footer and its signed unsubscribe link. Consent DECIDES; the
+        # footer is formatting.
+        from app.core import consent
+        if not consent.allows("email", to, commercial=True):
+            logger.info(f"[send_email] SKIPPED commercial email to {to!r} "
+                        f"(consent: {consent.state('email', to)})")
             return {'success': False, 'skipped': 'unsubscribed', 'to': to,
                     'message': f'{to} has unsubscribed from commercial email'}
+        _allowed, body_html, body_text = consent.guard_outbound(
+            to, body_html, body_text)
 
     addr     = _email_address()
     password = _email_password()

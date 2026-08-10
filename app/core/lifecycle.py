@@ -42,10 +42,21 @@ DELETE, ANONYMIZE, RETAIN = "delete", "anonymize", "retain"
 
 
 def _sat(table: str, column: str, action: str, why: str,
-         via: Optional[Tuple[str, str, str]] = None) -> Dict[str, Any]:
+         via: Optional[Tuple[str, str, str]] = None,
+         also: Optional[Tuple[str, ...]] = None) -> Dict[str, Any]:
     """A satellite store. `via` = (parent_table, parent_key, parent_match_col) for
-    child rows reachable only through a parent (e.g. messages via conversations)."""
-    return {"table": table, "column": column, "action": action, "why": why, "via": via}
+    child rows reachable only through a parent (e.g. messages via conversations).
+
+    `also` = EXTRA columns OR'd with `column` when matching the subject. A table
+    can reference the same person through more than one column, and matching
+    only the first leaves the rest behind. F-9.5: identity_links names two
+    parties per row (primary_id, duplicate_id) and erasure matched only
+    duplicate_id, so a subject on the PRIMARY side survived their own erasure
+    with their identifier still in `evidence` — measured, 7 of 20 rows carried
+    an email there.
+    """
+    return {"table": table, "column": column, "action": action, "why": why,
+            "via": via, "also": tuple(also or ())}
 
 
 # ── Derived-copy registry ────────────────────────────────────────────────────
@@ -144,7 +155,9 @@ PLANS: Dict[str, Dict[str, Any]] = {
             _sat("channel_identities", "party_id", DELETE,
                  "phone/email/handle → party links ARE the identifiers"),
             _sat("identity_links", "duplicate_id", DELETE,
-                 "duplicate links point at the erased record"),
+                 "identity links naming this person on EITHER side — the row "
+                 "records a match between two parties and carries the matched "
+                 "identifier in `evidence` (F-9.5)", also=("primary_id",)),
             _sat("conversation_messages", "conversation_id", DELETE,
                  "transcripts contain personal content",
                  via=("conversations", "conversation_id", "party_id")),
@@ -176,7 +189,8 @@ PLANS: Dict[str, Dict[str, Any]] = {
                  "undo-log images of this person's previously deleted rows"),
             _sat("crm_agent_memory", "entity_id", DELETE, "agent scratch memory"),
             _sat("channel_identities", "party_id", DELETE, "identifier links"),
-            _sat("identity_links", "duplicate_id", DELETE, "duplicate links"),
+            _sat("identity_links", "duplicate_id", DELETE,
+                 "identity links naming this person on EITHER side — the row records a match between two parties and carries the matched identifier in `evidence` (F-9.5)", also=("primary_id",)),
             _sat("activities", "lead_id", ANONYMIZE, "history retained, de-linked"),
             _sat("email_suppression", "email", RETAIN,
                  "MUST survive: consent/suppression proof"),
@@ -197,7 +211,8 @@ PLANS: Dict[str, Dict[str, Any]] = {
                  "undo-log images of this person's previously deleted rows"),
             _sat("content_embeddings", "account_id", DELETE,
                  "semantic index stores indexed text verbatim in `snippet`"),
-            _sat("identity_links", "duplicate_id", DELETE, "duplicate links"),
+            _sat("identity_links", "duplicate_id", DELETE,
+                 "identity links naming this person on EITHER side — the row records a match between two parties and carries the matched identifier in `evidence` (F-9.5)", also=("primary_id",)),
             _sat("invoices", "account_id", RETAIN, "financial record — legal retention"),
             _sat("payments", "account_id", RETAIN, "financial record — legal retention"),
             _sat("orders", "account_id", RETAIN, "financial record — legal retention"),
@@ -256,8 +271,17 @@ def _count(cur, sat: Dict[str, Any], entity: str, record_id: str,
             else:
                 cur.execute(f"SELECT count(*) FROM {t} WHERE {col}=%s::uuid", (record_id,))
         elif t == "identity_links":
-            cur.execute(f"SELECT count(*) FROM {t} WHERE entity=%s AND {col}=%s::uuid",
-                        (entity, record_id))
+            # MUST use the same predicate erase_sp uses, `also` columns
+            # included. preview() is what a human approves against: if it
+            # counts on duplicate_id while the erasure deletes on
+            # duplicate_id OR primary_id, the approver is shown fewer rows
+            # than will actually be destroyed. A preview that undercounts is
+            # worse than no preview, because it is trusted.
+            cols = [col] + [a for a in sat.get("also", ())
+                            if _has_col(cur, t, a)]
+            pred = " OR ".join(f"{x}=%s::uuid" for x in cols)
+            cur.execute(f"SELECT count(*) FROM {t} WHERE entity=%s AND ({pred})",
+                        (entity, *([record_id] * len(cols))))
         elif t == "audit_log":
             cur.execute(f"SELECT count(*) FROM {t} WHERE {col}=%s::uuid", (record_id,))
         else:
@@ -405,13 +429,25 @@ def erase_sp(params: Dict[str, Any]) -> Dict[str, Any]:
                                     (record_id,))
                     elif t in ("custom_field_values", "interaction_memories",
                                "crm_agent_memory", "identity_links"):
+                        # `also` columns are OR'd in, and only if they really
+                        # exist — a satellite that names a column the table
+                        # does not have must not abort the whole erasure.
+                        cols = [col] + [a for a in sat.get("also", ())
+                                        if _has_col(cur, t, a)]
+                        pred = " OR ".join(f"{x}=%s::uuid" for x in cols)
+                        args = [record_id] * len(cols)
                         if _has_col(cur, t, "entity"):
-                            cur.execute(f"DELETE FROM {t} WHERE entity=%s AND {col}=%s::uuid",
-                                        (entity, record_id))
+                            cur.execute(
+                                f"DELETE FROM {t} WHERE entity=%s AND ({pred})",
+                                (entity, *args))
                         else:
-                            cur.execute(f"DELETE FROM {t} WHERE {col}=%s::uuid", (record_id,))
+                            cur.execute(f"DELETE FROM {t} WHERE {pred}", tuple(args))
                     else:
-                        cur.execute(f"DELETE FROM {t} WHERE {col}=%s::uuid", (record_id,))
+                        cols = [col] + [a for a in sat.get("also", ())
+                                        if _has_col(cur, t, a)]
+                        pred = " OR ".join(f"{x}=%s::uuid" for x in cols)
+                        cur.execute(f"DELETE FROM {t} WHERE {pred}",
+                                    tuple([record_id] * len(cols)))
                     if cur.rowcount:
                         deleted[t] = deleted.get(t, 0) + cur.rowcount
                 else:  # ANONYMIZE a satellite = drop the pointer, keep the row

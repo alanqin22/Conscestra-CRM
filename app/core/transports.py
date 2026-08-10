@@ -253,6 +253,31 @@ async def whatsapp_inbound(request: Request):
         return JSONResponse({"ok": False, "error": "no WhatsApp sender/body"}, status_code=400)
 
     cap = channel_adapters.capture_whatsapp(sender, text or "")
+
+    # Opt-out keywords, ahead of the assistant — the same rule as inbound SMS.
+    # WhatsApp has NO outbound sender wired today (the reply below is drafted,
+    # not sent), so this cannot yet stop a message going out. It is here anyway
+    # because the WITHDRAWAL must be recorded the moment it is expressed: when
+    # a sender is eventually wired, consent.allows("whatsapp", …) must already
+    # know about everyone who said stop, not start from an empty list.
+    try:
+        from app.core import consent
+        verdict = consent.classify_inbound(text or "")
+        if verdict:
+            consent.record("whatsapp", sender, verdict,
+                           reason=f"inbound keyword: {(text or '')[:40]}",
+                           source="inbound_whatsapp", actor=sender)
+            logger.info(f"[transports] WhatsApp {verdict} recorded for {sender}")
+            return JSONResponse(_thread_and_reply(
+                cap, "whatsapp",
+                ("You have been unsubscribed and will receive no further "
+                 "marketing messages. Reply START to resubscribe."
+                 if verdict == "opted_out" else
+                 "You are resubscribed. Reply STOP to unsubscribe."),
+                {"sent": False, "reason": "consent confirmation (drafted — no "
+                                          "WhatsApp sender wired)"}))
+    except Exception as exc:                                # noqa: BLE001
+        logger.warning(f"[transports] whatsapp consent check skipped: {exc}")
     # Reuse the SMS composer — WhatsApp is conversational text, same tier logic.
     from app.core.telephony import _compose_sms_reply
     reply = await _compose_sms_reply(sender, text or "", sender_e164=sender)

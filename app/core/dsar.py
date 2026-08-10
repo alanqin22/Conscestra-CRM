@@ -91,6 +91,12 @@ DIRECT: Dict[str, Tuple[str, ...]] = {
     # Marketing and consent
     "marketing_sends":            ("contact_id", "account_id", "email"),
     "email_suppression":          ("email",),
+    # Channel-aware consent (Axis 6 V1). `email`/`phone` are GENERATED from
+    # `identifier`, which is what makes these matchable here at all — a bare
+    # `identifier` column would be invisible to this matcher and the subject's
+    # own consent record would be withheld from their Art. 15 export.
+    "consent_state":              ("email", "phone"),
+    "consent_log":                ("email", "phone"),
     # What the AI holds about them
     "account_intelligence":       ("account_id",),
     "account_intelligence_history": ("account_id",),
@@ -198,9 +204,243 @@ def _schema_subject_tables(cur) -> Dict[str, List[str]]:
     return {t: sorted(cols) for t, cols in cur.fetchall()}
 
 
+# ── content-level PII discovery ──────────────────────────────────────────────
+# WHAT coverage() PROVES, EXACTLY: every table carrying a column NAMED in
+# SUBJECT_COLUMNS is declared. It is a STRUCTURAL check — it reads pg_attribute,
+# never a row. A table with no subject column is invisible to it no matter what
+# it contains.
+#
+# Measured 2026-08-08, with coverage() reporting complete=true and undeclared=[]:
+#   events              6,911 rows, no subject column, 52 rows carry an email
+#                       address inside `payload` — including one contact.deleted
+#   knowledge_articles  10 answers contain an email address
+#   identity_links      7 rows, email inside `evidence`
+#   email_sentiment     5 rows, `from_addr`
+#   custom_agents / custom_agent_versions   an email inside `instructions`
+# None of those are exported by a DSAR request and none are reached by erasure.
+#
+# DETECTION LIMITS — this is a smoke detector, not a guarantee:
+#   * email-shaped text only. Names, postal addresses, free-text phone numbers
+#     and government identifiers are NOT detected. Absence of a hit is NOT
+#     evidence of absence of personal data.
+#   * FALSE POSITIVES are expected and are not defects in themselves:
+#     support@ourcompany.com in a KB article, a template's bcc address, a staff
+#     address in an agent instruction. Each hit needs a human disposition, which
+#     is why they are ACKNOWLEDGED in PII_CONTENT_ACK rather than auto-cleared.
+#   * FALSE NEGATIVES: obfuscated ("name at example dot com"), base64, encrypted
+#     or truncated values; anything in a binary column; anything in a table the
+#     scan cannot read.
+#   * It samples the CURRENT rows. A store that is empty today and PII-bearing
+#     tomorrow passes today.
+_EMAIL_RX = r"[[:alnum:]._%+-]+@[[:alnum:].-]+[.][[:alpha:]]{2,}"
+
+# Obfuscated addresses — "alan [at] example [dot] com". Deliberate constructions,
+# so precision is high and the pattern earns a place in the GATE.
+# BRACKETED FORMS ONLY. The first version also allowed a bare " at ", which
+# matched ordinary English — "meeting at 3pm", "products at the warehouse" —
+# and produced 5 false findings against the live schema (event_types,
+# executive_snapshot, memory_metrics_history, notification_messages, products).
+# A bracketed [at]/(at) is a deliberate obfuscation and almost never prose.
+_OBFUSCATED_RX = (r"[[:alnum:]._%+-]+[[:space:]]*(\[at\]|\(at\))"
+                  r"[[:space:]]*[[:alnum:].-]+")
+
+# Phone: a COARSE prefilter in SQL, confirmed in Python by the matcher already
+# proven in job_ledger.scrub. Deliberately not a second phone regex — two
+# independent definitions of "what a phone number looks like" drift apart, and
+# this one has already been tuned against real false positives (SO-2026-101730,
+# 2026-08-01 00:30:00). One definition, one place, reused.
+_PHONE_PREFILTER = r"[0-9][0-9()+.[:space:]-]{7,}[0-9]"
+_PHONE_SAMPLE = 200          # values pulled per column for confirmation
+
+# ADVISORY ONLY — never gates. Street-suffix matching cannot distinguish a
+# customer's home address from our own in an email footer, a product
+# description, or a KB article. Reported as a count so the exposure is visible;
+# making it a gate would produce failures nobody can action.
+_ADDRESS_RX = (r"[0-9]{1,6}[[:space:]]+[[:alpha:].]+([[:space:]]+[[:alpha:].]+)*"
+               r"[[:space:]]+(St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|"
+               r"Drive|Lane|Ln|Way|Court|Ct|Cres|Crescent)\.?([[:space:]]|,|$)")
+
+# Stores where email-shaped content has been seen, reviewed, and dispositioned.
+# Presence here means A HUMAN DECIDED, not that the store is clean. A store that
+# starts carrying PII and is NOT here fails content_coverage().
+PII_CONTENT_ACK: Dict[str, str] = {
+    "company_profile":  "our own company contact details, not a data subject's",
+    "email_templates":  "our own from/bcc addresses and template boilerplate",
+    "custom_agents":    "authored agent instructions may name a staff mailbox to "
+                        "escalate to; staff data, see EXCLUDED['employees']",
+    "custom_agent_versions": "version history of the above",
+    # ── F-8.7 dispositions, 2026-08-08. Each was inspected, not assumed. ────
+    "knowledge_articles":
+        "OUR OWN addresses. Inspected: the only three are info@agentorc.ca, "
+        "ithelp@agentorc.ca and security@agentorc.ca — published support "
+        "contacts in article bodies, not data about a subject. No action.",
+    "email_sentiment":
+        "BOUNDED BY RETENTION. from_addr is a correspondent's address; mostly "
+        "our own inbox, some external senders. A sentiment score has no "
+        "independent basis for indefinite retention, so retention.POLICIES "
+        "now expires it at 90 days rather than building an export path for "
+        "operational exhaust.",
+    "events":
+        "BOUNDED BY RETENTION (180d). Payload carries subject identifiers and "
+        "the table has no subject FK, so it is neither exported nor erasable. "
+        "KNOWN LIMITATION, recorded rather than hidden: until a row expires, "
+        "a subject's address can persist here after their erasure — including "
+        "in the contact.deleted event itself. Declared so the gap is visible.",
+    "identity_links":
+        "ERASABLE, PARTIALLY. Measured: erasure DELETEs identity_links rows "
+        "for contacts/leads/accounts, but matches on duplicate_id only — a "
+        "row where the subject is the PRIMARY side survives with their "
+        "identifier still in `evidence`. Follow-up F-9.5; recorded here so "
+        "the acknowledgement does not overstate the coverage.",
+}
+
+
+def content_coverage(limit_tables: int = 0) -> Dict[str, Any]:
+    """Find PII by CONTENT, in stores no structural check can see.
+
+    Complements coverage(): that one asks "is every subject-linked table
+    declared?", this one asks "is there personal data somewhere nothing
+    declared?". A store is a FINDING when it carries email-shaped content and
+    is neither in the export manifest, nor in EXCLUDED, nor acknowledged in
+    PII_CONTENT_ACK.
+
+    Read-only. Never mutates, never deletes, never redacts — a scanner that
+    edits evidence is worse than no scanner.
+    """
+    from app.core import lifecycle
+
+    exported = set(DIRECT) | set(BY_ENTITY) | set(CHILD)
+    erasable = {s["table"] for p in lifecycle.PLANS.values()
+                for s in p.get("satellites", [])} | set(lifecycle.PLANS)
+
+    conn = get_connection()
+    scanned = 0
+    hits: Dict[str, Dict[str, int]] = {}
+    phone_hits: Dict[str, Dict[str, int]] = {}
+    address_hits: Dict[str, Dict[str, int]] = {}
+    unreadable: List[str] = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.relname, a.attname,
+                       format_type(a.atttypid, a.atttypmod) AS typ
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0
+                                     AND NOT a.attisdropped
+                 WHERE n.nspname = 'public' AND c.relkind = 'r'
+                   AND format_type(a.atttypid, a.atttypmod) ~
+                       '^(text|character varying|json|jsonb)'
+                 ORDER BY c.relname, a.attname""")
+            cols = cur.fetchall()
+            if limit_tables:
+                keep = sorted({t for t, _, _ in cols})[:limit_tables]
+                cols = [c for c in cols if c[0] in keep]
+            for table, col, typ in cols:
+                expr = (f'"{col}"::text' if typ.startswith(("json", "jsonb"))
+                        else f'"{col}"')
+                try:
+                    # GATING detectors: email + obfuscated email.
+                    cur.execute(
+                        f'SELECT count(*) FROM "{table}" '
+                        f'WHERE {expr} ~ %s OR {expr} ~ %s',
+                        (_EMAIL_RX, _OBFUSCATED_RX))
+                    n = cur.fetchone()[0]
+
+                    # GATING: phone. Coarse SQL prefilter, then confirm each
+                    # candidate with job_ledger's proven matcher, so a document
+                    # number or a timestamp cannot be counted as a phone number.
+                    cur.execute(
+                        f'SELECT {expr} FROM "{table}" WHERE {expr} ~ %s '
+                        f'LIMIT {int(_PHONE_SAMPLE)}', (_PHONE_PREFILTER,))
+                    candidates = [r[0] for r in cur.fetchall() if r[0]]
+                    if candidates:
+                        from app.core.job_ledger import _PHONE_CAND, _phone_sub
+                        confirmed = sum(
+                            1 for v in candidates
+                            if _PHONE_CAND.sub(_phone_sub, str(v)) != str(v))
+                        if confirmed:
+                            phone_hits.setdefault(table, {})[col] = confirmed
+                            # ADVISORY, NOT GATING — demoted after measurement.
+                            # Promoted to a gate it produced 9 new findings
+                            # against the live schema, and inspection showed
+                            # them to be false: product_image.image_url
+                            # ('…/Office%20Supplies/Quartet%20Lined%…') is
+                            # CONFIRMED as a phone number by the matcher,
+                            # because percent-encoding makes long digit runs.
+                            # SKUs and content hashes prefilter in too.
+                            # The matcher was tuned against EXCEPTION TEXT in
+                            # job_ledger, and that is the domain where it is
+                            # accurate; URLs, hashes and identifiers are not.
+                            # A gate that fires on image URLs teaches people
+                            # to ignore the gate, which costs more than the
+                            # detection is worth.
+
+                    # ADVISORY: address-like. Counted, never gates.
+                    cur.execute(
+                        f'SELECT count(*) FROM "{table}" WHERE {expr} ~ %s',
+                        (_ADDRESS_RX,))
+                    a = cur.fetchone()[0]
+                    if a:
+                        address_hits.setdefault(table, {})[col] = a
+
+                    scanned += 1
+                except Exception:
+                    conn.rollback()
+                    unreadable.append(f"{table}.{col}")
+                    continue
+                if n:
+                    hits.setdefault(table, {})[col] = n
+    finally:
+        conn.close()
+
+    findings, acknowledged = [], []
+    for table in sorted(hits):
+        row = {"table": table, "columns": hits[table],
+               "exported": table in exported,
+               "excluded": table in EXCLUDED,
+               "erasable": table in erasable}
+        if table in exported or table in EXCLUDED:
+            continue                      # governed already; content is in scope
+        note = PII_CONTENT_ACK.get(table)
+        # An entry marked UNRESOLVED is a PLACEHOLDER, not a disposition. It
+        # must keep failing the gate, or writing the word "UNRESOLVED" into the
+        # acknowledgement list would be enough to turn the check green — which
+        # is the exact failure this check exists to prevent.
+        settled = note is not None and not note.startswith("UNRESOLVED")
+        (acknowledged if settled else findings).append({**row, "note": note})
+
+    return {
+        "columns_scanned": scanned,
+        "columns_unreadable": unreadable,
+        "stores_with_email_content": len(hits),
+        "findings": findings,
+        "acknowledged": acknowledged,
+        "phone_hits": phone_hits,
+        # ADVISORY. Reported, never gating — see _ADDRESS_RX. A count here does
+        # NOT mean a finding; most matches are our own address in a footer or a
+        # street name inside a product description.
+        "address_advisory": address_hits,
+        "detector": "GATING: email-shaped text and obfuscated addresses "
+                    "([at]/[dot]). ADVISORY ONLY (counted, never gates): "
+                    "phone-shaped and address-shaped text — both were measured "
+                    "as too noisy to gate on (a percent-encoded image URL "
+                    "confirms as a phone number). Names, prose addresses, "
+                    "encoded and truncated values are NOT detected at all. "
+                    "Broader coverage has NOT made this complete — a clean "
+                    "result is NOT proof that no personal data exists",
+        "complete": not findings,
+    }
+
+
 def coverage() -> Dict[str, Any]:
     """Which subject-linked tables the manifest accounts for, and which it does
-    not. `undeclared` being non-empty means exports cannot be certified."""
+    not. `undeclared` being non-empty means exports cannot be certified.
+
+    STRUCTURAL ONLY. This reads pg_attribute and never looks at a row, so it
+    cannot see personal data sitting in a JSON payload on a table with no
+    subject column — see content_coverage() for that half.
+    """
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -518,6 +758,10 @@ def main() -> int:
     ap.add_argument("--purpose", default="Art. 15 access request")
     ap.add_argument("--out")
     ap.add_argument("--coverage", action="store_true")
+    ap.add_argument("--content-coverage", action="store_true",
+                    dest="content_coverage",
+                    help="scan row CONTENT for PII in stores no structural "
+                         "check can see (email-shaped text only)")
     ap.add_argument("--allow-incomplete", action="store_true",
                     help="export even though the manifest is out of date; the "
                          "result is marked certified_complete=false")
@@ -533,7 +777,24 @@ def main() -> int:
             for t in c["phantom_manifest_entries"]:
                 print(f"  manifest entry with no table: {t}")
             return 1
-        print("\nmanifest covers every subject-linked table")
+        print("\nmanifest covers every subject-linked table "
+              "(STRUCTURAL only — run --content-coverage for the other half)")
+        return 0
+
+    if a.content_coverage:
+        c = content_coverage()
+        print(json.dumps(c, indent=2))
+        if not c["complete"]:
+            print("\nPII CONTENT FOUND IN UNGOVERNED STORES:")
+            for f in c["findings"]:
+                print(f"  {f['table']}: {f['columns']} "
+                      f"(exported={f['exported']} erasable={f['erasable']})")
+            print("\nEach needs a disposition: add it to the export manifest, "
+                  "to EXCLUDED with a justification, to an erasure plan, or to "
+                  "PII_CONTENT_ACK if the match is our own data.")
+            return 1
+        print("\nno unacknowledged PII content found — NOTE: email-shaped text "
+              "only; this is not proof that no personal data exists")
         return 0
 
     pairs = [("contact", a.contact), ("lead", a.lead),

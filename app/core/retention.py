@@ -84,6 +84,21 @@ POLICIES: List[Policy] = [
     Policy("a2a_dispatches", "at", 90,
            "agent call log — kept long enough to investigate an incident, "
            "not indefinitely"),
+    # F-8.7 dispositions (Axis 6). Both stores were found by the content scan
+    # holding subject email addresses while being invisible to the structural
+    # DSAR check, unreachable by erasure, and governed by nothing. Neither is a
+    # record anyone needs years of, so the proportionate answer is to BOUND the
+    # exposure rather than build export/erasure paths for operational exhaust.
+    Policy("events", "created_at", 180,
+           "domain event log — payloads carry subject identifiers (52 rows "
+           "measured 2026-08-08, including a contact.deleted event retaining "
+           "the erased contact's address). No subject FK, so neither exported "
+           "nor erasable; six months is the window in which 'what happened to "
+           "this record?' is still asked"),
+    Policy("email_sentiment", "received_at", 90,
+           "inbound sentiment scores keyed by correspondent address. Mostly "
+           "our own inbox, but external senders appear; a sentiment score is "
+           "not a record with an independent basis for indefinite retention"),
     Policy("scheduled_job_runs", "started_at", 90,
            "scheduled-job outcome log — the window in which 'did the nightly "
            "batch run on the 3rd?' is still a question anyone asks. Same "

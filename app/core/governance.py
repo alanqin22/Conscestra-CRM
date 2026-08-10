@@ -29,7 +29,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -1188,26 +1188,84 @@ def governance_history(limit: int = 30):
 
 class _DeleteBody(BaseModel):
     ids: List[str]
+    reason: Optional[str] = None
+    deleted_by: Optional[str] = None
 
 
 @router.post("/governance/history/delete")
 def governance_history_delete(body: _DeleteBody):
-    """Delete decided audit rows (executed/failed/rejected/expired). Pending
-    actions can never be deleted — they must be approved or rejected first."""
+    """Clear decided rows (executed/failed/rejected/expired) out of the queue.
+
+    NOT destructive any more. trg_action_approvals_deletion_log archives the
+    whole row into governed_deletions first, so this removes a decision from
+    the working list without destroying the record that it happened — and
+    restore_governed_deletion() can put one back. See
+    sql/governance_history_audit.sql for why that record matters: these rows
+    are the ONLY trace of a governed decision anywhere in the database.
+
+    Pending actions can never be deleted — they must be approved or rejected
+    first.
+    """
     ids = [i for i in (body.ids or []) if i]
     if not ids:
         return {"deleted": 0}
+
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            # An EXECUTED row records a human authorising a real change. It may
+            # still be cleared — the archive makes that safe — but not silently:
+            # the reason is captured in the archive alongside the row, so the
+            # question "who cleared the record of that approval, and why" has an
+            # answer that does not depend on someone remembering.
+            cur.execute(
+                "SELECT count(*) FROM action_approvals "
+                "WHERE approval_uuid = ANY(%s::uuid[]) AND status = 'executed'",
+                (ids,))
+            executed = cur.fetchone()[0]
+            if executed and not (body.reason or "").strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{executed} of these rows are 'executed' — they "
+                           f"record an authorised action. Give a reason to "
+                           f"clear them (the row is archived either way).")
+
+            actor = (body.deleted_by or "").strip() or "admin"
+            # Read by log_governed_deletion(). The repair_key must NOT be
+            # 'undeclared': that tier is purged after 30 days, which would
+            # quietly undo the archive. A declared key is kept for a year.
+            cur.execute("SET LOCAL app.repair_key = 'governance:history-delete'")
+            cur.execute("SET LOCAL app.actor = %s", (actor[:120],))
+
             cur.execute(
                 "DELETE FROM action_approvals "
                 "WHERE approval_uuid = ANY(%s::uuid[]) AND status <> 'pending' "
-                "RETURNING approval_uuid", (ids,))
-            n = len(cur.fetchall())
+                "RETURNING approval_uuid, status", (ids,))
+            rows = cur.fetchall()
+            n = len(rows)
+
+            # Prove the archive actually happened in this same transaction
+            # rather than trusting that the trigger is attached. If the
+            # migration has not been applied, the delete is still destructive
+            # and the caller must find out now, not at the next audit.
+            cur.execute(
+                "SELECT count(*) FROM governed_deletions "
+                "WHERE table_name = 'action_approvals' "
+                "  AND txid = txid_current()")
+            archived = cur.fetchone()[0]
+            if n and archived < n:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=500,
+                    detail="refused: deleting these rows would not have been "
+                           "archived (apply sql/governance_history_audit.sql). "
+                           "Nothing was deleted.")
         conn.commit()
-        logger.info(f"[governance] deleted {n} decided history row(s)")
-        return {"deleted": n, "requested": len(ids)}
+        logger.info(f"[governance] cleared {n} decided history row(s) by "
+                    f"{actor} ({executed} executed); archived to "
+                    f"governed_deletions")
+        return {"deleted": n, "requested": len(ids), "archived": archived,
+                "executed_cleared": executed, "recoverable": True}
     finally:
         conn.close()
 
