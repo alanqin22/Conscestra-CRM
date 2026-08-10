@@ -1154,6 +1154,45 @@ disable them**. The application's own health endpoint reports which role it
 connected as, so the separation is something you can verify rather than
 something you were told.
 
+## "Stop" Means Stop, on Whichever Channel You Said It
+
+Consent is usually built for whichever channel a product launched with, and
+then quietly fails to follow it anywhere else. Ours began as an email
+suppression list — one table keyed on an address — and when the phone line, SMS
+and WhatsApp arrived, they inherited nothing. An unsubscribe by email left the
+same person textable, and there was no way to unsubscribe from SMS at all,
+because nothing existed that could record it.
+
+Consent is now a property of a **channel and a person**, not of an address.
+Every outbound path asks the same question through the same predicate, at the
+chokepoint above the carrier, so email, SMS, voice and WhatsApp cannot drift
+apart and neither can two telephony providers. "Unknown" is the absence of a
+record rather than a stored value, because *never contacted* and *asked and
+never answered* are different facts and should not be forced to share a row.
+
+The posture is deliberate and per channel. Email keeps the suppression-list
+model it has always had, where absence means mailable — the standard the
+existing consent was lawfully built on. SMS, voice and WhatsApp start strict:
+no record means no commercial message. Nothing accumulated on those channels
+before, so beginning strict costs nothing and is the safe side of a question
+CASL actually asks.
+
+Inbound `STOP` is now read **before** the assistant sees it. It used to be
+treated as an ordinary question: the knowledge-grounded responder answered it,
+and the reply went out — another message to someone who had just asked for
+none. `ARRÊT` is recognised for the same reason the assistants answer in
+French, accented or not, and so are the Spanish and Chinese equivalents. A
+whole-message keyword is an opt-out; "stop sending me invoices at 3am" is a
+complaint a human should read, and is deliberately left alone.
+
+The acknowledgement is treated as an obligation rather than as outreach, so it
+is sent even when automatic sending is switched off — a withdrawal that is
+recorded but never confirmed is not a withdrawal the customer can trust. Every
+transition is written to an append-only log the application cannot edit or
+delete, which is what turns "they opted out" from an assertion into evidence,
+and a consent record about a person is part of that person's data: it is
+returned in their access request like anything else.
+
 ## Erasure Is Permitted, and Never Silent
 
 A customer asks to be forgotten. The law requires the data to go, and the same
