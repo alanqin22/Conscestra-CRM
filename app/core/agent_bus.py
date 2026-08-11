@@ -47,6 +47,7 @@ import logging
 import os
 import re
 import socket
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -174,6 +175,54 @@ def _last_activity_sync() -> Optional[datetime]:
         conn.close()
 
 
+def _durable_watermark_sync() -> Optional[datetime]:
+    """The resume watermark, read from its OWN table.
+
+    Stage C. Previously this answer came from max(last_attempt_at) over
+    event_queue — making a disposable work queue the durable record of consumer
+    progress, which notification_triage purges on a schedule.
+
+    Returns None on ANY failure, including the table not existing, so the caller
+    falls back to the legacy scan. That is what makes this safe to deploy before
+    the migration and safe to roll back by dropping the table."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT last_settled_at FROM agent_bus_watermark "
+                        "WHERE scope = 'global'")
+            row = cur.fetchone()
+            return row[0] if row else None
+    except Exception as exc:
+        conn.rollback()
+        logger.debug(f"[agent_bus] durable watermark unavailable: {exc}")
+        return None
+    finally:
+        conn.close()
+
+
+def _write_watermark_sync() -> None:
+    """Advance the durable watermark. Called once per tick that settled work —
+    not once per event; this is checkpoint state, not an event log.
+
+    Best-effort by design: a failure here must never fail a tick. The legacy
+    max(last_attempt_at) scan remains underneath as the safety net."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO agent_bus_watermark (scope, last_settled_at, updated_at)
+                   VALUES ('global', now(), now())
+                   ON CONFLICT (scope) DO UPDATE
+                     SET last_settled_at = EXCLUDED.last_settled_at,
+                         updated_at      = now()""")
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        logger.debug(f"[agent_bus] watermark write skipped: {exc}")
+    finally:
+        conn.close()
+
+
 def _resume_cutoff() -> datetime:
     """Eligibility floor for a starting consumer.
 
@@ -201,7 +250,10 @@ def _resume_cutoff() -> datetime:
     now = datetime.now(timezone.utc)
     if BACKFILL_MIN:
         return now - timedelta(minutes=BACKFILL_MIN)
-    watermark = _last_activity_sync()
+    # Durable table first (Stage C); the event_queue scan remains as the
+    # fallback so a missing/empty table degrades to the previous behaviour
+    # rather than to now().
+    watermark = _durable_watermark_sync() or _last_activity_sync()
     if watermark is None:
         return now
     return max(watermark, now - timedelta(hours=MAX_CATCHUP_HOURS))
@@ -213,9 +265,16 @@ def orphaned_sync(cutoff: Optional[datetime] = None) -> Dict[str, Any]:
     An orphan is not a backlog that is draining slowly — it is work the bus has
     silently decided not to do. Surfaced in /agent-bus/status and Platform
     Health (U3) so the decision to drain or discard is made by a person."""
+    # A stopped consumer used to report orphaned=0, which on a health surface
+    # reads as "healthy" when it actually means "I have no cutoff to measure
+    # against". Measured 2026-08-11: it reported 0 while the true prospective
+    # figure was 54. Fall back to the SAME derivation run_once() would use, and
+    # label the answer prospective so it is never mistaken for a live reading.
     cut = cutoff or _CUTOFF
+    prospective = False
     if cut is None:
-        return {"orphaned": 0, "cutoff": None, "note": "consumer not started"}
+        cut = _resume_cutoff()
+        prospective = True
     types = list(HANDLERS.keys())
     conn = get_connection()
     try:
@@ -236,15 +295,20 @@ def orphaned_sync(cutoff: Optional[datetime] = None) -> Dict[str, Any]:
                 {"cut": cut, "catchall": CATCHALL, "types": types})
             by_type = {t: c for t, c in cur.fetchall()}
         return {"orphaned": int(n or 0), "cutoff": cut.isoformat(),
+                "prospective": prospective,
                 "by_type": by_type,
                 "oldest": oldest.isoformat() if oldest else None,
                 "newest": newest.isoformat() if newest else None,
-                "note": ("these will never be processed by the running consumer; "
+                "note": ("consumer not started — this is what it WOULD skip on "
+                         "next start; POST /agent-bus/drain if these matter")
+                        if (prospective and n) else
+                        ("these will never be processed by the running consumer; "
                          "POST /agent-bus/drain to process them deliberately")
                         if n else "none"}
     except Exception as exc:
         conn.rollback()
-        return {"orphaned": None, "error": str(exc)[:160]}
+        return {"orphaned": None, "prospective": prospective,
+                "error": str(exc)[:160]}
     finally:
         conn.close()
 
@@ -1355,7 +1419,94 @@ def _resolve_account_sync(entity_type: str, entity_id: str) -> Optional[str]:
         conn.close()
 
 
+# ── Workflow-engine chain ────────────────────────────────────────────────────
+# The workflow engine used to be a SECOND consumer of event_queue: it claimed
+# rows with FOR UPDATE SKIP LOCKED exactly as this module does. With
+# AGENT_BUS_CATCHALL=1 that is a starvation race — whichever worker polls first
+# wins and the other never sees the event, silently, in both logs.
+#
+# So it is chained instead of partitioned. This module stays the SOLE queue
+# consumer; the engine becomes a pure function of an event
+# (workflow_run_rules_for_event) that never touches event_queue. There is no
+# queue state to contend over and no partition to drift.
+_WF_ENABLED = os.getenv("WORKFLOW_ENGINE_ENABLED", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+_WF_TYPES: List[str] = []
+_WF_TYPES_AT: float = 0.0
+_WF_TTL = 60.0
+
+
+def _workflow_types_sync() -> List[str]:
+    """Event types with at least one enabled rule. Cached briefly so a rule
+    toggle takes effect without a restart, without a query per event."""
+    global _WF_TYPES, _WF_TYPES_AT
+    now = time.time()
+    if now - _WF_TYPES_AT < _WF_TTL:
+        return _WF_TYPES
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT workflow_owned_event_types()")
+            _WF_TYPES = list(cur.fetchone()[0] or [])
+            _WF_TYPES_AT = now
+    except Exception as exc:
+        logger.warning(f"[agent_bus] workflow type list unavailable: {exc}")
+        _WF_TYPES = []
+    finally:
+        conn.close()
+    return _WF_TYPES
+
+
+def _run_workflow_rules_sync(event_uuid: str) -> Dict[str, Any]:
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT workflow_run_rules_for_event(%s)", (event_uuid,))
+            out = cur.fetchone()[0]
+        conn.commit()
+        return out
+    except Exception as exc:
+        conn.rollback()
+        return {"ok": False, "error": str(exc).splitlines()[0][:140]}
+    finally:
+        conn.close()
+
+
+async def _maybe_run_workflow(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Invoke the workflow engine for this event, if it owns the type.
+
+    Never raises: a workflow failure must not stop the orchestrator from
+    settling the queue row, or the event would be retried forever."""
+    if not _WF_ENABLED or not event.get("entity_uuid"):
+        return None
+    try:
+        types = await asyncio.to_thread(_workflow_types_sync)
+        if event["event_type"] not in types:
+            return None
+        res = await asyncio.to_thread(_run_workflow_rules_sync,
+                                      str(event["event_uuid"]))
+        if res.get("ran") or res.get("failed"):
+            logger.info(f"[agent_bus] workflow {event['event_type']}: {res}")
+        return res
+    except Exception as exc:
+        logger.warning(f"[agent_bus] workflow chain failed for "
+                       f"{event.get('event_type')}: {exc}")
+        return {"ok": False, "error": str(exc)[:140]}
+
+
 async def handle_default(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Orchestrator catch-all, with the workflow engine chained in front.
+
+    Wraps the original body rather than editing its four return paths, so the
+    chain cannot be missed on one of them."""
+    wf = await _maybe_run_workflow(event)
+    result = await _handle_default_inner(event)
+    if wf is not None:
+        result["workflow"] = wf
+    return result
+
+
+async def _handle_default_inner(event: Dict[str, Any]) -> Dict[str, Any]:
     """Orchestrator catch-all — settle any event without a bespoke handler."""
     et = event["event_type"]
     entity_type = (event.get("entity_type") or "").lower()
@@ -1411,7 +1562,18 @@ async def handle_default(event: Dict[str, Any]) -> Dict[str, Any]:
 
 async def run_once() -> Dict[str, Any]:
     """Process one batch. Safe to call manually (tests / admin endpoint)."""
-    cutoff = _CUTOFF or (datetime.now(timezone.utc) - timedelta(minutes=BACKFILL_MIN))
+    # Fall back to the SAME derivation the running loop uses, not an ad-hoc one.
+    #
+    # This used to be `now() - BACKFILL_MIN`, which with the default
+    # BACKFILL_MIN=0 collapses to `now()` — claiming only events created after
+    # this instant, i.e. nothing. A manual tick therefore reported
+    # claimed=0 and looked like a broken consumer.
+    #
+    # That is the very bug _resume_cutoff() was written to fix (see its
+    # docstring: 50 events stranded, found 2026-07-25). The fix was applied to
+    # start() but not here, so the defect survived at every entry point except
+    # the loop. Using one derivation everywhere is what stops it recurring.
+    cutoff = _CUTOFF or _resume_cutoff()
     events = await asyncio.to_thread(_claim_batch_sync, cutoff)
     summary = {"claimed": len(events), "results": []}
     for ev in events:
@@ -1426,6 +1588,8 @@ async def run_once() -> Dict[str, Any]:
             await asyncio.to_thread(_fail_sync, ev["event_uuid"], ev["attempts"], str(exc))
             summary["results"].append({"event": et, "status": "error", "error": str(exc)})
     if events:
+        # Checkpoint AFTER the batch, once — not per event.
+        await asyncio.to_thread(_write_watermark_sync)
         logger.info(f"[agent_bus] tick — {summary}")
     return summary
 
@@ -1657,10 +1821,14 @@ def agent_bus_status():
 
 @router.post("/agent-bus/run-once")
 async def agent_bus_run_once():
-    """Drive one tick on demand (handy for demos without waiting for the poll)."""
-    if not _CUTOFF:
-        # allow manual ticks even when the loop isn't running
-        globals()["_CUTOFF"] = datetime.now(timezone.utc) - timedelta(minutes=max(BACKFILL_MIN, 60))
+    """Drive one tick on demand (handy for demos without waiting for the poll).
+
+    This used to patch a 60-minute cutoff into the module global when the loop
+    wasn't running — a workaround for the same `now()` collapse now fixed in
+    run_once(). It was doing two harmful things: inventing a THIRD cutoff
+    policy, and MUTATING _CUTOFF, so one manual tick silently moved the
+    eligibility floor for the live consumer afterwards. run_once() now derives
+    its own cutoff, so neither is needed."""
     return await run_once()
 
 
