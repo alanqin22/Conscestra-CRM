@@ -81,10 +81,38 @@ def _rows(sql: str) -> List[tuple]:
 # Account candidates — normalized-name blocking + domain/phone corroboration
 # ============================================================================
 
+# ── F-9.11: tombstones are not candidates ───────────────────────────────────
+# An erased person's row SURVIVES anonymised, so referential integrity holds.
+# It therefore still arrives in every duplicate-detection query, where it has
+# no business being: a record with no name and no contactable identifier
+# cannot legitimately be "the same person" as anyone, and proposing a merge
+# against one asks a human to adjudicate a person who exercised their right to
+# be forgotten.
+#
+# This matters beyond noise. identity_links.decided() feeds REJECTED pairs back
+# as a do-not-merge memory, and erasure deletes those rows (Option A). Without
+# this filter the tombstone becomes re-proposable with the memory that said
+# "not the same person" already gone.
+#
+# The marker is imported from lifecycle, which writes it — see ERASED_EMAIL_LIKE.
+def _not_erased(col: str = "email") -> str:
+    """SQL fragment excluding anonymised rows. Fails OPEN (empty string) if
+    lifecycle cannot be imported: dedupe noise is a smaller harm than a
+    detector that stops running."""
+    try:
+        from app.core.lifecycle import ERASED_EMAIL_LIKE
+        return (f" AND COALESCE({col},'') NOT LIKE "
+                f"'{ERASED_EMAIL_LIKE}'")
+    except Exception:                                       # noqa: BLE001
+        logger.warning("[identity-res] erased-record filter unavailable")
+        return ""
+
+
 def account_candidates() -> List[Dict[str, Any]]:
     rows = _rows(
         "SELECT account_id::text, account_name, email, website, phone, owner_id::text, "
-        "created_at FROM accounts WHERE COALESCE(is_deleted,false)=false")
+        "created_at FROM accounts WHERE COALESCE(is_deleted,false)=false"
+        + _not_erased())
     groups: Dict[str, List[dict]] = defaultdict(list)
     for aid, name, email, website, phone, owner, created in rows:
         key = _norm_org(name)
@@ -149,14 +177,15 @@ def _person_candidates(entity: str, sql: str) -> List[Dict[str, Any]]:
 def contact_candidates() -> List[Dict[str, Any]]:
     return _person_candidates("contacts",
         "SELECT contact_id::text, TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')), "
-        "email, phone, created_at FROM contacts WHERE COALESCE(is_deleted,false)=false")
+        "email, phone, created_at FROM contacts WHERE COALESCE(is_deleted,false)=false"
+        + _not_erased())
 
 
 def lead_candidates() -> List[Dict[str, Any]]:
     return _person_candidates("leads",
         "SELECT lead_id::text, TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')), "
         "email, phone, created_at FROM leads WHERE COALESCE(is_deleted,false)=false "
-        "AND merged_into_lead_id IS NULL")
+        "AND merged_into_lead_id IS NULL" + _not_erased())
 
 
 # ============================================================================
@@ -194,6 +223,8 @@ def account_candidates_fuzzy() -> List[Dict[str, Any]]:
              AND similarity(lower(a.account_name), lower(b.account_name)) >= {SIMILARITY_MIN}
             WHERE COALESCE(a.is_deleted,false)=false
               AND COALESCE(b.is_deleted,false)=false
+              {_not_erased("a.email")}
+              {_not_erased("b.email")}
             ORDER BY 11 DESC
             LIMIT 200""")
     out = []
