@@ -80,6 +80,23 @@ EVENT_RETENTION_DAYS = int(os.getenv("EVENT_RETENTION_DAYS", "14"))  # delete se
 # Belt-and-braces: any HANDLED (non-unread) notification CREATED this long ago
 # is deleted regardless of when it was marked read. 0 disables.
 NOTIF_HANDLED_MAX_AGE_DAYS = int(os.getenv("NOTIF_HANDLED_MAX_AGE_DAYS", "30"))
+# Settled queue rows carry `last_attempt_at`, which agent_bus._resume_cutoff()
+# reads as its RESUME WATERMARK — the answer to "where do I start again after a
+# restart?". This pass used to delete them UNCONDITIONALLY, with no age bound,
+# and it runs roughly every two hours: the watermark was being destroyed about
+# twelve times a day. What survived was incidental ('cancelled' rows, matched by
+# no retention path), so the bus resumed from an arbitrary old timestamp — and
+# had those gone too, from now(), which is precisely the bug _resume_cutoff()
+# was written to fix (50 events stranded, found 2026-07-25).
+#
+# This value must stay comfortably above agent_bus MAX_CATCHUP_HOURS (24h) —
+# asserted at import below, not merely assumed. 0 disables this retention.
+QUEUE_SETTLED_RETENTION_DAYS = int(os.getenv("QUEUE_SETTLED_RETENTION_DAYS", "7"))
+if QUEUE_SETTLED_RETENTION_DAYS and QUEUE_SETTLED_RETENTION_DAYS * 24 <= 24:
+    logging.getLogger("notification_triage").warning(
+        "[triage] QUEUE_SETTLED_RETENTION_DAYS=%s is not longer than agent_bus "
+        "MAX_CATCHUP_HOURS (24h); the resume watermark may be deleted before "
+        "the consumer can use it.", QUEUE_SETTLED_RETENTION_DAYS)
 
 _UNREAD = ("pending", "sent", "unread")
 
@@ -603,17 +620,25 @@ def _retention(cur, apply: bool) -> Dict[str, Any]:
         cur.execute(f"SELECT count(*) FROM notifications WHERE {n_sql_where}", _params)
         n_notif = int(cur.fetchone()[0])
 
-    # 2) event_queue: settled rows + legacy pending past the window
+    # 2) event_queue: settled rows past their window + legacy pending past theirs.
+    #    COALESCE(last_attempt_at, created_at) is deliberate: 'completed' rows
+    #    always carry last_attempt_at (written by agent_bus._complete_sync), but
+    #    'superseded' rows are set elsewhere and may not. Without the fallback a
+    #    NULL would make those rows immortal.
+    _q = {"d": EVENT_RETENTION_DAYS, "s": QUEUE_SETTLED_RETENTION_DAYS}
+    _settled = ("status IN ('completed','superseded') "
+                "AND COALESCE(last_attempt_at, created_at) "
+                "    < now() - (%(s)s || ' days')::interval")
+    _stale_pending = ("status='pending' "
+                      "AND created_at < now() - (%(d)s || ' days')::interval")
     if apply:
-        cur.execute("DELETE FROM event_queue WHERE status IN ('completed','superseded')")
+        cur.execute(f"DELETE FROM event_queue WHERE {_settled}", _q)
         nq = cur.rowcount
-        cur.execute("DELETE FROM event_queue WHERE status='pending' "
-                    "AND created_at < now() - (%(d)s || ' days')::interval", {"d": EVENT_RETENTION_DAYS})
+        cur.execute(f"DELETE FROM event_queue WHERE {_stale_pending}", _q)
         nq += cur.rowcount
     else:
-        cur.execute("SELECT count(*) FROM event_queue WHERE status IN ('completed','superseded') "
-                    "OR (status='pending' AND created_at < now() - (%(d)s || ' days')::interval)",
-                    {"d": EVENT_RETENTION_DAYS})
+        cur.execute(f"SELECT count(*) FROM event_queue "
+                    f"WHERE ({_settled}) OR ({_stale_pending})", _q)
         nq = int(cur.fetchone()[0])
 
     # 3) events past the window, no longer referenced by any FK table

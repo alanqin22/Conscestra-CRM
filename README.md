@@ -1002,6 +1002,44 @@ says which it is.
 
 **A platform that can act on its own must be able to tell you when it can't.**
 
+## Progress That Survives Anything
+
+A queue is disposable work — process it, discard it. Progress is durable
+memory — it has to outlive the work it describes. Conscestra keeps the two
+apart.
+
+The event consumer records how far it has got in its own durable store,
+independent of the queue it reads from. Housekeeping can sweep the queue as
+aggressively as it likes; a deploy can restart the platform mid-stream; the
+work can be archived entirely. The consumer still resumes at exactly the right
+point, and events that arrived while it was away are picked up rather than
+skipped.
+
+The guarantee is proven the way every safeguard here is proven — by removing
+the thing it depends on. Delete every row of the queue, and the consumer still
+knows precisely where it was.
+
+**Restart-safe by construction, not by good timing.**
+
+## Every Preview Follows the Whole Chain
+
+Before anything irreversible runs, you see what it will do — including the
+records that follow the ones you named.
+
+Business records travel in company. Retiring an event touches its queue entry,
+its notifications, the recipients of those notifications, its automation runs
+and every step within them. Conscestra's expiry preview walks that entire chain
+of consequence, to whatever depth it reaches, and reports three outcomes
+separately — because they carry three different risks. Some records are
+**deleted**. Some **survive but are altered**. Some would **refuse the
+operation outright**.
+
+It is equally precise about its own limits, stating plainly that the per-run
+safety cap applies to the records you selected, not to the ones that follow
+them.
+
+**Know the full blast radius before you approve it, not after.**
+
 ## Fast Because It Was Measured, Not Because It Feels Fast
 
 Performance work here starts with a number and ends with a number. Semantic
@@ -1153,6 +1191,45 @@ resistant to tampering than ever — and **the application itself cannot alter o
 disable them**. The application's own health endpoint reports which role it
 connected as, so the separation is something you can verify rather than
 something you were told.
+
+## "Stop" Means Stop, on Whichever Channel You Said It
+
+Consent is usually built for whichever channel a product launched with, and
+then quietly fails to follow it anywhere else. Ours began as an email
+suppression list — one table keyed on an address — and when the phone line, SMS
+and WhatsApp arrived, they inherited nothing. An unsubscribe by email left the
+same person textable, and there was no way to unsubscribe from SMS at all,
+because nothing existed that could record it.
+
+Consent is now a property of a **channel and a person**, not of an address.
+Every outbound path asks the same question through the same predicate, at the
+chokepoint above the carrier, so email, SMS, voice and WhatsApp cannot drift
+apart and neither can two telephony providers. "Unknown" is the absence of a
+record rather than a stored value, because *never contacted* and *asked and
+never answered* are different facts and should not be forced to share a row.
+
+The posture is deliberate and per channel. Email keeps the suppression-list
+model it has always had, where absence means mailable — the standard the
+existing consent was lawfully built on. SMS, voice and WhatsApp start strict:
+no record means no commercial message. Nothing accumulated on those channels
+before, so beginning strict costs nothing and is the safe side of a question
+CASL actually asks.
+
+Inbound `STOP` is now read **before** the assistant sees it. It used to be
+treated as an ordinary question: the knowledge-grounded responder answered it,
+and the reply went out — another message to someone who had just asked for
+none. `ARRÊT` is recognised for the same reason the assistants answer in
+French, accented or not, and so are the Spanish and Chinese equivalents. A
+whole-message keyword is an opt-out; "stop sending me invoices at 3am" is a
+complaint a human should read, and is deliberately left alone.
+
+The acknowledgement is treated as an obligation rather than as outreach, so it
+is sent even when automatic sending is switched off — a withdrawal that is
+recorded but never confirmed is not a withdrawal the customer can trust. Every
+transition is written to an append-only log the application cannot edit or
+delete, which is what turns "they opted out" from an assertion into evidence,
+and a consent record about a person is part of that person's data: it is
+returned in their access request like anything else.
 
 ## Erasure Is Permitted, and Never Silent
 

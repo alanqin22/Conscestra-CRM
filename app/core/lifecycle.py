@@ -40,6 +40,27 @@ logger = logging.getLogger("lifecycle")
 
 DELETE, ANONYMIZE, RETAIN = "delete", "anonymize", "retain"
 
+# ── The mark an anonymised record carries ────────────────────────────────────
+# An erased core row SURVIVES (so invoices and audit history stay referentially
+# intact) with its personal fields redacted. `email` gets a UNIQUE placeholder
+# rather than NULL, because a NOT NULL/UNIQUE constraint would otherwise block
+# the erasure — and that placeholder is the only durable, machine-readable
+# signal that a row is a tombstone rather than a person.
+#
+# It is defined HERE, next to the code that writes it, and imported by anything
+# that needs to recognise one. A second copy of this string somewhere else is a
+# copy that will still say `redacted+` after this one changes.
+ERASED_EMAIL_PREFIX = "redacted+"
+ERASED_EMAIL_DOMAIN = "@invalid.local"
+# SQL LIKE pattern for "this row was erased" — see identity_resolution, which
+# uses it to keep tombstones out of duplicate detection (F-9.11).
+ERASED_EMAIL_LIKE = f"{ERASED_EMAIL_PREFIX}%{ERASED_EMAIL_DOMAIN}"
+
+
+def erased_email(record_id: str) -> str:
+    """The placeholder written into `email` when a record is anonymised."""
+    return f"{ERASED_EMAIL_PREFIX}{record_id[:8]}{ERASED_EMAIL_DOMAIN}"
+
 
 def _sat(table: str, column: str, action: str, why: str,
          via: Optional[Tuple[str, str, str]] = None,
@@ -474,7 +495,7 @@ def erase_sp(params: Dict[str, Any]) -> Dict[str, Any]:
                     continue
                 if expr is None:            # unique placeholder (email)
                     sets.append(f"{col}=%s")
-                    vals.append(f"redacted+{record_id[:8]}@invalid.local")
+                    vals.append(erased_email(record_id))
                 else:
                     sets.append(f"{col}={expr}")
             if _has_col(cur, entity, "updated_at"):
