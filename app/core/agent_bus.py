@@ -1499,11 +1499,10 @@ async def handle_default(event: Dict[str, Any]) -> Dict[str, Any]:
 
     Wraps the original body rather than editing its four return paths, so the
     chain cannot be missed on one of them."""
-    wf = await _maybe_run_workflow(event)
-    result = await _handle_default_inner(event)
-    if wf is not None:
-        result["workflow"] = wf
-    return result
+    # The chain moved to the dispatch loop in run_once() so that it also
+    # covers events with a bespoke handler. Invoking it here as well would
+    # double-fire it for unhandled types.
+    return await _handle_default_inner(event)
 
 
 async def _handle_default_inner(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -1579,8 +1578,26 @@ async def run_once() -> Dict[str, Any]:
     for ev in events:
         et = ev["event_type"]
         try:
+            # WORKFLOW CHAIN — for EVERY claimed event, before the handler.
+            #
+            # This used to live inside handle_default. But dispatch is
+            # `HANDLERS.get(et) or handle_default`, so a bespoke handler
+            # REPLACES the default one — and with it, the chain. Any event type
+            # having both a handler and workflow rules silently lost its rules.
+            # Measured 2026-08-12: 14 invoice.overdue events queued, 0 workflow
+            # runs, while invoice.created/opportunity.created/payment.received
+            # (no bespoke handler) ran 27/16/27. The two are COMPLEMENTARY —
+            # handle_invoice_overdue sends dunning, the rule creates the
+            # escalation task; neither does the other's job.
+            #
+            # Runs BEFORE the handler so a handler failure cannot cost the
+            # workflow its execution. Safe against the resulting retry because
+            # workflow_run_rules_for_event is idempotent per (event, rule).
+            wf = await _maybe_run_workflow(ev)
             handler = HANDLERS.get(et) or handle_default
             result = await handler(ev)
+            if wf is not None:
+                result["workflow"] = wf
             await asyncio.to_thread(_complete_sync, ev["event_uuid"], result)
             summary["results"].append({"event": et, **result})
         except Exception as exc:
