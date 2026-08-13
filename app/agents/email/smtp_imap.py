@@ -106,7 +106,13 @@ def send_email(
     # internals, over-cap discounts. Applies to EVERY path through here.
     try:
         from app.core.outbound_guard import screen
-        g = screen(f"{subject or ''}\n{body_text or body_html or ''}", "email")
+        # Pass the RECIPIENT, not an audience: the guard resolves policy from
+        # database identity. Channel is transport, not audience — this one send
+        # path carries both customer mail and internal executive briefings, and
+        # screening them under identical tone rules is what blocked the CEO
+        # briefing (sent=0, failed=1).
+        g = screen(f"{subject or ''}\n{body_text or body_html or ''}", "email",
+                   recipient=to)
         if not g["ok"]:
             return {'success': False, 'blocked': True, 'to': to,
                     'message': "blocked by outbound guard: "
