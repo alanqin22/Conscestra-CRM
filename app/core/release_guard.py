@@ -273,9 +273,45 @@ def _check_configuration_integrity() -> Dict[str, Any]:
                        f"(workers={workers or 1}, leader_election=on)"}
 
 
+def _check_public_url() -> Dict[str, Any]:
+    """APP_URL is the host printed into every link we email a human.
+
+    THE DEFECT THIS EXISTS TO CATCH. governance builds one-click approve/reject
+    links as `os.getenv("APP_URL","") or "http://localhost:8000"`. That default
+    is right on a laptop and silently wrong once deployed, and nothing said so.
+    Measured on the info@ BCC archive: 19 of 19 approval emails carried
+    `http://localhost:8000` decision links — including the ones production sent
+    to the CFO and CRO. Every one-click approval ever emailed was unusable by
+    anyone not running the local server, against the local database, holding
+    the local signing secret. The buttons rendered, the mail sent, the recipient
+    clicked, and got "Link not valid". Nothing in the system was wrong enough to
+    report itself.
+
+    A control whose failure looks exactly like success needs a startup check,
+    not a comment. Advisory, not blocking: an unreachable link is a broken
+    workflow, not an unsafe one, and refusing to boot over it would be worse.
+    """
+    url = (os.getenv("APP_URL") or "").strip()
+    local = any(h in url.lower() for h in ("localhost", "127.0.0.1", "0.0.0.0"))
+    if not is_deployed():
+        return {"control": "public_url", "ok": True, "severity": "ok",
+                "message": f"APP_URL={url or '(unset → localhost)'} — local"}
+    if not url:
+        return {"control": "public_url", "ok": False, "severity": "advisory",
+                "message": "APP_URL is UNSET in a deployed environment — every "
+                           "emailed approval/verification link will point at "
+                           "http://localhost:8000 and fail for the recipient"}
+    if local:
+        return {"control": "public_url", "ok": False, "severity": "advisory",
+                "message": f"APP_URL={url} in a deployed environment — emailed "
+                           f"links point at the recipient's own machine"}
+    return {"control": "public_url", "ok": True, "severity": "ok",
+            "message": f"emailed links resolve to {url}"}
+
+
 CHECKS = (_check_calendar_feed, _check_api_auth, _check_admin_token,
           _check_training_ack, _check_secret_strength,
-          _check_configuration_integrity)
+          _check_configuration_integrity, _check_public_url)
 
 
 def audit() -> Dict[str, Any]:
