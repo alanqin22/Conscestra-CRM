@@ -264,8 +264,10 @@ def _semantic_hits(query: str, limit: int = 4,
                 tuple(args))
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        via = {h["article_uuid"]: h.get("via", "floor") for h in sims}
         for r in rows:
             r["sim"] = by_uuid[r["article_uuid"]]
+            r["via"] = via.get(r["article_uuid"], "floor")
         return sorted(rows, key=lambda r: r["sim"], reverse=True)
     except Exception as exc:
         logger.debug(f"[knowledge] semantic fetch skipped: {exc}")
@@ -384,6 +386,16 @@ def rag_block(subject: str, body: str,
         if gap_channel:
             log_gap(gap_channel, body)
         return ""
+    # THIRD STATE. Everything reaching here is served to the customer exactly
+    # as before — this records WHY, it does not gate anything. A hit whose only
+    # support is `via='decisive'` never cleared the similarity floor; it was
+    # admitted for leading a weak field. That is correct for a question the
+    # vector leg alone can answer (a Chinese query contributes no FTS terms at
+    # all) and wrong for a question whose topic merely has one nearby article.
+    # Since retrieval cannot tell those apart, the weak ones are recorded
+    # instead of discarded, and a human reads the list.
+    if gap_channel and hits and all(h.get("via") == "decisive" for h in hits):
+        log_weak_match(gap_channel, body)
     _mark_used([h["article_uuid"] for h in hits])
     lines = ["[APPROVED KNOWLEDGE BASE]"]
     for h in hits:
@@ -764,11 +776,56 @@ def draft_pass(force: bool = False) -> Dict[str, Any]:
 # GAP MINING — unanswered questions → agent-grounded article proposals
 # ============================================================================
 
+WEAK_MATCH_STATUS = "weak_match"
+
+
+def log_weak_match(channel: str, question: str) -> None:
+    """Record a question answered only from a hit the KB was not confident in.
+
+    THE DEFECT THIS EXISTS TO KILL. rag_block had exactly two outcomes:
+
+        hits == []   ->  log_gap()  ->  the nightly miner can propose an article
+        hits != []   ->  covered    ->  nothing recorded, ever
+
+    So "an article came back" was treated as "the question was answered", and a
+    question the KB could not really answer left no trace at all. Measured on
+    this KB: of 19 adversarial questions with no real answer, 11 still returned
+    an article and none was recorded. Worse, promotion runs through
+    `UPDATE kb_gaps SET hits = hits + 1` inside log_gap, so a falsely-covered
+    question cannot accumulate hits — asking it a thousand times ranks it below
+    a one-off gap. Frequency, the only prioritisation signal the miner has, is
+    precisely what a false match destroys.
+
+    A weak match is the third state: the customer still gets the answer the
+    system would have given anyway — NOTHING about the reply changes — but the
+    demand is no longer discarded. Written with status='weak_match' so
+    `_open_gaps` (status='open') never picks it up: a weak match is evidence
+    that retrieval was unconvincing, which is not the same claim as "an article
+    is missing", and it should not auto-propose one. Read it with
+    /knowledge/gaps?status=weak_match.
+
+    Deliberately NOT a schema change: `status` carries no CHECK constraint, so
+    a new value needs no migration.
+    """
+    _log_demand(channel, question, WEAK_MATCH_STATUS)
+
+
 def log_gap(channel: str, question: str) -> None:
     """Record a question the KB could not answer (called from rag_block).
     PII-masked, deduped by sorted salient terms (repeat asks bump `hits`).
     Best-effort: missing table = silent skip, same as the sdr_sessions
     pattern — losing telemetry must never break a live reply."""
+    _log_demand(channel, question, "open")
+
+
+def _log_demand(channel: str, question: str, status: str) -> None:
+    """One writer for both demand states, so they cannot drift apart.
+
+    Dedup is scoped to the row's OWN status: a repeat of a weak match bumps the
+    weak-match row, a repeat of a gap bumps the gap row. Sharing one dedup key
+    across states would let a weak match silently absorb a later true miss of
+    the same question, which is the failure this whole change exists to stop.
+    """
     q = str(question or "").strip()[:500]
     # Dedup key: salient terms, crudely de-pluralized ('orders'→'order') so
     # rephrasings of the same ask land on one row and bump its hit count.
@@ -784,18 +841,20 @@ def log_gap(channel: str, question: str) -> None:
             with conn.cursor() as cur:
                 cur.execute(
                     """UPDATE kb_gaps SET hits = hits + 1, updated_at = now()
-                       WHERE status = 'open' AND terms = %s::text[]
-                       RETURNING gap_id""", (terms,))
+                       WHERE status = %s AND terms = %s::text[]
+                       RETURNING gap_id""", (status, terms))
                 if not cur.fetchone():
                     cur.execute(
-                        "INSERT INTO kb_gaps (channel, question, terms) "
-                        "VALUES (%s, %s, %s)", (channel[:20], q, terms))
+                        "INSERT INTO kb_gaps (channel, question, terms, status) "
+                        "VALUES (%s, %s, %s, %s)",
+                        (channel[:20], q, terms, status))
             conn.commit()
         finally:
             conn.close()
-        logger.info(f"[knowledge] KB gap logged ({channel}): {q[:80]}")
+        label = "KB gap" if status == "open" else "KB weak match"
+        logger.info(f"[knowledge] {label} logged ({channel}): {q[:80]}")
     except Exception as exc:
-        logger.debug(f"[knowledge] gap log skipped (table missing?): {exc}")
+        logger.debug(f"[knowledge] demand log skipped (table missing?): {exc}")
 
 
 def _open_gaps(cap: int) -> List[Dict[str, Any]]:

@@ -270,12 +270,22 @@ def search(query: str, limit: int = 4,
     # hit only if it is BOTH above a hard noise floor and clearly ahead of the
     # next one. This matters most for Chinese, which contributes no FTS terms
     # at all, so the vector leg is the only signal it has.
+    for h in kept:
+        h["via"] = "floor"          # cleared the absolute floor on its own
     if not kept and sims and sims[0]["sim"] >= DECISIVE_MIN:
         best = sims[0]["sim"]
         second = sims[1]["sim"] if len(sims) > 1 else 0.0
         if best > 0 and (best - second) / best >= DECISIVE_MARGIN:
             logger.debug(f"[semantic] decisive winner {best:.3f} over "
                          f"{second:.3f} (floor {floor})")
+            # `via` records WHY this hit was accepted. A decisive winner did
+            # NOT clear the floor — it was admitted because it led a weak
+            # field, which is the right call for a cross-lingual question the
+            # vector leg alone can answer, and the wrong one for a question
+            # whose topic simply has a single nearby article. The two are
+            # indistinguishable here, so the tag travels with the hit and the
+            # caller decides. Nothing about acceptance changes.
+            sims[0]["via"] = "decisive"
             kept = [sims[0]]
     return kept[:limit]
 
