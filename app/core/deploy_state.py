@@ -67,7 +67,12 @@ REQUIRED_MIGRATIONS: List[str] = [
     "erasure_authorization.sql",
     "erasure_log_retention.sql",
     "executives_audit_and_touch.sql",
-    "tier1_audit_instrumentation.sql",
+    # tier1_audit_instrumentation.sql is DELIBERATELY NOT DECLARED. The file
+    # exists and is validated, but applying it has not been authorized. This
+    # list means "the schema must have this", so declaring an unapplied,
+    # unauthorized migration turns `migrate --check` red for a decision nobody
+    # has taken — it states a proposal as a requirement. Add the line in the
+    # same change that applies the migration, not before.
 ]
 
 # The parameters that decide what an agent may SAY. A difference in any of these
