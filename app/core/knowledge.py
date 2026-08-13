@@ -821,10 +821,22 @@ def log_gap(channel: str, question: str) -> None:
 def _log_demand(channel: str, question: str, status: str) -> None:
     """One writer for both demand states, so they cannot drift apart.
 
-    Dedup is scoped to the row's OWN status: a repeat of a weak match bumps the
-    weak-match row, a repeat of a gap bumps the gap row. Sharing one dedup key
-    across states would let a weak match silently absorb a later true miss of
-    the same question, which is the failure this whole change exists to stop.
+    ONE ROW PER QUESTION, and the state only ever ratchets UP:
+
+        weak_match  ──promote──▶  open        (a true miss supersedes)
+        open        ──never───▶  weak_match   (a gap is the stronger claim)
+
+    Scoping dedup to each status separately looked right and was wrong. Measured
+    on a live Mandarin call: '你们提供API吗？有没有调用频率限制？' produced BOTH an
+    `open` row and a `weak_match` row eight seconds apart, because rag_block
+    retries a MISS through an LLM query rewrite, and a rewrite that happens to
+    surface a decisive hit turns the same question into a weak match. One
+    question then occupies two rows whose hit counts each understate the real
+    demand — which is the same information loss this file exists to prevent,
+    reintroduced one level down.
+
+    Promotion (never absorption) keeps the original guarantee: a weak match can
+    never swallow a later true miss. It is upgraded by it.
     """
     q = str(question or "").strip()[:500]
     # Dedup key: salient terms, crudely de-pluralized ('orders'→'order') so
@@ -839,11 +851,38 @@ def _log_demand(channel: str, question: str, status: str) -> None:
         conn = get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """UPDATE kb_gaps SET hits = hits + 1, updated_at = now()
-                       WHERE status = %s AND terms = %s::text[]
-                       RETURNING gap_id""", (status, terms))
-                if not cur.fetchone():
+                bump = ("""UPDATE kb_gaps SET hits = hits + 1, updated_at = now()
+                            WHERE status = %s AND terms = %s::text[]
+                            RETURNING gap_id""")
+                hit = None
+                if status == "open":
+                    # A gap outranks a weak match, so try the gap row first,
+                    # then PROMOTE a weak match rather than opening a rival row.
+                    cur.execute(bump, ("open", terms))
+                    hit = cur.fetchone()
+                    if not hit:
+                        cur.execute(
+                            """UPDATE kb_gaps
+                                  SET status = 'open', hits = hits + 1,
+                                      updated_at = now()
+                                WHERE status = %s AND terms = %s::text[]
+                                RETURNING gap_id""", (WEAK_MATCH_STATUS, terms))
+                        hit = cur.fetchone()
+                        if hit:
+                            logger.info(f"[knowledge] weak match promoted to "
+                                        f"gap ({channel}): {q[:60]}")
+                else:
+                    # Ordering matters and cost a bug: checking "bump my own
+                    # status" first let a weak match keep incrementing its own
+                    # row while a gap row for the same question sat beside it.
+                    # A known gap absorbs the observation; only if none exists
+                    # does the weak-match row take it.
+                    cur.execute(bump, ("open", terms))
+                    hit = cur.fetchone()
+                    if not hit:
+                        cur.execute(bump, (WEAK_MATCH_STATUS, terms))
+                        hit = cur.fetchone()
+                if not hit:
                     cur.execute(
                         "INSERT INTO kb_gaps (channel, question, terms, status) "
                         "VALUES (%s, %s, %s, %s)",
