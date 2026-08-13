@@ -30,7 +30,8 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
 
@@ -77,28 +78,114 @@ _DISCOUNT = re.compile(r"(\d{1,3})\s?%\s*(?:off|discount)", re.IGNORECASE)
 _counters: Dict[str, int] = {"screened": 0, "blocked": 0}
 
 
-def screen(text: str, channel: str = "email") -> Dict[str, Any]:
-    """{'ok': bool, 'violations': [...]} — never raises. Empty text passes
-    (emptiness is the caller's problem, not a safety issue)."""
+# ── Audience ────────────────────────────────────────────────────────────────
+# CHANNEL IS NOT AUDIENCE. `channel` describes transport; an "email" may go to a
+# customer or to our own CFO. screen() previously received only text+channel and
+# therefore could not tell the two apart, so every rule — including the
+# customer-facing TONE rules — was applied to internal mail. The CEO briefing was
+# blocked by _SHOUT because its section headers are legitimately uppercase
+# (measured: sent=0, failed=1). A control that blocks legitimate internal traffic
+# is a control somebody eventually switches off, so the fix is to give the wall
+# the missing information rather than to lower it.
+#
+# Audience is resolved from DATABASE IDENTITY, never from subject text, sender
+# name, or an address pattern:
+#     employees                        -> internal   (staff and AI agents)
+#     owners that are not contacts     -> internal   (the exec identities)
+#     contacts                         -> customer
+#     anything unresolved / any error  -> customer   (strict)
+_AUD_CUSTOMER, _AUD_INTERNAL = "customer", "internal"
+_aud_cache: Dict[str, tuple] = {}
+_AUD_TTL = 300.0
+
+
+def resolve_audience(recipient: Optional[str]) -> str:
+    """Authoritative audience resolver. THE normal way to obtain an audience.
+
+    Fails closed: an unknown recipient, a missing table or any error yields
+    'customer', which is the stricter policy."""
+    if not recipient:
+        return _AUD_CUSTOMER
+    key = recipient.strip().lower()
+    hit = _aud_cache.get(key)
+    if hit and (time.time() - hit[1]) < _AUD_TTL:
+        return hit[0]
+    aud = _AUD_CUSTOMER
+    try:
+        from app.core.database import get_connection
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                # A contact is a customer even if the same address also appears
+                # in `owners` — 42 of 44 owners duplicate a contact, so contact
+                # membership must win or customers would be classed internal.
+                cur.execute("SELECT 1 FROM contacts WHERE lower(email)=%s LIMIT 1", (key,))
+                if cur.fetchone():
+                    aud = _AUD_CUSTOMER
+                else:
+                    cur.execute("SELECT 1 FROM employees WHERE lower(email)=%s LIMIT 1", (key,))
+                    if cur.fetchone():
+                        aud = _AUD_INTERNAL
+                    else:
+                        cur.execute("SELECT 1 FROM owners WHERE lower(email)=%s LIMIT 1", (key,))
+                        aud = _AUD_INTERNAL if cur.fetchone() else _AUD_CUSTOMER
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(f"[guard] audience unresolved for {key!r} ({exc}); "
+                       f"defaulting to customer (strict)")
+        return _AUD_CUSTOMER
+    _aud_cache[key] = (aud, time.time())
+    return aud
+
+
+def screen(text: str, channel: str = "email",
+           recipient: Optional[str] = None,
+           audience: Optional[str] = None) -> Dict[str, Any]:
+    """{'ok': bool, 'violations': [...], 'audience': str, 'audience_source': str}
+
+    Never raises. Empty text passes (emptiness is the caller's problem).
+
+    Pass `recipient` and let the guard decide the policy — that is the intended
+    path, because it gives the guard a FACT (who) rather than a DECISION (which
+    policy). `audience` is an explicit override for callers with no recipient
+    (the eval harness); it is recorded in the result and logged so an assertion
+    of 'internal' is always auditable. See the module docstring on trust."""
     if not ENABLED:
-        return {"ok": True, "violations": []}
+        return {"ok": True, "violations": [], "audience": _AUD_CUSTOMER,
+                "audience_source": "disabled"}
+    if recipient:
+        aud, src = resolve_audience(recipient), "resolved"
+    elif audience:
+        aud, src = (audience if audience in (_AUD_CUSTOMER, _AUD_INTERNAL)
+                    else _AUD_CUSTOMER), "asserted"
+        if aud == _AUD_INTERNAL:
+            logger.info(f"[guard] audience 'internal' ASSERTED by caller on "
+                        f"{channel} with no recipient to verify against")
+    else:
+        aud, src = _AUD_CUSTOMER, "default"
+    customer_facing = aud == _AUD_CUSTOMER
+
     t = text or ""
     v: List[str] = []
-    if _TOXIC.search(t):
-        v.append("toxic/aggressive language")
-    if _BINDING.search(t):
-        v.append("legally binding promise")
+    # ── SAFETY: every audience, no exceptions. 'internal' is a policy
+    #    classification, not a safety bypass.
     if _LEAKS.search(t):
         v.append("internal marker leaked")
-    if _PLACEHOLDER.search(t):
-        v.append("unresolved template placeholder")
     if _CARD.search(t):
         v.append("payment-card number in message body")
-    if _SHOUT.search(t):
+    # ── TONE / COMMERCIAL / QUALITY: customer-facing only.
+    if customer_facing and _TOXIC.search(t):
+        v.append("toxic/aggressive language")
+    if customer_facing and _BINDING.search(t):
+        v.append("legally binding promise")
+    if customer_facing and _PLACEHOLDER.search(t):
+        v.append("unresolved template placeholder")
+    if customer_facing and _SHOUT.search(t):
         v.append("shouting (all-caps run)")
-    if t.count("!!!") >= 2 or "!!!!" in t:
+    if customer_facing and (t.count("!!!") >= 2 or "!!!!" in t):
         v.append("excessive punctuation")
-    m = _DISCOUNT.search(t)
+    m = _DISCOUNT.search(t) if customer_facing else None
     if m:
         try:
             from app.core import governance
@@ -111,9 +198,10 @@ def screen(text: str, channel: str = "email") -> Dict[str, Any]:
     _counters["screened"] += 1
     if v:
         _counters["blocked"] += 1
-        logger.warning(f"[guard] BLOCKED {channel} message: {', '.join(v)} — "
-                       f"{t[:120]!r}")
-    return {"ok": not v, "violations": v}
+        logger.warning(f"[guard] BLOCKED {channel}/{aud} message: "
+                       f"{', '.join(v)} — {t[:120]!r}")
+    return {"ok": not v, "violations": v, "audience": aud,
+            "audience_source": src}
 
 
 router = APIRouter(tags=["outbound-guard"])
@@ -125,6 +213,7 @@ def guard_status():
 
 
 @router.get("/outbound-guard/test")
-def guard_test(text: str, channel: str = "test"):
+def guard_test(text: str, channel: str = "test",
+               recipient: str = None, audience: str = None):
     """Dry-run the screen against arbitrary text (admin tooling)."""
-    return screen(text, channel)
+    return screen(text, channel, recipient=recipient, audience=audience)

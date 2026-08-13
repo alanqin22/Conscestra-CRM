@@ -704,7 +704,15 @@ def _run_ceo_briefing() -> None:
         out = tenancy.for_each_tenant(send_briefing, job="ceo_briefing")
         for tid, res in (out.get("results") or {}).items():
             if isinstance(res, dict) and not res.get("skipped"):
-                logger.info(f"[CEOBriefing][{tid}] {res}")
+                # A send that delivered nothing is an error, not an info line.
+                # send_briefing already pages; this keeps the log honest too,
+                # so `grep ERROR` and the alert stream agree.
+                if res.get("expected", 0) > res.get("sent_count", 0):
+                    logger.error(f"[CEOBriefing][{tid}] DELIVERED "
+                                 f"{res.get('sent_count')}/{res.get('expected')} "
+                                 f"— {res.get('failures')}")
+                else:
+                    logger.info(f"[CEOBriefing][{tid}] {res}")
         for tid, err in (out.get("errors") or {}).items():
             logger.error(f"[CEOBriefing][{tid}] send failed: {err}")
     except Exception as exc:
