@@ -20,7 +20,7 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter
 
-from app.core.database import get_connection
+from app.core.database import execute_sp, get_connection
 
 logger = logging.getLogger("ceo_briefing")
 
@@ -1054,6 +1054,71 @@ def _subscribers(cur, category: str) -> List[tuple]:
     return [(r[0], r[1]) for r in cur.fetchall() if r[0]]
 
 
+def _alert_silent_failure(results: Dict[str, Any], sent: int, expected: int,
+                          reasons: List[str]) -> None:
+    """Page when a scheduled internal briefing produced no mail.
+
+    The CEO briefing failed silently for five consecutive days: the outbound
+    guard rejected it, send_briefing counted the rejection into `results`, and
+    nothing looked at `results`. A scheduled job that is SUPPOSED to send and
+    sends nothing is an incident, not a statistic — the whole value of the
+    briefing is that it arrives unprompted, so nobody is waiting to notice it
+    missing.
+
+    Two conditions page, because they fail differently:
+      sent == 0 with subscribers   total outage (the guard-block signature)
+      sent  < expected             partial — one role silently dropped
+
+    Emitted as `supervisor.alert`, which is an already-registered event type
+    with existing consumers. A new event type would need registering first and
+    would otherwise be dropped on the floor — the same silence this fixes.
+    Deduped per rule per day so a persistent fault pages once, not hourly.
+    """
+    if expected <= 0:
+        return                                    # nothing was owed; not a fault
+    if sent >= expected:
+        return
+    total_outage = sent == 0
+    rule = "ceo_briefing.silent" if total_outage else "ceo_briefing.partial"
+    detail = "; ".join(dict.fromkeys(reasons))[:400] or "no reason reported"
+    headline = (f"Executive briefing sent NOTHING ({expected} subscriber(s) "
+                f"expected) — {detail}") if total_outage else (
+                f"Executive briefing sent {sent}/{expected} — {detail}")
+    logger.error(f"[ceo_briefing] ALERT {rule}: {headline}")
+    try:
+        import json as _json
+        import uuid as _uuid
+        dup = execute_sp(
+            """SELECT 1 AS x FROM events
+                WHERE event_type='supervisor.alert' AND source_system='ceo_briefing'
+                  AND payload->'context'->>'rule' = %(r)s
+                  AND created_at > now() - interval '20 hours' LIMIT 1""",
+            {"r": rule})
+        if dup:
+            return
+        payload = _json.dumps({"context": {
+            "rule": rule,
+            "severity": "critical" if total_outage else "warning",
+            "headline": headline,
+            "metric": "briefings_sent",
+            "value": sent,
+            "expected": expected,
+            "owner_agent": "ceo_briefing",
+            "recommended_action": (
+                "Check the outbound guard verdict and executive subscriptions "
+                "(executives.notification_categories)."),
+            "by_briefing": results}})
+        execute_sp(
+            "SELECT emit_event('supervisor.alert','system',%(id)s::uuid,"
+            "%(p)s::jsonb,NULL,'ceo_briefing') AS r",
+            {"id": str(_uuid.uuid4()), "p": payload})
+    except Exception as exc:
+        # Never let the alerter break the job it is watching — but do not let it
+        # fail quietly either, since quiet failure is the defect being fixed.
+        logger.error(f"[ceo_briefing] could not emit {rule} alert: {exc}",
+                     exc_info=True)
+
+
 def send_briefing(force: bool = False) -> Dict[str, Any]:
     """Capture today's snapshot (always), then deliver each role briefing
     (CEO/CFO/CRO/COO) to its subscribers — execs whose notification_categories
@@ -1078,11 +1143,14 @@ def send_briefing(force: bool = False) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
     total = 0
     any_sub = False
+    expected = 0                      # how many sends were OWED, for the alert
+    reasons: List[str] = []           # why the ones that failed, failed
     for cat, (role, builder) in _BRIEFINGS.items():
         rc = subs.get(cat) or []
         if not rc:
             continue
         any_sub = True
+        expected += len(rc)
         msg = ceo_msg if cat == "ceo_briefing" else builder(d, deltas)
         s = f = 0
         for email, _name in rc:
@@ -1090,17 +1158,37 @@ def send_briefing(force: bool = False) -> Dict[str, Any]:
                 res = send_email(email, msg["subject"], msg["html"], msg["text"], from_name="Conscestra CRM")
                 ok = bool(res.get("success", True)) if isinstance(res, dict) else True
                 s += 1 if ok else 0; f += 0 if ok else 1; total += 1 if ok else 0
+                if not ok:
+                    # Carry the provider/guard reason into the alert. Without it
+                    # the page says "nothing sent" and the operator still has to
+                    # go digging for why.
+                    why = res.get("message") if isinstance(res, dict) else None
+                    reasons.append(f"{role}: {why or 'send reported failure'}")
             except Exception as exc:
                 logger.error(f"[ceo_briefing] {role} send to {email} failed: {exc}", exc_info=True)
                 f += 1
+                reasons.append(f"{role}: {type(exc).__name__}: {exc}")
         results[cat] = {"role": role, "sent": s, "failed": f}
 
     # Fallback: no executive subscribers at all → send CEO briefing to env address.
     if not any_sub and RECIPIENT:
+        expected += 1
         res = send_email(RECIPIENT, ceo_msg["subject"], ceo_msg["html"], ceo_msg["text"], from_name="Conscestra CRM")
         ok = bool(res.get("success", True)) if isinstance(res, dict) else True
         results["env_fallback"] = {"role": "CEO", "sent": 1 if ok else 0, "failed": 0 if ok else 1}
         total += 1 if ok else 0
+        if not ok:
+            reasons.append(f"env_fallback: {res.get('message') if isinstance(res, dict) else 'failed'}")
+
+    # No subscribers AND no env fallback is its own failure: the job is enabled,
+    # ran, and could not have delivered to anyone. Silent by construction.
+    if not any_sub and not RECIPIENT:
+        logger.error("[ceo_briefing] ALERT ceo_briefing.no_recipients: enabled "
+                     "but no executive subscribes to any briefing and "
+                     "CEO_BRIEFING_EMAIL is unset — nothing can be delivered")
+        results["no_recipients"] = True
+
+    _alert_silent_failure(results, total, expected, reasons)
 
     # Proactive Slack post (#5) — broadcast the CEO briefing into the team channel.
     # Best-effort + self-gated (SLACK_PROACTIVE_ENABLED + a configured channel);
@@ -1115,7 +1203,8 @@ def send_briefing(force: bool = False) -> Dict[str, Any]:
         logger.debug(f"[ceo_briefing] proactive Slack post skipped: {exc}")
 
     logger.info(f"[ceo_briefing] delivered total={total} by_briefing={results}")
-    return {"sent_count": total, "by_briefing": results, "subject": ceo_msg["subject"]}
+    return {"sent_count": total, "expected": expected, "by_briefing": results,
+            "failures": reasons, "subject": ceo_msg["subject"]}
 
 
 # ── Admin endpoints ───────────────────────────────────────────────────────────────
