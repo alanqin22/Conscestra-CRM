@@ -113,8 +113,23 @@ def _recipient_is_deliverable(to: str) -> Dict[str, Any]:
         return {"ok": False,
                 "reason": f"{addr} is not a verified, deliverable recipient "
                           f"(is_email_verified is false, or the domain is a "
-                          f"placeholder/seed domain)"}
+                          f"reserved placeholder such as example.com)"}
     return {"ok": True}
+
+
+# @seed.agentorc.ca is DELIVERABLE ON PURPOSE and is not filtered here.
+#
+# It is a catch-all this project owns, created so the synthetic corpus would
+# stop pointing at RFC 2606 addresses that belong to nobody. Verification, not
+# the domain, is the gate: a seed contact carries is_email_verified=false and is
+# refused above like any other, and one that has been deliberately verified is
+# how an end-to-end send is exercised into a mailbox we control.
+#
+# An earlier version of the message above claimed this function rejected
+# "placeholder/seed" domains. It never did — `seed.agentorc.ca` is not in
+# _PLACEHOLDER_EMAIL_DOMAINS and matches none of the reserved suffixes. Wording
+# that overstates a control is the same defect class this module exists because
+# of, so it is corrected rather than left as a comforting sentence.
 
 
 def _compose(params: Dict[str, Any]) -> Dict[str, str]:
