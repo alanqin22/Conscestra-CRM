@@ -60,18 +60,52 @@ logger = logging.getLogger("metrics")
 # ============================================================================
 _DECISION_TS: Optional[str] = None
 
+# The zone a bare `close_date` is understood to be a calendar day IN.
+#
+# `close_date` is a DATE — a day with no time — so turning it into an instant
+# requires choosing which midnight it means. That choice is a business fact, not
+# a formatting detail: it decides which day a deal is counted on.
+#
+# It was 'UTC', and that dated every close_date-derived deal ONE DAY EARLY for
+# this business. 'UTC' asserts the day begins at 00:00 UTC, which is 20:00 the
+# previous evening in Toronto — so a deal closing the 15th carried a decision
+# instant of the 14th at 20:00. Measured 2026-08-14: of 322 opportunities that
+# fall back to close_date, ZERO landed on their own close_date and all 322 land
+# on it under the business zone.
+#
+# The bug was invisible wherever the session ran in UTC, because there the two
+# agree. Anchoring to the business zone is correct in BOTH, which is the
+# property this registry exists to provide: one answer, not one-per-session.
+#
+# It MUST equal METRICS_TZ (below), which anchors calendar bucketing. Those are
+# the same business fact asked twice — "which day did this land on?" and "which
+# month does that day belong to?" — and letting them disagree would recreate the
+# drift this module exists to remove, one layer down: a deal dated by one zone
+# and bucketed by another. test_metric_registry.py asserts they agree.
+#
+# It is a LITERAL and deliberately NOT read from the environment, unlike
+# METRICS_TZ. This string is compiled into idx_opportunities_decided_ts; if it
+# varied per deployment the index would stop matching the predicate, and that
+# failure is a silent sequential scan rather than an error. An operator who
+# overrides METRICS_TZ gets a failed test, not a slow database.
+BUSINESS_TZ = "America/New_York"
+
 # The canonical decision timestamp, as SQL. Kept as a module constant so the
 # SQL generator (metric_sql.py) emits the SAME expression the Python path uses.
 #
-# The fallback cast is `::timestamp AT TIME ZONE 'UTC'`, NOT `::timestamptz`.
+# The cast is `::timestamp AT TIME ZONE '<literal>'`, NOT `::timestamptz`.
 # A plain date→timestamptz cast reads the session TimeZone, so Postgres marks it
 # STABLE and REFUSES to build an index on it ("functions in index expression
 # must be marked IMMUTABLE"). Anchoring the zone as a literal makes it immutable,
 # which is what lets idx_opportunities_decided_ts exist AND match this predicate.
+# `timezone(text, timestamp)` is IMMUTABLE for ANY literal zone — verified in
+# pg_proc — so naming the business zone costs nothing the UTC literal was buying.
 # Same string in Python, in the generated view, and in the index — a mismatch
 # would silently cost the index and re-open the drift this module closes.
-DECISION_TS_SQL = "COALESCE(o.decided_at, o.close_date::timestamp AT TIME ZONE 'UTC')"
-DECISION_TS_FALLBACK_SQL = "(o.close_date::timestamp AT TIME ZONE 'UTC')"
+DECISION_TS_SQL = ("COALESCE(o.decided_at, "
+                   f"o.close_date::timestamp AT TIME ZONE '{BUSINESS_TZ}')")
+DECISION_TS_FALLBACK_SQL = (
+    f"(o.close_date::timestamp AT TIME ZONE '{BUSINESS_TZ}')")
 
 
 def decision_ts() -> str:

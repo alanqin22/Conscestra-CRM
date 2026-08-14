@@ -105,6 +105,42 @@ def classify_outcome(status: Optional[int], body: Optional[dict],
     return FAILED                           # every other 4xx/5xx
 
 
+def classify_sp_result(data: Any, raised: bool = False) -> str:
+    """The same doctrine, applied to the STRUCTURED (sp=) path.
+
+    The HTTP path was fixed first because that is where the 25 false "sent"
+    records came from. The structured path had the identical defect wearing
+    different clothes: it returned `A2AResult(True, ...)` whenever `cap.sp` did
+    not RAISE, so an SP that reported its own refusal by RETURN VALUE was read
+    as success. Measured on 2026-08-14, six SPs already did exactly that —
+    `sms.send` answering {'ok': False, 'error': "unusable phone number"} was
+    dispatched as ACCEPTED.
+
+    This matters beyond tidiness: moving email.send_payment_reminder onto the
+    sp= path (the fix for the 403) would have carried it off the repaired path
+    and back onto this one, restoring the original defect on the exact
+    capability it was found in.
+
+    Two refusal conventions are in use and both are honoured — `success` (the
+    email module) and `ok` (sms, contact.update_profile, scoring.activate, the
+    data.* family). Only the SINGULAR `error` key counts; `crm.plan` returns a
+    plural `errors` list that is empty on success.
+
+    Anything else that completed without raising is ACCEPTED, so the read
+    capabilities returning bare lists and row dicts are unaffected.
+    """
+    if raised:
+        return FAILED                       # did not complete
+    if data is None:
+        return UNKNOWN                      # completed, told us nothing
+    if isinstance(data, dict):
+        if data.get("success") is False or data.get("ok") is False:
+            return REJECTED                 # the SP reported its own refusal
+        if data.get("error"):
+            return REJECTED
+    return ACCEPTED
+
+
 @dataclass
 class A2AResult:
     ok: bool
@@ -242,6 +278,17 @@ def _sp_account_context(p: Dict[str, Any]) -> Any:
     if not aid:
         return {"error": "account_id required"}
     return blackboard.context("account", aid)
+
+
+def _sp_email_send_payment_reminder(p: Dict[str, Any]) -> Any:
+    """Email: send an overdue-invoice payment reminder (structured, no HTTP).
+
+    Registered so dispatch() stops routing this over the in-process ASGI hop to
+    the admin-gated /email-chat, which answered 403 in every environment and
+    meant no payment reminder was ever transmitted.
+    """
+    from app.agents.email.structured import send_payment_reminder_sp
+    return send_payment_reminder_sp(p or {})
 
 
 def _sp_campaign_winback(p: Dict[str, Any]) -> Any:
@@ -491,7 +538,8 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                lambda p: (f"send a payment reminder email to {p['to']} about invoice "
                           f"{p.get('invoice_number', '')} for {p.get('amount', '')}, "
                           f"{p.get('days_overdue', '')} days overdue"),
-               "send an overdue-invoice payment reminder"),
+               "send an overdue-invoice payment reminder",
+               sp=_sp_email_send_payment_reminder),
     Capability("campaign.winback", "marketing", "/marketing/campaigns", "write",
                lambda p: "launch a win-back campaign for high-churn customers",
                "create + launch a win-back marketing campaign (segment defaults "
@@ -964,10 +1012,27 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
             data = await asyncio.to_thread(cap.sp, req.params)
         except Exception as exc:
             return A2AResult(False, req.intent, cap.agent, cid,
+                             outcome=FAILED,
                              error=f"sp failed for '{req.intent}': {exc}")
+        # Not raising is not the same as succeeding. An SP that refuses by
+        # RETURN VALUE ({'ok': False}, {'success': False}, {'error': ...}) used
+        # to arrive here as A2AResult(True, ...) — the structured twin of the
+        # defect that recorded 25 payment reminders as sent.
+        outcome = classify_sp_result(data)
+        if outcome != ACCEPTED:
+            detail = (data.get("error") or data.get("message")
+                      if isinstance(data, dict) else None)
+            logger.warning(f"[a2a] {req.from_agent} → {cap.agent}.{req.intent} "
+                           f"(structured) → {outcome} cid={cid[:8]}"
+                           + (f": {detail}" if detail else ""))
+            return A2AResult(False, req.intent, cap.agent, cid, data=data,
+                             outcome=outcome,
+                             error=str(detail) if detail else
+                             f"'{req.intent}' returned {outcome}")
         logger.info(f"[a2a] {req.from_agent} → {cap.agent}.{req.intent} "
                     f"(structured) cid={cid[:8]}")
         return A2AResult(True, req.intent, cap.agent, cid, data=data,
+                         outcome=ACCEPTED,
                          output=_summarize(req.intent, data))
 
     try:
