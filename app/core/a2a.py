@@ -65,6 +65,46 @@ class A2ARequest:
                                      # (set when an approved action re-dispatches)
 
 
+# ── Outcome of a dispatch ───────────────────────────────────────────────────
+# Four states, because a boolean cannot say "we could not tell". The predicate
+# this replaces was `ok = (success is not False) and not error`, which never
+# looked at the HTTP status and therefore read 403/404/429/500, empty bodies and
+# non-JSON alike as success.
+ACCEPTED = "accepted"   # the request was processed and not refused
+REJECTED = "rejected"   # it was refused — explicitly, or by authorization
+FAILED   = "failed"     # transport or server error; it did not complete
+UNKNOWN  = "unknown"    # completed with no readable signal — NOT a success
+
+
+def classify_outcome(status: Optional[int], body: Optional[dict],
+                     parsed: bool = True) -> str:
+    """Map an HTTP exchange to one of the four outcomes.
+
+    THE INVARIANT: there is no path here in which the ABSENCE of an error
+    produces ACCEPTED. Acceptance requires a 2xx — a positive statement from the
+    server — plus a body that is readable and does not itself report failure.
+
+    401/403 are REJECTED by owner decision (2026-08-13). Note for whoever adds
+    retries: REJECTED therefore mixes non-retryable causes (bad address,
+    suppression) with retryable ones (a credential that can be corrected), so
+    retry logic must key off something other than this enum alone.
+    """
+    if status is None:
+        return UNKNOWN                      # transport failure / no response
+    body = body or {}
+    if status in (401, 403):
+        return REJECTED                     # authorization refused it
+    if 200 <= status < 300:
+        if not parsed:
+            return UNKNOWN                  # a 200 we could not read
+        if not body:
+            return UNKNOWN                  # 200 with an empty body says nothing
+        if body.get("success") is False or body.get("error"):
+            return REJECTED                 # the agent reported its own refusal
+        return ACCEPTED
+    return FAILED                           # every other 4xx/5xx
+
+
 @dataclass
 class A2AResult:
     ok: bool
@@ -76,6 +116,16 @@ class A2AResult:
     error: Optional[str] = None
     hops: List[str] = field(default_factory=list)   # delegated sub-calls (audit)
     raw: Optional[Dict[str, Any]] = None            # full agent response (NL path)
+    # Which of the four states this was. Defaults from `ok` so the many
+    # positional A2AResult(True/False, ...) constructions keep working; the HTTP
+    # path sets it explicitly. Callers that must not over-claim (recording a
+    # send, say) should read THIS, not `ok`.
+    outcome: str = ""
+    status: Optional[int] = None                    # HTTP status, NL path only
+
+    def __post_init__(self):
+        if not self.outcome:
+            self.outcome = ACCEPTED if self.ok else FAILED
 
 
 # ============================================================================
@@ -735,7 +785,19 @@ def _log_dispatch(req: "A2ARequest", res: "A2AResult", ms: int) -> None:
 # IN-PROCESS INVOKE (ASGI — no network hop)
 # ============================================================================
 
-async def _invoke(endpoint: str, message: str, session_id: str) -> dict:
+async def _invoke(endpoint: str, message: str,
+                  session_id: str) -> Tuple[Optional[int], dict, bool]:
+    """POST the agent endpoint in-process. Returns (status, body, parsed).
+
+    THE STATUS IS RETURNED BECAUSE DISCARDING IT WAS THE DEFECT. This used to
+    return the body alone, so dispatch() judged success from body keys and never
+    saw the HTTP code. A 403 from an admin-gated endpoint carries
+    {"detail": "..."} — no `success`, no `error` — and was read as success:
+    measured on 2026-06-26, 25 payment reminders were recorded as sent while the
+    independent BCC archive holds none. `parsed` is False when the body was not
+    JSON, so "we could not read the answer" stays distinct from "the answer said
+    nothing was wrong".
+    """
     from app.main import app as _app  # lazy import avoids a circular import
     transport = httpx.ASGITransport(app=_app)
     async with httpx.AsyncClient(transport=transport,
@@ -748,10 +810,12 @@ async def _invoke(endpoint: str, message: str, session_id: str) -> dict:
         try:
             data = resp.json()
         except Exception:
-            return {"output": resp.text[:2000]}
+            return resp.status_code, {"output": resp.text[:2000]}, False
         if isinstance(data, list):
             data = data[0] if data else {}
-        return data if isinstance(data, dict) else {"output": str(data)[:2000]}
+        if not isinstance(data, dict):
+            return resp.status_code, {"output": str(data)[:2000]}, True
+        return resp.status_code, data, True
 
 
 # ============================================================================
@@ -929,14 +993,27 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
     session = f"a2a-{req.from_agent}-{cid[:8]}"
     logger.info(f"[a2a] {req.from_agent} → {cap.agent}.{req.intent} "
                 f"(conf={req.confidence}) cid={cid[:8]}")
-    resp = await _invoke(cap.endpoint, message, session)
+    try:
+        status, resp, parsed = await _invoke(cap.endpoint, message, session)
+    except Exception as exc:
+        # A transport failure is UNKNOWN, not failure-shaped-as-success and not
+        # a silent swallow: the call may or may not have reached the agent.
+        logger.warning(f"[a2a] transport failure {cap.endpoint} cid={cid[:8]}: {exc}")
+        return A2AResult(False, req.intent, cap.agent, cid,
+                         error=f"transport failure: {exc}", outcome=UNKNOWN)
+
+    outcome = classify_outcome(status, resp, parsed)
+    if outcome != ACCEPTED:
+        logger.warning(f"[a2a] {cap.agent}.{req.intent} → {outcome} "
+                       f"(HTTP {status}) cid={cid[:8]}")
     return A2AResult(
-        ok=(resp.get("success") is not False) and not resp.get("error"),
+        ok=(outcome == ACCEPTED),
         intent=req.intent, agent=cap.agent, correlation_id=cid,
         data=resp.get("records") if "records" in resp else resp.get("result"),
         output=str(resp.get("output", ""))[:4000],
-        error=resp.get("error"),
-        raw=resp,
+        error=resp.get("error") or (None if outcome == ACCEPTED
+                                    else f"{outcome} (HTTP {status})"),
+        raw=resp, outcome=outcome, status=status,
     )
 
 

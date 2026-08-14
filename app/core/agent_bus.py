@@ -605,6 +605,7 @@ async def handle_invoice_overdue(event: Dict[str, Any]) -> Dict[str, Any]:
             # reaction delegates delivery to whichever agent owns the
             # 'email.send_payment_reminder' capability (the Email agent) — no
             # hardcoded endpoint, with correlation lineage carried through.
+            from app.core import a2a as a2a_mod
             from app.core.a2a import A2ARequest, EntityRef, dispatch
             res = await dispatch(A2ARequest(
                 from_agent="accounting",
@@ -620,7 +621,17 @@ async def handle_invoice_overdue(event: Dict[str, Any]) -> Dict[str, Any]:
                                 if event.get("correlation_id") else None),
                 confidence=0.9,
             ))
-            sent = res.ok or "sent" in (res.output or "").lower()
+            # Only an ACCEPTED dispatch may be recorded as sent. The previous
+            # form — `res.ok or "sent" in output` — had two false-success paths:
+            # `ok` was true for any response lacking a `success`/`error` key
+            # (including a 403), and an agent merely writing the word "sent" in
+            # its prose satisfied the second clause. Measured 2026-06-26: 25
+            # reminders recorded as sent, zero in the BCC archive.
+            sent = (res.outcome == a2a_mod.ACCEPTED)
+            if not sent:
+                logger.warning(
+                    f"[agent_bus] dunning NOT sent for {ctx['invoice_number']}: "
+                    f"{res.outcome} ({res.error or 'no detail'})")
         except Exception as exc:  # delivery is best-effort; never fail the event
             logger.warning(f"[agent_bus] email handoff send failed: {exc}")
 
