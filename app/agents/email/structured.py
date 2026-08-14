@@ -94,14 +94,27 @@ def _recipient_is_deliverable(to: str) -> Dict[str, Any]:
             # Fail closed on ambiguity: if ANY contact holding this address is
             # unverified, treat the address as unverified. A duplicate row must
             # not be a way to acquire consent.
+            #
+            # The first name comes back from the SAME lookup. The caller's
+            # params are not required to carry it, and the dunning loop did not:
+            # it passed only to/invoice_number/amount/days_overdue, so a
+            # customer the CRM knows as Alice Johnson-Smith was emailed "Hi
+            # there". Resolving it here fixes every caller at once —
+            # the dunning loop, a governance approval, the planner, MCP —
+            # rather than requiring each to remember. Only unambiguous names are
+            # used: with two contacts on one address, min() = max() fails and it
+            # falls back to the neutral greeting rather than guessing which
+            # person is being written to.
             cur.execute(
                 """SELECT bool_and(COALESCE(is_email_verified, false)),
-                          count(*)
+                          count(*),
+                          CASE WHEN min(first_name) = max(first_name)
+                               THEN min(first_name) END
                      FROM contacts
                     WHERE lower(email) = lower(%s)
                       AND COALESCE(is_deleted, false) = false""",
                 (addr,))
-            all_verified, n = cur.fetchone()
+            all_verified, n, first_name = cur.fetchone()
     finally:
         conn.close()
 
@@ -114,7 +127,7 @@ def _recipient_is_deliverable(to: str) -> Dict[str, Any]:
                 "reason": f"{addr} is not a verified, deliverable recipient "
                           f"(is_email_verified is false, or the domain is a "
                           f"reserved placeholder such as example.com)"}
-    return {"ok": True}
+    return {"ok": True, "first_name": (first_name or "").strip() or None}
 
 
 # @seed.agentorc.ca is DELIVERABLE ON PURPOSE and is not filtered here.
@@ -193,6 +206,9 @@ def send_payment_reminder_sp(params: Optional[Dict[str, Any]]) -> Dict[str, Any]
         return {"ok": False, "skipped": "unverified_recipient",
                 "to": to, "invoice_number": invoice, "error": gate["reason"]}
 
+    # The caller's name wins if it supplied one; otherwise use the name the
+    # gate already resolved from the contact record.
+    p.setdefault("contact_first", gate.get("first_name"))
     msg = _compose(p)
     from app.agents.email.smtp_imap import send_email
     # Transactional, NOT commercial. A payment reminder concerns an existing
