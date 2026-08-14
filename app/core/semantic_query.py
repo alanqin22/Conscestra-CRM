@@ -67,6 +67,25 @@ class ExploreError(ValueError):
 # COMPILE  (spec → parameterized SQL)
 # ============================================================================
 
+_DATE_ONLY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _is_date_only(value: Any) -> bool:
+    """True when a filter bound names a DAY rather than an instant.
+
+    The distinction decides whether a `between` upper bound means "midnight
+    that morning" or "the end of that day". datetime is checked before date
+    because datetime IS a date in Python — the subclass would otherwise match
+    first and every timestamp would be treated as a bare day.
+    """
+    import datetime as _dt
+    if isinstance(value, _dt.datetime):
+        return False
+    if isinstance(value, _dt.date):
+        return True
+    return bool(_DATE_ONLY_RE.fullmatch(str(value).strip()))
+
+
 def _window_predicate(ename: str, e: Dict[str, Any], window: str) -> str:
     """Resolve a named time window against this explore's `time_field`, reusing
     the Metric Registry's window vocabulary so 'last_30d' means the same thing in
@@ -204,7 +223,25 @@ def compile(spec: Dict[str, Any]) -> Tuple[str, List[Any]]:
         elif op == "between":
             if not isinstance(val, (list, tuple)) or len(val) != 2:
                 raise ExploreError(f"filter '{field}' op 'between' needs a [low, high] value")
-            where.append(f"{col} BETWEEN %s AND %s")
+            if _is_date_only(val[1]):
+                # A CALENDAR-DAY range must include the whole of its last day.
+                #
+                # `BETWEEN lo AND hi` on a TIMESTAMP column resolves `hi` to
+                # midnight, so "between 2026-05-16 and today" silently discarded
+                # everything that happened after 00:00 today — the user asked
+                # for a day and got an instant. Measured against /metrics, which
+                # bounds the same window as `< hi + 1`: two opportunities whose
+                # decision timestamp fell at 20:00 were counted by one surface
+                # and not the other, so the two disagreed on the size of the
+                # same question (873 vs 874 deals over 90 days).
+                #
+                # Half-open [lo, hi+1) is the fix, and it is correct for DATE
+                # columns too: `d < hi + 1` is equivalent to `d <= hi` there.
+                # A bound carrying an explicit TIME still means that instant, so
+                # it keeps plain BETWEEN.
+                where.append(f"{col} >= %s AND {col} < (%s::date + 1)")
+            else:
+                where.append(f"{col} BETWEEN %s AND %s")
             params.extend([val[0], val[1]])
         else:
             raise ExploreError(f"unknown operator '{op}'. "
