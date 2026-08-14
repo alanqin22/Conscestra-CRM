@@ -153,16 +153,41 @@ def identity_space(candidate: Optional[str]) -> Dict[str, Any]:
         found.append({"space": "assignable", "email": row["email"],
                       "who": row["display_name"]})
 
+    # Is this owner actually a CUSTOMER contact? Two independent signals, OR'd.
+    #
+    # The shared PRIMARY KEY is the authoritative one: `contact_id = owner_id`
+    # means the two tables are describing one identity, and it cannot drift
+    # because it IS the identity. Email equality was the original — and only —
+    # signal, and it silently went to zero when the synthetic contact addresses
+    # were migrated to @seed.agentorc.ca while `owners` kept theirs: 39 real
+    # customer contacts re-labelled `legacy_owner` overnight, with no error.
+    # Deriving an identity from a MUTABLE ATTRIBUTE is the defect; the email
+    # check is kept only as a widening secondary signal.
+    #
+    # OR is deliberate and fail-safe. `customer_contact` is the cautious answer
+    # — it marks someone as an outsider who must not be routed work — so a
+    # false positive costs a missed assignment, while a false negative would
+    # present a customer as ex-staff. Widening can only err toward caution.
     for row in _rows("""SELECT o.email, o.first_name, o.last_name,
                           EXISTS (SELECT 1 FROM contacts c
+                                  WHERE c.contact_id = o.owner_id)
+                            AS contact_by_id,
+                          EXISTS (SELECT 1 FROM contacts c
                                   WHERE lower(c.email) = lower(o.email))
-                            AS is_contact
+                            AS contact_by_email
                         FROM owners o WHERE o.owner_id = %s::uuid""", (raw,)):
+        signals = [s for s, hit in (("shared contact_id", row["contact_by_id"]),
+                                    ("matching email", row["contact_by_email"]))
+                   if hit]
         found.append({
-            "space": "customer_contact" if row["is_contact"] else "legacy_owner",
+            "space": "customer_contact" if signals else "legacy_owner",
             "email": row["email"],
             "who": f"{row['first_name'] or ''} {row['last_name'] or ''}".strip(),
-            "reason": "in `owners`; not granted assignability"})
+            "evidence": signals,
+            "reason": (f"in `owners`, but is a customer contact "
+                       f"({' + '.join(signals)}); not granted assignability"
+                       if signals else
+                       "in `owners`; not granted assignability")})
 
     for row in _rows("""SELECT email, employee_name FROM employees
                         WHERE employee_uuid = %s::uuid""", (raw,)):
