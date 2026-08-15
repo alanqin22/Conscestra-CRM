@@ -517,12 +517,45 @@ def _compose_reminder(ctx: Dict[str, Any], tier: str) -> str:
     )
 
 
+# What an activity subject may CLAIM, per A2A outcome. One vocabulary shared
+# with app/core/order_notifications.py, because two outbound paths describing
+# the same evidence in different words is how a reader learns to distrust both.
+#
+# The ceiling is "accepted by provider". SMTP handoff and a Resend message id
+# are evidence that a provider TOOK the message; neither is evidence it was
+# transmitted, and nothing here can observe delivery at all. `sent` overstated
+# even a correct outcome — flagged in docs/email_autosend_remediation_design.md
+# ("wording is a small follow-on decision, not a blocker") and deferred until
+# now.
+_OUTCOME_VERB = {
+    "accepted": "accepted by provider",
+    "rejected": "refused",          # the provider or a guard declined it
+    "failed":   "failed",           # transport/server error — did not complete
+    "unknown":  "unconfirmed",      # completed with no readable signal
+}
+# Not dispatched at all (autosend off, or an unverified recipient): composed and
+# deliberately not transmitted. Unchanged — "drafted" was always accurate.
+_NOT_ATTEMPTED = "drafted"
+
+
 def _record_action_sync(ctx: Dict[str, Any], draft: str, tier: str,
-                        correlation_id, sent: bool) -> None:
+                        correlation_id, outcome: Optional[str]) -> None:
     """Log the Accounting agent's action and hand the draft to the Email agent
-    over the bus (emit invoice.dunning_drafted → fans out to EmailAgent inbox)."""
+    over the bus (emit invoice.dunning_drafted → fans out to EmailAgent inbox).
+
+    Takes the OUTCOME, not a boolean. The design that fixed the false-success
+    predicate said so explicitly — "the activity writer takes the outcome, not a
+    boolean" — but only the predicate was implemented: the caller computed
+    `res.outcome`, immediately flattened it to `sent: bool`, and flattened that
+    to a word. Four distinguishable results became two, and a REJECTED dispatch
+    was recorded in the same language as one that was never attempted.
+
+    The subject keeps its 'Payment reminder' prefix: _already_dunned_sync
+    matches on that prefix, and the 20-hour idempotency guard must not be
+    weakened by a wording change.
+    """
     import json
-    verb = "sent" if sent else "drafted"
+    verb = _OUTCOME_VERB.get(outcome or "", _NOT_ATTEMPTED)
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -555,7 +588,9 @@ def _record_action_sync(ctx: Dict[str, Any], draft: str, tier: str,
                         "tier": tier,
                         "contact_email": ctx.get("contact_email"),
                         "draft": draft,
-                        "delivered": sent,
+                        # NOT "delivered" — nothing here can observe delivery.
+                        # The key said so for as long as it existed.
+                        "outcome": outcome or "not_attempted",
                     }),
                     None, "agent_bus", correlation_id,
                 ),
@@ -598,7 +633,9 @@ async def handle_invoice_overdue(event: Dict[str, Any]) -> Dict[str, Any]:
     # contacts (is_email_verified=false) are drafted+logged but never emailed,
     # mirroring the order-email gate. Prevents dunning blasts to fake addresses.
     real = _is_real_email(ctx.get("contact_email"), ctx.get("is_email_verified"))
-    sent = False
+    # None = never dispatched. Distinct from a dispatch that came back refused,
+    # which is the distinction the old `sent = False` threw away.
+    outcome: Optional[str] = None
     if AUTOSEND and real:
         try:
             # Phase 2: typed, capability-routed A2A handoff. The Accounting
@@ -627,16 +664,20 @@ async def handle_invoice_overdue(event: Dict[str, Any]) -> Dict[str, Any]:
             # (including a 403), and an agent merely writing the word "sent" in
             # its prose satisfied the second clause. Measured 2026-06-26: 25
             # reminders recorded as sent, zero in the BCC archive.
-            sent = (res.outcome == a2a_mod.ACCEPTED)
-            if not sent:
+            outcome = res.outcome
+            if outcome != a2a_mod.ACCEPTED:
                 logger.warning(
                     f"[agent_bus] dunning NOT sent for {ctx['invoice_number']}: "
                     f"{res.outcome} ({res.error or 'no detail'})")
         except Exception as exc:  # delivery is best-effort; never fail the event
+            # The dispatch itself raised — it did not complete. "failed"
+            # as a literal because a2a_mod may not be bound if the import
+            # is what raised.
+            outcome = "failed"
             logger.warning(f"[agent_bus] email handoff send failed: {exc}")
 
     await asyncio.to_thread(
-        _record_action_sync, ctx, draft, tier, event.get("correlation_id"), sent
+        _record_action_sync, ctx, draft, tier, event.get("correlation_id"), outcome
     )
 
     # Phase 4: post AR risk to the shared blackboard so other agents (Sales,
@@ -653,7 +694,8 @@ async def handle_invoice_overdue(event: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "status": "ok",
-        "action": "sent" if sent else "drafted",
+        "action": _OUTCOME_VERB.get(outcome or "", _NOT_ATTEMPTED),
+        "outcome": outcome or "not_attempted",
         "invoice": ctx["invoice_number"],
         "tier": tier,
         "recipient_real": real,                       # verified + deliverable?
