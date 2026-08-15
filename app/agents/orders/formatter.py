@@ -476,6 +476,49 @@ def format_response(db_rows: List[Dict], params: Dict[str, Any]) -> Dict[str, An
                 if summary.get('total_quantity') is not None: out.append(f"   Quantity: {summary['total_quantity']}")
                 if summary.get('total_amount')   is not None: out.append(f"   **Total:  {_fmt_currency(summary['total_amount'])}**")
                 out.append('')
+            # ── Customer notifications ───────────────────────────────────────
+            # Read-only visibility into the automated lifecycle emails. Every
+            # word here comes from the STATE column, so this surface CANNOT say
+            # "Sent": the system does not know that, and a status line that
+            # overstates a control is the exact defect this path exists because
+            # of. "Accepted by provider" is the strongest claim available.
+            notes = response.get('notifications')
+            if notes is not None:
+                out.append('**Customer Notifications**')
+                _LABEL = {
+                    'order.created':   'Order confirmation',
+                    'order.shipped':   'Shipment notification',
+                    'order.delivered': 'Delivery notification',
+                }
+                _MARK = {'accepted': '✓', 'skipped': '⊘', 'failed': '✗',
+                         'attempted': '…', 'queued': '○'}
+                _STATE = {
+                    'accepted':  'Accepted by provider',
+                    'skipped':   'Not sent',
+                    'failed':    'Failed — will retry',
+                    'attempted': 'Attempted',
+                    'queued':    'Pending',
+                }
+                by_event = {n.get('event_type'): n for n in notes}
+                for _ev, _label in _LABEL.items():
+                    n = by_event.get(_ev)
+                    if not n:
+                        out.append(f"   ○ {_label} — Not yet triggered")
+                        continue
+                    _state = n.get('state') or 'queued'
+                    _line = (f"   {_MARK.get(_state, '·')} {_label} — "
+                             f"{_STATE.get(_state, _state)}")
+                    if n.get('recipient_email'):
+                        _line += f" → {n['recipient_email']}"
+                    out.append(_line)
+                    if n.get('provider_message_id'):
+                        out.append(f"      Provider: {n.get('provider')} "
+                                   f"(id {n['provider_message_id']})")
+                    if n.get('failure_reason'):
+                        out.append(f"      Reason: {n['failure_reason']}")
+                    if (n.get('attempts') or 0) > 1:
+                        out.append(f"      Attempts: {n['attempts']}")
+                out.append('')
             out.append('**Audit Information**')
             if order.get('created_by_name') or order.get('created_by_id'):
                 out.append(f"   Created By: {order.get('created_by_name') or order.get('created_by_id')}")

@@ -306,6 +306,24 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as fe:
                 logger.warning(f"[status-filter] Python filter skipped: {fe}")
 
+        # ── get_detail: attach the order's customer-notification history ─────
+        # Server-side, on the SAME response the page already renders, so any
+        # client of /order-chat sees it — not just order-mgmt.html. The email
+        # automation itself is nowhere near the browser; this is the read-side
+        # view of what the notification service recorded.
+        if parsed_json.get("mode") == "get_detail" and db_rows:
+            try:
+                from app.core import order_notifications
+                for row in db_rows:
+                    result = row.get("result") if isinstance(row, dict) else None
+                    order = (result or {}).get("order") or {}
+                    oid = order.get("order_id")
+                    if oid:
+                        result["notifications"] = order_notifications.history(oid)
+            except Exception as ne:
+                # Never let the read-side view break the order detail itself.
+                logger.warning(f"[order-notifications] history skipped: {ne}")
+
         return {**state, "db_rows": db_rows}
 
     except ValueError as e:
