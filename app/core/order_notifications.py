@@ -492,21 +492,82 @@ def _update(notification_id: str, **fields) -> Dict[str, Any]:
         conn.close()
 
 
-def mark_attempted(notification_id: str, recipient: str, subject: str,
-                   ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """Record that we are about to call the provider. Written BEFORE the call,
-    so an attempt that never returns is still visible as an attempt."""
+# How long one worker owns a send before it is presumed dead and reclaimable.
+# Longer than any plausible SMTP/HTTP timeout (send_email caps at 15s), short
+# enough that a killed process does not strand a notification for a shift.
+ATTEMPT_LEASE = "15 minutes"
+
+
+def acquire(notification_id: str) -> Optional[Dict[str, Any]]:
+    """Take EXCLUSIVE ownership of this send. Returns None if someone else has it.
+
+    THE BUG THIS FIXES. Claiming the row and reading its state are two separate
+    operations, and `claim()` deliberately returns the existing row when it loses
+    the INSERT race. Every loser then read state='queued', concluded the work was
+    unclaimed, and sent. Measured before this existed: **8 concurrent notify()
+    calls for one business event produced 8 emails and 1 ledger row** — the worst
+    possible shape, an audit record asserting one notification while the customer
+    received eight.
+
+    The check must therefore BE the claim, not precede it. This is a
+    compare-and-swap: PostgreSQL takes a row lock for the UPDATE, and under READ
+    COMMITTED a waiting statement re-evaluates its WHERE against the committed
+    new version — so exactly one caller can move the row out of a sendable state.
+
+    Reclaimable states:
+      queued / failed  — nobody is sending; go.
+      attempted        — someone WAS sending. Only reclaim after ATTEMPT_LEASE,
+                         so a crashed worker cannot strand the notification
+                         forever while a live one cannot be double-sent.
+    accepted / skipped are terminal and never reclaimed.
+
+    `attempts` is NOT incremented here. It counts PROVIDER calls, and acquiring
+    the lease is not one — the autosend-off path acquires and releases without
+    ever reaching a provider.
+    """
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 f"""UPDATE order_notifications
-                       SET state='attempted',
-                           recipient_email=%s, subject=%s,
+                       SET state = 'attempted',
+                           first_attempted_at = COALESCE(first_attempted_at, now()),
+                           last_attempted_at  = now()
+                     WHERE notification_id = %s::uuid
+                       AND (state IN ('queued', 'failed')
+                            OR (state = 'attempted'
+                                AND last_attempted_at
+                                    < now() - interval '{ATTEMPT_LEASE}'))
+                 RETURNING {_COLS}""",
+                (str(notification_id),))
+            row = _row(cur)
+        conn.commit()
+        return row
+    finally:
+        conn.close()
+
+
+def release(notification_id: str, reason: str) -> Dict[str, Any]:
+    """Hand the lease back without sending, leaving the row eligible again.
+    Used when the send is deliberately not attempted (autosend off)."""
+    return _update(notification_id, state="queued", failure_reason=reason[:2000])
+
+
+def mark_attempted(notification_id: str, recipient: str, subject: str,
+                   ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Record that we are about to call the PROVIDER. Written before the call, so
+    an attempt that never returns is still visible as an attempt. The state is
+    already 'attempted' — `acquire()` set it — so this only records who the
+    message is for and counts the provider call."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""UPDATE order_notifications
+                       SET recipient_email=%s, subject=%s,
                            contact_id=%s, account_id=%s,
                            attempts = attempts + 1,
-                           first_attempted_at = COALESCE(first_attempted_at, now()),
-                           last_attempted_at  = now(),
+                           last_attempted_at = now(),
                            failure_reason = NULL
                      WHERE notification_id = %s::uuid
                  RETURNING {_COLS}""",
@@ -515,6 +576,62 @@ def mark_attempted(notification_id: str, recipient: str, subject: str,
             row = _row(cur)
         conn.commit()
         return row
+    finally:
+        conn.close()
+
+
+# Legacy subjects written by handle_order_status_changed before this module
+# existed. Only 'sent' counts: a 'drafted' row means nothing was transmitted.
+_LEGACY_SUBJECT = {
+    "order.created": "Order confirmation email sent%",
+    "order.shipped": "Order shipped email sent%",
+    # The legacy path had no delivered notice at all.
+}
+
+
+def legacy_already_sent(order_id: str, event_type: str) -> bool:
+    """Did the OLD path already email this order for this event?
+
+    THE ORDERING TRAP THIS REMOVES. sql/order_lifecycle_notifications.sql adopts
+    legacy `activities` rows into this ledger so an order already emailed is not
+    emailed again. That backfill is a snapshot, and during a cutover the two
+    systems overlap: on 2026-08-15 the database had the new trigger while the app
+    still ran the old sender, so two orders were emailed by the legacy path
+    AFTER the backfill and existed nowhere the new code looks. Deploying would
+    have sent those customers a second confirmation.
+
+    Making the batch backfill correct requires running it at exactly the right
+    moment, between the deploy and the next transition. Checking here instead
+    makes that ordering irrelevant: the guard travels with the send.
+
+    Costs one indexed lookup on the first claim of each notification, and becomes
+    permanently inert once no legacy row can be written — which is true the
+    moment the old sender is gone.
+
+    ERRORS ARE NOT SWALLOWED, and the first draft of this got it wrong. It
+    caught the exception and returned True — "if we cannot tell, assume it was
+    already sent" — which sounds like the safe default and is not. True marks
+    the row `accepted` with provider='legacy-activity', a TERMINAL state, so one
+    transient database blip would permanently and silently deprive a customer of
+    a notification nobody would ever retry.
+
+    Letting it raise is the genuinely safe answer: `notify()` has done nothing
+    irreversible yet, the exception reaches the bus, and the event is retried
+    under its existing backoff. Neither sent nor suppressed — just not decided.
+    """
+    pattern = _LEGACY_SUBJECT.get(event_type)
+    if not pattern:
+        return False
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT 1 FROM activities
+                    WHERE related_type='order' AND related_id=%s::uuid
+                      AND channel='email' AND subject LIKE %s
+                    LIMIT 1""",
+                (str(order_id), pattern))
+            return cur.fetchone() is not None
     finally:
         conn.close()
 
@@ -728,13 +845,40 @@ def notify(order_id: str, event_type: str, event_uuid: Optional[str] = None,
         raise RetryableNotificationError(
             f"could not claim {order_id}:{event_type}")
 
-    # ── The idempotency decision, made once, on durable state ───────────────
+    # ── Idempotency, layer 1: durable terminal state ────────────────────────
     if row["state"] in TERMINAL_STATES:
         logger.info(f"[order_notifications] {row['idempotency_key']} already "
                     f"{row['state']} — no second email")
         return {"status": "ok", "action": f"already_{row['state']}",
                 "idempotency_key": row["idempotency_key"],
                 "state": row["state"], "duplicate_suppressed": True}
+
+    # ── Idempotency, layer 2: the path this one replaced ────────────────────
+    # Only on a brand-new claim: if the row already existed, this was decided
+    # the first time round and re-asking every retry would be wasted work.
+    if is_new and legacy_already_sent(order_id, event_type):
+        adopted = _update(row["notification_id"], state="accepted",
+                          accepted_at=datetime.now(), provider="legacy-activity",
+                          provider_response="already emailed by the legacy "
+                                            "handler before this module existed")
+        logger.info(f"[order_notifications] {row['idempotency_key']} was already "
+                    f"emailed by the legacy path — adopted, not re-sent")
+        return {"status": "ok", "action": "already_accepted", "state": "accepted",
+                "idempotency_key": row["idempotency_key"],
+                "duplicate_suppressed": True, "provider": "legacy-activity"}
+
+    # ── Idempotency, layer 3: exclusive ownership of THIS send ──────────────
+    # Everything above is a read. Two callers can pass all of it simultaneously
+    # and both send — measured at 8 emails for one event. This is the layer that
+    # is also the claim.
+    owned = acquire(row["notification_id"])
+    if owned is None:
+        logger.info(f"[order_notifications] {row['idempotency_key']} is being "
+                    f"sent by another worker — not sending a second copy")
+        return {"status": "ok", "action": "in_flight_elsewhere",
+                "idempotency_key": row["idempotency_key"],
+                "state": "attempted", "duplicate_suppressed": True}
+    row = owned
 
     ctx = load_context(order_id)
     if ctx is None:
@@ -757,14 +901,15 @@ def notify(order_id: str, event_type: str, event_uuid: Optional[str] = None,
     subject, body_text, body_html = compose(ctx, event_type)
 
     if not _autosend():
-        # Draft-first, the platform's existing posture. The row stays 'queued',
-        # which is true: it was composed and not transmitted. It is NOT recorded
-        # as skipped, because enabling autosend changes the answer.
-        updated = _update(row["notification_id"], recipient_email=recipient,
-                          subject=subject, contact_id=ctx.get("contact_id"),
-                          account_id=ctx.get("account_id"),
-                          failure_reason="AGENT_BUS_AUTOSEND=0 — composed, "
-                                         "not transmitted")
+        # Draft-first, the platform's existing posture. The lease is RELEASED
+        # back to 'queued', which is true: it was composed and not transmitted,
+        # and enabling autosend must let it proceed. Not 'skipped' — that is a
+        # decision, and this one reverses.
+        _update(row["notification_id"], recipient_email=recipient,
+                subject=subject, contact_id=ctx.get("contact_id"),
+                account_id=ctx.get("account_id"))
+        updated = release(row["notification_id"],
+                          "AGENT_BUS_AUTOSEND=0 — composed, not transmitted")
         _record_activity(ctx, event_type, updated)
         return {"status": "ok", "action": "drafted", "state": "queued",
                 "order": ctx["order_number"], "to": recipient,
@@ -772,7 +917,7 @@ def notify(order_id: str, event_type: str, event_uuid: Optional[str] = None,
                 "idempotency_key": row["idempotency_key"]}
 
     # Written before the call, so an attempt that never returns is still an
-    # attempt in the record.
+    # attempt in the record. The lease is already held by acquire().
     row = mark_attempted(row["notification_id"], recipient, subject, ctx)
 
     from app.agents.email.smtp_imap import send_email
