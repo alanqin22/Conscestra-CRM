@@ -79,10 +79,21 @@ def _send_via_resend(
         timeout=15,
     )
     logger.info(f"[Resend] HTTP {resp.status_code} — body: {resp.text[:300]}")
+    # A 4xx/5xx raises here and is caught by send_email, which returns
+    # success=False. Status is never inferred from "the call returned".
     resp.raise_for_status()
     body = resp.json()
     logger.info(f"[Resend] OK id={body.get('id')} → {to} | subject={subject!r}")
-    return {'success': True, 'message': f'Email sent to {to}', 'to': to, 'subject': subject}
+    # The message id is the provider's own identifier for the message it took
+    # responsibility for. Callers that must distinguish 'accepted' from
+    # 'we called a function' have nothing else to go on, so it is returned
+    # rather than logged and discarded. Note the wording: ACCEPTED for
+    # transmission. Resend issuing an id is not evidence of delivery.
+    return {'success': True, 'message': f'Email accepted by Resend for {to}',
+            'to': to, 'subject': subject,
+            'provider': 'resend',
+            'provider_message_id': body.get('id'),
+            'provider_status': resp.status_code}
 
 
 
@@ -155,7 +166,8 @@ def send_email(
             return _send_via_resend(to, subject, body_html, body_text, addr, from_name, bcc_addr)
         except Exception as e:
             logger.error(f"[send_email] Resend API error: {e}", exc_info=True)
-            return {'success': False, 'message': str(e)}
+            return {'success': False, 'provider': 'resend', 'to': to,
+                    'message': str(e)}
 
     logger.info(f"[send_email] → using SMTP path (host={host} port={port})")
     try:
@@ -173,26 +185,43 @@ def send_email(
         recipients = [to] + ([bcc_addr] if bcc_addr else [])
         raw        = msg.as_string()
 
+        # sendmail() returns the recipients the server REFUSED. It raises only
+        # when EVERY recipient is refused, so a partial refusal used to be
+        # discarded — and if the refused one was the customer while the BCC
+        # archive was accepted, this returned success for an email nobody got.
+        refused: Dict[str, Any] = {}
         try:
             logger.debug(f"[send_email] Trying SMTP_SSL {host}:{port} timeout=15s")
             with smtplib.SMTP_SSL(host, port, context=context, timeout=15) as server:
                 server.login(addr, password)
-                server.sendmail(addr, recipients, raw)
-            logger.info(f"[send_email] Email sent (SSL) → {to} | subject={subject!r}")
+                refused = server.sendmail(addr, recipients, raw) or {}
+            logger.info(f"[send_email] Email accepted by SMTP (SSL) → {to} | subject={subject!r}")
         except smtplib.SMTPException as smtp_err:
             logger.warning(f"[send_email] SMTP_SSL failed: {smtp_err} — retrying STARTTLS on port 587")
             with smtplib.SMTP(host, 587, timeout=15) as server:
                 server.ehlo()
                 server.starttls(context=context)
                 server.login(addr, password)
-                server.sendmail(addr, recipients, raw)
-            logger.info(f"[send_email] Email sent (STARTTLS) → {to} | subject={subject!r}")
+                refused = server.sendmail(addr, recipients, raw) or {}
+            logger.info(f"[send_email] Email accepted by SMTP (STARTTLS) → {to} | subject={subject!r}")
 
-        return {'success': True, 'message': f'Email sent to {to}', 'to': to, 'subject': subject}
+        if to in refused:
+            logger.error(f"[send_email] SMTP REFUSED the recipient {to}: {refused[to]}")
+            return {'success': False, 'to': to, 'provider': 'smtp',
+                    'message': f'SMTP refused {to}: {refused[to]}'}
+
+        # 'accepted', not 'sent': the SMTP server took the message (250). SMTP
+        # issues no message id, so provider_message_id stays absent — the
+        # evidence here is the absence of a refusal, which is weaker than
+        # Resend's id and is described as such rather than upgraded.
+        return {'success': True, 'message': f'Email accepted by SMTP for {to}',
+                'to': to, 'subject': subject, 'provider': 'smtp',
+                'provider_message_id': None}
 
     except Exception as e:
         logger.error(f"[send_email] SMTP error: {e}", exc_info=True)
-        return {'success': False, 'message': str(e)}
+        return {'success': False, 'provider': 'smtp', 'to': to,
+                'message': str(e)}
 
 
 def fetch_inbox(limit: int = 20, unseen_only: bool = False) -> List[Dict[str, Any]]:

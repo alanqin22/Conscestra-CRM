@@ -1108,180 +1108,81 @@ def _is_real_email(addr: Optional[str], is_verified: bool) -> bool:
     return True
 
 
-def _load_order_email_ctx_sync(order_id: str) -> Optional[Dict[str, Any]]:
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT o.order_number, o.status, o.total_amount,
-                          o.account_id, o.contact_id, c.email,
-                          NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' ||
-                                      COALESCE(c.last_name,'')), '') AS contact_name,
-                          -- "Verified" = the order's own contact is verified, OR the
-                          -- buyer's email is verified on ANY contact row (fallback for
-                          -- when checkout linked a duplicate/seed contact that shares
-                          -- the real, signed-up email).
-                          (COALESCE(c.is_email_verified, false)
-                           OR EXISTS (
-                                SELECT 1 FROM contacts c2
-                                WHERE c.email IS NOT NULL
-                                  AND lower(c2.email) = lower(c.email)
-                                  AND c2.is_email_verified
-                           )) AS is_email_verified
-                   FROM orders o
-                   LEFT JOIN contacts c ON c.contact_id = o.contact_id
-                   WHERE o.order_id = %s""",
-                (order_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-            return {
-                "order_id": order_id, "order_number": row[0], "status": row[1],
-                "total_amount": float(row[2] or 0),
-                "account_id": row[3], "contact_id": row[4],
-                "contact_email": row[5], "contact_name": row[6] or "there",
-                "is_email_verified": bool(row[7]),
-            }
-    finally:
-        conn.close()
-
-
-def _order_email_already_sent_sync(order_id: str, kind: str) -> bool:
-    """Idempotency: have we already logged this order-email kind for this order?"""
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT 1 FROM activities
-                   WHERE related_type='order' AND related_id=%s
-                     AND channel='email' AND subject ILIKE %s LIMIT 1""",
-                (order_id, f"Order {kind} email%"),
-            )
-            return cur.fetchone() is not None
-    finally:
-        conn.close()
-
-
-def _compose_order_email(ctx: Dict[str, Any], kind: str):
-    name = ctx["contact_name"]
-    num = ctx["order_number"]
-    total = f"${ctx['total_amount']:,.2f}"
-    if kind == "confirmation":
-        subject = f"Order confirmation — {num}"
-        body_text = (f"Hi {name},\n\nThanks for your order! We've received {num} "
-                     f"(total {total}) and it's now being processed. We'll email you "
-                     f"again as soon as it ships.\n\n— Conscestra CRM")
-        intro = "Thanks for your order! We've received it and it's now being processed."
-        tail = "We'll email you again as soon as it ships."
-    else:  # shipped
-        subject = f"Your order has shipped — {num}"
-        body_text = (f"Hi {name},\n\nGood news — your order {num} (total {total}) has "
-                     f"shipped and is on its way.\n\n— Conscestra CRM")
-        intro = "Good news — your order has shipped and is on its way."
-        tail = "Thank you for shopping with us."
-    body_html = (
-        f'<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px 24px">'
-        f'<h2 style="color:#0d9488;margin-bottom:8px">Conscestra CRM</h2>'
-        f'<p>Hi {name},</p><p>{intro}</p>'
-        f'<div style="background:#f0fdfa;border-radius:8px;padding:16px;margin:16px 0">'
-        f'<strong>Order:</strong> {num}<br><strong>Total:</strong> {total}</div>'
-        f'<p style="color:#6b7280;font-size:0.875rem">{tail}</p></div>'
-    )
-    return subject, body_text, body_html
-
-
-def _record_order_email_sync(ctx: Dict[str, Any], kind: str, body_text: str, sent: bool) -> None:
-    """Audit the order-email action as a COMPLETED activity (never an open task —
-    it's a record of a done send/draft, so it stays off the overdue worklist)."""
-    verb = "sent" if sent else "drafted"
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO activities
-                     (type, status, subject, description, due_at, completed_at,
-                      related_type, related_id, account_id, contact_id, channel,
-                      outcome, created_at, updated_at)
-                   VALUES ('task','completed', %(subj)s, %(desc)s, now(), now(),
-                           'order', %(oid)s, %(acct)s, %(ct)s, 'email',
-                           %(out)s, now(), now())""",
-                {"subj": f"Order {kind} email {verb} – {ctx['order_number']}",
-                 "desc": body_text, "oid": ctx["order_id"],
-                 "acct": ctx.get("account_id"), "ct": ctx.get("contact_id"),
-                 "out": f"auto: order {kind} email {verb} to buyer"},
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _send_order_email_sync(ctx: Dict[str, Any], subject: str, body_html: str, body_text: str) -> bool:
-    from app.agents.email.smtp_imap import send_email
-    res = send_email(to=ctx["contact_email"], subject=subject,
-                     body_html=body_html, body_text=body_text)
-    return bool(res.get("success"))
+# The five helpers that lived here — _load_order_email_ctx_sync,
+# _order_email_already_sent_sync, _compose_order_email,
+# _record_order_email_sync, _send_order_email_sync — were REMOVED, not kept
+# for reference. Their replacements are in app/core/order_notifications.py.
+# A dormant second composer and a dormant second idempotency check are how a
+# parallel email path gets rebuilt by the next person who greps for
+# "order confirmation" and finds two answers.
+#
+# _is_real_email above STAYS: it is the single definition of "a deliverable,
+# opted-in recipient", and both order_notifications and
+# agents/email/structured.py import it rather than restating the rules.
 
 
 async def handle_order_status_changed(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Two reactions to an order status change:
-      1. Close the order's milestone activity (existing behaviour).
-      2. Email the BUYER — an order confirmation when the order is placed
-         (pending/processing) or a shipped notice on dispatch. Real outbound only
-         when AUTOSEND=1 AND the buyer's contact email is verified & deliverable
-         (_is_real_email); otherwise draft + log. Idempotent per (order, kind)."""
+    """Close the order's milestone activity.
+
+    THE EMAIL HALF OF THIS HANDLER WAS REMOVED, deliberately, and moved to
+    app/core/order_notifications.py behind three explicit event types
+    (order.created / order.shipped / order.delivered).
+
+    It is removed rather than left alongside because two independent senders
+    with two independent idempotency stores would each conclude the other had
+    not sent, and the shipped notice would go out twice. The 13 activity rows
+    the old path wrote have been adopted into `order_notifications` by
+    sql/order_lifecycle_notifications.sql, so orders it already emailed are not
+    emailed again by the new one.
+
+    What was wrong with it, recorded so it is not rebuilt:
+      • idempotency read activity SUBJECT TEXT and matched drafted rows as well
+        as sent ones, so a failed send blocked its own retry permanently;
+      • the record was written AFTER the send, so a crash between them produced
+        a duplicate on replay;
+      • a send exception was swallowed with logger.warning and the row was then
+        written as 'drafted' — a transient SMTP failure became a completed
+        notification that would never be retried;
+      • 'sent' was claimed from a bare boolean, with no provider evidence;
+      • an unverified recipient produced NO record at all, so a customer who
+        was never emailed was indistinguishable from one who was.
+    """
     milestone = await handle_milestone_settled(event)
-
-    order_id = str(event["entity_uuid"])
-    payload = event.get("payload") or {}
-    new_status = (((payload.get("diff") or {}).get("status") or {}).get("new")
-                  or (payload.get("after") or {}).get("status"))
-    kind = ("confirmation" if new_status in ("pending", "processing")
-            else "shipped" if new_status == "shipped" else None)
-    if not kind:
-        return {"status": "ok", "milestone": milestone, "email": "skipped (status not emailable)"}
-
-    ctx = await asyncio.to_thread(_load_order_email_ctx_sync, order_id)
-    if not ctx:
-        return {"status": "skipped", "reason": "order not found", "milestone": milestone}
-
-    # Only real, opted-in customers get an order email (or a draft+log). The
-    # synthetic seed contacts (is_email_verified=false) are skipped entirely — no
-    # log row — so the high-volume generated orders don't flood the activity table.
-    real = _is_real_email(ctx.get("contact_email"), ctx.get("is_email_verified"))
-    if not real:
-        return {"status": "skipped", "milestone": milestone,
-                "reason": "recipient not verified/deliverable", "order": ctx["order_number"]}
-
-    if await asyncio.to_thread(_order_email_already_sent_sync, order_id, kind):
-        return {"status": "skipped", "reason": f"{kind} email already logged",
-                "milestone": milestone}
-
-    subject, body_text, body_html = _compose_order_email(ctx, kind)
-
-    sent = False
-    if AUTOSEND:
-        try:
-            sent = await asyncio.to_thread(
-                _send_order_email_sync, ctx, subject, body_html, body_text)
-        except Exception as exc:  # delivery is best-effort; never fail the event
-            logger.warning(f"[agent_bus] order {kind} email send failed: {exc}")
-
-    await asyncio.to_thread(_record_order_email_sync, ctx, kind, body_text, sent)
-
-    return {
-        "status": "ok",
-        "milestone": milestone,
-        "order": ctx["order_number"],
-        "email_kind": kind,
-        "action": "sent" if sent else "drafted",
-        "recipient_real": real,           # verified + deliverable?
-        "verified": ctx["is_email_verified"],
-        "autosend": AUTOSEND,
-    }
+    return {"status": "ok", "milestone": milestone,
+            "email": "handled by order.created/shipped/delivered "
+                     "(app/core/order_notifications.py)"}
 
 
 HANDLERS["order.status_changed"] = handle_order_status_changed
+
+
+# ── Customer lifecycle emails — the three explicit business events ───────────
+# The trigger (trgfn_order_lifecycle_notify) detects the TRANSITION and emits;
+# this handler is the consumer. All the logic — idempotent claim, recipient
+# gate, composition, provider-outcome classification, audit — lives in
+# order_notifications so it is identical for every caller and testable without
+# the bus.
+
+async def handle_order_lifecycle_notification(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Send (at most once) the customer email for one order lifecycle event.
+
+    A retryable provider failure RAISES, which is how the event is handed back
+    to _fail_sync's exponential backoff. That is safe precisely because the
+    redelivered event re-claims the SAME (order_id, event_type) row: retry
+    cannot duplicate the email."""
+    from app.core import order_notifications
+
+    return await asyncio.to_thread(
+        order_notifications.notify,
+        str(event["entity_uuid"]),
+        event["event_type"],
+        event.get("event_uuid"),
+        str(event["correlation_id"]) if event.get("correlation_id") else None,
+    )
+
+
+for _lifecycle_event in ("order.created", "order.shipped", "order.delivered"):
+    HANDLERS[_lifecycle_event] = handle_order_lifecycle_notification
 
 
 # ============================================================================

@@ -67,6 +67,20 @@ REQUIRED_MIGRATIONS: List[str] = [
     "erasure_authorization.sql",
     "erasure_log_retention.sql",
     "executives_audit_and_touch.sql",
+    # Applied to BOTH local and Railway on 2026-08-15, and declared in the same
+    # change — which is the rule this list exists to enforce. Ordered: the
+    # address trigger must be repaired before the backfill restores addresses,
+    # or the backfill's work is undone by the next line-item edit.
+    "fix_order_address_overwrite.sql",
+    "backfill_contact_shipping_addresses.sql",
+    "order_lifecycle_notifications.sql",
+    # verify_order_test_contacts.sql is DELIBERATELY NOT DECLARED, and this is
+    # not the same reason as tier1 below. It is not a schema requirement at all
+    # — it flips is_email_verified on a handful of contacts so live sends can be
+    # exercised. Declaring it would assert that every database MUST have those
+    # people emailable, which is false for a fresh environment and false for
+    # production. It is also not portable: it names contact_ids, and on Railway
+    # four of the five do not exist (see the file's own header).
     # tier1_audit_instrumentation.sql is DELIBERATELY NOT DECLARED. The file
     # exists and is validated, but applying it has not been authorized. This
     # list means "the schema must have this", so declaring an unapplied,
