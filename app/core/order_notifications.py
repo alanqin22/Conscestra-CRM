@@ -252,6 +252,48 @@ def _greeting_name(ctx: Dict[str, Any]) -> str:
     return (ctx.get("contact_name") or ctx.get("account_name") or "there").strip()
 
 
+def _addressee_lines(ctx: Dict[str, Any]) -> List[str]:
+    """WHO the parcel is addressed to, above the street address.
+
+    An address block with no name is not a shipping label — it is a location.
+    The customer cannot tell whether the parcel is addressed to them, to a
+    colleague, or to a company mailroom, which is exactly the question the block
+    exists to answer.
+
+    Person first, then company when it differs: a B2B parcel needs both, and
+    repeating "Bennett Foods / Bennett Foods" for an account named after its
+    only contact is noise. Falls back to whichever is known and returns nothing
+    when neither is — deliberately NOT _greeting_name(), whose 'there' fallback
+    is fine at the top of a letter and absurd on a parcel.
+    """
+    name = (ctx.get("contact_name") or "").strip()
+    account = (ctx.get("account_name") or "").strip()
+    lines = [n for n in (name, account) if n]
+    if len(lines) == 2 and lines[0].lower() == lines[1].lower():
+        lines = lines[:1]
+    return lines
+
+
+def _address_text(ctx: Dict[str, Any], label: str) -> str:
+    """The '<label>:\\n  Name\\n  Street…' block, or nothing when no address."""
+    ship = ctx.get("shipping_address") or []
+    if not ship:
+        return ""
+    body = _addressee_lines(ctx) + list(ship)
+    return f"\n\n{label}:\n" + "\n".join(f"  {ln}" for ln in body)
+
+
+def _address_html(ctx: Dict[str, Any], label: str) -> str:
+    ship = ctx.get("shipping_address") or []
+    if not ship:
+        return ""
+    names = _addressee_lines(ctx)
+    rendered = ([f"<strong>{html.escape(str(n))}</strong>" for n in names]
+                + [html.escape(str(ln)) for ln in ship])
+    return (f'<p style="margin-top:16px"><strong>{html.escape(label)}</strong><br>'
+            + "<br>".join(rendered) + '</p>')
+
+
 def _items_text(items: List[Dict[str, Any]], currency: str) -> str:
     if not items:
         return "  (no line items recorded on this order)"
@@ -319,7 +361,7 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
 
     if event_type == "order.created":
         subject = f"Order Confirmation — {num}"
-        addr_t = ("\n\nShipping to:\n" + "\n".join(f"  {ln}" for ln in ship)) if ship else ""
+        addr_t = _address_text(ctx, "Shipping to")
         body_text = (
             f"Hi {name},\n\n"
             f"Thank you for your order. We have received it and it is now being "
@@ -332,8 +374,7 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
             f"What happens next: we will prepare your order for dispatch and "
             f"email you again as soon as it ships."
             + _footer_text())
-        addr_h = ('<p style="margin-top:16px"><strong>Shipping to</strong><br>'
-                  + "<br>".join(html.escape(str(ln)) for ln in ship) + '</p>') if ship else ""
+        addr_h = _address_html(ctx, "Shipping to")
         body_html = _shell(
             f"Order Confirmation — {html.escape(num)}",
             "Thank you for your order. We have received it and it is now being processed.",
@@ -359,7 +400,7 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
         # no shipped_at column — and inventing one for the email would be
         # inventing the fact it reports.
         ship_day = _day(ctx.get("updated_at"))
-        addr_t = ("\n\nShipping to:\n" + "\n".join(f"  {ln}" for ln in ship)) if ship else ""
+        addr_t = _address_text(ctx, "Shipping to")
         body_text = (
             f"Hi {name},\n\n"
             f"Good news — your order has shipped and is on its way.\n\n"
@@ -370,8 +411,7 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
             f"Carrier and tracking details are not recorded for this order. If "
             f"you need them, reply to this email and we will follow up."
             + _footer_text())
-        addr_h = ('<p style="margin-top:16px"><strong>Shipping to</strong><br>'
-                  + "<br>".join(html.escape(str(ln)) for ln in ship) + '</p>') if ship else ""
+        addr_h = _address_html(ctx, "Shipping to")
         body_html = _shell(
             f"Your Order {html.escape(num)} Has Shipped",
             "Good news — your order has shipped and is on its way.",
@@ -389,7 +429,7 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
     elif event_type == "order.delivered":
         subject = f"Your Order {num} Has Been Delivered"
         del_day = _day(ctx.get("updated_at"))
-        addr_t = ("\n\nDelivered to:\n" + "\n".join(f"  {ln}" for ln in ship)) if ship else ""
+        addr_t = _address_text(ctx, "Delivered to")
         body_text = (
             f"Hi {name},\n\n"
             f"Your order has been marked as delivered.\n\n"
@@ -400,8 +440,7 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
             f"If anything is missing or damaged, reply to this email or contact "
             f"customer service below and we will put it right."
             + _footer_text())
-        addr_h = ('<p style="margin-top:16px"><strong>Delivered to</strong><br>'
-                  + "<br>".join(html.escape(str(ln)) for ln in ship) + '</p>') if ship else ""
+        addr_h = _address_html(ctx, "Delivered to")
         body_html = _shell(
             f"Your Order {html.escape(num)} Has Been Delivered",
             "Your order has been marked as delivered.",
