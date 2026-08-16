@@ -181,6 +181,122 @@ def _compose(params: Dict[str, Any]) -> Dict[str, str]:
             "text": text, "html": html}
 
 
+# How long one reminder covers an invoice. Mirrors agent_bus._already_dunned_sync
+# EXACTLY — two windows that disagree is a second way to send twice.
+REMINDER_WINDOW_HOURS = 20
+
+
+def _reminder_claim(invoice_number: str) -> Dict[str, Any]:
+    """Has this invoice already been reminded inside the window? Resolve it here,
+    in the SENDER.
+
+    THE DEFECT THIS CLOSES. Five customers received the same reminder twice on
+    2026-08-15 — INV-000178, 180, 183, 204 and 598 — once at 12:21 from a direct
+    A2A dispatch and again at 22:25 from the nightly loop. Both dunning guards
+    read records that only the LOOP writes:
+
+        agent_bus._already_dunned_sync    activities  ILIKE 'Payment reminder%'
+        fn_emit_overdue_invoice_events    events      'invoice.overdue'
+
+    This function writes neither, so it was invisible to its own idempotency.
+    Any second caller — a human approving one reminder, the planner, MCP —
+    reopened the same hole.
+
+    The order path never had this problem, and the difference is structural
+    rather than lucky: `order_notifications.notify()` claims its row BEFORE
+    calling the provider, so the evidence is written by the thing that sends.
+    Here the evidence was written by the CALLER, and a caller-held guard is only
+    ever as good as the number of callers who remember to hold it.
+
+    Returns {'ok': True, 'invoice_id': …} when the send may proceed.
+    """
+    from app.core.database import get_connection
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT invoice_id FROM invoices WHERE invoice_number = %s",
+                        (invoice_number,))
+            row = cur.fetchone()
+            if not row:
+                # Not a known invoice — so the guard cannot be evaluated. PROCEED
+                # anyway, and say so rather than pretending otherwise.
+                #
+                # Refusing here was the first version, and it was scope creep
+                # wearing a safety costume: it broke 14 existing tests that
+                # encode a deliberate prior decision — "a contact with no first
+                # name must not block the reminder, the debt is the point" —
+                # and it would silence real reminders whenever an invoice lookup
+                # failed for any reason. The defect being fixed is DUPLICATES
+                # against real invoices, which is every caller the dunning path
+                # actually has. Turning that into a new way to send NOTHING
+                # trades a known bug for an unknown one.
+                logger.warning(
+                    f"[email.sp] {invoice_number} is not a known invoice — "
+                    f"sending without an idempotency claim; a repeat call "
+                    f"cannot be suppressed")
+                return {"ok": True, "invoice_id": None, "idempotency": "unavailable"}
+            invoice_id = row[0]
+            cur.execute(
+                f"""SELECT subject, created_at FROM activities
+                     WHERE related_type='invoice' AND related_id=%s
+                       AND subject ILIKE 'Payment reminder%%'
+                       AND created_at > now() - interval '{REMINDER_WINDOW_HOURS} hours'
+                     ORDER BY created_at DESC LIMIT 1""",
+                (invoice_id,))
+            prior = cur.fetchone()
+    finally:
+        conn.close()
+
+    if prior:
+        return {"ok": False, "already": True, "invoice_id": invoice_id,
+                "error": f"{invoice_number} was already reminded at "
+                         f"{prior[1]:%Y-%m-%d %H:%M} "
+                         f"({REMINDER_WINDOW_HOURS}h window): {prior[0]}"}
+    return {"ok": True, "invoice_id": invoice_id}
+
+
+def _record_reminder(invoice_id, invoice_number: str, to: str, params: Dict[str, Any],
+                     body_text: str) -> None:
+    """Write the evidence, from the sender, immediately after acceptance.
+
+    Subject keeps the 'Payment reminder' prefix that _already_dunned_sync and
+    _reminder_claim both match on, and the shared outcome vocabulary — "accepted
+    by provider" is the strongest claim available; nothing here observes
+    transmission or delivery.
+    """
+    from app.core.database import get_connection
+
+    tier = str(params.get("tier") or _tier(int(params.get("days_overdue") or 0))[0])
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO activities
+                     (type, status, subject, description, due_at, completed_at,
+                      direction, related_type, related_id, account_id, contact_id,
+                      channel, outcome, created_at, updated_at)
+                   VALUES ('task','completed', %(subj)s, %(desc)s, now(), now(),
+                           'outbound', 'invoice', %(inv)s, %(acct)s, %(ct)s,
+                           'email', %(out)s, now(), now())""",
+                {"subj": f"Payment reminder ({tier}) accepted by provider – {invoice_number}",
+                 "desc": body_text,
+                 "inv": invoice_id,
+                 "acct": params.get("account_id"),
+                 "ct": params.get("contact_id"),
+                 "out": f"auto: payment reminder accepted by provider → {to}"})
+        conn.commit()
+    except Exception as exc:                                   # noqa: BLE001
+        conn.rollback()
+        # The email HAS gone. Losing the record does not un-send it, and the
+        # 20h guard now has nothing to see — so this is loud, not debug.
+        logger.error(f"[email.sp] reminder for {invoice_number} was ACCEPTED but "
+                     f"its record failed to write ({exc}) — the idempotency "
+                     f"guard is blind to this send")
+    finally:
+        conn.close()
+
+
 def send_payment_reminder_sp(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Send an overdue-invoice payment reminder. Params → send → truthful result.
 
@@ -206,6 +322,17 @@ def send_payment_reminder_sp(params: Optional[Dict[str, Any]]) -> Dict[str, Any]
         return {"ok": False, "skipped": "unverified_recipient",
                 "to": to, "invoice_number": invoice, "error": gate["reason"]}
 
+    # Idempotency, held by the SENDER so every caller inherits it — the nightly
+    # loop, a human approving one reminder, the planner, MCP. Checked after the
+    # consent gate so an unverified recipient is still reported as unverified
+    # rather than as a duplicate.
+    claim = _reminder_claim(invoice)
+    if not claim["ok"]:
+        logger.info(f"[email.sp] payment reminder NOT sent for {invoice}: "
+                    f"{claim['error']}")
+        return {"ok": False, "skipped": "already_reminded",
+                "to": to, "invoice_number": invoice, "error": claim["error"]}
+
     # The caller's name wins if it supplied one; otherwise use the name the
     # gate already resolved from the contact record.
     p.setdefault("contact_first", gate.get("first_name"))
@@ -222,7 +349,18 @@ def send_payment_reminder_sp(params: Optional[Dict[str, Any]]) -> Dict[str, Any]
     out = dict(result or {})
     out.setdefault("to", to)
     out["invoice_number"] = invoice
-    if not out.get("success"):
+    if out.get("success"):
+        # Written by the sender, right after acceptance — this is what makes the
+        # guard above true for the NEXT caller, whoever that turns out to be.
+        if claim.get("invoice_id"):
+            _record_reminder(claim["invoice_id"], invoice, to, p, msg["text"])
+            out["recorded"] = True
+        else:
+            # No invoice row to hang the record on (activities.related_id is NOT
+            # NULL). Reported, never implied.
+            out["recorded"] = False
+            out["idempotency"] = "unavailable"
+    else:
         logger.warning(f"[email.sp] payment reminder FAILED for {invoice} → "
                        f"{to}: {out.get('message') or out.get('error')}")
     return out

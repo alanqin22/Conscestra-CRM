@@ -556,26 +556,34 @@ def _record_action_sync(ctx: Dict[str, Any], draft: str, tier: str,
     """
     import json
     verb = _OUTCOME_VERB.get(outcome or "", _NOT_ATTEMPTED)
+    # On ACCEPTED the SENDER has already written the activity row
+    # (email.structured._record_reminder), which is what makes the 20h guard
+    # hold for every caller rather than only for this one. Writing here too
+    # would duplicate the audit row and double-count the guard's evidence.
+    # Every other outcome — drafted, refused, failed, unconfirmed — never
+    # reached the sender, so this is the only place that can record it.
+    write_activity = (outcome != "accepted")
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO activities
-                     (type, status, subject, description, due_at, owner_id,
-                      related_type, related_id, account_id, contact_id, channel,
-                      created_at, updated_at)
-                   VALUES ('task','open', %(subj)s, %(desc)s, now() + interval '1 day',
-                           %(owner)s, 'invoice', %(inv)s, %(acct)s, %(ct)s, 'email',
-                           now(), now())""",
-                {
-                    "subj": f"Payment reminder ({tier}) {verb} – {ctx['invoice_number']}",
-                    "desc": draft,
-                    "owner": ctx.get("owner_id"),
-                    "inv": ctx["invoice_id"],
-                    "acct": ctx.get("account_id"),
-                    "ct": ctx.get("contact_id"),
-                },
-            )
+            if write_activity:
+                cur.execute(
+                        """INSERT INTO activities
+                         (type, status, subject, description, due_at, owner_id,
+                          related_type, related_id, account_id, contact_id, channel,
+                          created_at, updated_at)
+                       VALUES ('task','open', %(subj)s, %(desc)s, now() + interval '1 day',
+                               %(owner)s, 'invoice', %(inv)s, %(acct)s, %(ct)s, 'email',
+                               now(), now())""",
+                    {
+                        "subj": f"Payment reminder ({tier}) {verb} – {ctx['invoice_number']}",
+                        "desc": draft,
+                        "owner": ctx.get("owner_id"),
+                        "inv": ctx["invoice_id"],
+                        "acct": ctx.get("account_id"),
+                        "ct": ctx.get("contact_id"),
+                    },
+                )
             # Hand off to the Email agent via the bus (lineage-chained event).
             cur.execute(
                 "SELECT emit_event(%s,%s,%s,%s,%s,%s,%s)",
