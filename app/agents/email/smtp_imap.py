@@ -53,6 +53,7 @@ def _send_via_resend(
     from_addr: str,
     from_name: str,
     bcc_addr: str,
+    auto_replied: bool = False,
 ) -> Dict[str, Any]:
     """Send via Resend API using the requests library (avoids Cloudflare bot detection)."""
     import requests as _requests
@@ -71,6 +72,13 @@ def _send_via_resend(
     }
     if bcc_addr:
         payload['bcc'] = [_clean(bcc_addr)]
+    if auto_replied:
+        # RFC 3834 on the Resend path too. Railway sends via Resend, so omitting
+        # this here would leave the loop guard working on local (SMTP) and not
+        # in production — the same split-by-environment trap as the SQL/Python
+        # deploy seam.
+        payload['headers'] = {'Auto-Submitted': 'auto-replied',
+                              'Precedence': 'auto_reply'}
 
     resp = _requests.post(
         'https://api.resend.com/emails',
@@ -105,6 +113,7 @@ def send_email(
     from_name: str = 'Conscestra CRM Team',
     bcc: Optional[str] = None,
     commercial: bool = False,
+    auto_replied: bool = False,
 ) -> Dict[str, Any]:
     """Send an email. Uses Resend API when RESEND_API_KEY is set, otherwise SMTP.
 
@@ -163,7 +172,8 @@ def send_email(
     if resend_key:
         logger.info(f"[send_email] → using Resend API path")
         try:
-            return _send_via_resend(to, subject, body_html, body_text, addr, from_name, bcc_addr)
+            return _send_via_resend(to, subject, body_html, body_text, addr,
+                                    from_name, bcc_addr, auto_replied)
         except Exception as e:
             logger.error(f"[send_email] Resend API error: {e}", exc_info=True)
             return {'success': False, 'provider': 'resend', 'to': to,
@@ -175,6 +185,12 @@ def send_email(
         msg['Subject'] = subject
         msg['From']    = f'{from_name} <{addr}>'
         msg['To']      = to
+        if auto_replied:
+            # RFC 3834. Marks this message as machine-generated so no
+            # autoresponder — including our own IMAP poller reading the BCC
+            # archive copy — treats it as a human asking for a reply.
+            msg['Auto-Submitted'] = 'auto-replied'
+            msg['Precedence'] = 'auto_reply'
         if bcc_addr:
             msg['Bcc'] = bcc_addr
 
@@ -318,6 +334,11 @@ def _parse_email(msg) -> Dict[str, Any]:
     to_      = _decode_header(msg.get('To', ''))
     date_    = msg.get('Date', '')
     msg_id   = msg.get('Message-ID', '')
+    # RFC 3834 loop-prevention headers. Extracted here so should_skip() can
+    # decline to answer automatic mail — without them an autoresponder on the
+    # far end and ours ping-pong until a rate limit happens to bite.
+    auto_sub = (msg.get('Auto-Submitted', '') or '').strip()
+    precedence = (msg.get('Precedence', '') or '').strip()
 
     body_text = ''
     body_html = ''
@@ -371,6 +392,8 @@ def _parse_email(msg) -> Dict[str, Any]:
         'to':         to_,
         'date':       date_,
         'message_id': msg_id,
+        'auto_submitted': auto_sub,
+        'precedence':     precedence,
         'preview':    body_text[:200].strip(),
         'body_text':  body_text,
         'body_html':  body_html,
