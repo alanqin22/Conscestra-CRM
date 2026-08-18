@@ -705,6 +705,25 @@ async def orchestrator_chat(req: OrchChatRequest, request: Request):
     data['routedTo'] = path
     data['routedBy'] = decision.label
 
+    # ── Stage 1: structured-intent SHADOW (Phase 9) ─────────────────────────
+    # Resolves the operation and records whether the module agreed. Changes
+    # nothing — the module's answer is returned exactly as before. Shipping the
+    # resolver dark is what makes the next stage a migration rather than a
+    # rewrite: the agreement rate is measured on real traffic first, and a
+    # resolver that disagrees on cases nobody anticipated shows up here instead
+    # of in production.
+    try:
+        from app.core import operation_resolver
+        _obj_hint = {'/contact-chat': 'contact', '/account-chat': 'account',
+                     '/lead-chat': 'lead', '/opportunity-chat': 'opportunity',
+                     '/order-chat': 'order', '/accounting-chat': 'invoice',
+                     '/prod-chat': 'product'}.get(path)
+        _sh = operation_resolver.shadow(message, str(data.get('mode') or ''),
+                                        object_hint=_obj_hint)
+        data['intentShadow'] = _sh['outcome']
+    except Exception as _exc:                               # pragma: no cover
+        logger.debug(f'intent shadow skipped: {_exc}')
+
     # ── H3: never return a silent response ──────────────────────────────────
     # "Show me the executive dashboard." came back with an EMPTY output and no
     # success flag, which read as a broken formatter. It was not: analytics is
