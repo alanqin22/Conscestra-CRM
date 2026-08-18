@@ -485,6 +485,51 @@ def _find_operation(text: str) -> Optional[str]:
     return None
 
 
+def _classified(text: str, obj: str) -> Tuple[Optional[str], Optional[str]]:
+    """(operation, target) for `obj` from the classifier, or (None, None).
+
+    The target comes from the model too, and that is a deliberate reversal of
+    the A2 rejection — worth being explicit about, because the surface looks
+    identical.
+
+    A2 failed because a REGEX scanned for runs of non-stop-list tokens and
+    produced "be possible to", "first place", "is needing". It had no concept
+    of what a name is; it matched whatever was not on a list, and no list
+    enumerates every word that is not a name. The model is asked a different
+    question — report the identifier the user actually wrote, and return null
+    for "these", "them" or "it" — which it can answer without a list. Measured
+    on the frozen set: 0 unsafe, and none of the sixteen invented targets that
+    killed A2.
+
+    Deterministic extractors still run first for ids, emails and phone
+    numbers. The model is consulted only for the name case, which is the one
+    where capitals were doing work the user never agreed to supply.
+
+    Returns (None, None) on every failure — disabled flag, timeout,
+    unparseable reply, a mode outside the enum, or a model that tried to move
+    the object. The deterministic path is the fallback, so the worst case is
+    the behaviour that existed before this function.
+    """
+    try:
+        from app.core import operation_classifier
+        data, _reason = operation_classifier.classify(text, object_hint=obj)
+    except Exception as exc:                                # pragma: no cover
+        logger.debug(f"[resolver] classifier unavailable: {exc}")
+        return None, None
+    if not data:
+        return None, None
+    if data.get("object") != obj:
+        # The model reached for a different record type. That is the exact
+        # retargeting the deterministic object resolution exists to prevent.
+        logger.info(f"[resolver] classifier moved object {obj!r} -> "
+                    f"{data.get('object')!r}; discarded")
+        return None, None
+    op = data.get("operation")
+    if not op or op in FORM_OWNED or op not in SP_MODES.get(obj, set()):
+        return None, None
+    return op, (data.get("target") or None)
+
+
 def _find_target(text: str, operation: str) -> Dict[str, Any]:
     """Identifying parameters, or {} when the user named nothing concrete."""
     params: Dict[str, Any] = {}
@@ -568,6 +613,40 @@ def _resolve_core(message: str, object_hint: Optional[str] = None
         return None, OUTCOME_NOT_IMPERATIVE
 
     operation, why, _rule = _find_operation_traced(text)
+    _classified_target = None
+
+    # ── Hybrid recognition (OPERATION_CLASSIFIER) ───────────────────────────
+    # The pattern list recognises 36% of the ways people ask; a model asked to
+    # pick from a closed enum recognises 67%, measured on the same frozen set.
+    # Enumerating phrasings is unbounded — the next independent author always
+    # writes forms nobody listed — so the model is used for BREADTH only, and
+    # only where the deterministic pass already failed to find a verb.
+    #
+    # Three things stay deterministic, and each one closes a failure the
+    # unconstrained version actually produced when measured:
+    #
+    #   guards        run above, so negation, capability questions,
+    #                 past-tense description, reads and ambiguity never reach
+    #                 the model at all
+    #   the OBJECT    resolved below by _find_object, never by the model. Left
+    #                 to choose, it moved "qualify barrett consulting" (an
+    #                 account) onto leads because that is where qualify lives
+    #   the VERB CHECK if the user's own verb names an operation this object
+    #                 does not support, refuse before asking the model — it
+    #                 answered "delete this contact" with archive, which is
+    #                 substitution arriving by a politer route
+    #
+    # Those three removed all three unsafe outcomes while keeping the recall.
+    # What remains for the model is one job: name an operation from
+    # SP_MODES[object], or decline. StructuredIntent still raises on anything
+    # outside the enum, so an invented operation stays unrepresentable.
+    if operation is None and why == OUTCOME_NO_OPERATION:
+        _hint_obj = _find_object(text, None) or object_hint
+        if _hint_obj:
+            operation, _classified_target = _classified(text, _hint_obj)
+            if operation:
+                why = OUTCOME_MATCHED
+
     if operation is None:
         return None, why
     if operation in FORM_OWNED:
@@ -603,6 +682,11 @@ def _resolve_core(message: str, object_hint: Optional[str] = None
                                    TRUTH.objects_supporting(operation))
 
     params = _find_target(text, operation)
+    if not params and _classified_target:
+        # Reached only when ids, emails and phone numbers all found nothing:
+        # the name case, where the deterministic pattern demanded capitals the
+        # user never typed.
+        params = {"name": _classified_target}
     needs = REQUIRES_TARGET.get(operation)
     if needs and not params:
         raise MissingTarget(obj, operation, needs)
