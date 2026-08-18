@@ -894,6 +894,56 @@ def _gather_digits(prompt_inner: str) -> str:
 # LEVEL 0 — KB-grounded wording (no tools, no CRM; script fallback)
 # ============================================================================
 
+# ── Brand mishearing ────────────────────────────────────────────────────────
+# "Conscestra" is an invented word, so speech-to-text reaches for real ones.
+# Observed on a single production call: Concentra, concessor, concessionaire.
+#
+# Retrieval is not the casualty — the KB returns the right article for all
+# three, because embeddings tolerate a wrong token in an otherwise clear
+# question. The ANSWERING model is: told to answer only from approved
+# knowledge and never invent, it treats a word it does not recognise as a
+# reason to decline, and says so ("I'm not sure what 'concessor' refers to").
+# Two good answers were lost that way on one call, while a third recovered on
+# its own — so the behaviour is inconsistent as well as wrong.
+#
+# Normalising is deliberately a FIXED LIST, not fuzzy matching. A phonetic
+# distance function would eventually rewrite a word the caller meant, and on a
+# support line the cost of mangling a real word is higher than the cost of
+# missing an unlisted mishearing. Add observed forms here as calls produce
+# them; the transcript keeps the raw text, so the evidence for the next entry
+# is always in the record.
+# Every entry must be either an observed mishearing or a nonsense string. Two
+# speculative additions were tested and removed: "concession" rewrote "can I
+# get a concession on the price?", and "concerta" is a medication. Aliasing an
+# ordinary English word breaks a sentence that was never about the product —
+# a worse failure than missing an unlisted mishearing, because the caller gets
+# a confidently wrong reading of what they said.
+_BRAND_ALIASES = (
+    # observed in the 2026-08-18 call
+    "concentra", "concessor", "concessionaire",
+    # nonsense strings, no ordinary meaning to collide with
+    "conscentra", "consestra", "consessra", "conchestra", "constestra",
+    "conquestra", "consultra", "con sistra", "con sestra", "kon sestra",
+)
+_BRAND_RE = re.compile(
+    r"\b(" + "|".join(re.escape(a) for a in _BRAND_ALIASES) + r")\b", re.I)
+
+
+def normalise_brand(heard: str) -> str:
+    """Rewrite known mishearings of the product name to 'Conscestra'.
+
+    Applied to the WORKING copy only. The transcript stores what was actually
+    said, so a later reader can see the mishearing rather than a tidied version
+    of the call — and so the alias list can be extended from real evidence.
+    """
+    if not heard:
+        return heard
+    fixed, n = _BRAND_RE.subn("Conscestra", heard)
+    if n:
+        logger.info(f"[voice] brand mishearing normalised x{n}: {heard[:60]!r}")
+    return fixed
+
+
 def _kb_answer(sess: Dict[str, Any], heard: str,
                audience: Optional[str] = "public") -> str:
     """audience=None lets the OPERATOR tier see internal articles too — staff
@@ -906,6 +956,9 @@ def _kb_answer(sess: Dict[str, Any], heard: str,
     try:
         from app.core import knowledge, language, privacy
         from app.core.graph_utils import _get_llm
+        # Both the retrieval and the model see the corrected name. Retrieval
+        # tolerated the mishearing already; the model did not.
+        heard = normalise_brand(heard)
         # Empty subject: fixed channel labels pollute term matching. A miss
         # is logged as a KB gap — demand for the nightly gap miner.
         #
@@ -961,6 +1014,11 @@ async def _operator_answer(sess: Dict[str, Any], heard: str) -> str:
     from app.core.write_guard import WritePermissionError, set_readonly_channel
 
     set_readonly_channel("voice")
+    # Same mishearing, different tier. Staff say the product name more often
+    # than customers do, and this tier routes to a module agent rather than
+    # the KB — a request for "Concentra's overdue invoices" is one unfamiliar
+    # token away from being routed on a word that means nothing here.
+    heard = normalise_brand(heard)
     # Bare follow-ups ("yes", "the second one") stay with the agent this call
     # was last talking to — same stickiness as the SMS operator tier.
     from app.core.telephony import _SMS_FOLLOWUP_RE
