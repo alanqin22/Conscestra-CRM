@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from datetime import date
 from typing import Any, Dict, List, Optional
@@ -38,7 +39,29 @@ from app.agents.orchestrator.executive import (
 
 logger = logging.getLogger(__name__)
 
+
+def intent_boundary_classify(message: str) -> str:
+    """Intent label, or '' if the boundary module is unavailable.
+
+    Wrapped so a failure here can never take down routing: an unavailable
+    classifier must degrade to the previous behaviour, not to a 500.
+    """
+    try:
+        from app.core import intent_boundary
+        return str(intent_boundary.classify(message).get('intent') or '')
+    except Exception as exc:                                # pragma: no cover
+        logger.debug(f'intent classify unavailable: {exc}')
+        return ''
+
+
 router = APIRouter()
+
+# Knowledge boundary kill switch (Phase 5). On by default; set to 0 to restore
+# pure keyword routing if the classifier is ever found to claim traffic it
+# should not. Kept as a flag because this changes which subsystem answers a
+# whole class of user requests.
+KNOWLEDGE_ROUTING = os.getenv("CRM_KNOWLEDGE_ROUTING", "1").strip().lower() in (
+    "1", "true", "yes", "on")
 
 
 # ============================================================================
@@ -369,6 +392,82 @@ async def orchestrator_chat(req: OrchChatRequest, request: Request):
                              'mode': 'web_search', 'output': text,
                              'rawParams': {'mode': 'web_search', 'query': _q}})
 
+    # ── 0b. Premise firewall (Phase 4) ───────────────────────────────────────
+    # _route_single() below is pure keyword matching with no notion of whether
+    # a message is a QUESTION or an INSTRUCTION. "Why did the nightly duplicate
+    # cleanup merge my contacts?" contains 'contact', so it routed to
+    # /contact-chat, which dutifully ran the duplicates report — and the model,
+    # handed a report and a question presupposing a nightly job, answered
+    # "the account clean-up job runs nightly at 02:30 AM server local time".
+    # No such job exists. That was a measured P0.
+    #
+    # The KB fixes could not reach this: nothing on this path calls rag_block,
+    # so the customer channel's scope caution never applied here.
+    #
+    # This intercepts ONLY messages that assert something the implementation
+    # contradicts — an automation, a schedule, a past event, or a capability on
+    # an object that does not have it. Everything else, including every
+    # legitimate lookup, report, form and action, falls through untouched. That
+    # asymmetry is deliberate: this path's job is executing work, and a
+    # firewall that swallowed ambiguous traffic would break the thing it is
+    # meant to protect.
+    #
+    # Deliberately deterministic — see premise_firewall's module docstring:
+    # asking a model to catch an invented schedule reintroduces the faculty
+    # that invented it.
+    from app.core import premise_firewall
+    _pf = premise_firewall.check(message)
+    if _pf:
+        logger.info(f"→ premise firewall [{_pf['rule']}]: {message[:80]!r}")
+        return JSONResponse({
+            'sessionId': session_id, 'success': True,
+            'mode': f"premise_correction:{_pf['rule']}",
+            'output': premise_firewall.as_answer(_pf),
+            'rawParams': {'rule': _pf['rule'], 'capability': _pf['capability'],
+                          'objects': _pf['objects'], 'blocked_action': _pf['is_action']},
+        })
+
+    # ── 0c. Knowledge boundary (Phase 5 — H2) ────────────────────────────────
+    # Informational questions are answered from approved knowledge instead of
+    # being keyword-routed to whichever module owns a word in them. "Can I
+    # merge duplicate contacts?" previously landed on the executive agent and
+    # was answered from model knowledge; now it is grounded in the KB.
+    #
+    # ONLY interrogatives are claimed. Actions, lookups, reports and anything
+    # unclassified continue down the existing path untouched — misrouting an
+    # ACTION into prose is a functional regression on a path whose job is
+    # execution, so the classifier requires positive evidence of a question.
+    #
+    # A retrieval miss REFUSES and logs a gap. It must never fall back to the
+    # module agent: that fallthrough is exactly how Phase 3 produced "the
+    # account clean-up job runs nightly at 02:30 AM" — the KB found nothing,
+    # the executive agent answered anyway, and a gap became a fabrication.
+    if KNOWLEDGE_ROUTING:
+        from app.core import intent_boundary
+        _cls = intent_boundary.classify(message)
+        if _cls['intent'] == intent_boundary.KNOWLEDGE:
+            from app.core import knowledge_route
+            _ka = knowledge_route.answer(message)
+            if _ka:
+                logger.info(f"→ knowledge boundary [{_ka['mode']}]: {message[:70]!r}")
+                return JSONResponse({
+                    'sessionId': session_id, 'success': True,
+                    'mode': _ka['mode'], 'output': _ka['output'],
+                    'rawParams': {'grounded': _ka['grounded'],
+                                  'source': _ka['source'],
+                                  'articles': _ka['articles'],
+                                  'gapLogged': _ka['gap_logged']},
+                })
+        elif _cls['intent'] == intent_boundary.MIXED:
+            # Answer the knowledge half, then let the operational half run.
+            # The knowledge answer never executes anything itself.
+            from app.core import knowledge_route
+            _ka = knowledge_route.answer(message)
+            if _ka:
+                _mixed_prefix = _ka['output']
+                logger.info(f"→ mixed intent: knowledge first, then routing")
+                request.state.mixed_prefix = _mixed_prefix   # noqa: attribute
+
     # ── 0. Capability routing (Phase 2 — A2A) ────────────────────────────────
     # Route by *capability* via the A2A registry instead of keyword matching.
     # Additive: only these explicit handles trigger it.
@@ -498,7 +597,25 @@ async def orchestrator_chat(req: OrchChatRequest, request: Request):
     # Matches before symphonies and single-agent routing so phrases like
     # "weighted forecast vs commit" get the executive pack, not keyword
     # routing. Out-of-CRM topics return an honest scope note + best proxy.
-    exec_match = match_exec_question(message)
+    # Guarded by intent: the executive bank answers QUESTIONS, and its 138
+    # patterns are unanchored keyword matches. One of them is a bare
+    # `duplicates?`, so "Merge these duplicate contacts." matched, was
+    # answered with a lead-funnel report, and never reached the contact merge
+    # route at all (I2). The word appears mid-sentence in an imperative; the
+    # matcher has no notion of mood, and 137 other patterns can misfire the
+    # same way.
+    #
+    # Fixing the one pattern would leave the class of defect in place, so the
+    # guard is on intent instead: an imperative is a request to DO something
+    # and is never an executive question, whatever words it contains.
+    # Skips ACTION and LOOKUP. A lookup that names a record type ("show me
+    # duplicate contacts") belongs to that module, not to the executive pack —
+    # the same bare `duplicates?` pattern was answering it with a
+    # company-wide lead-funnel report. REPORT is deliberately NOT skipped:
+    # "show me the executive dashboard" is exactly what the pack is for.
+    _exec_intent = intent_boundary_classify(message)
+    exec_match = (None if _exec_intent in ('action', 'lookup')
+                  else match_exec_question(message))
     if exec_match:
         sections, note = exec_match
         try:
@@ -587,4 +704,55 @@ async def orchestrator_chat(req: OrchChatRequest, request: Request):
     data.setdefault('sessionId', session_id)
     data['routedTo'] = path
     data['routedBy'] = decision.label
+
+    # ── Stage 1: structured-intent SHADOW (Phase 9) ─────────────────────────
+    # Resolves the operation and records whether the module agreed. Changes
+    # nothing — the module's answer is returned exactly as before. Shipping the
+    # resolver dark is what makes the next stage a migration rather than a
+    # rewrite: the agreement rate is measured on real traffic first, and a
+    # resolver that disagrees on cases nobody anticipated shows up here instead
+    # of in production.
+    try:
+        from app.core import operation_resolver
+        _obj_hint = {'/contact-chat': 'contact', '/account-chat': 'account',
+                     '/lead-chat': 'lead', '/opportunity-chat': 'opportunity',
+                     '/order-chat': 'order', '/accounting-chat': 'invoice',
+                     '/prod-chat': 'product'}.get(path)
+        _sh = operation_resolver.shadow(message, str(data.get('mode') or ''),
+                                        object_hint=_obj_hint)
+        data['intentShadow'] = _sh['outcome']
+    except Exception as _exc:                               # pragma: no cover
+        logger.debug(f'intent shadow skipped: {_exc}')
+
+    # ── H3: never return a silent response ──────────────────────────────────
+    # "Show me the executive dashboard." came back with an EMPTY output and no
+    # success flag, which read as a broken formatter. It was not: analytics is
+    # role-gated, `require_analytics_access` raised a 403, and FastAPI's error
+    # body carries the reason under `detail` — a key nothing downstream maps to
+    # `output`. So a correct, deliberate authorization refusal was delivered to
+    # the user as silence.
+    #
+    # Surfacing it is the fix, not bypassing the gate: the user should be told
+    # they lack access, not left staring at nothing, and certainly not handed a
+    # KB article as a substitute for a permission they do not have.
+    _mp = getattr(request.state, 'mixed_prefix', None)
+    if _mp and str(data.get('output') or '').strip():
+        # Mixed intent: knowledge answer first, then the operational result.
+        data['output'] = _mp + "\n\n---\n\n" + str(data['output'])
+        data['mode'] = f"mixed:{data.get('mode', 'routed')}"
+
+    if not str(data.get('output') or '').strip():
+        reason = (data.get('detail') or data.get('error')
+                  or data.get('message') or '')
+        if reason:
+            data['output'] = str(reason)
+            data.setdefault('success', False)
+            data.setdefault('mode', 'refused')
+        else:
+            # Genuinely empty with no reason given — still not silence.
+            data['output'] = ("The request reached the right module but came "
+                              "back with no content. Nothing was changed. "
+                              "Please rephrase, or report this if it repeats.")
+            data.setdefault('success', False)
+            data.setdefault('mode', 'empty_response')
     return JSONResponse(data)

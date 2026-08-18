@@ -49,12 +49,57 @@ def _extract_first_name(raw: str) -> str:
     return local.split('.')[0].capitalize() if local else 'there'
 
 
+def _is_our_own_mail(sender: str, own_address: str) -> bool:
+    """Is this message from US, under any hostname the mail system uses?
+
+    THE LOOP THIS CLOSES. The check was `sender == own_address.lower()`, an
+    exact match against EMAIL_ADDRESS (info@agentorc.ca). Every outbound message
+    BCCs the archive mailbox, and the server delivers those copies with the
+    From rewritten to the transport host — info@MAIL.agentorc.ca. One character
+    of difference, so the guard missed it and the poller answered our own
+    transactional mail: 37 auto-replies to our own payment reminders and order
+    confirmations, found 2026-08-17.
+
+    Only the per-sender hour rate-limit stopped it going further, and that lives
+    in a module-level dict — it resets on every restart and is per-replica, so
+    it is a backstop, not a guard.
+
+    Matching on the LOCAL PART plus our own domain (or any subdomain of it)
+    recognises the same mailbox however the transport labels it.
+    """
+    sender = (sender or '').lower()
+    own = (own_address or '').lower()
+    if not sender or not own:
+        return False
+    if sender == own:
+        return True
+    s_local, _, s_domain = sender.partition('@')
+    o_local, _, o_domain = own.partition('@')
+    if not (s_local and o_local and s_domain and o_domain):
+        return False
+    return s_local == o_local and (s_domain == o_domain
+                                   or s_domain.endswith('.' + o_domain))
+
+
 def should_skip(email: Dict[str, Any], own_address: str) -> Optional[str]:
     """Return a skip reason string, or None if the email should be processed."""
     sender = _extract_email_addr(email.get('from', ''))
 
-    if not sender or sender == own_address.lower():
+    if not sender:
         return 'own address'
+    if _is_our_own_mail(sender, own_address):
+        return f'own address ({sender})'
+
+    # RFC 3834: an automatic responder must not answer automatic mail. Honouring
+    # these headers stops a loop with ANY correct responder, not just our own —
+    # a vacation autoresponder on the far end would otherwise ping-pong with us
+    # until one side's rate limit happened to bite.
+    auto = str(email.get('auto_submitted') or '').strip().lower()
+    if auto and auto != 'no':
+        return f'Auto-Submitted: {auto}'
+    prec = str(email.get('precedence') or '').strip().lower()
+    if prec in ('bulk', 'auto_reply', 'junk', 'list'):
+        return f'Precedence: {prec}'
 
     if _SKIP_SENDER_PATTERNS.search(sender):
         return f'skip-sender pattern matched ({sender})'
@@ -399,6 +444,10 @@ def process_inbound_email(email: Dict[str, Any], own_address: str) -> bool:
         subject=reply['subject'],
         body_html=reply['body_html'],
         body_text=reply['body_text'],
+        # Declare this as an automatic reply so nothing answers it — the third
+        # leg of the loop fix, alongside recognising our own address under any
+        # hostname and honouring these same headers on inbound mail.
+        auto_replied=True,
     )
 
     if result.get('success'):
