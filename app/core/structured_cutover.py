@@ -125,35 +125,47 @@ def resolve_for_route(message: str, path: str) -> Optional[Dict[str, Any]]:
         {"kind": "refuse",  "output": "…"}     — object does not support it
         None                                    — not ours; route as today
     """
-    from app.core.operation_resolver import (resolve, MissingTarget,
-                                             UnsupportedOperation)
+    from app.core.operation_resolver import (resolve_traced,
+                                             OUTCOME_BYPASSED,
+                                             OUTCOME_MATCHED,
+                                             OUTCOME_MISSING_TARGET,
+                                             OUTCOME_UNSUPPORTED)
     obj_hint = ROUTE_OBJECT.get(path)
     if not is_enabled(obj_hint or ""):
-        return None
-    try:
-        intent = resolve(message, object_hint=obj_hint)
-    except MissingTarget as exc:
-        logger.info(f"[cutover] {exc.operation} on {exc.object}: no target -> ask")
-        return {"kind": "ask", "object": exc.object, "operation": exc.operation,
-                "output": (
-                    f"I can {exc.operation} {exc.object}s, but I need to know "
-                    f"which — {exc.needs}. Nothing has been changed. Tell me "
-                    f"the record and I'll run it.")}
-    except UnsupportedOperation as exc:
-        supported = ", ".join(f"{s}s" for s in (exc.supported or [])) or "no record type"
-        logger.info(f"[cutover] {exc.object} does not support {exc.operation}")
-        return {"kind": "refuse", "object": exc.object, "operation": exc.operation,
-                "output": (
-                    f"Conscestra does not support {exc.operation} for "
-                    f"{exc.object}s — it is available for {supported}. I have "
-                    f"not applied it to any other record type on your behalf.")}
-    except Exception as exc:                                # pragma: no cover
-        logger.warning(f"[cutover] resolve failed, falling back: {exc}")
-        return None
+        return {"kind": "bypassed", "outcome": OUTCOME_BYPASSED,
+                "object": obj_hint, "operation": None}
+    payload, outcome = resolve_traced(message, object_hint=obj_hint)
 
+    if outcome == OUTCOME_MISSING_TARGET:
+        logger.info(f"[cutover] {payload.operation} on {payload.object}: no "
+                    f"target -> ask")
+        return {"kind": "ask", "outcome": outcome, "object": payload.object,
+                "operation": payload.operation,
+                "output": (
+                    f"I can {payload.operation} {payload.object}s, but I need "
+                    f"to know which — {payload.needs}. Nothing has been "
+                    f"changed. Tell me the record and I'll run it.")}
+
+    if outcome == OUTCOME_UNSUPPORTED:
+        supported = ", ".join(f"{s}s" for s in (payload.supported or [])) \
+            or "no record type"
+        logger.info(f"[cutover] {payload.object} does not support "
+                    f"{payload.operation}")
+        return {"kind": "refuse", "outcome": outcome, "object": payload.object,
+                "operation": payload.operation,
+                "output": (
+                    f"Conscestra does not support {payload.operation} for "
+                    f"{payload.object}s — it is available for {supported}. I "
+                    f"have not applied it to any other record type on your "
+                    f"behalf.")}
+
+    intent = payload if outcome == OUTCOME_MATCHED else None
     if intent is None:
-        return None
+        # Declined — and now it says WHY. This is the distinction whose absence
+        # made the Stage 3 attribution wrong.
+        return {"kind": "declined", "outcome": outcome,
+                "object": obj_hint, "operation": None}
     logger.info(f"[cutover] AUTHORITATIVE {intent.object}.{intent.operation} "
                 f"params={list(intent.parameters)}")
-    return {"kind": "intent", "object": intent.object,
+    return {"kind": "intent", "outcome": outcome, "object": intent.object,
             "operation": intent.operation, "params": to_params(intent)}

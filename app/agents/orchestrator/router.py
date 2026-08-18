@@ -706,12 +706,15 @@ async def orchestrator_chat(req: OrchChatRequest, request: Request):
         _cut = structured_cutover.resolve_for_route(message, path)
     except Exception as _exc:                               # pragma: no cover
         logger.warning(f'cutover skipped: {_exc}')
+        _cut = {'kind': 'not_reached', 'outcome': 'not_reached'}
+    _resolver_outcome = (_cut or {}).get('outcome') or 'not_reached'
     if _cut and _cut['kind'] in ('ask', 'refuse'):
         logger.info(f"[cutover] {_cut['kind']} -> returning without executing")
         return JSONResponse({
             'sessionId': session_id, 'success': True,
             'mode': f"structured_{_cut['kind']}", 'routedTo': path,
             'output': _cut['output'],
+            'resolverOutcome': _resolver_outcome,
             'rawParams': {'object': _cut.get('object'),
                           'operation': _cut.get('operation'), 'executed': False}})
     _structured = _cut['params'] if _cut and _cut['kind'] == 'intent' else None
@@ -738,6 +741,9 @@ async def orchestrator_chat(req: OrchChatRequest, request: Request):
     data.setdefault('sessionId', session_id)
     data['routedTo'] = path
     data['routedBy'] = decision.label
+    # N2: state WHY the cutover did or did not claim this request. Without it
+    # a resolver decline and a routing miss are the same response.
+    data['resolverOutcome'] = _resolver_outcome
 
     # ── Stage 1: structured-intent SHADOW (Phase 9) ─────────────────────────
     # Resolves the operation and records whether the module agreed. Changes

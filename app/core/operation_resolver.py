@@ -38,6 +38,32 @@ from app.core import kb_capability_truth as TRUTH
 logger = logging.getLogger(__name__)
 
 
+
+# ── Resolver outcomes (N2) ──────────────────────────────────────────────────
+# Every failure in this programme has been attributed by INFERENCE from the
+# final response, and the inference was wrong twice. Stage 3 reported the
+# resolver as 2 of 45 failures; probing it directly said 41 of 45. The two are
+# observationally identical downstream: when resolve() returns None the cutover
+# does not engage and the legacy router answers, so the response looks the same
+# whether the resolver declined, was never consulted, or was bypassed.
+#
+# So the resolver now states which of those happened. These are outcomes of a
+# decision, not log levels, and they are asserted in CI — an instrument that
+# cannot be tested is the thing that produced the wrong attributions.
+OUTCOME_MATCHED       = "matched"          # intent produced
+OUTCOME_MISSING_TARGET = "missing_target"  # operation clear, target absent
+OUTCOME_UNSUPPORTED   = "unsupported"      # object does not support operation
+OUTCOME_NO_OPERATION  = "no_operation"     # no operation verb recognised
+OUTCOME_NO_OBJECT     = "no_object"        # operation clear, no object anywhere
+OUTCOME_FORM_OWNED    = "form_owned"       # create/update belong to the UI form
+OUTCOME_NOT_IMPERATIVE = "not_imperative"  # question, negation, read, ambiguity
+OUTCOME_BYPASSED      = "bypassed"         # module not enabled for the cutover
+OUTCOME_NOT_REACHED   = "not_reached"      # cutover code never ran
+
+ALL_OUTCOMES = (OUTCOME_MATCHED, OUTCOME_MISSING_TARGET, OUTCOME_UNSUPPORTED,
+                OUTCOME_NO_OPERATION, OUTCOME_NO_OBJECT, OUTCOME_FORM_OWNED,
+                OUTCOME_NOT_IMPERATIVE, OUTCOME_BYPASSED, OUTCOME_NOT_REACHED)
+
 class IntentError(Exception):
     """Base for resolution failures. Never swallowed into a fallback mode."""
 
@@ -286,6 +312,29 @@ def _find_object(text: str, operation: Optional[str] = None) -> Optional[str]:
     return found[0]
 
 
+def _find_operation_traced(text: str) -> "tuple[Optional[str], str]":
+    """(operation, reason), where reason names the GUARD that fired.
+
+    Inferring the reason from a heuristic afterwards ("was a verb present?")
+    reported `no_operation` for "Show me the duplicate contacts", which the
+    read guard had rejected. Same answer, wrong cause — the fix for a missing
+    verb is vocabulary, the fix for a read guard is nothing at all. Reporting
+    the guard directly is the difference between telemetry and a second guess.
+    """
+    if _NEGATION_RE.search(text):
+        return None, OUTCOME_NOT_IMPERATIVE
+    if _CAPABILITY_Q_RE.search(text):
+        return None, OUTCOME_NOT_IMPERATIVE
+    if _PAST_DESC_RE.search(text):
+        return None, OUTCOME_NOT_IMPERATIVE
+    if _AMBIGUOUS_RE.match(text):
+        return None, OUTCOME_NOT_IMPERATIVE
+    if _READ_LEAD_RE.match(text):
+        return None, OUTCOME_NOT_IMPERATIVE
+    op = _find_operation(text)
+    return (op, OUTCOME_MATCHED) if op else (None, OUTCOME_NO_OPERATION)
+
+
 def _find_operation(text: str) -> Optional[str]:
     """The operation the user is ASKING FOR, or None.
 
@@ -349,8 +398,8 @@ def _find_target(text: str, operation: str) -> Dict[str, Any]:
     return params
 
 
-def resolve(message: str, object_hint: Optional[str] = None
-            ) -> Optional[StructuredIntent]:
+def _resolve_core(message: str, object_hint: Optional[str] = None
+                  ) -> "tuple[Any, str]":
     """Prose -> StructuredIntent.
 
     None means "not an operation request" — the caller keeps its existing
@@ -361,11 +410,13 @@ def resolve(message: str, object_hint: Optional[str] = None
     """
     text = (message or "").strip()
     if not text or not _IMPERATIVE_RE.match(text):
-        return None
+        return None, OUTCOME_NOT_IMPERATIVE
 
-    operation = _find_operation(text)
-    if operation is None or operation in FORM_OWNED:
-        return None
+    operation, why = _find_operation_traced(text)
+    if operation is None:
+        return None, why
+    if operation in FORM_OWNED:
+        return None, OUTCOME_FORM_OWNED
 
     named = _find_object(text, operation)
     if named and operation not in SP_MODES.get(named, set())             and object_hint and operation in SP_MODES.get(object_hint, set())             and _names_only_outputs(text, named):
@@ -386,11 +437,11 @@ def resolve(message: str, object_hint: Optional[str] = None
                                    TRUTH.objects_supporting(operation))
     obj = named or object_hint
     if obj is None:
-        return None
+        return None, OUTCOME_NO_OBJECT
 
     # void_invoice is named for its SP mode; the verb is just "void".
     if operation == "void_invoice" and obj != "invoice":
-        return None
+        return None, OUTCOME_NO_OBJECT
 
     if operation not in SP_MODES.get(obj, set()):
         raise UnsupportedOperation(obj, operation,
@@ -401,7 +452,37 @@ def resolve(message: str, object_hint: Optional[str] = None
     if needs and not params:
         raise MissingTarget(obj, operation, needs)
 
-    return StructuredIntent(object=obj, operation=operation, parameters=params)
+    return (StructuredIntent(object=obj, operation=operation,
+                            parameters=params), OUTCOME_MATCHED)
+
+
+def resolve_traced(message: str, object_hint: Optional[str] = None
+                   ) -> "tuple[Any, str]":
+    """(payload, outcome) and NEVER raises.
+
+    payload is a StructuredIntent when matched, the MissingTarget /
+    UnsupportedOperation instance when the request is understood but cannot be
+    executed as asked, else None. Telemetry that throws is missing precisely
+    when something went wrong, so the raising core is wrapped rather than
+    exposed.
+    """
+    try:
+        return _resolve_core(message, object_hint)
+    except MissingTarget as exc:
+        return exc, OUTCOME_MISSING_TARGET
+    except UnsupportedOperation as exc:
+        return exc, OUTCOME_UNSUPPORTED
+
+
+def resolve(message: str, object_hint: Optional[str] = None
+            ) -> Optional[StructuredIntent]:
+    """Raising facade, unchanged for existing callers."""
+    payload, outcome = resolve_traced(message, object_hint)
+    if outcome == OUTCOME_MISSING_TARGET:
+        raise payload
+    if outcome == OUTCOME_UNSUPPORTED:
+        raise payload
+    return payload if outcome == OUTCOME_MATCHED else None
 
 
 def shadow(message: str, actual_mode: str,
