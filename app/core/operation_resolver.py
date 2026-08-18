@@ -239,6 +239,32 @@ class StructuredIntent:
         return {"mode": self.operation, **self.parameters}
 
 
+def _names_only_outputs(text: str, named: str) -> bool:
+    """True only when EVERY mention of `named` follows a destination
+    preposition, and there is at least one mention.
+
+    "Convert X into an account" names an OUTPUT. "Score the account" names the
+    SUBJECT. Only the first may be overridden by the route.
+
+    The `saw_any` guard is not defensive padding. Without it the function
+    returned True when it found no mentions at all — vacuously, since a loop
+    over nothing satisfies "every" — and that True authorised the route to
+    override a stated object. It turned "Score the Harris Construction
+    account" into lead.score: scoring a different record type than the one the
+    user named, which is the substitution this whole programme exists to stop.
+    """
+    saw_any = False
+    for pat_name, pat in _OBJECT_MAP:
+        if pat_name != named:
+            continue
+        for m in re.finditer(rf"({pat})", text, re.I):
+            saw_any = True
+            before = text[max(0, m.start() - 24):m.start()].lower()
+            if not re.search(r"(into|to|as)\s+(an?\s+)?$", before):
+                return False          # this mention is the subject
+    return saw_any
+
+
 def _find_object(text: str, operation: Optional[str] = None) -> Optional[str]:
     """The record type acted ON -- not merely a noun in the sentence.
 
@@ -342,11 +368,22 @@ def resolve(message: str, object_hint: Optional[str] = None
         return None
 
     named = _find_object(text, operation)
-    if named and operation not in SP_MODES.get(named, set())             and object_hint and operation in SP_MODES.get(object_hint, set()):
-        # Named objects are the operation's outputs; the route knows its subject.
-        logger.debug(f"[resolver] {named!r} names an output of {operation!r}; "
+    if named and operation not in SP_MODES.get(named, set())             and object_hint and operation in SP_MODES.get(object_hint, set())             and _names_only_outputs(text, named):
+        # The named types are DESTINATIONS of the operation, not its subject:
+        # "Convert <lead> into an account and an opportunity". The route knows
+        # the subject, so it wins.
+        logger.debug(f"[resolver] {named!r} follows a destination preposition; "
                      f"using route object {object_hint!r}")
         named = object_hint
+    elif named and operation not in SP_MODES.get(named, set()):
+        # The user named the subject and it does not support the operation.
+        # REFUSE. Retargeting to whatever the route happened to pick turns
+        # "Score the Harris Construction account" into lead.score — silently
+        # scoring a different record type than the one named. An earlier
+        # version of this function did exactly that; a hint may SUPPLY a
+        # missing object, never OVERRIDE a stated one.
+        raise UnsupportedOperation(named, operation,
+                                   TRUTH.objects_supporting(operation))
     obj = named or object_hint
     if obj is None:
         return None
