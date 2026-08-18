@@ -47,6 +47,22 @@ def pre_router_node(state: Dict[str, Any]) -> Dict[str, Any]:
     chat_input = state.get("chat_input", {})
     logger.info(f"Session: {state.get('session_id')!r}  Message: {user_input[:120]}")
 
+    # ── Stage 3: structured intent is authoritative (Phase 9) ───────────────
+    # When the orchestrator resolved the operation, execute THAT. The prose is
+    # not parsed at all here, which is what makes substitution impossible
+    # rather than merely unlikely: the heuristics below and the LLM node never
+    # receive the request.
+    #
+    # Flows into the same parsed_json the pre-router would have produced, so
+    # sql_builder validation, write_guard and the formatter all apply
+    # unchanged. Joining the pipeline at this seam is deliberate — a new path
+    # to the database would have to re-earn every permission check it skipped.
+    _si = (chat_input or {}).get("structuredIntent")
+    if isinstance(_si, dict) and _si.get("mode"):
+        logger.info(f"STRUCTURED INTENT (authoritative) -> mode={_si.get('mode')}")
+        return {**state, "router_action": True, "parsed_json": dict(_si),
+                "should_call_api": True}
+
     result = route_request(user_input, chat_input)
 
     if result["router_action"]:
