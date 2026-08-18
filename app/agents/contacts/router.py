@@ -36,6 +36,11 @@ router = APIRouter(prefix="", tags=["Contacts"])
 
 class ContactChatInput(BaseModel):
     """All chatInput fields used by the Contact pre-router (v3.1) and HTML forms."""
+    # Stage 3 (Phase 9): the operation the orchestrator resolved. Declared
+    # explicitly because pydantic drops undeclared fields — the intent was
+    # being sent, silently discarded here, and the module fell back to parsing
+    # prose, which looked exactly like the cutover not working.
+    structuredIntent: Optional[Dict[str, Any]] = None
     message:      Optional[str]  = None   # optional — AI chat path only
     mode:         Optional[str]  = None   # direct SP route
     routerAction: Optional[bool] = None   # True → bypass AI agent

@@ -63,6 +63,17 @@ def pre_router_node(state: Dict[str, Any]) -> Dict[str, Any]:
     session_id = state.get("session_id", "")
     logger.info(f"Message: {chat_input.get('message', '')[:120]}")
 
+    # ── Stage 3: structured intent is authoritative (Phase 9) ───────────────
+    # See contacts/graph.py — the orchestrator resolved the operation, so the
+    # prose is not parsed here and neither the heuristics nor the LLM can
+    # substitute a different one. Joins the pipeline at the same seam the
+    # pre-router did, inheriting sql_builder validation and write_guard.
+    _si = (chat_input or {}).get("structuredIntent")
+    if isinstance(_si, dict) and _si.get("mode"):
+        logger.info(f"STRUCTURED INTENT (authoritative) -> mode={_si.get('mode')}")
+        return {**state, "router_action": True, "parsed_json": dict(_si),
+                "should_call_api": True}
+
     result = route_request(body, chat_input, session_id)
 
     if result["router_action"]:

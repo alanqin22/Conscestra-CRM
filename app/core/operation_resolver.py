@@ -120,19 +120,72 @@ FORM_OWNED = {"create", "update"}
 
 # Verb -> canonical operation. Order matters: longest/most specific first, so
 # "disqualify" is never matched as "qualify".
+# Lexical forms per operation. Hyphens are explicit: `unarchiv\w*` does not
+# match "un-archive", which cost one v2 question outright.
+#
+# restore MUST be tested before archive: "un-archive" contains "archive", and a
+# first-match table would restore nothing and archive everything.
 _VERB_MAP = [
+    ("restore",    r"un-?archiv\w*|un-?delet\w*|restor\w*|reinstat\w*|"
+                   r"bring\s+(it|them|this|that|these|those)\s+back|"
+                   r"put\s+(it|them|this|that)\s+back"),
     ("disqualify", r"disqualif\w*"),
     ("qualify",    r"qualif\w*"),
-    ("merge",      r"merg\w*|combin\w*|de-?duplicat\w*|dedup\w*"),
-    ("archive",    r"archiv\w*"),
-    ("restore",    r"restor\w*|unarchiv\w*|un-?delet\w*"),
-    ("convert",    r"convert\w*"),
+    ("merge",      r"merg\w*|combin\w*|consolidat\w*|de-?duplicat\w*|dedup\w*"),
+    ("archive",    r"archiv\w*|put\s+(\w+\s+){0,3}away"),
+    ("convert",    r"convert\w*|turn\s+(\w+\s+){0,3}into"),
     ("score",      r"scor\w*"),
     ("delete",     r"delet\w*|remov\w*"),
     ("create",     r"creat\w*|add\b|new\b"),
     ("update",     r"updat\w*|chang\w*|edit\b|set\b"),
     ("void_invoice", r"void\w*"),
 ]
+
+# --- Framing: is the operation REQUESTED, or merely MENTIONED? --------------
+# Raising recall on non-initial verbs is the dangerous half of this change. The
+# guards below run BEFORE any verb is matched, and each exists because a
+# sentence that mentions an operation must never become one.
+#
+# Negation. "Don't merge these" contains merge; acting on it is the worst
+# possible reading of a user's words.
+_NEGATION_RE = re.compile(
+    r"\b(do\s*n[o']?t|don t|never|no need to|rather not|instead of|without|"
+    r"should\s*n[o']?t|must\s*n[o']?t|avoid)\b", re.I)
+
+# Capability / explanatory questions. "Can I merge..." asks what is possible;
+# "Can you merge..." asks for it to happen. The pronoun carries the whole
+# distinction, so they are separated rather than lumped as "interrogative".
+_CAPABILITY_Q_RE = re.compile(
+    r"^\s*(can|could|may)\s+(i|we|a|an|the|this|these|those|contacts?|"
+    r"accounts?|leads?)\b"
+    r"|^\s*(how|what|why|when|which|does|do|is|are|tell\s+me|explain)\b"
+    r"|\bis\s+it\s+possible\b|\bam\s+i\s+able\s+to\b"
+    r"|\bhow\s+does\b|\bwhat\s+happens\b", re.I)
+
+# Past/passive description of something already done -- "Which contacts were
+# merged?", "Why were these archived?" -- a report, not an instruction.
+_PAST_DESC_RE = re.compile(
+    r"\b(were|was|has\s+been|have\s+been|had\s+been|got)\s+\w*"
+    r"(merged|archived|restored|deleted|converted|qualified)\b", re.I)
+
+# Reads. The modules own these; the resolver declines them on purpose.
+_READ_LEAD_RE = re.compile(
+    r"^\s*(please\s+)?(show|list|find|get|search|display|give|pull|look|"
+    r"check|view|tell)\b", re.I)
+
+# Vague verbs that name no operation. Guessing one here is exactly the
+# substitution this whole programme exists to remove.
+_AMBIGUOUS_RE = re.compile(
+    r"^\s*(take\s+care\s+of|do\s+something|handle|deal\s+with|sort\s+out|"
+    r"fix|clean\s+up|tidy)\b", re.I)
+
+# Request framings that legitimately put the verb later in the sentence.
+_REQUEST_FRAME_RE = re.compile(
+    r"^\s*(please|could\s+you|can\s+you|would\s+you|i\s+need|i\s+want|"
+    r"i'?d\s+like|let'?s|we\s+should|go\s+ahead)\b"
+    r"|\bshould\s+be\s+\w+ed\b"
+    r"|,\s*(please\s+)?\w+\s+(them|it|these|those|em|all)\b"
+    r"|\bcan\s+you\b|\bcould\s+you\b", re.I)
 
 _OBJECT_MAP = [
     ("opportunity", r"opportunit(y|ies)|deals?"),
@@ -186,17 +239,59 @@ class StructuredIntent:
         return {"mode": self.operation, **self.parameters}
 
 
-def _find_object(text: str) -> Optional[str]:
-    for name, pat in _OBJECT_MAP:
-        if re.search(rf"\b({pat})\b", text, re.I):
-            return name
-    return None
+def _find_object(text: str, operation: Optional[str] = None) -> Optional[str]:
+    """The record type acted ON -- not merely a noun in the sentence.
+
+    "Convert Mason Reid into an account and an opportunity" names three record
+    types. Convert belongs to leads; the other two are its OUTPUTS. Taking the
+    first noun found returned `opportunity`, which has no convert mode, so a
+    valid request was refused as unsupported.
+
+    Given an operation, only objects that actually support it are eligible.
+    """
+    found = [name for name, pat in _OBJECT_MAP
+             if re.search(rf"\b({pat})\b", text, re.I)]
+    if not found:
+        return None
+    if operation:
+        eligible = [o for o in found if operation in SP_MODES.get(o, set())]
+        if eligible:
+            return eligible[0]
+    return found[0]
 
 
 def _find_operation(text: str) -> Optional[str]:
+    """The operation the user is ASKING FOR, or None.
+
+    Verb position is no longer required to be first -- that rule explained only
+    2 of the 14 in-scope v2 failures -- but every relaxation is paid for by a
+    framing guard, because "mentions merge" and "asks to merge" are different
+    sentences and only one of them may execute.
+    """
+    # Each guard is a reason NOT to act, and outranks any verb found later.
+    if _NEGATION_RE.search(text):
+        return None
+    if _CAPABILITY_Q_RE.search(text):
+        return None
+    if _PAST_DESC_RE.search(text):
+        return None
+    if _AMBIGUOUS_RE.match(text):
+        return None
+    if _READ_LEAD_RE.match(text):
+        return None
+
+    # Verb in first position -- the unambiguous imperative.
     for name, pat in _VERB_MAP:
         if re.match(rf"^\s*(please\s+)?({pat})\b", text, re.I):
             return name
+
+    # Verb later in the sentence, but only inside a recognised request framing.
+    # Without that condition "there's a bunch of dupes in here" and "we already
+    # merged those" would read alike.
+    if _REQUEST_FRAME_RE.search(text):
+        for name, pat in _VERB_MAP:
+            if re.search(rf"\b({pat})\b", text, re.I):
+                return name
     return None
 
 
@@ -246,7 +341,13 @@ def resolve(message: str, object_hint: Optional[str] = None
     if operation is None or operation in FORM_OWNED:
         return None
 
-    obj = _find_object(text) or object_hint
+    named = _find_object(text, operation)
+    if named and operation not in SP_MODES.get(named, set())             and object_hint and operation in SP_MODES.get(object_hint, set()):
+        # Named objects are the operation's outputs; the route knows its subject.
+        logger.debug(f"[resolver] {named!r} names an output of {operation!r}; "
+                     f"using route object {object_hint!r}")
+        named = object_hint
+    obj = named or object_hint
     if obj is None:
         return None
 

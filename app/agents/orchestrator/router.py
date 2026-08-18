@@ -208,15 +208,20 @@ def _route_single(lower: str) -> str:
 # IN-PROCESS AGENT CALLS (ASGI — no network hop)
 # ============================================================================
 
-async def _call_agent(path: str, message: str, session_id: str) -> dict:
+async def _call_agent(path: str, message: str, session_id: str,
+                      structured: dict | None = None) -> dict:
     from app.main import app as _app  # lazy import avoids a circular import
     transport = httpx.ASGITransport(app=_app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url='http://orchestrator.internal',
                                  timeout=300) as client:
+        _ci = {'message': message}
+        if structured is not None:
+            # Stage 3: the module consumes this INSTEAD of parsing the prose.
+            _ci['structuredIntent'] = structured
         resp = await client.post(path, json={
             'sessionId': session_id,
-            'chatInput': {'message': message},
+            'chatInput': _ci,
         })
         try:
             data = resp.json()
@@ -686,8 +691,37 @@ async def orchestrator_chat(req: OrchChatRequest, request: Request):
     from app.core.a2a import dispatch, resolve, query_intent_for_endpoint, A2ARequest
     q_intent = query_intent_for_endpoint(path)
     logger.info(f'[route] → {path} via {decision.label} (a2a intent={q_intent})')
+    # ── Stage 3 cutover (Phase 9) ────────────────────────────────────────────
+    # Placed ABOVE the a2a/else split because BOTH branches delegate. The first
+    # attempt sat in the else branch and never fired: contacts requests travel
+    # via `a2a:contacts.query`, so a merge was being dispatched through a
+    # capability named *query* — which is the substitution problem restated as
+    # a routing topology.
+    #
+    # A resolved write therefore bypasses the query capability deliberately and
+    # goes straight to the module with its operation attached.
+    _cut = None
     try:
-        if q_intent and resolve(q_intent):
+        from app.core import structured_cutover
+        _cut = structured_cutover.resolve_for_route(message, path)
+    except Exception as _exc:                               # pragma: no cover
+        logger.warning(f'cutover skipped: {_exc}')
+    if _cut and _cut['kind'] in ('ask', 'refuse'):
+        logger.info(f"[cutover] {_cut['kind']} -> returning without executing")
+        return JSONResponse({
+            'sessionId': session_id, 'success': True,
+            'mode': f"structured_{_cut['kind']}", 'routedTo': path,
+            'output': _cut['output'],
+            'rawParams': {'object': _cut.get('object'),
+                          'operation': _cut.get('operation'), 'executed': False}})
+    _structured = _cut['params'] if _cut and _cut['kind'] == 'intent' else None
+
+    try:
+        if _structured:
+            data = dict(await _call_agent(path, message, session_id, _structured))
+            data['routedVia'] = 'structured_intent'
+            data['structuredIntent'] = _structured
+        elif q_intent and resolve(q_intent):
             res = await dispatch(A2ARequest(
                 intent=q_intent, from_agent='orchestrator',
                 params={'message': message}, prose=True, correlation_id=session_id))
