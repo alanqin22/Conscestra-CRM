@@ -276,6 +276,58 @@ def _semantic_hits(query: str, limit: int = 4,
         conn.close()
 
 
+# ── Answerability gate ──────────────────────────────────────────────────────
+# _fuse is reciprocal-rank FUSION: it ranks, it does not judge. RRF scores have
+# no absolute meaning — every article on either input list receives one — so if
+# a list is non-empty something always reaches the agent, labelled [APPROVED
+# KNOWLEDGE BASE]. That is why out-of-scope questions were answered: the
+# semantic floor of 0.33 sits far below where real answers live, and nothing
+# downstream re-checks relevance.
+#
+# Measured on this KB (60 golden positives vs 10 out-of-scope controls):
+#     clean positives      min 0.524   median 0.766
+#     negative controls    max 0.534   median 0.387
+# The distributions look separable, but raising the floor alone does NOT work —
+# noisy real utterances reach down to 0.368 and non-English questions to 0.500,
+# so any floor high enough to exclude 0.534 also discards genuine traffic.
+#
+# The discriminator that DOES separate them is agreement between the two
+# retrieval halves: the top semantic hit also appearing in the keyword list.
+#     positives 56/60 agree    negatives 0/10 agree
+# So: accept a strong semantic match outright, or a moderate one that the
+# keyword half independently corroborates.
+#
+# ANSWERABILITY_HI is deliberately below the 0.55 that scored perfectly on
+# English, because non-Latin-script queries have no keyword half at all (the
+# tsvector is English) and would fail the corroboration arm — Mandarin "how do
+# I export contacts" measures 0.500. Excluding a correct multilingual answer to
+# exclude one more control question is a bad trade.
+ANSWERABILITY_GATE = _flag("KB_ANSWERABILITY_GATE", "1")
+ANSWERABILITY_HI = float(os.getenv("KB_ANSWERABILITY_HI", "0.50"))
+ANSWERABILITY_LO = float(os.getenv("KB_ANSWERABILITY_LO", "0.40"))
+
+
+def _answerable(fts: List[Dict[str, Any]], sem: List[Dict[str, Any]]) -> bool:
+    """Is ANY retrieved article plausibly an answer, in absolute terms?
+
+    Returning False means refuse and log a gap — which is a better outcome than
+    the nearest article, because a gap is recoverable and a confident wrong
+    answer is not.
+    """
+    if not ANSWERABILITY_GATE:
+        return bool(fts or sem)
+    if not sem:
+        # Keyword-only hits already passed term-count precision in _fts_hits;
+        # they are corroborated by construction, so they stand on their own.
+        return bool(fts)
+    best = float(sem[0].get("sim") or 0.0)
+    if best >= ANSWERABILITY_HI:
+        return True
+    fts_ids = {h["article_uuid"] for h in fts}
+    corroborated = any(h["article_uuid"] in fts_ids for h in sem)
+    return best >= ANSWERABILITY_LO and corroborated
+
+
 def _fuse(fts: List[Dict[str, Any]], sem: List[Dict[str, Any]],
           top: int = 2, k: int = 60) -> List[Dict[str, Any]]:
     """Reciprocal-rank fusion of the two ranked lists. An article on BOTH
@@ -330,6 +382,8 @@ def retrieve(subject: str, body: str, audience: Optional[str] = "public",
         # to the original sequential path rather than returning nothing.
         logger.debug(f"[knowledge] parallel retrieve fell back to serial: {exc}")
         fts, sem = _fts_hits(query, audience), _semantic_hits(query, 4, audience)
+    if not _answerable(fts, sem):
+        return []
     return _fuse(fts, sem, top=top)
 
 
@@ -397,7 +451,34 @@ def rag_block(subject: str, body: str,
     if gap_channel and hits and all(h.get("via") == "decisive" for h in hits):
         log_weak_match(gap_channel, body)
     _mark_used([h["article_uuid"] for h in hits])
-    lines = ["[APPROVED KNOWLEDGE BASE]"]
+    # The scope caution below is part of the block itself, not of any one
+    # agent's prompt, because every channel consumes rag_block — auto_reply,
+    # SDR, store chat, the console and authored agents. A caution added to one
+    # prompt would leave the others exactly as they were.
+    #
+    # It exists because of a measured failure: after the KB was corrected to
+    # say contact merge EXISTS, the assistant answered "why did the automatic
+    # nightly de-duplication merge my contacts?" by explaining how merging
+    # works — confirming a nightly job that does not exist. The article was
+    # true; the inference drawn from it was not. Retrieval cannot catch this,
+    # because the right article WAS retrieved.
+    #
+    # Three distinctions the model has to keep apart, none of which an article
+    # about a capability states on its own:
+    #     the capability exists  ≠  it runs automatically
+    #     it runs automatically  ≠  it ran in THIS case
+    #     it applies to contacts ≠  it applies to orders
+    lines = [
+        "[APPROVED KNOWLEDGE BASE]",
+        "(Scope: these answers say what the product CAN do, for the record type "
+        "named. A capability existing does NOT mean it runs automatically, on a "
+        "schedule, in the background, or that it happened in any particular "
+        "case; and it does NOT extend to record types the answer does not "
+        "mention. If the question assumes automatic behaviour, a past event, or "
+        "a different record type, correct that assumption plainly before "
+        "answering the rest. Never describe the timing, frequency or history of "
+        "something these answers do not establish.)",
+    ]
     for h in hits:
         lines.append(f"Q: {h['title']}\nA: {h['answer'][:600]}")
     return "\n".join(lines)

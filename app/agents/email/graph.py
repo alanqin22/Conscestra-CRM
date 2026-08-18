@@ -145,8 +145,10 @@ def db_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 body_text = str(parsed_json.get('bodyText') or parsed_json.get('body_text') or ''),
                 commercial=True,   # CASL: suppression check + unsubscribe footer
             )
-            _log_sent_email(parsed_json.get('to', ''),
-                            parsed_json.get('subject', ''), mode)
+            # This one logged action='sent' UNCONDITIONALLY — a refused send
+            # was recorded as sent mail.
+            _log_send_attempt(str(parsed_json.get('to') or ''),
+                              str(parsed_json.get('subject') or ''), mode, result)
             extra['sent_result'] = result
             return {**state, "db_rows": [], "extra": extra}
 
@@ -250,6 +252,31 @@ def _handle_send_template(params: dict) -> dict:
     entity_id     = str(params.get('entityId') or '')
     template_type = str(params.get('templateType') or 'welcome').lower()
 
+    # The friendly name a caller types is not the row's event_type, and the
+    # lookup below searches event_type. 'welcome' is the default templateType
+    # AND the one the pre-router sends for "send welcome email:", yet NO
+    # template's event_type contains that word — the welcome copy lives under
+    # event_type='lead.created', with "Welcome" only in subject_tpl. So every
+    # welcome request has been answering "No active template found for type:
+    # welcome" rather than sending anything.
+    #
+    # Mapped explicitly rather than by also searching subject_tpl: a LIKE over
+    # subject text would match 'account.created' ("Welcome to Orbit, …") just as
+    # readily and pick whichever the planner returned first, so a lead could be
+    # sent an account welcome. Unmapped names fall through to the original
+    # event_type search, which is what makes 'invoice' still resolve to
+    # 'invoice_created'.
+    _TEMPLATE_ALIASES = {
+        'welcome':   'lead.created',
+        'converted': 'lead.converted',
+        'qualified': 'lead.qualified',
+        'account':   'account.created',
+    }
+    if entity_type == 'account' and template_type == 'welcome':
+        template_type = 'account.created'          # welcoming an ACCOUNT
+    else:
+        template_type = _TEMPLATE_ALIASES.get(template_type, template_type)
+
     if not entity_id:
         return {'success': False, 'message': 'entityId is required for send_template'}
 
@@ -283,6 +310,7 @@ def _handle_send_template(params: dict) -> dict:
         return {'success': False, 'message': f'No email address found for {entity_type} {entity_id}'}
 
     # Fill template tokens
+    entity_data = _with_display_tokens(entity_data)
     subject   = _fill_tokens(str(tpl_data.get('subject_tpl',   '')), entity_data)
     body_html = _fill_tokens(str(tpl_data.get('body_html_tpl', '')), entity_data)
     body_text = _fill_tokens(str(tpl_data.get('body_text_tpl', '')), entity_data)
@@ -299,8 +327,7 @@ def _handle_send_template(params: dict) -> dict:
         commercial=True,   # CASL: template sends are commercial messages
     )
 
-    if result.get('success'):
-        _log_sent_email(to_email, subject, template_type)
+    _log_send_attempt(to_email, subject, template_type, result)
 
     return result
 
@@ -318,6 +345,13 @@ def _fetch_entity(entity_type: str, entity_id: str) -> Optional[dict]:
     if not entry:
         return None
 
+    # These SPs return an envelope keyed by entity name, not 'data'/'record':
+    #   sp_leads    -> {'lead': {...},    'metadata': {...}}
+    #   sp_accounts -> {'account': {...}, 'contacts': [...], 'stats': {...}, ...}
+    # Unwrapping only 'data'/'record' therefore returned the ENVELOPE, whose
+    # keys are 'lead' and 'metadata' — no 'email' — so every lead send died at
+    # "No email address found". Try the entity-named key first.
+
     sp_name, id_param = entry
     query = f"SELECT {sp_name}({id_param} := '{entity_id}', p_mode := 'get') AS result;"
     try:
@@ -330,13 +364,61 @@ def _fetch_entity(entity_type: str, entity_id: str) -> Optional[dict]:
                 result = json.loads(result)
             except Exception:
                 return None
-        data = result.get('data') or result.get('record') or result
+        data = (result.get(entity_type)      # 'lead' / 'contact' / 'account'
+                or result.get('data')
+                or result.get('record')
+                or result)
         if isinstance(data, list) and data:
             data = data[0]
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        # An envelope that yielded no usable record is a miss, not a record with
+        # a missing email — returning it would surface as "no email address"
+        # and hide the real cause. sp_contacts answers {'metadata': ...} alone
+        # when the id resolves to nothing.
+        if not any(k in data for k in ('email', 'primary_email', 'contact_email')):
+            logger.warning(
+                f"_fetch_entity: {entity_type} {entity_id} returned no record "
+                f"carrying an email (keys={sorted(data)[:8]})")
+            return None
+        return data
     except Exception as e:
         logger.error(f"_fetch_entity error: {e}")
         return None
+
+
+def _with_display_tokens(data: dict) -> dict:
+    """Add presentation-only tokens so warm prose survives missing data.
+
+    Templates are flat string substitution — no conditionals — so a sentence
+    like "learn more about {{company}} and how we might help" collapses into
+    "learn more about  and how we might help" the moment a lead has no company.
+    That is not hypothetical: 5 of 122 leads have no company, 4 no source, 1 no
+    last name.
+
+    A blank cell in a details TABLE is untidy; a blank hole mid-SENTENCE reads
+    as a broken mail merge. So prose gets a fallback that still scans, and the
+    table gets an em dash instead of an empty cell.
+
+    Returns a copy — the caller's entity dict is not mutated.
+    """
+    out = dict(data)
+
+    def _clean(key: str) -> str:
+        return str(out.get(key) or '').strip()
+
+    company, source = _clean('company'), _clean('source')
+    first, last     = _clean('first_name'), _clean('last_name')
+
+    # Prose: must read naturally either way.
+    out['company_or_yours'] = company or 'your business'
+    # Tables: visibly absent beats invisibly empty.
+    out['company_display']  = company or '—'
+    out['source_display']   = source  or '—'
+    # Avoids the trailing space a blank last name leaves behind.
+    out['full_name']        = ' '.join(p for p in (first, last) if p) or 'there'
+
+    return out
 
 
 def _fill_tokens(template: str, data: dict) -> str:
@@ -348,25 +430,60 @@ def _fill_tokens(template: str, data: dict) -> str:
             snake = re.sub(r'([A-Z])', r'_\1', key).lower().lstrip('_')
             if snake != key:
                 template = template.replace('{{' + snake + '}}', str(value))
+
+    # Anything still unresolved would go out to the customer as literal
+    # "{{source}}". The lead templates happen to fill completely from a lead
+    # row, but the same welcome template is documented for contacts, which have
+    # no `source` — so the leak is one entityType away, not hypothetical.
+    # Blank it and say which tokens were missing: an empty label is a cosmetic
+    # flaw, raw template syntax in a customer's inbox is not.
+    leftover = re.findall(r'\{\{(\w+)\}\}', template)
+    if leftover:
+        logger.warning(f"_fill_tokens: unresolved tokens dropped: {sorted(set(leftover))}")
+        template = re.sub(r'\{\{\w+\}\}', '', template)
     return template
 
 
-def _log_sent_email(to: str, subject: str, event_type: str):
-    """Insert an audit_log row for the sent email."""
+def _log_send_attempt(to: str, subject: str, event_type: str, result: dict):
+    """Record what actually happened to a template send.
+
+    This wrote action='sent' whenever send_email returned success — but success
+    on both transports means "the provider ACCEPTED this for delivery", which is
+    the SMTP 250 or the Resend 200, not evidence anybody received it. The order
+    notification path stops at 'accepted' for exactly this reason; this path
+    claimed more than it knew, in the same audit table.
+
+    So: record the provider's own answer. 'accepted' when it took the message,
+    'failed' when it did not — and log the failures too, which the old
+    success-only call discarded, leaving a refused send with no trace at all.
+    """
+    accepted = bool(result.get('success'))
+    action   = 'accepted' if accepted else 'failed'
+
+    payload = {
+        'to':              to,
+        'subject':         subject,
+        'event_type':      event_type,
+        'outcome':         action,
+        'provider':        result.get('provider'),
+        'provider_msg_id': result.get('provider_message_id'),
+        'provider_status': result.get('provider_status'),
+        # Only meaningful on failure; the provider's refusal reason.
+        'reason':          None if accepted else result.get('message'),
+    }
+
     try:
-        safe_to      = to.replace("'", "''")
-        safe_subject = subject.replace("'", "''")
-        safe_type    = event_type.replace("'", "''")
-        query = (
-            f"INSERT INTO audit_log (entity, entity_id, action, payload, created_at) "
-            f"VALUES ('email', gen_random_uuid(), 'sent', "
-            f"'{{\"to\":\"{safe_to}\",\"subject\":\"{safe_subject}\","
-            f"\"event_type\":\"{safe_type}\"}}'::jsonb, now());"
-        )
         conn = get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(query)
+                # Parameterised — the old build interpolated the subject and
+                # recipient into JSON by hand, which a quote in a company name
+                # was one token away from breaking.
+                cur.execute(
+                    "INSERT INTO audit_log (entity, entity_id, action, payload, created_at) "
+                    "VALUES ('email', gen_random_uuid(), %s, %s::jsonb, now())",
+                    (action, json.dumps(payload)),
+                )
             conn.commit()
         finally:
             conn.close()

@@ -86,6 +86,17 @@ def _build_passthru_message(raw: str, chat_input: dict) -> str:
     return current.strip()
 
 
+
+def _operation_intent(raw: str):
+    """Operation extraction; None on any failure so routing never breaks."""
+    try:
+        from app.core.operation_intent import extract
+        return extract(raw)
+    except Exception as exc:                                # pragma: no cover
+        logger.debug(f'operation_intent unavailable: {exc}')
+        return None
+
+
 def route_request(message: str, chat_input: dict) -> Dict[str, Any]:
     """
     Inspect the incoming message and return a routing decision dict.
@@ -109,6 +120,26 @@ def route_request(message: str, chat_input: dict) -> Dict[str, Any]:
     """
     raw = (message or '').strip()
     msg = raw.lower()
+
+    # ── Operation preservation (Phase 7) ────────────────────────────────────
+    # The noun-phrase heuristics below never consult the leading VERB, so
+    # "Merge these duplicate contacts." matched the substring 'duplicate
+    # contacts' and became a duplicates SEARCH, and "Archive these contacts."
+    # was parsed as a person named "these contacts". The request reached the
+    # right module and then quietly became a different operation.
+    #
+    # This runs FIRST so an explicit verb always outranks a noun match. With a
+    # named target the colon-protocol handlers below still do the work; with no
+    # identifiable target the request is passed through to the agent, which
+    # asks which records to act on. Passing through is the point: answering a
+    # different question is what this guard exists to stop.
+    _op = _operation_intent(raw)
+    if _op and not _op['has_target']:
+        logger.info(f"[operation-preserve] {_op['operation']} requested with no "
+                    f"identifiable target -> passthrough (agent will ask)")
+        return {'router_action': False,
+                'current_message': _build_passthru_message(raw, chat_input)}
+
 
     # ── Deterministic web-search route ───────────────────────────────────────
     # Explicit "search the web…" phrasings go straight to mode=web_search so
