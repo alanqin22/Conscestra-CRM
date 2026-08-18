@@ -175,8 +175,19 @@ _VERB_MAP = [
 # Negation. "Don't merge these" contains merge; acting on it is the worst
 # possible reading of a user's words.
 _NEGATION_RE = re.compile(
-    r"\b(do\s*n[o']?t|don t|never|no need to|rather not|instead of|without|"
-    r"should\s*n[o']?t|must\s*n[o']?t|avoid)\b", re.I)
+    # Contracted auxiliaries are listed individually. `do\s*n[o']?t` covers
+    # "do not" and "don't" but NOT "didn't", "won't" or "can't" — those are
+    # different auxiliaries, not different spellings of the same one, and they
+    # matched no guard at all. "we won't be merging these" was refused only
+    # because no request-framing rule happened to fire: safety by coincidence,
+    # and the next recall change removes the coincidence.
+    r"\b("
+    r"do\s*n[o']?t|does\s*n[o']?t|did\s*n[o']?t|don t|"
+    r"wo\s*n[o']?t|ca\s*n[o']?t|cannot|"
+    r"should\s*n[o']?t|would\s*n[o']?t|must\s*n[o']?t|"
+    r"is\s*n[o']?t|are\s*n[o']?t|"
+    r"never|no need to|rather not|instead of|without|avoid|hold off"
+    r")\b", re.I)
 
 # Capability / explanatory questions. "Can I merge..." asks what is possible;
 # "Can you merge..." asks for it to happen. The pronoun carries the whole
@@ -235,7 +246,44 @@ _UUID_RE = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b")
 _PHONE_RE = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
-_NAME_RE = re.compile(r"(?<!^)\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})+\b")
+# Two or more adjacent word tokens, CASE-INSENSITIVE. The previous pattern
+# required capitals, which cost every request typed the way people actually
+# type: "i want isla bennett archived", "hugo mendes should be disqualified".
+# Requiring capitals is requiring the user to punctuate before the system will
+# identify who they mean.
+#
+# Case-insensitivity has to be paid for. Capitals were doing the work of
+# separating a person's name from an ordinary noun phrase, so _NAME_STOP takes
+# that job: any token that is CRM vocabulary — an operation verb, a record
+# type, a determiner, a filler word — disqualifies the phrase. "duplicate
+# contacts" and "the archived record" are noun phrases; "isla bennett" is not.
+_NAME_RE = re.compile(r"(?<!^)\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})+)\b")
+
+_NAME_STOP = {
+    # operations and their inflections
+    "merge", "merged", "merging", "archive", "archived", "archiving",
+    "restore", "restored", "restoring", "delete", "deleted", "deleting",
+    "convert", "converted", "converting", "qualify", "qualified",
+    "qualifying", "disqualify", "disqualified", "score", "scored", "scoring",
+    "combine", "combined", "combining", "consolidate", "consolidated",
+    "duplicate", "duplicates", "dupes", "dupe", "remove", "removed",
+    "update", "updated", "create", "created", "put", "bring", "take", "get",
+    # record types
+    "contact", "contacts", "account", "accounts", "lead", "leads", "order",
+    "orders", "invoice", "invoices", "opportunity", "opportunities",
+    "product", "products", "record", "records", "customer", "customers",
+    "company", "companies", "person", "people",
+    # grammar and filler
+    "the", "these", "those", "this", "that", "them", "they", "it", "its",
+    "and", "for", "with", "from", "into", "onto", "please", "should", "would",
+    "could", "want", "wants", "wanted", "need", "needs", "needed", "have",
+    "has", "had", "are", "was", "were", "been", "being", "you", "your", "our",
+    "his", "her", "their", "all", "any", "some", "one", "two", "both",
+    "before", "after", "today", "tomorrow", "yesterday", "next", "last",
+    "week", "month", "year", "friday", "monday", "audit", "mistake", "error",
+    "not", "dont", "doesnt", "same", "old", "new", "just", "really", "sec",
+    "when", "while", "since", "because", "over", "under", "about",
+}
 # Referents that look like targets and identify nothing.
 _VAGUE_RE = re.compile(
     r"\b(these|those|them|it|the (duplicate|dupe)s?|all|any|my)\b", re.I)
@@ -291,10 +339,10 @@ def _names_only_outputs(text: str, named: str) -> bool:
     for pat_name, pat in _OBJECT_MAP:
         if pat_name != named:
             continue
-        for m in re.finditer(rf"({pat})", text, re.I):
+        for m in re.finditer(rf"\b({pat})\b", text, re.I):
             saw_any = True
             before = text[max(0, m.start() - 24):m.start()].lower()
-            if not re.search(r"(into|to|as)\s+(an?\s+)?$", before):
+            if not re.search(r"\b(into|to|as)\s+(an?\s+)?$", before):
                 return False          # this mention is the subject
     return saw_any
 
@@ -397,16 +445,16 @@ def _find_operation(text: str) -> Optional[str]:
     framing guard, because "mentions merge" and "asks to merge" are different
     sentences and only one of them may execute.
     """
+    # Guards run through guard_for(), the single source of truth. They used to
+    # be re-implemented inline here, so the same five checks existed twice —
+    # and the copies could drift without anything noticing. The symptom that
+    # exposed it was a sabotage test that disabled a guard and saw no change:
+    # the other copy was still running, which means the test proved nothing
+    # about the guard it was aiming at.
+    #
     # Each guard is a reason NOT to act, and outranks any verb found later.
-    if _NEGATION_RE.search(text):
-        return None
-    if _CAPABILITY_Q_RE.search(text):
-        return None
-    if _PAST_DESC_RE.search(text):
-        return None
-    if _AMBIGUOUS_RE.match(text):
-        return None
-    if _READ_LEAD_RE.match(text):
+    rule, _protects = guard_for(text)
+    if rule:
         return None
 
     # Verb in first position -- the unambiguous imperative.
@@ -414,13 +462,26 @@ def _find_operation(text: str) -> Optional[str]:
         if re.match(rf"^\s*(please\s+)?({pat})\b", text, re.I):
             return name
 
-    # Verb later in the sentence, but only inside a recognised request framing.
-    # Without that condition "there's a bunch of dupes in here" and "we already
-    # merged those" would read alike.
-    if _REQUEST_FRAME_RE.search(text):
-        for name, pat in _VERB_MAP:
-            if re.search(rf"\b({pat})\b", text, re.I):
-                return name
+    # Verb anywhere in the sentence. The previous version required one of a
+    # list of recognised request framings, which is why five phrasing families
+    # scored between 0% and 29%: "needs merging", "would you mind archiving",
+    # "should be merged" and "these are dupes, merge them" are all ordinary
+    # requests wearing frames nobody had enumerated. Enumerating frames is an
+    # unbounded job — there is always another way to ask politely.
+    #
+    # Safety does not come from the frame list. It comes from the guards above,
+    # which is the right place for it: negation, capability questions,
+    # past-tense description, reads and ambiguity are what separate "mentions
+    # merge" from "asks to merge", and every one of them is checked BEFORE this
+    # point. A verb that survives all five guards is a request, whatever
+    # sentence position it occupies.
+    #
+    # This is the trade the guard-calibration work in Stage 5 was buying: make
+    # the guards precise enough to carry the safety load alone, then stop
+    # second-guessing them with a frame whitelist.
+    for name, pat in _VERB_MAP:
+        if re.search(rf"\b({pat})\b", text, re.I):
+            return name
     return None
 
 
@@ -446,10 +507,50 @@ def _find_target(text: str, operation: str) -> Dict[str, Any]:
     # A full proper name only — "these contacts" must not qualify.
     stripped = re.sub(r"^\s*(please\s+)?\w+\b", "", text).strip()
     if not _VAGUE_RE.match(stripped):
-        m = _NAME_RE.search(text)
-        if m:
-            params["name"] = m.group(0)
+        name = _first_proper_name(text)
+        if name:
+            params["name"] = name
     return params
+
+
+def _first_proper_name(text: str) -> Optional[str]:
+    """The first multi-token phrase that reads as a name, or None.
+
+    Every candidate token must be outside _NAME_STOP. A single CRM word
+    anywhere in the phrase disqualifies it, because that is the signal capitals
+    used to carry: "duplicate contacts" and "archived record" are noun phrases
+    describing WHAT, while "isla bennett" and "roy health group" name WHICH.
+
+    Returning None is the safe outcome — it produces MissingTarget, and asking
+    which record is always better than acting on a phrase that merely looked
+    like a name.
+    """
+    # REVERTED to requiring capitals, and the reason is worth keeping.
+    #
+    # A case-insensitive version was built and measured: it read lowercase
+    # names correctly ("isla bennett", "hugo mendes", "roy health group") and
+    # was rejected anyway. Scanning for runs of non-stop-list tokens also
+    # produced targets out of ordinary English — "be possible to", "first
+    # place", "is needing", "email basically" — because a stop-list cannot
+    # enumerate every word that is not a name. Sixteen ASK cases invented a
+    # target, and one capability question became an executable
+    # account.restore on a record called "be possible to".
+    #
+    # Capitals are a weak signal, but they are the user's own assertion that a
+    # token is a proper noun. Nothing in the sentence's shape replaces that.
+    # Reading lowercase names needs a different KIND of evidence — matching
+    # candidate spans against real record names in the database — not a better
+    # guess about English. Until then, missing the name and asking which
+    # record is the correct outcome.
+    m = _NAME_RE.search(text)
+    if not m:
+        return None
+    phrase = m.group(1).strip()
+    tokens = [t for t in re.split(r"\s+", phrase) if t]
+    if len(tokens) < 2 or any(t.lower().strip("'’-") in _NAME_STOP
+                              for t in tokens):
+        return None
+    return phrase
 
 
 def _resolve_core(message: str, object_hint: Optional[str] = None
