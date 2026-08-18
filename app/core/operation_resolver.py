@@ -158,7 +158,7 @@ _VERB_MAP = [
     ("disqualify", r"disqualif\w*"),
     ("qualify",    r"qualif\w*"),
     ("merge",      r"merg\w*|combin\w*|consolidat\w*|de-?duplicat\w*|dedup\w*"),
-    ("archive",    r"archiv\w*|put\s+(\w+\s+){0,3}away"),
+    ("archive",    r"archiv\w*|put\s+(\w+\s+){0,3}away|get\s+rid\s+of"),
     ("convert",    r"convert\w*|turn\s+(\w+\s+){0,3}into"),
     ("score",      r"scor\w*"),
     ("delete",     r"delet\w*|remov\w*"),
@@ -183,8 +183,9 @@ _NEGATION_RE = re.compile(
 # distinction, so they are separated rather than lumped as "interrogative".
 _CAPABILITY_Q_RE = re.compile(
     r"^\s*(can|could|may)\s+(i|we|a|an|the|this|these|those|contacts?|"
-    r"accounts?|leads?)\b"
-    r"|^\s*(how|what|why|when|which|does|do|is|are|tell\s+me|explain)\b"
+    r"accounts?|leads?)\b(?!\s+(get|have|see|grab|pull)\b)"
+    r"|^\s*(how|why|when|which|does|do|is|are|tell\s+me|explain)\b"
+    r"|^\s*what\s+(is|are|does|do|happens?|makes?)\b"
     r"|\bis\s+it\s+possible\b|\bam\s+i\s+able\s+to\b"
     r"|\bhow\s+does\b|\bwhat\s+happens\b", re.I)
 
@@ -197,7 +198,14 @@ _PAST_DESC_RE = re.compile(
 # Reads. The modules own these; the resolver declines them on purpose.
 _READ_LEAD_RE = re.compile(
     r"^\s*(please\s+)?(show|list|find|get|search|display|give|pull|look|"
-    r"check|view|tell)\b", re.I)
+    r"check|view|tell)\b(?!\s+rid\b)", re.I)
+
+# A write clause joined to a read clause. "Find the duplicates AND MERGE the
+# ones I pick" contains an instruction the read guard would otherwise discard.
+_TRAILING_WRITE_RE = re.compile(
+    r"\b(and|then|,)\s+(please\s+)?(also\s+)?"
+    r"(merge|archive|restore|delete|convert|qualify|disqualify|score|"
+    r"update|combine|consolidate)\b", re.I)
 
 # Vague verbs that name no operation. Guessing one here is exactly the
 # substitution this whole programme exists to remove.
@@ -312,27 +320,73 @@ def _find_object(text: str, operation: Optional[str] = None) -> Optional[str]:
     return found[0]
 
 
-def _find_operation_traced(text: str) -> "tuple[Optional[str], str]":
-    """(operation, reason), where reason names the GUARD that fired.
 
-    Inferring the reason from a heuristic afterwards ("was a verb present?")
-    reported `no_operation` for "Show me the duplicate contacts", which the
-    read guard had rejected. Same answer, wrong cause — the fix for a missing
-    verb is vocabulary, the fix for a read guard is nothing at all. Reporting
-    the guard directly is the difference between telemetry and a second guess.
+# ── Guards, named ───────────────────────────────────────────────────────────
+# Each entry is (rule_name, compiled_pattern, protects). The name reaches the
+# response, because "not_imperative" in aggregate cannot answer the only
+# question that matters when recall is missing: WHICH safety property is
+# costing it, and is that trade worth making?
+#
+# Stage 4B measured 10 legitimate EXECUTE/ASK requests rejected by this set
+# without being able to say which member did it.
+_GUARDS = [
+    ("negation",        _NEGATION_RE,
+     "a negated request must never execute"),
+    ("capability_question", _CAPABILITY_Q_RE,
+     "'can I merge' asks what is possible; answering it by merging is the "
+     "worst possible reading"),
+    ("past_description", _PAST_DESC_RE,
+     "'which contacts were merged' reports history; it must not create it"),
+    ("ambiguous_verb",  _AMBIGUOUS_RE,
+     "'take care of these' names no operation; guessing one is substitution"),
+    ("read_request",    _READ_LEAD_RE,
+     "reads belong to the modules; claiming them would replace a working "
+     "list with a write"),
+]
+
+
+def guard_for(text: str):
+    """(rule_name, protects) for the guard that rejects `text`, else (None, None).
+
+    A guard is skipped when the same sentence also carries an explicit
+    instruction. Two shapes made this necessary, and both were the guard
+    answering the easier half of a request:
+
+        "Find the duplicates and merge the ones I pick"   read + write
+        "...was archived in error and should be restored" description + write
+
+    Rejecting these protected nothing — no negation, no capability question —
+    while discarding an instruction the user plainly gave.
     """
-    if _NEGATION_RE.search(text):
-        return None, OUTCOME_NOT_IMPERATIVE
-    if _CAPABILITY_Q_RE.search(text):
-        return None, OUTCOME_NOT_IMPERATIVE
-    if _PAST_DESC_RE.search(text):
-        return None, OUTCOME_NOT_IMPERATIVE
-    if _AMBIGUOUS_RE.match(text):
-        return None, OUTCOME_NOT_IMPERATIVE
-    if _READ_LEAD_RE.match(text):
-        return None, OUTCOME_NOT_IMPERATIVE
+    has_trailing_write = bool(_TRAILING_WRITE_RE.search(text))
+    for name, rx, protects in _GUARDS:
+        hit = rx.match(text) if name in ("ambiguous_verb", "read_request") \
+            else rx.search(text)
+        if not hit:
+            continue
+        # Negation is never overridden: "find the dupes and don't merge them"
+        # must still refuse. The other guards yield to an explicit instruction.
+        if has_trailing_write and name in ("read_request", "past_description"):
+            continue
+        return name, protects
+    return None, None
+
+
+def _find_operation_traced(text: str) -> "tuple[Optional[str], str, Optional[str]]":
+    """(operation, outcome, rule).
+
+    `rule` names the guard responsible when nothing was recognised. Reporting
+    the guard rather than inferring it afterwards is the same correction made
+    in Stage 4B one level up: a heuristic reconstruction of the cause was
+    wrong, and the fixes for different causes point in opposite directions.
+    """
+    rule, _protects = guard_for(text)
+    if rule:
+        return None, OUTCOME_NOT_IMPERATIVE, rule
     op = _find_operation(text)
-    return (op, OUTCOME_MATCHED) if op else (None, OUTCOME_NO_OPERATION)
+    if op:
+        return op, OUTCOME_MATCHED, None
+    return None, OUTCOME_NO_OPERATION, None
 
 
 def _find_operation(text: str) -> Optional[str]:
@@ -412,7 +466,7 @@ def _resolve_core(message: str, object_hint: Optional[str] = None
     if not text or not _IMPERATIVE_RE.match(text):
         return None, OUTCOME_NOT_IMPERATIVE
 
-    operation, why = _find_operation_traced(text)
+    operation, why, _rule = _find_operation_traced(text)
     if operation is None:
         return None, why
     if operation in FORM_OWNED:
