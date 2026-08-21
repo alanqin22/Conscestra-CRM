@@ -3446,7 +3446,52 @@ router = APIRouter(tags=["voice-support"])
 
 @router.get("/voice-support/status")
 def voice_support_status():
+    """Operational truth about this line, readable from outside.
+
+    The cancellation block exists because flipping a flag on a deployed
+    environment is otherwise an act of faith: you set the variable, restart, and
+    have no way to confirm the process agrees with you short of phoning it. Two
+    of these are read LIVE rather than at import, so this endpoint reports what
+    the next call will actually do, not what the container believed at boot.
+    """
+    try:
+        from app.core import escalation
+        esc_email = {"enabled": escalation.EMAIL_ENABLED,
+                     "to": escalation.ESCALATION_EMAIL_TO,
+                     "reasons": sorted(escalation._EMAIL_REASONS)}
+    except Exception:                                          # noqa: BLE001
+        esc_email = {"enabled": None, "error": "escalation module unavailable"}
+
     return {"enabled": ENABLED, "otp_ttl_seconds": OTP_TTL,
             "otp_attempts": OTP_ATTEMPTS, "max_turns": MAX_TURNS,
             "operator_numbers": len(_operator_numbers()),
-            "active_calls": len(_CALLS)}
+            "active_calls": len(_CALLS),
+            "order_cancellation": {
+                "enabled": cancel_enabled(),
+                "cancellable_statuses": sorted(CANCELLABLE_STATUSES),
+                "too_late_statuses": sorted(TOO_LATE_STATUSES),
+                "attempts_per_call": CANCEL_ATTEMPTS,
+                "order_attempts_24h": ORDER_ATTEMPTS_24H,
+                "otp_sends_per_hour": OTP_SENDS_PER_HOUR,
+                # The limiter FAILS CLOSED, so a missing table means every
+                # cancellation is refused. Surfacing it here turns that from a
+                # confusing outage into a one-line answer.
+                "rate_limiter_table": _limiter_ready()},
+            "escalation_email": esc_email}
+
+
+def _limiter_ready() -> bool:
+    """Does voice_verification_attempts exist here? Cheap, read-only, and the
+    single most useful thing to know before enabling the feature in a new
+    environment."""
+    try:
+        conn = get_connection()
+        try:
+            conn.set_session(readonly=True)
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass('voice_verification_attempts')")
+                return cur.fetchone()[0] is not None
+        finally:
+            conn.close()
+    except Exception:                                          # noqa: BLE001
+        return False
