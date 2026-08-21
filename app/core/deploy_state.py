@@ -74,6 +74,7 @@ REQUIRED_MIGRATIONS: List[str] = [
     "fix_order_address_overwrite.sql",
     "backfill_contact_shipping_addresses.sql",
     "order_lifecycle_notifications.sql",
+    "order_cancellation_voice.sql",
     # verify_order_test_contacts.sql is DELIBERATELY NOT DECLARED, and this is
     # not the same reason as tier1 below. It is not a schema requirement at all
     # — it flips is_email_verified on a handful of contacts so live sends can be

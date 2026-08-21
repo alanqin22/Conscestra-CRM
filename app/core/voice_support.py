@@ -23,10 +23,21 @@ deterministic tier ladder — never by the LLM:
                          and the scoped queries below inject the account_id
                          from the verified session, never from anything said.
 
-WRITES: never executed from a call. A verified caller's change request
-(phone/email on file) is read back, confirmed, and queued as a governance
-proposal (`contact.update_profile`) for human approval — same queue, critic
-and undo machinery as every other agent write.
+WRITES: never executed from a call, WITH ONE ENUMERATED EXCEPTION. A verified
+caller's change request (phone/email on file) is read back, confirmed, and
+queued as a governance proposal (`contact.update_profile`) for human approval —
+same queue, critic and undo machinery as every other agent write.
+
+    THE EXCEPTION is order cancellation (see ORDER CANCELLATION below):
+    orders.status -> 'cancelled', only from 'pending'/'processing'/'ready',
+    only after an OTP round-trip to the number on the ORDER's contact, and only
+    through one function containing one UPDATE against one table. It does not
+    go through sp_orders, and execute_sp's blanket refusal under customer scope
+    is untouched. The reason it is synchronous rather than proposed: the
+    customer is on the line being told the outcome, and "I've submitted a
+    request" is a different, weaker promise than the one the workflow makes.
+    Every rule that bounds it is enforced by SQL or by deterministic Python —
+    none of it by the prompt.
 
 VERIFICATION HARDENING: 6-digit code, SHA-256 stored (never the code),
 5-minute expiry, single use, 3 attempts then lockout to a human follow-up
@@ -45,6 +56,8 @@ CONFIG (env)
   VOICE_OTP_TTL            300   seconds a texted code stays valid
   VOICE_OTP_ATTEMPTS       3     wrong codes before lockout
   VOICE_SUPPORT_MAX_TURNS  30    hard stop per call
+  VOICE_ORDER_CANCEL_ENABLED 0   the order-cancellation flow on/off (ships dark)
+  VOICE_CANCEL_ATTEMPTS    3     verification attempts per call before lockout
 """
 
 from __future__ import annotations
@@ -126,6 +139,8 @@ def _new_session(from_number: str) -> Dict[str, Any]:
             "contact_id": None, "account_id": None, "owner_id": None,
             "display": None, "pending_question": None,
             "pending_change": None,    # {'field','new_value'}
+            "cancel": None,            # in-flight order-cancellation flow
+            "cancel_auth": None,       # capability-scoped: ONE order, ONE action
             "asked_hint": False, "last_agent": None,
             "transcript": [], "at": time.time()}
 
@@ -881,10 +896,18 @@ def open_callback_obligation(*, conversation_id: str, handle: Optional[str],
         logger.error(f"[voice] could not record the callback obligation: {exc}")
 
 
-def _gather_digits(prompt_inner: str) -> str:
-    """Keypad-only Gather for the verification code — DTMF keeps the code out
-    of the speech transcript and is far more reliable than spoken digits."""
-    return (f'<Gather input="dtmf" numDigits="6" timeout="12" '
+def _gather_digits(prompt_inner: str, num_digits: int = 6,
+                   timeout: int = 12) -> str:
+    """Keypad-only Gather — DTMF keeps the digits out of the speech transcript
+    and is far more reliable than spoken ones.
+
+    num_digits is a parameter because the cancellation flow collects a 10-digit
+    phone number this way. A live call had speech-to-text render
+    '416-889-6638' as '016889. 6638.' — a dropped digit and a 4 heard as a 0.
+    Keypad entry has no such failure mode, and a phone number is the one thing
+    every caller can key in without being asked to spell anything."""
+    return (f'<Gather input="dtmf" numDigits="{int(num_digits)}" '
+            f'timeout="{int(timeout)}" '
             f'action="/voice/support/verify" method="POST">{prompt_inner}'
             f'</Gather>'
             + '<Redirect method="POST">/voice/support/verify</Redirect>')
@@ -893,6 +916,56 @@ def _gather_digits(prompt_inner: str) -> str:
 # ============================================================================
 # LEVEL 0 — KB-grounded wording (no tools, no CRM; script fallback)
 # ============================================================================
+
+# ── Brand mishearing ────────────────────────────────────────────────────────
+# "Conscestra" is an invented word, so speech-to-text reaches for real ones.
+# Observed on a single production call: Concentra, concessor, concessionaire.
+#
+# Retrieval is not the casualty — the KB returns the right article for all
+# three, because embeddings tolerate a wrong token in an otherwise clear
+# question. The ANSWERING model is: told to answer only from approved
+# knowledge and never invent, it treats a word it does not recognise as a
+# reason to decline, and says so ("I'm not sure what 'concessor' refers to").
+# Two good answers were lost that way on one call, while a third recovered on
+# its own — so the behaviour is inconsistent as well as wrong.
+#
+# Normalising is deliberately a FIXED LIST, not fuzzy matching. A phonetic
+# distance function would eventually rewrite a word the caller meant, and on a
+# support line the cost of mangling a real word is higher than the cost of
+# missing an unlisted mishearing. Add observed forms here as calls produce
+# them; the transcript keeps the raw text, so the evidence for the next entry
+# is always in the record.
+# Every entry must be either an observed mishearing or a nonsense string. Two
+# speculative additions were tested and removed: "concession" rewrote "can I
+# get a concession on the price?", and "concerta" is a medication. Aliasing an
+# ordinary English word breaks a sentence that was never about the product —
+# a worse failure than missing an unlisted mishearing, because the caller gets
+# a confidently wrong reading of what they said.
+_BRAND_ALIASES = (
+    # observed in the 2026-08-18 call
+    "concentra", "concessor", "concessionaire",
+    # nonsense strings, no ordinary meaning to collide with
+    "conscentra", "consestra", "consessra", "conchestra", "constestra",
+    "conquestra", "consultra", "con sistra", "con sestra", "kon sestra",
+)
+_BRAND_RE = re.compile(
+    r"\b(" + "|".join(re.escape(a) for a in _BRAND_ALIASES) + r")\b", re.I)
+
+
+def normalise_brand(heard: str) -> str:
+    """Rewrite known mishearings of the product name to 'Conscestra'.
+
+    Applied to the WORKING copy only. The transcript stores what was actually
+    said, so a later reader can see the mishearing rather than a tidied version
+    of the call — and so the alias list can be extended from real evidence.
+    """
+    if not heard:
+        return heard
+    fixed, n = _BRAND_RE.subn("Conscestra", heard)
+    if n:
+        logger.info(f"[voice] brand mishearing normalised x{n}: {heard[:60]!r}")
+    return fixed
+
 
 def _kb_answer(sess: Dict[str, Any], heard: str,
                audience: Optional[str] = "public") -> str:
@@ -906,6 +979,9 @@ def _kb_answer(sess: Dict[str, Any], heard: str,
     try:
         from app.core import knowledge, language, privacy
         from app.core.graph_utils import _get_llm
+        # Both the retrieval and the model see the corrected name. Retrieval
+        # tolerated the mishearing already; the model did not.
+        heard = normalise_brand(heard)
         # Empty subject: fixed channel labels pollute term matching. A miss
         # is logged as a KB gap — demand for the nightly gap miner.
         #
@@ -961,6 +1037,11 @@ async def _operator_answer(sess: Dict[str, Any], heard: str) -> str:
     from app.core.write_guard import WritePermissionError, set_readonly_channel
 
     set_readonly_channel("voice")
+    # Same mishearing, different tier. Staff say the product name more often
+    # than customers do, and this tier routes to a module agent rather than
+    # the KB — a request for "Concentra's overdue invoices" is one unfamiliar
+    # token away from being routed on a word that means nothing here.
+    heard = normalise_brand(heard)
     # Bare follow-ups ("yes", "the second one") stay with the agent this call
     # was last talking to — same stickiness as the SMS operator tier.
     from app.core.telephony import _SMS_FOLLOWUP_RE
@@ -1615,6 +1696,1307 @@ def undo_profile_update(ap: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================================
+# ORDER CANCELLATION BY PHONE — the one write this line is allowed to make
+# ============================================================================
+# Design: docs/order_cancellation_by_phone_design.md
+#
+# THE INVARIANT THIS AMENDS, AND EXACTLY HOW FAR.
+#   The module docstring says "WRITES: never executed from a call." That stays
+#   true for everything except ONE transition, enumerated here and nowhere else:
+#   orders.status -> 'cancelled', from 'pending' | 'processing' | 'ready', for an
+#   order whose customer has just proven possession of the phone on file. It does
+#   NOT go through sp_orders, and execute_sp's blanket refusal under customer
+#   scope (database.py) is untouched — a routing bug still cannot reach a
+#   stored procedure from this call.
+#
+# WHERE EACH RULE IS ENFORCED. Not one of them is enforced by the prompt:
+#   "only pending/processing/ready"  -> the WHERE clause of the UPDATE itself
+#   "did it actually happen"         -> the row count from RETURNING
+#   "who is allowed"                 -> an OTP round-trip to the number ON FILE
+#   "where the email goes"           -> contacts.email via resolve_recipient
+#
+# ORDERING, AND WHY IT IS NOT THE ORDER THE SPEC LISTS.
+#   The workflow says: look the order up, then verify identity. Taken literally
+#   that builds an ORDER-EXISTENCE ORACLE — order numbers end in a global
+#   sequence, so a caller who hears a different response for "found" than for
+#   "not found" can enumerate them. Worse, sending the OTP first would let an
+#   enumerator make a stranger's phone ring by reciting numbers.
+#
+#   So the three spoken factors are collected FIRST, from every caller, and the
+#   OTP is sent only once all three already match. A wrong order number and a
+#   wrong name are indistinguishable from outside, and no SMS is ever sent to
+#   someone whose name, address and email the caller could not already state.
+
+def cancel_enabled() -> bool:
+    """Read PER CALL, not at import, for the same reason `_operator_numbers()`
+    is: an env fix should apply without a restart, and — more importantly here —
+    a ROLLBACK should take effect immediately.
+
+    This flag is coupled to a knowledge-base article. While it is on, the KB
+    tells callers "the phone assistant can cancel it during the call"; while it
+    is off, that sentence is a promise the code will not keep, and the level-0
+    tier will still read it out. A module-level constant means the disagreement
+    persists until someone restarts the process. Reading it live keeps the
+    window as short as the operator's intent.
+
+    See _cancel_unavailable() for the other half of that coupling.
+    """
+    return _flag("VOICE_ORDER_CANCEL_ENABLED")
+
+
+def _cancel_unavailable(sess: Dict[str, Any]) -> Tuple[str, str]:
+    """What a caller hears when they ask to cancel and the feature is OFF.
+
+    THE BUG THIS EXISTS TO KILL, found on the first live test call. With the
+    flag off, the cancellation intent used to fall through to the level-0 KB
+    brain — which answers from the article describing this very feature:
+    "the phone assistant can cancel it for you during the call". So a disabled
+    capability advertised itself, and the caller was promised something no code
+    path could deliver.
+
+    Catching the intent regardless of the flag, and branching on the flag for
+    the RESPONSE, makes the two impossible to disagree: the KB never gets asked
+    about cancellation on this line. A disabled feature routes to a human, which
+    is a smaller promise and a true one.
+    """
+    _escalate_cancel(sess, "order_cancel_unavailable",
+                     "caller asked to cancel an order while "
+                     "VOICE_ORDER_CANCEL_ENABLED=0 — routed to a human",
+                     priority="high")
+    return ("I can't cancel an order over the phone myself at the moment, so I "
+            "don't want to promise something I can't finish. I've passed this "
+            "to a colleague, who will call you back to cancel it for you. Is "
+            "there anything else I can help with?"), "speech"
+
+# Case-folded. 'Invoiced' exists in production with a capital I, so a raw
+# comparison would miss it and fall into the wrong branch.
+CANCELLABLE_STATUSES = frozenset({"pending", "processing", "ready"})
+# The spec calls this class "shipping"; the database has never held that value.
+# The real one is 'shipped'.
+TOO_LATE_STATUSES = frozenset({"shipped", "delivered", "completed"})
+# Deliberately NOT a third list. 'cancelled', 'Invoiced', 'refunded', NULL and
+# whatever gets added next year reach the escalate branch by falling off the end
+# of the two sets above — there is no `else: cancel` anywhere below.
+
+CANCEL_ATTEMPTS = int(os.getenv("VOICE_CANCEL_ATTEMPTS", "3"))
+# Re-prompts for a digits question that came back with no number in it, shared
+# across ALL steps of one call rather than budgeted per step. Per-step budgets
+# multiply: three steps at two each is six extra turns a caller can be held on,
+# which is its own kind of failure.
+CANCEL_REPROMPTS = int(os.getenv("VOICE_CANCEL_REPROMPTS", "3"))
+
+# CROSS-CALL CAPS. Both were raised on 2026-08-20 after a live call in which a
+# customer passed ALL THREE factors and was still refused: the per-destination
+# counter (then 2/hour) had been spent by earlier attempts on the same number.
+#
+# The caps were set when the three factors were checked AFTER the code was sent.
+# They are not any more (§4.3): to make a single SMS happen, a caller must
+# already state the last name, the postcode and the phone number. Blind
+# enumeration cannot reach the sender at all, so these counters are no longer
+# the anti-harassment front line — they are a backstop against a loop — and
+# tuning them for the attacker was costing real customers their cancellation.
+#
+# The enumeration brake is ORDER_ATTEMPTS_24H, which still binds hard: an
+# attacker must name a specific order, and gets five tries at it per day.
+ORDER_ATTEMPTS_24H = int(os.getenv("VOICE_CANCEL_ORDER_ATTEMPTS", "5"))
+OTP_SENDS_PER_HOUR = int(os.getenv("VOICE_CANCEL_OTP_PER_HOUR", "5"))
+_CANCEL_POLICY = "voice_order_cancel"
+
+# ONE sentence for every verification failure — wrong order number, wrong name,
+# wrong address, wrong email, no address on file, rate-limited, ambiguous match.
+# The caller cannot tell which, so nothing about the order (not even whether it
+# exists) leaks. The real reason goes to the human, in the escalation record.
+_CANCEL_REFUSAL = (
+    "I'm sorry — I can't process the cancellation, because the information "
+    "provided doesn't match our records. I've asked a colleague to follow up "
+    "with you.")
+
+_CANCEL_RE = _intent_re(
+    r"\b(cancel|cancelling|canceling|call off|stop)\b.{0,24}"
+    r"\b(order|purchase|shipment)\b"
+    r"|\b(order|purchase)\b.{0,24}\b(cancel|cancelled|canceled)\b",
+    latin=["annuler ma commande", "annuler la commande", "annuler une commande",
+           "cancelar mi pedido", "cancelar el pedido"],
+    cjk=["取消订单", "取消訂單", "取消我的订单"])
+
+
+# ── Normalisation: spoken text is not typed text ────────────────────────────
+
+def _fold(text: str) -> str:
+    """Casefold + strip accents and punctuation. STT does not reproduce
+    hyphens, apostrophes or accents reliably, so comparing raw strings fails
+    honest callers far more often than it catches dishonest ones."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", (text or ""))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"[^0-9a-zA-Z\s]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+_DIGIT_WORDS = {
+    "zero": "0", "oh": "0", "o": "0", "nought": "0",
+    "one": "1", "won": "1", "two": "2", "to": "2", "too": "2",
+    "three": "3", "tree": "3", "four": "4", "for": "4", "fore": "4",
+    "five": "5", "six": "6", "sex": "6", "seven": "7",
+    "eight": "8", "ate": "8", "nine": "9", "niner": "9",
+}
+_TENS_WORDS = {
+    "twenty": "2", "thirty": "3", "forty": "4", "fourty": "4", "fifty": "5",
+    "sixty": "6", "seventy": "7", "eighty": "8", "ninety": "9",
+}
+_TEEN_WORDS = {
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15", "sixteen": "16", "seventeen": "17",
+    "eighteen": "18", "nineteen": "19",
+}
+
+
+def _words_to_digits(text: str) -> str:
+    """'M five C one S six' → 'M 5 C 1 S 6'.
+
+    People SPELL postcodes and phone numbers aloud, so the recogniser returns
+    number WORDS, not digits — and every comparison downstream is written
+    against digits. Without this, a caller who reads their postcode out
+    perfectly is refused, which is the same class of defect that failed the
+    first two live calls.
+
+    The homophones are deliberate. A recogniser hearing a digit string with no
+    sentence context routinely returns 'to' for two, 'for' for four, 'ate' for
+    eight, 'oh' for zero. Mapping them is safe HERE because this runs only on
+    answers to "what is your postcode / phone number" — never on free prose,
+    where turning every 'to' into a 2 would be nonsense.
+
+    Compound forms are handled because people group digits when they read them
+    back: "sixty six thirty eight" is a completely ordinary way to say 6638, and
+    a converter that only knows single digits refuses it. So are teens
+    ("sixteen" -> 16) and the British "double six" -> 66.
+    """
+    tokens = [t for t in re.split(r"(\W+)", text or "")]
+    out: List[str] = []
+    i = 0
+    while i < len(tokens):
+        raw = tokens[i]
+        word = raw.strip().lower()
+        nxt = tokens[i + 2].strip().lower() if i + 2 < len(tokens) else ""
+
+        if word == "double" and nxt in _DIGIT_WORDS:
+            out.append(_DIGIT_WORDS[nxt] * 2)
+            i += 3
+            continue
+        if word == "triple" and nxt in _DIGIT_WORDS:
+            out.append(_DIGIT_WORDS[nxt] * 3)
+            i += 3
+            continue
+        if word in _TENS_WORDS:
+            # "sixty six" -> 66 ; a bare "sixty" -> 60
+            if nxt in _DIGIT_WORDS and nxt not in ("zero", "oh", "o"):
+                out.append(_TENS_WORDS[word] + _DIGIT_WORDS[nxt])
+                i += 3
+                continue
+            out.append(_TENS_WORDS[word] + "0")
+            i += 1
+            continue
+        if word in _TEEN_WORDS:
+            out.append(_TEEN_WORDS[word])
+            i += 1
+            continue
+        out.append(_DIGIT_WORDS.get(word, raw))
+        i += 1
+    return "".join(out)
+
+
+def _postal(text: str) -> str:
+    """'M5V 3A8' / 'm5v3a8' / 'M 5 V 3 A 8' -> 'm5v3a8'."""
+    return re.sub(r"[^0-9a-z]+", "", (text or "").lower())
+
+
+def _postal_matches(said: str, stored_pc: str) -> bool:
+    """Is the spoken postcode the stored one, allowing for transcription damage?
+
+    Exact match first. Then a bounded tolerance, because a live call produced
+    'F5C. 16.' for 'M5C 1S6' — an M heard as F and an S swallowed. A caller who
+    reads their postcode out correctly should not be refused for that.
+
+    The tolerance: the DIGITS must match exactly and in order, and at least one
+    LETTER must agree. A Canadian postcode is three digits and three letters, so
+    requiring all three digits keeps roughly 1-in-1000 discrimination, and the
+    letter check stops a bare digit-sequence coincidence. A genuinely different
+    postcode fails on the digits ('K1A 0B1' -> 101, not 516).
+
+    Deliberately NOT a fuzzy edit-distance: that would accept a wrong postcode
+    that happens to be typographically close, which is a different thing from
+    accepting a right one that was misheard.
+    """
+    said_norm = _postal(_words_to_digits(said))
+    if not stored_pc:
+        return False
+    if stored_pc in said_norm:
+        return True
+    said_digits = [ch for ch in said_norm if ch.isdigit()]
+    stored_digits = [ch for ch in stored_pc if ch.isdigit()]
+    if not stored_digits or said_digits != stored_digits:
+        return False
+    said_letters = {ch for ch in said_norm if ch.isalpha()}
+    stored_letters = {ch for ch in stored_pc if ch.isalpha()}
+    return bool(said_letters & stored_letters)
+
+
+def _street_number(text: str) -> str:
+    m = re.match(r"\s*(\d+)", (text or "").strip())
+    return m.group(1) if m else ""
+
+
+def _soundex(word: str) -> str:
+    """Classic Soundex. Dependency-free, deterministic, and enough for the job.
+
+    'Alan' and 'Allen' are the same name said once and transcribed twice; so are
+    'Catherine'/'Katherine', 'Sean'/'Shawn', 'Smyth'/'Smith'. A recogniser picks
+    whichever spelling its language model prefers, and an exact comparison then
+    refuses the person whose name it is. That happened on the second live call.
+
+    Soundex is crude — it is ASCII-oriented and it collapses some genuinely
+    different names together. Both are acceptable HERE and would not be if this
+    decided authorization: it does not. See _verify_identity's docstring.
+    """
+    w = re.sub(r"[^a-z]", "", (word or "").lower())
+    if not w:
+        return ""
+    codes = {**dict.fromkeys("bfpv", "1"), **dict.fromkeys("cgjkqsxz", "2"),
+             **dict.fromkeys("dt", "3"), "l": "4",
+             **dict.fromkeys("mn", "5"), "r": "6"}
+    out = w[0].upper()
+    last = codes.get(w[0], "")
+    for ch in w[1:]:
+        code = codes.get(ch, "")
+        if code and code != last:
+            out += code
+        if ch not in "hw":
+            last = code
+    return (out + "000")[:4]
+
+
+def _name_matches(said: str, stored: str) -> bool:
+    """Does the caller's spoken name contain the stored name?
+
+    TWO RULES, and the second exists because of a live test call.
+
+    1. TOKEN SUBSET — every stored token appears as a spoken token. "Turner,
+       Elias" matches "Elias Turner"; a bare surname does not.
+
+    2. CONTIGUOUS RUN, DESPACED — the stored name, with spaces removed, equals
+       some run of consecutive spoken words with spaces removed.
+
+    Rule 2 is not a nicety. Speech recognition splits and joins names
+    constantly: "Testcase" comes back as "Test case", "MacDonald" as "Mac
+    Donald", "Van Der Berg" as "Vanderberg". Under rule 1 alone the stored token
+    'testcase' is simply absent from {alan, test, case} and an honest caller is
+    refused — which is exactly what happened on the first end-to-end call.
+
+    Rule 2 is deliberately NOT a substring test. 'annlee' IS a substring of
+    'marianneleek', so `stored_despaced in said_despaced` would match Marianne
+    Leek against Ann Lee. Requiring a run of WHOLE spoken words to despace to
+    exactly the stored name keeps the boundaries that make the comparison mean
+    something.
+    """
+    said_tokens = [t for t in said.split() if t]
+    stored_tokens = [t for t in stored.split() if len(t) > 1]
+    if not stored_tokens or not said_tokens:
+        return False
+
+    long_said = {t for t in said_tokens if len(t) > 1}
+    if set(stored_tokens) <= long_said:
+        return True
+
+    target = "".join(stored_tokens)
+    n = len(said_tokens)
+    for i in range(n):
+        run = ""
+        for j in range(i, n):
+            run += said_tokens[j]
+            if len(run) > len(target):
+                break
+            if run == target:
+                return True
+
+    # 3. PHONETIC — every stored token has a same-sounding spoken token.
+    #    'Alan' came back as 'Allen' on the second live call. A recogniser picks
+    #    a spelling from its language model; refusing the person whose name it
+    #    is because it picked the other one is not a security control, it is a
+    #    defect that sends every such caller to a human.
+    said_codes = {_soundex(t) for t in long_said}
+    said_codes.discard("")
+    stored_codes = {_soundex(t) for t in stored_tokens}
+    stored_codes.discard("")
+    return bool(stored_codes) and stored_codes <= said_codes
+
+
+def _email_key(text: str) -> Optional[Tuple[str, str]]:
+    """A spoken or typed email address → (local, domain), normalised for
+    comparison, or None when no address is recoverable.
+
+    WHY NOT _spoken_email(). That helper (used by the profile-change flow) finds
+    an address with a regex, so on dictated speech it captures only the last
+    whitespace-free run before the '@': "alan testcase 410b at seed dot
+    agentorc dot ca" yields '410b@seed.agentorc.ca'. Everything before the final
+    space is silently dropped, and the comparison then fails for a caller who
+    read their address out correctly. Measured on the first live call.
+
+    The local part is reduced to alphanumerics, so dropped or invented
+    punctuation ('-' heard as nothing, or as 'dash') cannot decide the outcome.
+    That is a deliberate, small loosening: hyphens and dots in a local part are
+    not knowledge an attacker lacks once they know the letters, and this factor
+    corroborates the OTP rather than replacing it. The DOMAIN keeps its dots —
+    'seed.agentorc.ca' and 'seedagentorc.ca' are different hosts.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    t = re.sub(r"\s*\bat sign\b\s*|\s*\bat\b\s*", "@", t)
+    t = re.sub(r"\s*\b(?:dot|point|period)\b\s*", ".", t)
+    t = re.sub(r"\s*\b(?:dash|hyphen|minus)\b\s*", "-", t)
+    t = re.sub(r"\s*\b(?:underscore|under score)\b\s*", "_", t)
+    t = re.sub(r"\s+", "", t)
+    if "@" not in t:
+        return None
+    local, _, domain = t.rpartition("@")
+    local = re.sub(r"[^a-z0-9]", "", local)
+    domain = re.sub(r"[^a-z0-9.]", "", domain).strip(".")
+    if not local:
+        return None
+    # A domain that did not survive transcription is reported as None rather
+    # than discarding the whole answer. On the second live call the caller said
+    # "Alan dot Morgan at seed dot agentorc dot ca" and the recogniser produced
+    # "Alan dot Morgan at seat." — the LOCAL PART, which carries the entropy,
+    # was perfect. Throwing that away because the tail was mangled refuses a
+    # caller who answered correctly. _verify_identity decides what to do with a
+    # missing domain; this function only reports what was recoverable.
+    return local, (domain if "." in domain else None)
+
+
+def _has_digits(text: str) -> bool:
+    """Did this utterance carry ANY number at all, spoken or written?
+
+    Used to tell a wrong answer apart from half an answer. Speech recognisers
+    endpoint on pauses, and people pause in the middle of postcodes and phone
+    numbers, so a fragment with no digits in it is far more likely to be a split
+    utterance than a genuine mismatch — and treating it as a mismatch burns an
+    attempt AND leaves the second half to be scored against the next question.
+    """
+    return bool(re.search(r"\b\d+\b", _words_to_digits(text or "")))
+
+
+def _parse_order_number(heard: str) -> Optional[str]:
+    """The last six digits spoken. Order numbers look like SO-2026-105259, and
+    the suffix is unique across every order in the database — but STT mangles
+    the prefix ('S O twenty twenty six') far more often than the digits.
+
+    Returns the digit suffix, not a full order number: the lookup matches on it
+    and refuses if more than one row comes back, so uniqueness is verified
+    against the data rather than assumed from the format."""
+    digits = re.sub(r"\D", "", heard or "")
+    return digits[-6:] if len(digits) >= 6 else None
+
+
+# ── Cross-call rate limiting (voice_verification_attempts) ──────────────────
+
+def _hash_key(prefix: str, value: str) -> str:
+    """Phone numbers are HASHED into the counter key. This table must never
+    become a second directory of customer phone numbers."""
+    return f"{prefix}:{hashlib.sha256((value or '').encode('utf-8')).hexdigest()}"
+
+
+def _rate_ok(counter_key: str, cap: int, window_secs: int) -> bool:
+    """True when this key is still under `cap` within `window_secs`.
+
+    DB-backed on purpose. rate_limit.SlidingWindowLimiter is in-process: it does
+    not survive a restart and does not span replicas, and the threat model here
+    is precisely a caller who hangs up and redials.
+
+    FAILS CLOSED, and the reasoning is worth keeping because the obvious
+    argument for the opposite is wrong.
+
+    "A limiter outage must not take the support line down" sounds right, but
+    this limiter shares a connection — and therefore a fate — with
+    _load_order_for_cancel and cancel_order_sp. If the database is unreachable,
+    no cancellation can happen whatever this function returns. Failing open buys
+    no availability at all; it only opens a window where the limiter is absent
+    while everything around it still works.
+
+    So the question becomes: which failure reaches HERE and nowhere else? The
+    realistic one is THE MIGRATION IS NOT APPLIED — the expected state between
+    merging this and someone running scripts/migrate against production. Open in
+    that state means unlimited enumeration attempts and unlimited OTP texts to
+    strangers, silently. Closed means the feature is inert until its schema
+    exists, which is what "ships dark" is supposed to mean.
+
+    Closed is also cheap for the caller: refusal here produces the same uniform
+    sentence and the same human escalation as every other unverifiable case, not
+    an error or a dropped call.
+    """
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO voice_verification_attempts
+                         (counter_key, window_start, attempts, last_at)
+                       VALUES (%(k)s,
+                               to_timestamp(floor(extract(epoch FROM now())
+                                                  / %(w)s) * %(w)s),
+                               1, now())
+                       ON CONFLICT (counter_key, window_start) DO UPDATE
+                         SET attempts = voice_verification_attempts.attempts + 1,
+                             last_at  = now()
+                       RETURNING attempts""",
+                    {"k": counter_key, "w": window_secs})
+                n = int(cur.fetchone()[0])
+            conn.commit()
+        finally:
+            conn.close()
+        if n > cap:
+            logger.warning(f"[voice] rate limit hit for {counter_key[:24]}… "
+                           f"({n} > {cap} per {window_secs}s)")
+            return False
+        return True
+    except Exception as exc:                              # noqa: BLE001
+        # UndefinedTable is a DEPLOY GAP, not a database fault, and it is the
+        # likeliest way to land here. Named separately so an operator reading
+        # the log can tell "run the migration" from "the database is sick"
+        # without going and looking.
+        missing = "voice_verification_attempts" in str(exc) and (
+            "does not exist" in str(exc) or "UndefinedTable" in type(exc).__name__)
+        if missing:
+            logger.error("[voice] order-cancellation rate limiter is MISSING "
+                         "(sql/order_cancellation_voice.sql is not applied here) "
+                         "— refusing the cancellation. Apply the migration.")
+        else:
+            logger.error(f"[voice] rate counter unavailable ({exc}) — refusing "
+                         f"the cancellation (fail-closed)")
+        return False
+
+
+def sweep_verification_attempts(days: int = 30) -> int:
+    """Drop counter rows older than `days`. Called by the nightly scheduler."""
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM voice_verification_attempts "
+                    "WHERE last_at < now() - (%s || ' days')::interval",
+                    (str(int(days)),))
+                n = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        return int(n or 0)
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning(f"[voice] verification-attempt sweep failed: {exc}")
+        return 0
+
+
+# ── The order lookup ────────────────────────────────────────────────────────
+
+def _load_order_for_cancel(suffix: str) -> Optional[Dict[str, Any]]:
+    """Everything the cancellation flow needs about one order, read in a
+    READ ONLY transaction. Returns None when the suffix matches zero rows — or
+    MORE than one, which is a verification failure rather than a coin flip.
+
+    THE ADDRESS HERE IS NOT load_context's ADDRESS, and the difference matters.
+    order_notifications.load_context resolves a shipping address through a
+    five-level COALESCE that ends at the ACCOUNT's default address. That is
+    right for addressing an envelope and wrong for authenticating a human: on a
+    corporate account every contact shares that address, so 'do you know the
+    shipping address' would degrade to 'do you know where you work'. Only the
+    order-level address counts here — orders.shipping_address_id, or an
+    addresses row parented to the order. If neither exists, the factor is
+    UNAVAILABLE and verification fails closed.
+    """
+    conn = get_connection()
+    try:
+        conn.set_session(readonly=True)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT o.order_id::text, o.order_number, o.status,
+                          o.account_id::text, o.contact_id::text,
+                          c.first_name, c.last_name, c.email, c.phone,
+                          a.account_name,
+                          COALESCE(sa.line1, oa.line1)             AS line1,
+                          COALESCE(sa.city, oa.city)               AS city,
+                          COALESCE(sa.postal_code, oa.postal_code) AS postal_code
+                     FROM orders o
+                     LEFT JOIN contacts  c  ON c.contact_id = o.contact_id
+                     LEFT JOIN accounts  a  ON a.account_id = o.account_id
+                     LEFT JOIN addresses sa ON sa.address_id = o.shipping_address_id
+                     LEFT JOIN LATERAL (
+                            SELECT ad.line1, ad.city, ad.postal_code
+                              FROM addresses ad
+                             WHERE ad.parent_type = 'order'
+                               AND ad.parent_id   = o.order_id
+                               AND lower(ad.label) = 'shipping'
+                             ORDER BY ad.is_default DESC
+                             LIMIT 1) oa ON true
+                    WHERE o.deleted_at IS NULL
+                      AND regexp_replace(o.order_number, '\\D', '', 'g')
+                          LIKE %(suffix)s
+                    LIMIT 2""",
+                {"suffix": "%" + suffix})
+            rows = cur.fetchall()
+        # Two matches is ambiguous, and guessing which one the caller meant
+        # would risk cancelling a stranger's order. Treated as a failure.
+        if len(rows) != 1:
+            return None
+        return dict(rows[0])
+    finally:
+        conn.close()
+
+
+def _verify_identity(spoken: Dict[str, str],
+                     order: Dict[str, Any]) -> Tuple[bool, str]:
+    """(passed, internal_reason). The reason is for the ESCALATION RECORD only
+    — the caller always hears the same sentence, whichever factor failed.
+
+    All three must pass. Two of three is a failure: name and address are both
+    printed on the shipping label, so any pair of them proves only that someone
+    handled the parcel.
+
+    HOW STRICTLY, AND WHY NOT STRICTER. Each factor is matched TOLERANTLY:
+    phonetically for the name, one-strong-component for the address, local-part
+    for the email. Two live calls established that exact string comparison
+    against speech-to-text output refuses honest callers as a matter of course —
+    'Alan' transcribed as 'Allen', a postal code the caller had not reached yet,
+    a domain rendered 'seat.'. A check that legitimate customers routinely fail
+    is not a strong control; it is an outage that routes everyone to a human and
+    teaches staff to wave people through.
+
+    This IS a loosening, and it is affordable for one specific reason: these
+    three factors authorize nothing. The gate is the one-time code sent to the
+    phone on the ORDER'S contact — possession, not knowledge. Their job (§4.3 of
+    the design) is to stop an order-number enumerator from causing OTP texts to
+    strangers, and for that they only have to be hard to guess, not hard to
+    mispronounce. An attacker holding the parcel reads the name and address off
+    the label whatever the matching rules are; the email local part is the part
+    they would actually have to know, and it is still required in full.
+
+    What tolerance does NOT extend to: the postal code when the caller offers a
+    wrong one, the email domain when the caller says one that transcribes
+    cleanly, and the order-level address requirement (§4.5).
+    """
+    # --- 1. LAST NAME.  One word. The recogniser handles it, and the
+    #        first name added nothing but failure modes ('Alan' -> 'Allen').
+    stored_last = _fold(order.get("last_name") or "")
+    stored_account = _fold(order.get("account_name") or "")
+    said_name = _fold(spoken.get("last_name") or "")
+    if not (stored_last or stored_account):
+        return False, "no name on the order's contact or account record"
+    if not any(_name_matches(said_name, c)
+               for c in (stored_last, stored_account) if c):
+        return False, "last name did not match the order's contact or account"
+
+    # --- 2. ADDRESS: the STREET NUMBER of the ORDER-LEVEL shipping address
+    #        (§4.5: the account-level fallback is never accepted for identity).
+    #        The postcode is still honoured if the caller volunteers it, but it
+    #        is no longer what we ask for — see the prompt for why.
+    stored_pc = _postal(order.get("postal_code") or "")
+    stored_num = _street_number(order.get("line1") or "")
+    if not (stored_pc or stored_num):
+        return False, ("no ORDER-LEVEL address on this order — the address "
+                       "factor could not be evaluated (the account-level "
+                       "fallback is deliberately not accepted here)")
+    said_addr = spoken.get("postal") or ""
+    said_digits = re.findall(r"\d+", _words_to_digits(said_addr))
+    num_ok = bool(stored_num) and stored_num in said_digits
+    pc_ok = bool(stored_pc) and _postal_matches(said_addr, stored_pc)
+    if not (num_ok or pc_ok):
+        return False, ("neither the street number nor the postal code matched "
+                       "the order's shipping address")
+
+    # --- 3. PHONE NUMBER on the contact.  The one factor here that is NOT
+    #        printed on a shipping label, so it is what actually stops someone
+    #        who merely handled the parcel — and digits are what speech
+    #        recognition gets right. Compared on the last 10 digits: callers say
+    #        "416 555 0123" for a record holding "+1 416 555 0123", and a
+    #        country code is not a secret.
+    stored_phone = re.sub(r"\D", "", order.get("phone") or "")
+    if len(stored_phone) < 4:
+        return False, "no usable phone on the order's contact record"
+    said_phone = re.sub(r"\D", "", _words_to_digits(spoken.get("phone") or ""))
+    if len(said_phone) < 4:
+        return False, "fewer than four phone digits were recovered"
+    # LAST FOUR. A caller who recites the whole number still passes — the
+    # comparison takes the tail of whatever they gave — but four is all that is
+    # asked for, and four is what speech recognition returns reliably.
+    if stored_phone[-4:] != said_phone[-4:]:
+        return False, "phone digits did not match the order's contact record"
+
+    return True, "last name, postal code and phone all matched"
+
+
+# ── The write ───────────────────────────────────────────────────────────────
+
+def cancel_order_sp(p: Dict[str, Any]) -> Dict[str, Any]:
+    """THE guarded cancellation. Exactly one UPDATE, against exactly one table.
+
+    The status rule is not checked in Python and then applied — it IS the WHERE
+    clause. A read-then-check-then-write would leave a window in which the order
+    ships between the check and the write, and the agent would then tell a
+    customer their shipped order was cancelled. Here the predicate is evaluated
+    by Postgres against the committed row under a row lock, so:
+
+        1 row back -> the transition happened, and updated_at IS the
+                      cancellation time for every consumer downstream
+        0 rows back -> it did not happen, for any reason, and the caller must
+                      not be told otherwise
+
+    There is no code path in which this function reports success without a row.
+    """
+    order_id = str(p.get("order_id") or "")
+    if not order_id:
+        return {"ok": False, "error": "order_id required"}
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Prior status, under the same row lock the UPDATE will use, so the
+            # value recorded for undo is the one actually replaced.
+            cur.execute(
+                "SELECT status FROM orders WHERE order_id=%(id)s::uuid "
+                "AND deleted_at IS NULL FOR UPDATE",
+                {"id": order_id})
+            before = cur.fetchone()
+            prior = (before or {}).get("status")
+
+            cur.execute(
+                """UPDATE orders
+                      SET status     = 'cancelled',
+                          updated_at = now(),
+                          updated_by = COALESCE(%(by)s::uuid, updated_by)
+                    WHERE order_id   = %(id)s::uuid
+                      AND deleted_at IS NULL
+                      AND LOWER(TRIM(status)) IN ('pending','processing','ready')
+                RETURNING order_number, status, updated_at""",
+                {"id": order_id, "by": p.get("updated_by")})
+            row = cur.fetchone()
+
+            if not row:
+                conn.rollback()
+                return {"ok": False, "error": "not cancellable",
+                        "prior_status": prior,
+                        "reason": (f"status {prior!r} is not one of "
+                                   f"pending/processing/ready at write time")}
+
+            # The status change bypasses sp_orders, so the audit_log row that
+            # every other status change writes must be written here — otherwise
+            # the trail would show an order changing state with no audit entry.
+            cur.execute(
+                """INSERT INTO audit_log (entity, entity_id, action, payload,
+                                          created_at)
+                   VALUES ('order', %(id)s::uuid, 'cancel_by_agent',
+                           %(p)s::jsonb, now())""",
+                {"id": order_id,
+                 "p": _json.dumps({
+                     "before": {"status": prior},
+                     "after": {"status": "cancelled"},
+                     "verified_via": p.get("verified_via"),
+                     "channel": "voice-support",
+                     "call_sid": p.get("call_sid"),
+                 })})
+        conn.commit()
+        logger.info(f"[voice] order {row['order_number']} cancelled "
+                    f"(was {prior}) via {p.get('verified_via')}")
+        return {"ok": True, "order_id": order_id,
+                "order_number": row["order_number"],
+                "prior_status": prior,
+                "cancelled_at": row["updated_at"]}
+    except Exception as exc:                              # noqa: BLE001
+        conn.rollback()
+        logger.error(f"[voice] cancellation write failed: {exc}")
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+
+
+def undo_order_cancel(ap: Dict[str, Any]) -> Dict[str, Any]:
+    """Restore the status the cancellation replaced. Guarded in the same shape
+    as the forward write: it will only move a row that is still 'cancelled', so
+    an undo cannot stomp a status someone else has since set."""
+    params = ap.get("params") or {}
+    order_id = params.get("order_id")
+    prior = (params.get("prior_status") or "").strip().lower()
+    if not order_id or prior not in CANCELLABLE_STATUSES:
+        return {"ok": False,
+                "error": "no restorable prior status recorded on the approval"}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE orders
+                      SET status = %(s)s, updated_at = now()
+                    WHERE order_id = %(id)s::uuid
+                      AND LOWER(TRIM(status)) = 'cancelled'
+                RETURNING order_number""",
+                {"s": prior, "id": str(order_id)})
+            row = cur.fetchone()
+        conn.commit()
+        if not row:
+            return {"ok": False,
+                    "error": "order is no longer 'cancelled' — not undone"}
+        return {"ok": True, "order_number": row[0], "restored_to": prior}
+    except Exception as exc:                              # noqa: BLE001
+        conn.rollback()
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+
+
+# ── Telling a human ─────────────────────────────────────────────────────────
+
+def _notify_employee_of_cancellation(order: Dict[str, Any], result: Dict[str, Any],
+                                     verified_via: str, email_state: str,
+                                     email_detail: str, approval_uuid: str,
+                                     call_sid: str) -> bool:
+    """In-app notification to the linked executives.
+
+    THIS IS NOT EVIDENCE, and it is written so a reader cannot mistake it for
+    evidence. Every fact on it is copied from a record that already committed:
+    the cancellation from the UPDATE's RETURNING row, the email line from
+    order_notifications.state after the provider answered. It asserts nothing on
+    its own, and it names the ids so a reader who wants proof can go and read
+    them.
+
+    Best-effort: a failure here never rolls back the cancellation. escalation
+    carries the durable backstop.
+    """
+    ok_email = email_state == "accepted"
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                # notification_messages.event_uuid is NOT NULL: a notification
+                # must point at the event it is about. So the cancellation is
+                # EMITTED first and the notification hangs off that row.
+                #
+                # This is not bookkeeping. Without it the INSERT below fails the
+                # not-null constraint, the surrounding try swallows it as
+                # non-fatal (the way escalation._notify does), and "notify a
+                # human employee" silently does not happen — a promise kept in
+                # the code and broken in the database. Caught by the audit-chain
+                # test, which asserts the notification row EXISTS.
+                #
+                # emit_event drops payload keys outside the envelope, so the
+                # business fields ride under 'context'.
+                cur.execute(
+                    "SELECT emit_event(%s,%s,%s,%s,%s,%s)",
+                    ("order.cancelled", "order", result.get("order_id"),
+                     _json.dumps({"context": {
+                         "order_number": result.get("order_number"),
+                         "prior_status": result.get("prior_status"),
+                         "verified_via": verified_via,
+                         "cancelled_by": "ai-agent",
+                         "channel": "voice-support"}}),
+                     None, "voice-support"))
+                event_uuid = cur.fetchone()[0]
+
+                cur.execute("""SELECT employee_uuid::text FROM executives
+                               WHERE is_active AND employee_uuid IS NOT NULL""")
+                owners = [r[0] for r in cur.fetchall()]
+                if not owners:
+                    logger.info("[voice] no linked executives to notify of "
+                                "the cancellation")
+                    return False
+                who = (f"{order.get('first_name') or ''} "
+                       f"{order.get('last_name') or ''}").strip() or "(no name)"
+                account = order.get("account_name") or "—"
+                title = (f"Order {result['order_number']} cancelled by the "
+                         f"AI support agent")
+                body = (
+                    f"Order:          {result['order_number']}\n"
+                    f"Customer:       {who} ({account})\n"
+                    f"Status:         cancelled (was: {result.get('prior_status')})\n"
+                    f"Verified via:   {verified_via}\n"
+                    f"Cancelled at:   {result.get('cancelled_at')}\n"
+                    f"Confirmation email: {email_state}"
+                    + (f" — {email_detail}" if email_detail else "") + "\n"
+                    f"Follow-up:      "
+                    + ("none" if ok_email else
+                       "REQUIRED — the confirmation email did not complete; "
+                       "contact the customer") + "\n\n"
+                    f"This notification reports what other records already say. "
+                    f"The cancellation is proven by action_approvals "
+                    f"{(approval_uuid or '?')[:8]} and the audit_log row; the "
+                    f"email by order_notifications for this order.")
+                for owner in owners:
+                    cur.execute(
+                        """INSERT INTO notifications
+                             (employee_uuid, event_uuid, channel, status, title,
+                              body, metadata, created_at)
+                           VALUES (%(o)s::uuid, %(ev)s::uuid, 'in_app',
+                                   'pending', %(t)s, %(b)s, %(m)s::jsonb,
+                                   now())""",
+                        {"o": owner, "ev": event_uuid, "t": title, "b": body,
+                         "m": _json.dumps({
+                             "kind": "order_cancelled_by_agent",
+                             "source": "voice-support",
+                             "order_id": result.get("order_id"),
+                             "order_number": result.get("order_number"),
+                             "approval_uuid": approval_uuid,
+                             "verified_via": verified_via,
+                             "email_state": email_state,
+                             "call_sid": call_sid,
+                             "follow_up_required": not ok_email,
+                         })})
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning(f"[voice] cancellation notification skipped "
+                       f"(non-fatal): {str(exc)[:160]}")
+        return False
+
+
+def _escalate_cancel(sess: Dict[str, Any], reason: str, internal: str,
+                     order_number: Optional[str] = None,
+                     priority: str = "normal") -> Optional[str]:
+    """The durable record behind every refusal and every partial failure. The
+    caller hears one sentence; this is where the real reason lives.
+
+    WHAT THE CALLER SAID is recorded too, and the distinction is the point: the
+    stored name, address and email are NEVER written here (§10.3 — the whole
+    design refuses to echo them), but the caller's own words are theirs, and
+    without them a matcher failure is undebuggable. The first live call proved
+    that: the escalation said "name did not match" and nothing anywhere showed
+    that speech recognition had rendered 'Testcase' as 'Test case'. It is also
+    what an operator needs in order to ring the customer back and help.
+    """
+    heard = (sess.get("cancel") or {}).get("spoken") or {}
+
+    try:
+        from app.core import escalation
+        res = escalation.open(
+            reason, "voice-support",
+            summary=(f"Order cancellation could not be completed"
+                     + (f" for {order_number}" if order_number else "")),
+            # Labels must name the question that was ACTUALLY ASKED. This said
+            # "postcode" for two rounds after the question became the street
+            # number, so a real escalation email read "postcode: 88" — telling
+            # support the caller gave a nonsense postcode when they had answered
+            # correctly. The session key stays `postal` for compatibility; the
+            # human-facing label is what had to change.
+            transcript_excerpt=("caller said — "
+                                f"last name: {heard.get('last_name') or '(not reached)'} | "
+                                f"street no: {heard.get('postal') or '(not reached)'} | "
+                                f"phone last4: {heard.get('phone') or '(not reached)'}")[:400],
+            channel="voice", handle=sess.get("from"),
+            priority=priority,
+            metadata={"internal_reason": internal,
+                      "order_number": order_number,
+                      "call_sid": sess.get("call_sid"),
+                      "flow": "order.cancel"})
+        return (res or {}).get("escalation_id")
+    except Exception as exc:                              # noqa: BLE001
+        logger.error(f"[voice] escalation failed ({internal}): {exc}")
+        return None
+
+
+def _return_policy_answer(sess: Dict[str, Any], status: str,
+                          order_number: str) -> str:
+    """The too-late branch. The policy TEXT comes from the knowledge base, not
+    from a string in this file: the KB article is what the level-0 tier already
+    reads out, and a second copy here would drift from it — which is exactly how
+    an agent ends up contradicting itself inside one call."""
+    kb = ""
+    try:
+        kb = _kb_answer(sess, "what is your return and refund policy") or ""
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning(f"[voice] return-policy KB lookup failed: {exc}")
+    lead = (f"I've found order {order_number}, and it's already {status}, so it "
+            f"can't be cancelled at this point. ")
+    tail = (kb or
+            "You can return it under our return policy — reply to your order "
+            "confirmation email or contact customer service and the team will "
+            "start the return for you.")
+    return lead + tail + " Would you like me to have someone follow up?"
+
+
+# ── The conversation ────────────────────────────────────────────────────────
+#
+# States, in the order the caller walks them:
+#
+#   awaiting_number  -> awaiting_name -> awaiting_postal -> awaiting_phone
+#                    -> awaiting_otp  -> (decided)
+#
+# The three spoken factors come BEFORE the OTP deliberately (see the section
+# header above): it removes the existence oracle, and it means no stranger's
+# phone can be made to ring by someone reciting order numbers.
+
+def _cancel_begin(sess: Dict[str, Any]) -> Tuple[str, str]:
+    sess["cancel"] = {"state": "awaiting_number", "attempts": 0,
+                      "spoken": {}, "order": None}
+    return ("I can help with that. Could you tell me your order number, "
+            "please?"), "speech"
+
+
+def _cancel_fail(sess: Dict[str, Any], internal: str,
+                 order_number: Optional[str] = None,
+                 reason: str = "order_cancel_unverified") -> Tuple[str, str]:
+    """Every refusal exits here, so every refusal SOUNDS the same. The caller
+    cannot distinguish 'no such order' from 'wrong postcode' from 'too many
+    attempts'; the escalation record carries which it actually was."""
+    # Escalate BEFORE clearing the flow: the escalation reads
+    # sess['cancel']['spoken'] to record what the caller actually said. Clearing
+    # first made every refusal record read "(not reached)" for all three
+    # factors — the useful half of the record, silently blank.
+    _escalate_cancel(sess, reason, internal, order_number)
+    sess["cancel"] = None
+    logger.info(f"[voice] cancellation refused — {internal}")
+    return _CANCEL_REFUSAL, "speech"
+
+
+def _cancel_send_otp(sess: Dict[str, Any]) -> Tuple[str, str]:
+    """Possession check. The code goes to the number ON THE ORDER'S CONTACT —
+    never to the number the caller is speaking from, and never to one they
+    supply. A borrowed or spoofed handset therefore gains nothing."""
+    from app.core import telephony
+
+    c = sess["cancel"]
+    order = c["order"]
+    phone = (order.get("phone") or "").strip()
+    if not phone:
+        return _cancel_fail(sess, "no phone on file for the order's contact — "
+                                  "OTP impossible, so no self-service path exists",
+                            order.get("order_number"),
+                            reason="order_cancel_unverifiable")
+
+    # Anti-harassment counter, keyed on the DESTINATION (hashed). The caller
+    # cannot rotate this key: it comes from the record, not from them.
+    if not _rate_ok(_hash_key("dest", phone), cap=OTP_SENDS_PER_HOUR,
+                    window_secs=3600):
+        return _cancel_fail(sess, "OTP send cap reached for this destination "
+                                  "number within the hour, OR the limiter was "
+                                  "unavailable (see the log — a missing "
+                                  "migration is reported distinctly)",
+                            order.get("order_number"))
+
+    code = f"{secrets.randbelow(1000000):06d}"
+    res = telephony.send_sms(
+        phone,
+        f"Conscestra: your order cancellation code is {code}. It expires in "
+        f"5 minutes. If you did not request this, ignore it and call us.",
+        account_id=order.get("account_id"), sent_by="voice-support-cancel",
+        transactional=True)
+    if not res.get("sent"):
+        logger.warning(f"[voice] cancellation OTP send failed: {res.get('error')}")
+        return _cancel_fail(sess, f"OTP could not be sent: {res.get('error')}",
+                            order.get("order_number"),
+                            reason="order_cancel_unverifiable")
+
+    c["verify"] = {"hash": _hash_code(code), "expires": time.time() + OTP_TTL,
+                   "attempts": 0}
+    c["state"] = "awaiting_otp"
+    logger.info(f"[voice] cancellation OTP sent for order "
+                f"{order.get('order_number')}")
+    return ("Thank you — that all matches. For your security I've texted a "
+            "six digit code to the mobile number we have on file. Please "
+            "enter it on your keypad now."), "digits"
+
+
+async def _cancel_turn(sess: Dict[str, Any], heard: str) -> Tuple[str, str]:
+    """One spoken turn inside the cancellation flow."""
+    c = sess["cancel"]
+    state = c["state"]
+
+    if _NO_RE.search(heard) and _BYE_RE.search(heard):
+        sess["cancel"] = None
+        return "No problem — I haven't changed anything. Anything else?", "speech"
+
+    # ---- 1. the order number
+    if state == "awaiting_number":
+        suffix = _parse_order_number(heard)
+        if not suffix:
+            c["attempts"] += 1
+            if c["attempts"] >= CANCEL_ATTEMPTS:
+                return _cancel_fail(sess, "order number not understood after "
+                                          f"{CANCEL_ATTEMPTS} attempts")
+            return ("I didn't catch the order number. It's on your confirmation "
+                    "email — please read me the digits, for example "
+                    "1 0 5 2 5 9."), "speech"
+
+        # Enumeration brake. Keyed on the ORDER, which the attacker must name for
+        # anything to happen — unlike their caller ID, they cannot rotate it.
+        if not _rate_ok(f"order:{suffix}", cap=ORDER_ATTEMPTS_24H,
+                        window_secs=86400):
+            return _cancel_fail(sess, f"rate limit: too many verification "
+                                      f"attempts against order …{suffix} in 24h, "
+                                      f"OR the limiter was unavailable (see the "
+                                      f"log — a missing migration is reported "
+                                      f"distinctly)")
+
+        # Looked up NOW, spoken about LATER. A missing order does not change a
+        # single word the caller hears until the very end — that is the whole
+        # anti-oracle mechanism.
+        c["order"] = await asyncio.to_thread(_load_order_for_cancel, suffix)
+        c["suffix"] = suffix
+        c["state"] = "awaiting_name"
+        return ("Thanks. Before I can look at that, I need to verify your "
+                "identity. What's your last name?"), "speech"
+
+    # ---- 2-4. the three factors, collected from EVERY caller
+    if state == "awaiting_name":
+        c["spoken"]["last_name"] = heard
+        c["state"] = "awaiting_postal"
+        # STREET NUMBER, not postcode.
+        #
+        # Six live calls settled this. A postcode is alphanumeric AND has a
+        # pause built into how people say it, and the recogniser endpoints on
+        # that pause: "M5C 1S6" arrived as postcode="I'm 5C." followed by a
+        # SECOND turn "1F6.", which the flow then scored as the next answer.
+        # The halves never reach the same comparison, so no amount of matcher
+        # tolerance can rescue it — the QUESTION had to change.
+        #
+        # What has worked on every call is single words and pure digits. A
+        # street number is both: "eighty eight" is one breath, no letters, no
+        # mid-answer pause. The postcode is still ACCEPTED if a caller offers
+        # it; it is simply no longer asked for.
+        return ("Thank you. And the street number of the shipping address on "
+                "that order — just the number?"), "speech"
+
+    if state == "awaiting_postal":
+        # A digits question that came back with NO digits is almost always a
+        # split utterance, not a wrong answer: the recogniser endpointed on the
+        # caller's pause and sent half. Re-prompt rather than consuming the
+        # turn — the other half would otherwise arrive at the NEXT question and
+        # be scored as the answer to that one, which is exactly how
+        # postcode='I'm 5C.' / phone='1F6.' happened on a live call.
+        if not _has_digits(heard) and c.get("reprompts", 0) < CANCEL_REPROMPTS:
+            c["reprompts"] = c.get("reprompts", 0) + 1
+            return ("Sorry, I didn't catch a number there. Just the street "
+                    "number of the shipping address, please."), "speech"
+        c["spoken"]["postal"] = heard
+        c["state"] = "awaiting_phone"
+        # LAST FOUR DIGITS, spoken.
+        #
+        # The full number was tried both ways and both failed. Dictated, the
+        # recogniser turned '416-889-6638' into '016889. 6638.'. Keyed, it never
+        # arrived at all: the keypad step returned a NEW transport state
+        # ('phone_digits') that voice_stream.py had never heard of, so on a
+        # streamed call the presses fell through to the language-menu branch —
+        # a transport state added in one transport and not the other.
+        #
+        # Four digits are short enough that speech recognition gets them right,
+        # they need no new transport state, and they are the industry-standard
+        # shape of this question ("the last four digits on the account").
+        return ("Thank you. And finally, the last four digits of the phone "
+                "number on the account?"), "speech"
+
+    if state == "awaiting_phone":
+        if not _has_digits(heard) and c.get("reprompts", 0) < CANCEL_REPROMPTS:
+            c["reprompts"] = c.get("reprompts", 0) + 1
+            return ("Sorry, I didn't catch that. Just the last four digits of "
+                    "the phone number on the account, please."), "speech"
+        c["spoken"]["phone"] = heard
+        return await _cancel_decide(sess)
+
+    # ---- fell out of the state machine (restart mid-call, stray input)
+    sess["cancel"] = None
+    return "Let's start again — how can I help?", "speech"
+
+
+async def _cancel_decide(sess: Dict[str, Any]) -> Tuple[str, str]:
+    """All three factors are in. Check them, and on success send the code.
+
+    Extracted from the last conversation step because that step became a keypad
+    step: the phone number is now KEYED, so this runs from take_digits as well
+    as from _cancel_turn, and the decision must not live in only one of them.
+    """
+    c = sess.get("cancel") or {}
+    order = c.get("order")
+    if not order:
+        # No such order. Identical wording, identical timing, identical point in
+        # the conversation as a wrong name.
+        return _cancel_fail(sess, f"no order matched the spoken suffix "
+                                  f"…{c.get('suffix')}")
+
+    ok, why = _verify_identity(c["spoken"], order)
+    if not ok:
+        c["attempts"] += 1
+        return _cancel_fail(sess, why, order.get("order_number"))
+
+    return await asyncio.to_thread(_cancel_send_otp, sess)
+
+
+async def _cancel_check_code(sess: Dict[str, Any],
+                             digits: str) -> Tuple[str, str]:
+    """Keypad entry during a cancellation. Same discipline as the account-tier
+    OTP: hashed comparison, expiry, bounded attempts."""
+    c = sess.get("cancel") or {}
+    v = c.get("verify") or {}
+    order = c.get("order") or {}
+    if not v.get("hash"):
+        sess["cancel"] = None
+        return "Let's start again — how can I help?", "speech"
+
+    if time.time() > v["expires"]:
+        return _cancel_fail(sess, "verification code expired",
+                            order.get("order_number"))
+
+    if not _hmac.compare_digest(_hash_code(digits), v["hash"]):
+        v["attempts"] += 1
+        if v["attempts"] >= OTP_ATTEMPTS:
+            return _cancel_fail(sess, f"{OTP_ATTEMPTS} incorrect verification "
+                                      f"codes — locked out",
+                                order.get("order_number"),
+                                reason="order_cancel_lockout")
+        return ("That code doesn't match. Please try again."), "digits"
+
+    # Verified by possession AND by all three record factors.
+    sess["cancel_auth"] = {"order_id": order.get("order_id"),
+                           "verified_via": "voice-otp",
+                           "at": time.time(), "scope": "order.cancel"}
+    return await _execute_cancellation(sess)
+
+
+async def _execute_cancellation(sess: Dict[str, Any]) -> Tuple[str, str]:
+    """Verification is done. Decide on the STATUS, then act.
+
+    Note what does NOT happen here: there is no `else: cancel`. Only the
+    explicitly cancellable set reaches the write; the too-late set reaches the
+    return policy; everything else — 'cancelled', 'Invoiced', 'refunded', NULL,
+    a value invented next year — reaches a human.
+    """
+    c = sess.get("cancel") or {}
+    order = c.get("order") or {}
+    auth = sess.get("cancel_auth") or {}
+    sess["cancel"] = None
+    status = (order.get("status") or "").strip().lower()
+    num = order.get("order_number") or "(unknown)"
+
+    if status in TOO_LATE_STATUSES:
+        logger.info(f"[voice] {num} is {status} — cancellation refused, "
+                    f"return policy offered")
+        return _return_policy_answer(sess, status, num), "speech"
+
+    if status not in CANCELLABLE_STATUSES:
+        _escalate_cancel(sess, "order_cancel_unexpected_status",
+                         f"order status {order.get('status')!r} is neither "
+                         f"cancellable nor a recognised too-late status",
+                         num, priority="high")
+        return (f"I've found order {num}, but it's in a state I'm not able to "
+                f"act on, so I don't want to guess. I've passed this to a "
+                f"colleague who will call you back shortly."), "speech"
+
+    # ---- the write
+    result = await asyncio.to_thread(cancel_order_sp, {
+        "order_id": order.get("order_id"),
+        "verified_via": auth.get("verified_via"),
+        "call_sid": sess.get("call_sid")})
+
+    if not result.get("ok"):
+        # The order moved between the lookup and the write, or the database was
+        # unreachable. Either way the agent must NOT say 'cancelled'.
+        _escalate_cancel(sess, "order_cancel_race",
+                         f"guarded UPDATE affected no rows: "
+                         f"{result.get('reason') or result.get('error')}",
+                         num, priority="high")
+        return ("I wasn't able to complete the cancellation — the order's "
+                "status changed while we were talking. I've asked a colleague "
+                "to call you back and sort it out."), "speech"
+
+    # ---- audit ledger (pre-authorized, terminal). Never blocks the customer.
+    approval_uuid = None
+    try:
+        from app.core import governance
+        approval_uuid = await asyncio.to_thread(
+            governance.record_preauthorized,
+            "order.cancel", "voice-support", _CANCEL_POLICY,
+            {"order_id": result["order_id"],
+             "order_number": result["order_number"],
+             "prior_status": result.get("prior_status"),
+             "verified_via": auth.get("verified_via"),
+             "call_sid": sess.get("call_sid"),
+             "from_masked": (sess.get("from") or "")[-4:]},
+            {"ok": True, "order_number": result["order_number"],
+             "cancelled_at": str(result.get("cancelled_at")),
+             "prior_status": result.get("prior_status")},
+            entity_type="order", entity_id=result["order_id"],
+            performed_at=result.get("cancelled_at"))
+    except Exception as exc:                              # noqa: BLE001
+        logger.error(f"[voice] cancellation ledger write failed: {exc}")
+
+    # ---- the confirmation email. Reached ONLY because the UPDATE returned a
+    #      row. The state we read back is what the provider actually said.
+    email_state, email_detail = await asyncio.to_thread(
+        _send_cancellation_email, result["order_id"])
+
+    # ---- tell a human, whatever happened to the email
+    _notify_employee_of_cancellation(order, result, auth.get("verified_via") or "",
+                                     email_state, email_detail,
+                                     approval_uuid or "", sess.get("call_sid") or "")
+
+    if email_state != "accepted":
+        _escalate_cancel(sess, "order_cancel_email_failed",
+                         f"cancellation succeeded; confirmation email "
+                         f"{email_state}: {email_detail}",
+                         result["order_number"], priority="normal")
+
+    _log_call_activity(
+        f"Order {result['order_number']} cancelled on the support line",
+        f"Verified via {auth.get('verified_via')}. Prior status "
+        f"{result.get('prior_status')}. Confirmation email: {email_state}.",
+        account_id=order.get("account_id"), owner_id=None)
+
+    said = (f"That's done — order {result['order_number']} has been cancelled. ")
+    if email_state == "accepted":
+        said += ("I've emailed the confirmation to the address on your "
+                 "account. Anything else?")
+    else:
+        said += ("I wasn't able to get the confirmation email out, so a "
+                 "colleague will follow up with you. The cancellation itself "
+                 "is complete. Anything else?")
+    return said, "speech"
+
+
+def _send_cancellation_email(order_id: str) -> Tuple[str, str]:
+    """(state, detail) straight from order_notifications.
+
+    The agent is never allowed to say 'emailed' because this function was
+    called. It may only repeat the STATE this returns, which is written after
+    the provider answered — and 'accepted' additionally requires a provider
+    message id. There is no 'sent' and no 'delivered': the system has no
+    bounce or webhook ingestion, so it cannot know either.
+    """
+    from app.core import order_notifications as onf
+    try:
+        res = onf.notify(order_id, "order.cancelled")
+        return (str(res.get("state") or "unknown"),
+                str(res.get("reason") or res.get("action") or ""))
+    except Exception as exc:                              # noqa: BLE001
+        # Includes RetryableNotificationError: the bus owns retries, but there
+        # is no bus event here — the caller is on the line. The order stays
+        # cancelled regardless.
+        #
+        # THE ROW IS THE EVIDENCE, NOT THE EXCEPTION. On the first live
+        # cancellation the provider accepted the email and a KeyError was then
+        # raised by bookkeeping AFTER the send (a label dict missing the new
+        # event type). Reporting that as 'failed' told the customer their
+        # confirmation had not gone out, told an employee to follow up, and
+        # opened an escalation — all about an email sitting in the recipient's
+        # inbox. So on any exception we re-read the committed state and believe
+        # it: the ledger row is written by the code that actually talked to the
+        # provider, and it is the only thing here with evidence behind it.
+        logger.error(f"[voice] cancellation email raised for {order_id}: {exc}")
+        try:
+            for r in onf.history(order_id):
+                if r.get("event_type") == "order.cancelled" and r.get("state"):
+                    logger.info(f"[voice] …but the ledger says "
+                                f"{r['state']} — believing the row")
+                    return str(r["state"]), (str(r.get("failure_reason") or "")
+                                             or f"post-send error: {exc}"[:200])
+        except Exception:                                 # noqa: BLE001
+            pass
+        return "failed", str(exc)[:200]
+
+
+# ============================================================================
 # THE BRAIN'S TRANSPORT API — one conversation logic, two transports:
 # the signature-verified webhook (<Gather>) and the real-time media stream
 # (voice_stream.py). Every function returns (say, next) with next one of
@@ -1730,6 +3112,25 @@ async def take_turn(call_sid: str, heard: str) -> Tuple[str, str]:
             logger.error(f"[voice] transfer check failed, continuing with the "
                          f"AI: {exc}")
 
+    # ── cancellation flow ───────────────────────────────────────────────────
+    # Checked BEFORE the tier ladder, for the same reason as the transfer check
+    # above: a caller asking to cancel an order must not be answered by the
+    # level-0 KB brain, whose article says a human will take care of it. An
+    # in-flight flow keeps its turn; a new request starts one.
+    if sess.get("cancel"):
+        reply, nxt = await _cancel_turn(sess, heard)
+        sess["transcript"].append(("agent", reply))
+        return reply, nxt
+
+    # The intent is caught whether or not the feature is enabled. Only the
+    # RESPONSE depends on the flag — see _cancel_unavailable() for why letting
+    # this fall through to the KB brain was a live defect, not a theoretical one.
+    if _CANCEL_RE.search(heard):
+        reply, nxt = (_cancel_begin(sess) if cancel_enabled()
+                      else _cancel_unavailable(sess))
+        sess["transcript"].append(("agent", reply))
+        return reply, nxt
+
     if _BYE_RE.search(heard):
         bye = _line("bye", lang)
         sess["transcript"].append(("agent", bye))
@@ -1755,6 +3156,37 @@ async def take_turn(call_sid: str, heard: str) -> Tuple[str, str]:
 async def take_digits(call_sid: str, digits: str) -> Tuple[str, str]:
     """A keypad entry during verification → (say, next)."""
     sess = _CALLS.get(call_sid)
+
+    # A cancellation OTP is a SEPARATE verification from the account-tier one:
+    # it authorizes one action on one order and never promotes the session
+    # (see cancel_auth). Checked first so the two cannot be confused — passing
+    # a cancellation code must not unlock balances or profile changes.
+    # A caller who KEYS the last four instead of saying them still works: the
+    # streaming transport only submits DTMF in 'digits' mode, so this is reached
+    # only on the webhook path, but accepting it costs nothing and dead-ending
+    # would be rude.
+    if sess and (sess.get("cancel") or {}).get("state") == "awaiting_phone":
+        sess["at"] = time.time()
+        cleaned = re.sub(r"\D", "", digits or "")
+        if len(cleaned) < 4:
+            return ("I didn't catch that. What are the last four digits of the "
+                    "phone number on the account?"), "speech"
+        sess["cancel"]["spoken"]["phone"] = cleaned
+        return await _cancel_decide(sess)
+
+    if sess and (sess.get("cancel") or {}).get("state") == "awaiting_otp":
+        sess["at"] = time.time()
+        sess["turns"] += 1
+        if sess["turns"] > MAX_TURNS:
+            _close_call(sess, "max turns reached during cancellation")
+            return ("Thanks for calling — a teammate will follow up. Goodbye.",
+                    "hangup")
+        cleaned = re.sub(r"\D", "", digits or "")
+        if not cleaned:
+            return ("I didn't get the code. Please enter the six digits on "
+                    "your keypad."), "digits"
+        return await _cancel_check_code(sess, cleaned)
+
     if not sess or not sess.get("verify"):
         # No verification in flight (restart mid-call, stray redirect) —
         # fall back to the normal conversation, still at Level 0.

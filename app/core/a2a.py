@@ -387,6 +387,21 @@ def _sp_contact_update_profile(p: Dict[str, Any]) -> Any:
     return voice_support.profile_update_sp(p or {})
 
 
+def _sp_order_cancel(p: Dict[str, Any]) -> Any:
+    """Voice support: cancel ONE order at a verified customer's request.
+
+    Registered so the action is inspectable, traceable and undoable like every
+    other governed write. It is NOT the path the phone call uses — the call
+    reaches voice_support.cancel_order_sp directly, because the customer is on
+    the line waiting for a true answer. This entry exists so the capability is
+    visible in the registry, and so governance.undo has a named action type.
+    The status guard lives inside the UPDATE, so it applies to every caller of
+    this function equally.
+    """
+    from app.core import voice_support
+    return voice_support.cancel_order_sp(p or {})
+
+
 def _sp_scoring_activate(p: Dict[str, Any]) -> Any:
     """Predictive scoring: make a trained candidate the active model
     (executed on approval); undo restores the previous version."""
@@ -623,6 +638,17 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "proposed — never auto-executed from a call — validated again "
                "at execution time, undo restores the before-value",
                sp=_sp_contact_update_profile),
+    Capability("order.cancel", "orders", "", "write",
+               lambda p: (f"cancel order {p.get('order_number') or p.get('order_id', '?')} "
+                          f"(verified {p.get('verified_via', '?')})"),
+               "cancel an order at the request of a customer who has proven "
+               "possession of the phone number on the order AND matched the "
+               "name, shipping address and email on record; the allowed source "
+               "statuses (pending/processing/ready) are enforced inside the "
+               "UPDATE, not by the caller, so a shipped or delivered order "
+               "cannot be cancelled through this capability by anyone; "
+               "undo restores the prior status",
+               sp=_sp_order_cancel),
     Capability("scoring.activate", "leads", "", "write",
                lambda p: f"activate lead-scoring model v{p.get('version', '?')}",
                "make a trained predictive lead-scoring candidate the active "

@@ -3,8 +3,9 @@
     Who is allowed to receive CRM work?
 
 Nothing in this database could answer that. `owners` is the FK target for every
-`owner_id` column but is 90% customer contacts; `employees` is demo seed data on
-@company.com abandoned in January; `auth_credentials` authenticates customers.
+`owner_id` column but is 90% customer contacts; `employees` is demo seed data
+(on @emp.agentorc.ca since 2026-08-20, previously @company.com) abandoned in
+January; `auth_credentials` authenticates customers.
 So assignability is EXPLICIT MEMBERSHIP, never inference — see
 sql/assignable_identity.sql for the full evidence.
 
@@ -141,7 +142,7 @@ def identity_space(candidate: Optional[str]) -> Dict[str, Any]:
     # EVERY space is checked, not the first that hits.
     #
     # The identity spaces COLLIDE. `a1451ad6-310c-4bcc-ba17-dd383a881ee8` is
-    # julia.martin@company.com in `employees` AND john.smith@example.com in
+    # julia.martin@emp.agentorc.ca in `employees` AND john.smith@example.com in
     # `owners` — one uuid, two different people — and it is the owner of all
     # 120 historical cases. A first-match-wins chain would answer confidently
     # with whichever table it happened to try first, which is precisely the
@@ -247,7 +248,7 @@ def inventory() -> Dict[str, Any]:
                ORDER BY e.department NULLS LAST, e.email"""),
     }
     out["note"] = (
-        "employees_not_granted is the DEMO SEED cohort (@company.com, created "
+        "employees_not_granted is the DEMO SEED cohort (moved to @emp.agentorc.ca 2026-08-20, formerly @company.com; created "
         "2025-12-14 / 2026-01-07). It is listed as candidates, not imported — "
         "promoting seed data to 'may receive work' is the false inference this "
         "model exists to prevent.")

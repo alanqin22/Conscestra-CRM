@@ -1,8 +1,9 @@
-"""Automated customer emails for three order lifecycle events.
+"""Automated customer emails for four order lifecycle events.
 
     order.created    →  Order Confirmation — {order_number}
     order.shipped    →  Your Order {order_number} Has Shipped
     order.delivered  →  Your Order {order_number} Has Been Delivered
+    order.cancelled  →  Your Order {order_number} Has Been Cancelled
 
 WHERE THE TRIGGER LIVES, AND WHY NOT HERE
 
@@ -71,6 +72,7 @@ EVENT_TEMPLATES: Dict[str, str] = {
     "order.created":   "order_created",
     "order.shipped":   "order_shipped",
     "order.delivered": "order_delivered",
+    "order.cancelled": "order_cancelled",
 }
 
 # Terminal states. A row in one of these is never re-sent.
@@ -219,6 +221,27 @@ def load_context(order_id: str) -> Optional[Dict[str, Any]]:
                 {"name": r[0], "sku": r[1], "quantity": r[2], "line_total": r[3]}
                 for r in cur.fetchall()
             ]
+
+            # CONFIRMED money only, and only for the cancellation template.
+            # A cancellation email must never promise a refund that no payment
+            # record supports. Measured 2026-08-19: zero of the 55 cancellable
+            # orders (ready/processing) carry an invoice or a payment, so the
+            # refund block is normally absent — by evidence, not by omission.
+            # Same doctrine as the missing carrier/tracking columns above: the
+            # template cannot print what the context does not hold.
+            cur.execute(
+                """SELECT COALESCE(SUM(amount), 0)::numeric,
+                          COUNT(*),
+                          MAX(payment_method)
+                     FROM payments
+                    WHERE order_id = %s::uuid
+                      AND COALESCE(is_deleted, false) = false
+                      AND confirmed_at IS NOT NULL
+                      AND refunded_at  IS NULL""",
+                (str(order_id),))
+            prow = cur.fetchone()
+            ctx["paid_amount"] = prow[0] if prow and prow[1] else None
+            ctx["paid_method"] = prow[2] if prow and prow[1] else None
         return ctx
     finally:
         conn.close()
@@ -345,6 +368,38 @@ def _footer_text() -> str:
             f"{SUPPORT_HOURS}\n")
 
 
+def _refund_block(ctx: Dict[str, Any]) -> Tuple[str, str]:
+    """(text, html) describing the refund — or ('', '') when there is nothing
+    truthful to say.
+
+    A cancellation email is the moment a customer most wants to hear about their
+    money, which is exactly why this must not guess. If no CONFIRMED, un-refunded
+    payment exists on the order, the section is omitted entirely rather than
+    softened into "any refund due will be processed" — a sentence that sounds
+    reassuring and commits the business to nothing it can verify.
+
+    Note what is deliberately NOT here: a date, a duration, or "5-10 business
+    days". The system holds no refund SLA, so printing one would be invention of
+    the same kind as a fabricated tracking number.
+    """
+    amount = ctx.get("paid_amount")
+    if not amount:
+        return "", ""
+    money = _money(amount, ctx.get("currency") or "CAD")
+    method = (ctx.get("paid_method") or "").strip()
+    via = (f" to your original payment method ({method})" if method
+           else " to your original payment method")
+    text = (f"\n\nRefund:\n  We hold a confirmed payment of {money} on this "
+            f"order. It will be refunded{via}. You will receive a separate "
+            f"confirmation once the refund has been issued.")
+    html_block = (
+        f'<p style="margin-top:16px"><strong>Refund</strong><br>'
+        f'We hold a confirmed payment of {html.escape(money)} on this order. '
+        f'It will be refunded{html.escape(via)}. You will receive a separate '
+        f'confirmation once the refund has been issued.</p>')
+    return text, html_block
+
+
 def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
     """(subject, body_text, body_html) for one lifecycle event.
 
@@ -454,6 +509,41 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
             f'<tbody>{_items_html(ctx["items"], cur)}</tbody></table>{addr_h}',
             "If anything is missing or damaged, reply to this email or contact "
             "customer service below and we will put it right.")
+    elif event_type == "order.cancelled":
+        subject = f"Your Order {num} Has Been Cancelled"
+        # THE cancellation time is the DB `updated_at` returned by the guarded
+        # UPDATE — never a Python clock, and never the moment this email is
+        # composed. See voice_support.cancel_order_sp.
+        when = _day(ctx.get("updated_at"))
+        refund_t, refund_h = _refund_block(ctx)
+        body_text = (
+            f"Hi {name},\n\n"
+            f"Your order has been cancelled as you requested, and nothing "
+            f"further is needed from you.\n\n"
+            f"Order number:      {num}\n"
+            f"Cancelled on:      {when}\n"
+            f"Order total:       {total}\n\n"
+            f"Items cancelled:\n{_items_text(ctx['items'], cur)}"
+            f"{refund_t}\n\n"
+            f"If you did not request this cancellation, contact customer "
+            f"service below straight away."
+            + _footer_text())
+        body_html = _shell(
+            f"Your Order {html.escape(num)} Has Been Cancelled",
+            "Your order has been cancelled as you requested, and nothing "
+            "further is needed from you.",
+            f'<div style="background:#fef2f2;border-radius:8px;padding:12px 16px;margin:16px 0">'
+            f'<strong>Order number:</strong> {html.escape(num)}<br>'
+            f'<strong>Cancelled on:</strong> {html.escape(when)}<br>'
+            f'<strong>Order total:</strong> {html.escape(total)}</div>'
+            f'<table style="width:100%;border-collapse:collapse;font-size:0.9rem">'
+            f'<thead><tr><th align="left" style="padding:8px;border-bottom:2px solid #0d9488">Item cancelled</th>'
+            f'<th style="padding:8px;border-bottom:2px solid #0d9488">Qty</th>'
+            f'<th align="right" style="padding:8px;border-bottom:2px solid #0d9488">Total</th></tr></thead>'
+            f'<tbody>{_items_html(ctx["items"], cur)}</tbody></table>{refund_h}',
+            "If you did not request this cancellation, contact customer service "
+            "below straight away.")
+
     else:
         raise ValueError(f"not a customer lifecycle event: {event_type!r}")
 
@@ -827,9 +917,17 @@ def _record_activity(ctx: Dict[str, Any], event_type: str, row: Dict[str, Any]) 
              "failed":   "failed",
              "attempted": "attempted",
              "queued":   "queued"}.get(state, state)
+    # .get, not [] — and the difference is not stylistic. On the first live
+    # cancellation this dict was missing 'order.cancelled', so a KeyError was
+    # raised AFTER the provider had accepted the email. The caller caught it,
+    # reported the send as failed, told an employee to follow up, and opened an
+    # escalation — for an email that had actually gone out. A label this module
+    # cannot find is a cosmetic gap; it must never be able to contradict the
+    # ledger row.
     kind = {"order.created":   "confirmation",
             "order.shipped":   "shipment",
-            "order.delivered": "delivery"}[event_type]
+            "order.delivered": "delivery",
+            "order.cancelled": "cancellation"}.get(event_type, "notification")
     detail = (row.get("failure_reason")
               or (f"provider={row.get('provider')} "
                   f"id={row.get('provider_message_id') or 'n/a'}"))

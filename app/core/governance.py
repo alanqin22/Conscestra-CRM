@@ -219,6 +219,71 @@ def propose(action_type: str, proposed_by: str, params: Dict[str, Any],
         conn.close()
 
 
+def record_preauthorized(action_type: str, performed_by: str, policy: str,
+                         params: Dict[str, Any], result: Dict[str, Any],
+                         entity_type: Optional[str] = None,
+                         entity_id: Optional[str] = None,
+                         performed_at: Optional[Any] = None) -> Optional[str]:
+    """Ledger an action that ALREADY HAPPENED under a standing policy.
+
+    WHY THIS IS NOT propose()+approve(). A pending row that a confidence score
+    rubber-stamps is governance theatre: the queue shows an item nobody will
+    action, and the audit row then claims a human decided when none did. This
+    writes the row directly in the terminal 'executed' state, with
+    decided_by='policy:<name>', so:
+
+        • it never appears in pending() — the human queue stays a list of things
+          a human must actually do (every existing consumer of action_approvals
+          filters status='pending', so nothing else miscounts either);
+        • no record ever asserts a human authorised it;
+        • undo() still works — it requires an 'executed' row plus a registered
+          handler, which is the whole reason this lives in action_approvals
+          rather than a separate log table.
+
+    The authority is the POLICY, decided once by a human at design time and
+    enforced by a deterministic gate (for order.cancel: an OTP round-trip plus a
+    status predicate inside the UPDATE itself). This function only records what
+    that gate already permitted — it decides nothing.
+
+    Best-effort by construction: returns None on failure. A ledger write must
+    never roll back the customer-visible action it describes.
+    """
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO action_approvals
+                         (action_type, proposed_by, entity_type, entity_id,
+                          params, confidence, status, decided_by, decided_at,
+                          decision_reason, result, executed_at, expires_at)
+                       VALUES (%(at)s,%(by)s,%(et)s,%(eid)s,%(p)s::jsonb,1.0,
+                               'executed', %(db)s, COALESCE(%(ts)s, now()),
+                               %(why)s, %(r)s::jsonb, COALESCE(%(ts)s, now()),
+                               NULL)
+                       RETURNING approval_uuid""",
+                    {"at": action_type, "by": performed_by,
+                     "et": entity_type,
+                     "eid": str(entity_id) if entity_id else None,
+                     "p": json.dumps(params or {}),
+                     "db": f"policy:{policy}",
+                     "ts": performed_at,
+                     "why": f"pre-authorized by standing policy '{policy}' — "
+                            f"executed before this record was written",
+                     "r": json.dumps(result or {})})
+                aid = str(cur.fetchone()[0])
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info(f"[governance] ledgered pre-authorized {action_type} "
+                    f"under policy:{policy} → {aid[:8]}")
+        return aid
+    except Exception as exc:                              # noqa: BLE001
+        logger.error(f"[governance] could not ledger pre-authorized "
+                     f"{action_type}: {exc}")
+        return None
+
+
 # ============================================================================
 # Critic→revise loop — one bounded self-correction before the human sees it
 # ============================================================================
@@ -378,6 +443,7 @@ _ACTION_DESC = {
     "meeting.book": "Book a meeting on the owner's calendar.",
     "quote.generate": "Build and send a priced quotation.",
     "contact.update_profile": "Update a contact's profile field.",
+    "order.cancel": "Cancel an order at a verified customer's request.",
 }
 
 
@@ -1004,6 +1070,11 @@ def _undo_contact_update_profile(ap: Dict[str, Any]) -> Dict[str, Any]:
     return voice_support.undo_profile_update(ap)
 
 
+def _undo_order_cancel(ap: Dict[str, Any]) -> Dict[str, Any]:
+    from app.core import voice_support
+    return voice_support.undo_order_cancel(ap)
+
+
 _UNDO = {
     "campaign.winback": _undo_campaign_winback,
     "tuning.adjust": _undo_tuning_adjust,
@@ -1014,6 +1085,7 @@ _UNDO = {
     "data.merge_contacts": _undo_dq_merge,
     "identity.materialize_link": _undo_identity_materialize,
     "contact.update_profile": _undo_contact_update_profile,
+    "order.cancel": _undo_order_cancel,
 }
 
 
