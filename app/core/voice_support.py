@@ -527,6 +527,277 @@ _LINES: Dict[str, Dict[str, str]] = {
         "de": "Gut — wie kann ich Ihnen helfen?",
         "zh": "好的，请问有什么可以帮您？",
     },
+    # ── Order cancellation ──────────────────────────────────────────────────
+    # This whole flow was written in English on a line that answers in five
+    # languages. A Chinese caller matched the intent, then heard English
+    # prompts — and because _next_twiml sets the RECOGNITION language from the
+    # same `lang`, the call effectively switched language mid-flow and the
+    # caller could not continue. Reported from Railway, 2026-08-21.
+    #
+    # Every spoken string in the flow lives here now, so adding a language is a
+    # table edit rather than a hunt through branches.
+    "cx_ask_number": {
+        "en": "I can help with that. Could you tell me your order number, please?",
+        "fr": "Je peux vous aider. Pourriez-vous me donner votre numéro de "
+              "commande, s'il vous plaît ?",
+        "es": "Puedo ayudarle con eso. ¿Podría darme su número de pedido, "
+              "por favor?",
+        "de": "Dabei kann ich helfen. Können Sie mir bitte Ihre "
+              "Bestellnummer nennen?",
+        "zh": "我可以帮您处理。请告诉我您的订单号码，好吗？",
+    },
+    "cx_bad_number": {
+        "en": "I didn't catch the order number. It's on your confirmation "
+              "email — please read me the digits, for example 1 0 5 2 5 9.",
+        "fr": "Je n'ai pas saisi le numéro de commande. Il figure sur votre "
+              "e-mail de confirmation — dites-moi les chiffres, par exemple "
+              "1 0 5 2 5 9.",
+        "es": "No entendí el número de pedido. Está en su correo de "
+              "confirmación — dígame los dígitos, por ejemplo 1 0 5 2 5 9.",
+        "de": "Ich habe die Bestellnummer nicht verstanden. Sie steht in Ihrer "
+              "Bestätigungs-E-Mail — nennen Sie mir bitte die Ziffern, zum "
+              "Beispiel 1 0 5 2 5 9.",
+        "zh": "我没有听清订单号码。它在您的确认邮件上——请把数字念给我听，"
+              "例如 1 0 5 2 5 9。",
+    },
+    "cx_ask_name": {
+        "en": "Thanks. Before I can look at that, I need to verify your "
+              "identity. What's your last name?",
+        "fr": "Merci. Avant de consulter cette commande, je dois vérifier "
+              "votre identité. Quel est votre nom de famille ?",
+        "es": "Gracias. Antes de revisar ese pedido necesito verificar su "
+              "identidad. ¿Cuál es su apellido?",
+        "de": "Danke. Bevor ich das ansehen kann, muss ich Ihre Identität "
+              "bestätigen. Wie lautet Ihr Nachname?",
+        "zh": "谢谢。在查看这份订单之前，我需要核实您的身份。请问您姓什么？",
+    },
+    "cx_ask_street": {
+        "en": "Thank you. And the street number of the shipping address on "
+              "that order — just the number?",
+        "fr": "Merci. Et le numéro de rue de l'adresse de livraison de cette "
+              "commande — seulement le numéro ?",
+        "es": "Gracias. ¿Y el número de la calle de la dirección de envío de "
+              "ese pedido — solo el número?",
+        "de": "Danke. Und die Hausnummer der Lieferadresse dieser Bestellung — "
+              "nur die Nummer?",
+        "zh": "谢谢。请问这份订单的收货地址门牌号是多少——只要号码就好？",
+    },
+    "cx_bad_street": {
+        "en": "Sorry, I didn't catch a number there. Just the street number "
+              "of the shipping address, please.",
+        "fr": "Désolé, je n'ai pas entendu de numéro. Seulement le numéro de "
+              "rue de l'adresse de livraison, s'il vous plaît.",
+        "es": "Perdón, no escuché un número. Solo el número de la calle de la "
+              "dirección de envío, por favor.",
+        "de": "Entschuldigung, ich habe keine Nummer gehört. Bitte nur die "
+              "Hausnummer der Lieferadresse.",
+        "zh": "抱歉，我没有听到号码。请只说收货地址的门牌号。",
+    },
+    "cx_ask_phone4": {
+        "en": "Thank you. And finally, the last four digits of the phone "
+              "number on the account?",
+        "fr": "Merci. Enfin, les quatre derniers chiffres du numéro de "
+              "téléphone du compte ?",
+        "es": "Gracias. Por último, ¿los últimos cuatro dígitos del número de "
+              "teléfono de la cuenta?",
+        "de": "Danke. Und zuletzt die letzten vier Ziffern der Telefonnummer "
+              "im Konto?",
+        "zh": "谢谢。最后，请问账户上电话号码的最后四位数字是多少？",
+    },
+    "cx_bad_phone4": {
+        "en": "Sorry, I didn't catch that. Just the last four digits of the "
+              "phone number on the account, please.",
+        "fr": "Désolé, je n'ai pas compris. Seulement les quatre derniers "
+              "chiffres du numéro de téléphone du compte, s'il vous plaît.",
+        "es": "Perdón, no entendí. Solo los últimos cuatro dígitos del número "
+              "de teléfono de la cuenta, por favor.",
+        "de": "Entschuldigung, das habe ich nicht verstanden. Bitte nur die "
+              "letzten vier Ziffern der Telefonnummer im Konto.",
+        "zh": "抱歉，我没有听清。请只说账户上电话号码的最后四位数字。",
+    },
+    "cx_otp_sent": {
+        "en": "Thank you — that all matches. For your security I've texted a "
+              "six digit code to the mobile number we have on file. Please "
+              "enter it on your keypad now.",
+        "fr": "Merci — tout correspond. Pour votre sécurité, j'ai envoyé un "
+              "code à six chiffres par SMS au numéro de mobile que nous avons "
+              "au dossier. Saisissez-le sur votre clavier maintenant.",
+        "es": "Gracias — todo coincide. Por su seguridad he enviado un código "
+              "de seis dígitos por SMS al móvil que tenemos registrado. "
+              "Introdúzcalo en su teclado ahora.",
+        "de": "Danke — das stimmt alles. Zu Ihrer Sicherheit habe ich einen "
+              "sechsstelligen Code per SMS an die hinterlegte Mobilnummer "
+              "geschickt. Bitte geben Sie ihn jetzt über die Tastatur ein.",
+        "zh": "谢谢，信息都对得上。为了您的安全，我已经把六位数验证码短信发送到"
+              "我们记录的手机号码。请现在用键盘输入。",
+    },
+    "cx_bad_code": {
+        "en": "That code doesn't match. Please try again.",
+        "fr": "Ce code ne correspond pas. Veuillez réessayer.",
+        "es": "Ese código no coincide. Inténtelo de nuevo.",
+        "de": "Dieser Code stimmt nicht. Bitte versuchen Sie es erneut.",
+        "zh": "验证码不正确，请再试一次。",
+    },
+    "cx_no_code": {
+        "en": "I didn't get the code. Please enter the six digits on your "
+              "keypad.",
+        "fr": "Je n'ai pas reçu le code. Saisissez les six chiffres sur votre "
+              "clavier.",
+        "es": "No recibí el código. Introduzca los seis dígitos en su teclado.",
+        "de": "Ich habe den Code nicht erhalten. Bitte geben Sie die sechs "
+              "Ziffern über die Tastatur ein.",
+        "zh": "我没有收到验证码。请用键盘输入六位数字。",
+    },
+    # ONE refusal for every failure — see the existence-oracle analysis. It must
+    # be identical for a wrong order number, a wrong name and a rate limit, in
+    # every language.
+    "cx_refused": {
+        "en": "I'm sorry — I can't process the cancellation, because the "
+              "information provided doesn't match our records. I've asked a "
+              "colleague to follow up with you.",
+        "fr": "Je suis désolé — je ne peux pas traiter l'annulation, car les "
+              "informations fournies ne correspondent pas à nos dossiers. "
+              "J'ai demandé à un collègue de vous recontacter.",
+        "es": "Lo siento — no puedo procesar la cancelación, porque los datos "
+              "facilitados no coinciden con nuestros registros. He pedido a un "
+              "compañero que se ponga en contacto con usted.",
+        "de": "Es tut mir leid — ich kann die Stornierung nicht durchführen, "
+              "da die angegebenen Daten nicht mit unseren Unterlagen "
+              "übereinstimmen. Ein Kollege wird sich bei Ihnen melden.",
+        "zh": "很抱歉，我无法处理这次取消，因为您提供的信息与我们的记录不符。"
+              "我已经安排同事与您联系。",
+    },
+    "cx_done_emailed": {
+        "en": "That's done — order {num} has been cancelled. I've emailed the "
+              "confirmation to the address on your account. Anything else?",
+        "fr": "C'est fait — la commande {num} a été annulée. J'ai envoyé la "
+              "confirmation par e-mail à l'adresse de votre compte. Autre "
+              "chose ?",
+        "es": "Listo — el pedido {num} ha sido cancelado. He enviado la "
+              "confirmación por correo a la dirección de su cuenta. ¿Algo más?",
+        "de": "Erledigt — Bestellung {num} wurde storniert. Die Bestätigung "
+              "habe ich an die E-Mail-Adresse in Ihrem Konto gesendet. Sonst "
+              "noch etwas?",
+        "zh": "已经办好了——订单 {num} 已取消。确认邮件已发送到您账户上的邮箱。"
+              "还有别的需要帮忙吗？",
+    },
+    "cx_done_no_email": {
+        "en": "That's done — order {num} has been cancelled. I wasn't able to "
+              "get the confirmation email out, so a colleague will follow up "
+              "with you. The cancellation itself is complete. Anything else?",
+        "fr": "C'est fait — la commande {num} a été annulée. Je n'ai pas pu "
+              "envoyer l'e-mail de confirmation ; un collègue vous "
+              "recontactera. L'annulation elle-même est bien effectuée. Autre "
+              "chose ?",
+        "es": "Listo — el pedido {num} ha sido cancelado. No pude enviar el "
+              "correo de confirmación, así que un compañero se pondrá en "
+              "contacto. La cancelación sí está completa. ¿Algo más?",
+        "de": "Erledigt — Bestellung {num} wurde storniert. Die "
+              "Bestätigungs-E-Mail konnte ich nicht versenden; ein Kollege "
+              "meldet sich. Die Stornierung selbst ist abgeschlossen. Sonst "
+              "noch etwas?",
+        "zh": "已经办好了——订单 {num} 已取消。确认邮件没能发出，同事会与您联系。"
+              "取消本身已经完成。还有别的需要帮忙吗？",
+    },
+    "cx_race": {
+        "en": "I wasn't able to complete the cancellation — the order's status "
+              "changed while we were talking. I've asked a colleague to call "
+              "you back and sort it out.",
+        "fr": "Je n'ai pas pu finaliser l'annulation — le statut de la "
+              "commande a changé pendant notre conversation. Un collègue vous "
+              "rappellera pour régler cela.",
+        "es": "No pude completar la cancelación — el estado del pedido cambió "
+              "mientras hablábamos. Un compañero le llamará para resolverlo.",
+        "de": "Ich konnte die Stornierung nicht abschließen — der Status der "
+              "Bestellung hat sich während unseres Gesprächs geändert. Ein "
+              "Kollege ruft Sie zurück.",
+        "zh": "我没能完成取消——在我们通话期间订单状态发生了变化。"
+              "我已安排同事回电为您处理。",
+    },
+    "cx_unexpected": {
+        "en": "I've found order {num}, but it's in a state I'm not able to act "
+              "on, so I don't want to guess. I've passed this to a colleague "
+              "who will call you back shortly.",
+        "fr": "J'ai trouvé la commande {num}, mais elle est dans un état sur "
+              "lequel je ne peux pas agir, et je ne veux pas deviner. J'ai "
+              "transmis cela à un collègue qui vous rappellera sous peu.",
+        "es": "He encontrado el pedido {num}, pero está en un estado sobre el "
+              "que no puedo actuar, y no quiero adivinar. Lo he pasado a un "
+              "compañero que le llamará en breve.",
+        "de": "Ich habe Bestellung {num} gefunden, aber sie ist in einem "
+              "Zustand, in dem ich nicht handeln kann, und ich möchte nicht "
+              "raten. Ein Kollege ruft Sie in Kürze zurück.",
+        "zh": "我找到了订单 {num}，但它目前的状态我无法处理，我也不想擅自猜测。"
+              "我已转交同事，稍后会回电给您。",
+    },
+    "cx_too_late": {
+        "en": "I've found order {num}, and it's already {status}, so it can't "
+              "be cancelled at this point. ",
+        "fr": "J'ai trouvé la commande {num}, et elle est déjà {status}, elle "
+              "ne peut donc plus être annulée à ce stade. ",
+        "es": "He encontrado el pedido {num}, y ya está {status}, así que ya "
+              "no se puede cancelar. ",
+        "de": "Ich habe Bestellung {num} gefunden, sie ist bereits {status} "
+              "und kann daher nicht mehr storniert werden. ",
+        "zh": "我找到了订单 {num}，它已经是{status}状态，因此现在无法取消。",
+    },
+    "cx_return_fallback": {
+        "en": "You can return it under our return policy — reply to your order "
+              "confirmation email or contact customer service and the team "
+              "will start the return for you.",
+        "fr": "Vous pouvez le retourner selon notre politique de retour — "
+              "répondez à votre e-mail de confirmation ou contactez le service "
+              "client et l'équipe lancera le retour.",
+        "es": "Puede devolverlo según nuestra política de devoluciones — "
+              "responda al correo de confirmación o contacte con atención al "
+              "cliente y el equipo iniciará la devolución.",
+        "de": "Sie können sie im Rahmen unserer Rückgaberichtlinie "
+              "zurücksenden — antworten Sie auf Ihre Bestätigungs-E-Mail oder "
+              "wenden Sie sich an den Kundenservice.",
+        "zh": "您可以依据我们的退货政策办理退货——回复您的订单确认邮件，"
+              "或联系客服，团队会为您办理。",
+    },
+    "cx_follow_up_q": {
+        "en": " Would you like me to have someone follow up?",
+        "fr": " Souhaitez-vous qu'un collègue vous recontacte ?",
+        "es": " ¿Desea que un compañero se ponga en contacto con usted?",
+        "de": " Möchten Sie, dass sich ein Kollege bei Ihnen meldet?",
+        "zh": " 需要我安排同事跟进吗？",
+    },
+    "cx_discarded": {
+        "en": "No problem — I haven't changed anything. Anything else?",
+        "fr": "Pas de problème — je n'ai rien modifié. Autre chose ?",
+        "es": "No hay problema — no he cambiado nada. ¿Algo más?",
+        "de": "Kein Problem — ich habe nichts geändert. Sonst noch etwas?",
+        "zh": "没问题——我没有做任何更改。还有别的需要帮忙吗？",
+    },
+    "cx_restart": {
+        "en": "Let's start again — how can I help?",
+        "fr": "Reprenons — comment puis-je vous aider ?",
+        "es": "Empecemos de nuevo — ¿en qué puedo ayudarle?",
+        "de": "Fangen wir neu an — wie kann ich Ihnen helfen?",
+        "zh": "我们重新开始吧——请问有什么可以帮您？",
+    },
+    "cx_unavailable": {
+        "en": "I can't cancel an order over the phone myself at the moment, so "
+              "I don't want to promise something I can't finish. I've passed "
+              "this to a colleague, who will call you back to cancel it for "
+              "you. Is there anything else I can help with?",
+        "fr": "Je ne peux pas annuler une commande par téléphone pour le "
+              "moment, et je ne veux pas promettre ce que je ne peux pas "
+              "faire. J'ai transmis cela à un collègue qui vous rappellera "
+              "pour l'annuler. Puis-je vous aider avec autre chose ?",
+        "es": "Ahora mismo no puedo cancelar un pedido por teléfono, y no "
+              "quiero prometer algo que no puedo completar. Lo he pasado a un "
+              "compañero que le llamará para cancelarlo. ¿Puedo ayudarle en "
+              "algo más?",
+        "de": "Ich kann eine Bestellung derzeit telefonisch nicht selbst "
+              "stornieren und möchte nichts versprechen, was ich nicht "
+              "einhalten kann. Ein Kollege ruft Sie zurück und storniert sie "
+              "für Sie. Kann ich sonst noch helfen?",
+        "zh": "我目前无法在电话中直接为您取消订单，我不想承诺自己做不到的事。"
+              "我已转交同事，他们会回电为您取消。还有其他需要帮忙的吗？",
+    },
     "continue": {
         "en": "Let's continue — how can I help you today?",
         "fr": "Continuons — comment puis-je vous aider aujourd'hui ?",
@@ -1763,10 +2034,7 @@ def _cancel_unavailable(sess: Dict[str, Any]) -> Tuple[str, str]:
                      "caller asked to cancel an order while "
                      "VOICE_ORDER_CANCEL_ENABLED=0 — routed to a human",
                      priority="high")
-    return ("I can't cancel an order over the phone myself at the moment, so I "
-            "don't want to promise something I can't finish. I've passed this "
-            "to a colleague, who will call you back to cancel it for you. Is "
-            "there anything else I can help with?"), "speech"
+    return _line("cx_unavailable", _lang_of(sess)), "speech"
 
 # Case-folded. 'Invoiced' exists in production with a capital I, so a raw
 # comparison would miss it and fall into the wrong branch.
@@ -1799,6 +2067,38 @@ CANCEL_REPROMPTS = int(os.getenv("VOICE_CANCEL_REPROMPTS", "3"))
 # The enumeration brake is ORDER_ATTEMPTS_24H, which still binds hard: an
 # attacker must name a specific order, and gets five tries at it per day.
 ORDER_ATTEMPTS_24H = int(os.getenv("VOICE_CANCEL_ORDER_ATTEMPTS", "5"))
+
+
+def require_phone() -> bool:
+    """Is the PHONE half of verification usable in this environment?
+
+    Default yes, and it should stay yes anywhere with real customers, because
+    it is the entire security model: the last-four question and the one-time
+    code are the only factors a person holding the parcel does not already have.
+
+    Set VOICE_CANCEL_REQUIRE_PHONE=0 ONLY where the phone column is synthetic.
+    On seed data both phone gates are not merely weak, they are INOPERABLE: the
+    caller cannot know four digits of a generated number, and the code is texted
+    to a handset that does not exist. The flow then refuses every legitimate
+    tester, which is what happened on the first Railway call.
+
+    WHAT TURNING THIS OFF ACTUALLY COSTS. Possession is gone. What remains —
+    last name and street number — is printed on the shipping label, so anyone
+    who has handled the parcel can pass. This is a DEMONSTRATION mode, not a
+    weaker production mode, and the code refuses to pretend otherwise: every
+    cancellation made this way records verified_via='voice-demo-no-possession'
+    rather than 'voice-otp', so no audit row, employee notification or governance
+    entry can later be read as evidence that somebody proved who they were.
+
+    Read per call so it can be switched without a restart, and reported by
+    /voice-support/status so an operator can see which regime is live.
+    """
+    return _flag("VOICE_CANCEL_REQUIRE_PHONE", "1")
+
+
+# The value stamped on everything a demo-mode cancellation touches. Deliberately
+# ugly: it should look wrong in an audit trail, because it is.
+VERIFIED_VIA_DEMO = "voice-demo-no-possession"
 OTP_SENDS_PER_HOUR = int(os.getenv("VOICE_CANCEL_OTP_PER_HOUR", "5"))
 _CANCEL_POLICY = "voice_order_cancel"
 
@@ -1816,8 +2116,17 @@ _CANCEL_RE = _intent_re(
     r"\b(order|purchase|shipment)\b"
     r"|\b(order|purchase)\b.{0,24}\b(cancel|cancelled|canceled)\b",
     latin=["annuler ma commande", "annuler la commande", "annuler une commande",
-           "cancelar mi pedido", "cancelar el pedido"],
-    cjk=["取消订单", "取消訂單", "取消我的订单"])
+           "annuler cette commande", "je veux annuler", "je voudrais annuler",
+           "cancelar mi pedido", "cancelar el pedido", "cancelar un pedido",
+           "quiero cancelar", "bestellung stornieren", "stornieren"],
+    # Chinese is written without spaces, so  never matches between Han
+    # characters — these are SUBSTRING probes, not word-boundary patterns, and
+    # they must cover the ways people actually phrase it. "我要取消一个订单"
+    # (I want to cancel AN order) missed the original list because a measure
+    # word sits between the verb and the noun.
+    cjk=["取消订单", "取消訂單", "取消我的订单", "取消我的訂單",
+         "取消一个订单", "取消一個訂單", "取消这个订单", "取消這個訂單",
+         "取消这笔订单", "我要取消", "我想取消", "帮我取消", "幫我取消"])
 
 
 # ── Normalisation: spoken text is not typed text ────────────────────────────
@@ -2317,6 +2626,10 @@ def _verify_identity(spoken: Dict[str, str],
     #        recognition gets right. Compared on the last 10 digits: callers say
     #        "416 555 0123" for a record holding "+1 416 555 0123", and a
     #        country code is not a secret.
+    if not require_phone():
+        # The factor is not weakened here, it is ABSENT — and the caller records
+        # that as VERIFIED_VIA_DEMO so the distinction survives into the audit.
+        return True, "last name and street number matched (demo mode: no phone)"
     stored_phone = re.sub(r"\D", "", order.get("phone") or "")
     if len(stored_phone) < 4:
         return False, "no usable phone on the order's contact record"
@@ -2609,13 +2922,12 @@ def _return_policy_answer(sess: Dict[str, Any], status: str,
         kb = _kb_answer(sess, "what is your return and refund policy") or ""
     except Exception as exc:                              # noqa: BLE001
         logger.warning(f"[voice] return-policy KB lookup failed: {exc}")
-    lead = (f"I've found order {order_number}, and it's already {status}, so it "
-            f"can't be cancelled at this point. ")
-    tail = (kb or
-            "You can return it under our return policy — reply to your order "
-            "confirmation email or contact customer service and the team will "
-            "start the return for you.")
-    return lead + tail + " Would you like me to have someone follow up?"
+    lang = _lang_of(sess)
+    lead = _line("cx_too_late", lang).format(num=order_number, status=status)
+    # The KB answer already comes back in the caller's language (cross-lingual
+    # retrieval works); the FALLBACK is ours, so it has to be translated too.
+    tail = kb or _line("cx_return_fallback", lang)
+    return lead + tail + _line("cx_follow_up_q", lang)
 
 
 # ── The conversation ────────────────────────────────────────────────────────
@@ -2632,8 +2944,7 @@ def _return_policy_answer(sess: Dict[str, Any], status: str,
 def _cancel_begin(sess: Dict[str, Any]) -> Tuple[str, str]:
     sess["cancel"] = {"state": "awaiting_number", "attempts": 0,
                       "spoken": {}, "order": None}
-    return ("I can help with that. Could you tell me your order number, "
-            "please?"), "speech"
+    return _line("cx_ask_number", _lang_of(sess)), "speech"
 
 
 def _cancel_fail(sess: Dict[str, Any], internal: str,
@@ -2649,7 +2960,28 @@ def _cancel_fail(sess: Dict[str, Any], internal: str,
     _escalate_cancel(sess, reason, internal, order_number)
     sess["cancel"] = None
     logger.info(f"[voice] cancellation refused — {internal}")
-    return _CANCEL_REFUSAL, "speech"
+    return _line("cx_refused", _lang_of(sess)), "speech"
+
+
+def _cancel_authorize(sess: Dict[str, Any]) -> Tuple[str, str]:
+    """Possession, or — in demo mode — an honest admission that there is none.
+
+    Split out from the OTP send so the demo path cannot accidentally inherit
+    'voice-otp'. The value written here is the one every downstream record
+    carries: the governance ledger, the audit_log row and the employee
+    notification all read it back, and all three should say the same thing about
+    how this cancellation was authorised.
+    """
+    if not require_phone():
+        order = (sess.get("cancel") or {}).get("order") or {}
+        sess["cancel_auth"] = {"order_id": order.get("order_id"),
+                               "verified_via": VERIFIED_VIA_DEMO,
+                               "at": time.time(), "scope": "order.cancel"}
+        logger.warning(
+            "[voice] DEMO MODE cancellation for %s — no possession was proven "
+            "(VOICE_CANCEL_REQUIRE_PHONE=0)", order.get("order_number"))
+        return "", "decide"
+    return _cancel_send_otp(sess)
 
 
 def _cancel_send_otp(sess: Dict[str, Any]) -> Tuple[str, str]:
@@ -2695,19 +3027,18 @@ def _cancel_send_otp(sess: Dict[str, Any]) -> Tuple[str, str]:
     c["state"] = "awaiting_otp"
     logger.info(f"[voice] cancellation OTP sent for order "
                 f"{order.get('order_number')}")
-    return ("Thank you — that all matches. For your security I've texted a "
-            "six digit code to the mobile number we have on file. Please "
-            "enter it on your keypad now."), "digits"
+    return _line("cx_otp_sent", _lang_of(sess)), "digits"
 
 
 async def _cancel_turn(sess: Dict[str, Any], heard: str) -> Tuple[str, str]:
     """One spoken turn inside the cancellation flow."""
     c = sess["cancel"]
     state = c["state"]
+    lang = _lang_of(sess)
 
     if _NO_RE.search(heard) and _BYE_RE.search(heard):
         sess["cancel"] = None
-        return "No problem — I haven't changed anything. Anything else?", "speech"
+        return _line("cx_discarded", lang), "speech"
 
     # ---- 1. the order number
     if state == "awaiting_number":
@@ -2717,9 +3048,7 @@ async def _cancel_turn(sess: Dict[str, Any], heard: str) -> Tuple[str, str]:
             if c["attempts"] >= CANCEL_ATTEMPTS:
                 return _cancel_fail(sess, "order number not understood after "
                                           f"{CANCEL_ATTEMPTS} attempts")
-            return ("I didn't catch the order number. It's on your confirmation "
-                    "email — please read me the digits, for example "
-                    "1 0 5 2 5 9."), "speech"
+            return _line("cx_bad_number", lang), "speech"
 
         # Enumeration brake. Keyed on the ORDER, which the attacker must name for
         # anything to happen — unlike their caller ID, they cannot rotate it.
@@ -2737,8 +3066,7 @@ async def _cancel_turn(sess: Dict[str, Any], heard: str) -> Tuple[str, str]:
         c["order"] = await asyncio.to_thread(_load_order_for_cancel, suffix)
         c["suffix"] = suffix
         c["state"] = "awaiting_name"
-        return ("Thanks. Before I can look at that, I need to verify your "
-                "identity. What's your last name?"), "speech"
+        return _line("cx_ask_name", lang), "speech"
 
     # ---- 2-4. the three factors, collected from EVERY caller
     if state == "awaiting_name":
@@ -2757,8 +3085,7 @@ async def _cancel_turn(sess: Dict[str, Any], heard: str) -> Tuple[str, str]:
         # street number is both: "eighty eight" is one breath, no letters, no
         # mid-answer pause. The postcode is still ACCEPTED if a caller offers
         # it; it is simply no longer asked for.
-        return ("Thank you. And the street number of the shipping address on "
-                "that order — just the number?"), "speech"
+        return _line("cx_ask_street", lang), "speech"
 
     if state == "awaiting_postal":
         # A digits question that came back with NO digits is almost always a
@@ -2769,9 +3096,13 @@ async def _cancel_turn(sess: Dict[str, Any], heard: str) -> Tuple[str, str]:
         # postcode='I'm 5C.' / phone='1F6.' happened on a live call.
         if not _has_digits(heard) and c.get("reprompts", 0) < CANCEL_REPROMPTS:
             c["reprompts"] = c.get("reprompts", 0) + 1
-            return ("Sorry, I didn't catch a number there. Just the street "
-                    "number of the shipping address, please."), "speech"
+            return _line("cx_bad_street", lang), "speech"
         c["spoken"]["postal"] = heard
+        if not require_phone():
+            # Demo mode: the phone column is synthetic, so there is no fourth
+            # question to ask and no code to send. Decide on what we have.
+            c["state"] = "awaiting_phone"
+            return await _cancel_decide(sess)
         c["state"] = "awaiting_phone"
         # LAST FOUR DIGITS, spoken.
         #
@@ -2785,20 +3116,18 @@ async def _cancel_turn(sess: Dict[str, Any], heard: str) -> Tuple[str, str]:
         # Four digits are short enough that speech recognition gets them right,
         # they need no new transport state, and they are the industry-standard
         # shape of this question ("the last four digits on the account").
-        return ("Thank you. And finally, the last four digits of the phone "
-                "number on the account?"), "speech"
+        return _line("cx_ask_phone4", lang), "speech"
 
     if state == "awaiting_phone":
         if not _has_digits(heard) and c.get("reprompts", 0) < CANCEL_REPROMPTS:
             c["reprompts"] = c.get("reprompts", 0) + 1
-            return ("Sorry, I didn't catch that. Just the last four digits of "
-                    "the phone number on the account, please."), "speech"
+            return _line("cx_bad_phone4", lang), "speech"
         c["spoken"]["phone"] = heard
         return await _cancel_decide(sess)
 
     # ---- fell out of the state machine (restart mid-call, stray input)
     sess["cancel"] = None
-    return "Let's start again — how can I help?", "speech"
+    return _line("cx_restart", lang), "speech"
 
 
 async def _cancel_decide(sess: Dict[str, Any]) -> Tuple[str, str]:
@@ -2821,7 +3150,10 @@ async def _cancel_decide(sess: Dict[str, Any]) -> Tuple[str, str]:
         c["attempts"] += 1
         return _cancel_fail(sess, why, order.get("order_number"))
 
-    return await asyncio.to_thread(_cancel_send_otp, sess)
+    say, nxt = await asyncio.to_thread(_cancel_authorize, sess)
+    if nxt == "decide":
+        return await _execute_cancellation(sess)
+    return say, nxt
 
 
 async def _cancel_check_code(sess: Dict[str, Any],
@@ -2833,7 +3165,7 @@ async def _cancel_check_code(sess: Dict[str, Any],
     order = c.get("order") or {}
     if not v.get("hash"):
         sess["cancel"] = None
-        return "Let's start again — how can I help?", "speech"
+        return _line("cx_restart", _lang_of(sess)), "speech"
 
     if time.time() > v["expires"]:
         return _cancel_fail(sess, "verification code expired",
@@ -2846,7 +3178,7 @@ async def _cancel_check_code(sess: Dict[str, Any],
                                       f"codes — locked out",
                                 order.get("order_number"),
                                 reason="order_cancel_lockout")
-        return ("That code doesn't match. Please try again."), "digits"
+        return _line("cx_bad_code", _lang_of(sess)), "digits"
 
     # Verified by possession AND by all three record factors.
     sess["cancel_auth"] = {"order_id": order.get("order_id"),
@@ -2866,6 +3198,7 @@ async def _execute_cancellation(sess: Dict[str, Any]) -> Tuple[str, str]:
     c = sess.get("cancel") or {}
     order = c.get("order") or {}
     auth = sess.get("cancel_auth") or {}
+    lang = _lang_of(sess)
     sess["cancel"] = None
     status = (order.get("status") or "").strip().lower()
     num = order.get("order_number") or "(unknown)"
@@ -2880,9 +3213,7 @@ async def _execute_cancellation(sess: Dict[str, Any]) -> Tuple[str, str]:
                          f"order status {order.get('status')!r} is neither "
                          f"cancellable nor a recognised too-late status",
                          num, priority="high")
-        return (f"I've found order {num}, but it's in a state I'm not able to "
-                f"act on, so I don't want to guess. I've passed this to a "
-                f"colleague who will call you back shortly."), "speech"
+        return _line("cx_unexpected", lang).format(num=num), "speech"
 
     # ---- the write
     result = await asyncio.to_thread(cancel_order_sp, {
@@ -2897,9 +3228,7 @@ async def _execute_cancellation(sess: Dict[str, Any]) -> Tuple[str, str]:
                          f"guarded UPDATE affected no rows: "
                          f"{result.get('reason') or result.get('error')}",
                          num, priority="high")
-        return ("I wasn't able to complete the cancellation — the order's "
-                "status changed while we were talking. I've asked a colleague "
-                "to call you back and sort it out."), "speech"
+        return _line("cx_race", lang), "speech"
 
     # ---- audit ledger (pre-authorized, terminal). Never blocks the customer.
     approval_uuid = None
@@ -2944,15 +3273,8 @@ async def _execute_cancellation(sess: Dict[str, Any]) -> Tuple[str, str]:
         f"{result.get('prior_status')}. Confirmation email: {email_state}.",
         account_id=order.get("account_id"), owner_id=None)
 
-    said = (f"That's done — order {result['order_number']} has been cancelled. ")
-    if email_state == "accepted":
-        said += ("I've emailed the confirmation to the address on your "
-                 "account. Anything else?")
-    else:
-        said += ("I wasn't able to get the confirmation email out, so a "
-                 "colleague will follow up with you. The cancellation itself "
-                 "is complete. Anything else?")
-    return said, "speech"
+    key = "cx_done_emailed" if email_state == "accepted" else "cx_done_no_email"
+    return _line(key, lang).format(num=result["order_number"]), "speech"
 
 
 def _send_cancellation_email(order_id: str) -> Tuple[str, str]:
@@ -3183,8 +3505,7 @@ async def take_digits(call_sid: str, digits: str) -> Tuple[str, str]:
                     "hangup")
         cleaned = re.sub(r"\D", "", digits or "")
         if not cleaned:
-            return ("I didn't get the code. Please enter the six digits on "
-                    "your keypad."), "digits"
+            return _line("cx_no_code", _lang_of(sess)), "digits"
         return await _cancel_check_code(sess, cleaned)
 
     if not sess or not sess.get("verify"):
@@ -3476,7 +3797,13 @@ def voice_support_status():
                 # The limiter FAILS CLOSED, so a missing table means every
                 # cancellation is refused. Surfacing it here turns that from a
                 # confusing outage into a one-line answer.
-                "rate_limiter_table": _limiter_ready()},
+                "rate_limiter_table": _limiter_ready(),
+                # The single most important line here. If this is false the
+                # cancellations happening are DEMO cancellations: no possession
+                # was proven, and last name + street number are both on the
+                # shipping label.
+                "phone_verification_required": require_phone(),
+                "verified_via_when_off": VERIFIED_VIA_DEMO},
             "escalation_email": esc_email}
 
 
