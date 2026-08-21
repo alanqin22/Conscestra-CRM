@@ -2021,10 +2021,40 @@ _CHAT_PAGES = [
     "index.html",
 ]
 
+def _serve_page_or_redirect(filename: str, request: Request):
+    """Serve the page from disk, or send the caller to the host that has it.
+
+    SAME DEFECT AS THE FAVICON, thirty times over. Every one of these files is
+    gitignored, so none of them exists on Railway and each route answered a
+    plain page request with a 500. Measured 2026-08-21:
+
+        railway  /store-home.html   500      <- FileResponse, no such file
+        agentorc /store-home.html   200
+
+    A redirect is strictly better than either the 500 or a bare 404: the pages
+    really do exist, just on the static host, and a bookmark or a search result
+    pointing at the API origin then still lands somewhere useful. The query
+    string is carried across because for some pages it is the whole credential.
+
+    Falls back to 404 when PUBLIC_SITE_URL is unset -- a redirect to our own
+    origin would loop.
+    """
+    if os.path.exists(filename):
+        return FileResponse(filename, media_type="text/html")
+    site = (os.getenv("PUBLIC_SITE_URL") or "").strip().rstrip("/")
+    if not site:
+        logger.warning("[static] %s is not present and PUBLIC_SITE_URL is unset "
+                       "— nowhere to send the caller", filename)
+        return Response(status_code=404)
+    qs = str(request.url.query or "")
+    return RedirectResponse(f"{site}/{filename}" + (f"?{qs}" if qs else ""),
+                            status_code=307)
+
+
 def _register_chat_page(filename: str) -> None:
     @app.get(f"/{filename}", name=f"serve_{filename.replace('-', '_').replace('.', '_')}")
-    async def _serve():
-        return FileResponse(filename, media_type="text/html")
+    async def _serve(request: Request):
+        return _serve_page_or_redirect(filename, request)
 
 for _page in _CHAT_PAGES:
     _register_chat_page(_page)
@@ -2049,8 +2079,23 @@ for _slug in _RENAMED_PAGES:
 
 @app.get("/favicon.ico")
 async def serve_favicon():
-    """Silence the auto-requested /favicon.ico 404 across every page."""
-    return FileResponse("logo/Conscestra_CRM_Logo.png", media_type="image/png")
+    """Answer the browser's automatic /favicon.ico request without raising.
+
+    THE FILE IS NOT THERE IN PRODUCTION. `logo/` is gitignored (.gitignore:166)
+    exactly like `*.html`, so it ships to agentorc.ca by SFTP and never to
+    Railway. FileResponse on a missing path raises FileNotFoundError inside the
+    ASGI layer, which means this route -- written to silence a harmless 404 --
+    was instead returning a 500 with a stack trace to every browser that loaded
+    any page. Observed in the deploy log on 2026-08-21.
+
+    204 rather than 404 when it is absent: browsers stop asking after a 204, and
+    it is the truthful answer ("there is no icon here"), whereas a 404 is the
+    noise this route exists to remove.
+    """
+    icon = "logo/Conscestra_CRM_Logo.png"
+    if os.path.exists(icon):
+        return FileResponse(icon, media_type="image/png")
+    return Response(status_code=204)
 
 
 @app.get("/")
