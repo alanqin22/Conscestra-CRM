@@ -126,17 +126,20 @@ DIRECT: Dict[str, Tuple[str, ...]] = {
     # data IS there; flagged because a backup table is not a place personal
     # data should live indefinitely, and erasure routines do not know about it.
     "invoices_backup_v5e4":       ("contact_id", "account_id"),
-    # Migration safety nets that were never cleaned up: the seed-email rename
-    # (@seed.agentorc.ca) and the owner backfill each snapshotted the columns
-    # they were about to rewrite. They hold real addresses and real owner links
-    # for hundreds of rows, so the subject's data IS in them and Art. 15 covers
-    # it. Declared rather than excluded for that reason -- but the right end
-    # state is that they are DROPPED, not exported: erasure routines do not
-    # know about them, so a deletion completes while the old value survives here.
-    "accounts_email_backup_seed": ("account_id", "email"),
-    "contacts_email_backup_seed": ("contact_id", "email"),
-    "leads_email_backup_seed":    ("lead_id", "email"),
-    "contacts_owner_backup_d4":   ("contact_id", "account_id"),
+    # NOT LISTED HERE, deliberately: accounts_email_backup_seed,
+    # contacts_email_backup_seed, leads_email_backup_seed and
+    # contacts_owner_backup_d4. They were migration safety nets from the
+    # seed-email rename and the owner backfill, holding ~643 rows of stale
+    # addresses and owner links, and they were DROPPED from both databases on
+    # 2026-08-21 rather than declared.
+    #
+    # Dropping beat exporting, and the reason is worth keeping: erasure routines
+    # did not know about them, so a subject's deletion would complete while
+    # their old address survived in a backup nobody would think to look in. An
+    # exported copy of that is a correct answer to the wrong question.
+    #
+    # Declaring them now would be a defect in the other direction --
+    # phantom_manifest_entries, an entry whose export silently does nothing.
     # Their own request history. Art. 15 covers processing carried out ON the
     # subject, and answering their access requests is such processing — so the
     # register of those requests is disclosable to them. Found by the coverage
