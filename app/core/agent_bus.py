@@ -1136,9 +1136,22 @@ HANDLERS["invoice_paid"] = handle_milestone_settled
 # AGENT_BUS_AUTOSEND=1 AND the recipient passes _is_real_email().
 
 # Obvious placeholder / non-deliverable domains used by the seed data and RFC docs.
+#
+# company.com AND system.internal are here for a sharper reason than the rest.
+# They are the seeded EMPLOYEE domains — 9 rows and 12 rows respectively — and
+# `company.com` is a REAL domain that belongs to somebody else. It is not an
+# RFC-reserved name, so nothing else in this function would have stopped it:
+# the moment employee emailing is switched on and those rows are marked
+# verified, "julia.martin@company.com" becomes a live send to a stranger.
+#
+# Checked before adding: zero contacts and zero leads use either domain, so no
+# legitimate customer mail is affected. If a real customer ever does arrive on
+# company.com, that is the day to replace this blunt entry with a per-record
+# decision — not to quietly delete the line.
 _PLACEHOLDER_EMAIL_DOMAINS = {
     "example.com", "examples.com", "example.org", "example.net",
     "test.com", "test", "localhost", "invalid", "none.com",
+    "company.com", "system.internal",
 }
 
 def _is_real_email(addr: Optional[str], is_verified: bool) -> bool:

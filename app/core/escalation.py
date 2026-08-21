@@ -40,6 +40,8 @@ CONFIG (env)
   ESCALATION_ENABLED        1    kill switch
   ESCALATION_SLA_MINUTES    240  default deadline for a normal escalation
   ESCALATION_NOTIFY         1    also raise an in-app notification (high/urgent)
+  ESCALATION_EMAIL          0    ALSO email the role mailbox (exceptions only)
+  ESCALATION_EMAIL_TO       support@agentorc.ca   where those exceptions go
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ import json
 import logging
 import os
 import re
+from html import escape as html_escape
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
@@ -63,6 +66,10 @@ def _flag(name: str, default: str = "1") -> bool:
 
 ENABLED = _flag("ESCALATION_ENABLED", "1")
 NOTIFY = _flag("ESCALATION_NOTIFY", "1")
+# Ships DARK. Turn on after watching a few land in the console first.
+EMAIL_ENABLED = _flag("ESCALATION_EMAIL", "0")
+ESCALATION_EMAIL_TO = os.getenv("ESCALATION_EMAIL_TO",
+                                "support@agentorc.ca").strip()
 DEFAULT_SLA_MINUTES = int(os.getenv("ESCALATION_SLA_MINUTES", "240"))
 
 # Machine reasons — the WHY, kept small and stable so the queue can group them.
@@ -73,6 +80,61 @@ REASONS = {
     "complaint": "The customer expressed frustration or threatened to leave.",
     "agent_promised_followup": "The agent's reply promised a human follow-up.",
     "manual": "Raised by a human.",
+
+    # ── Order cancellation by phone (docs/order_cancellation_by_phone_design.md)
+    # These were being passed by voice_support and SILENTLY COLLAPSED to
+    # "manual" by the guard above, because an unregistered reason is not an
+    # error here — it is a default. The truth survived only in
+    # metadata.internal_reason, so the queue could not be filtered by what had
+    # actually gone wrong, and any routing keyed on `reason` would have matched
+    # nothing. Registering them is what makes the email routing below possible.
+    "order_cancel_race": "An order changed status mid-call; NOT cancelled, and "
+                         "the customer was promised a callback.",
+    "order_cancel_email_failed": "The order WAS cancelled but the customer's "
+                                 "confirmation email did not complete.",
+    "order_cancel_unexpected_status": "An order was in a state the agent will "
+                                      "not act on; it refused to guess.",
+    "order_cancel_unverified": "A caller could not be verified for a "
+                               "cancellation; no order was changed.",
+    "order_cancel_unverifiable": "No phone on file, so the caller could not be "
+                                 "verified by one-time code at all.",
+    "order_cancel_lockout": "Too many incorrect verification codes.",
+    "order_cancel_unavailable": "A cancellation was asked for while the "
+                                "capability is switched off.",
+}
+
+# ── WHICH ESCALATIONS ALSO GO OUT BY EMAIL ──────────────────────────────────
+# Deliberately NOT every escalation, and deliberately NOT successful actions.
+#
+# A successful AI cancellation is a completed self-service action with an audit
+# trail, a customer confirmation and an in-app notice. Emailing about it asks a
+# human to read something that needs no decision, and the fastest way to make an
+# alerting channel ignored is to send things that require no action.
+#
+# What is here is the set where a HUMAN MUST DO SOMETHING and no other mechanism
+# will make that happen: a customer promised a callback, a cancellation the
+# customer has no confirmation of, or a state the agent declined to judge.
+# The subject line is the whole message for someone triaging an inbox: it has to
+# say what to DO, not name an enum. "[Action needed] order_cancel_unverified"
+# makes a support agent open the mail to find out whether it matters. The reason
+# code is kept in parentheses so mail rules can still filter on it — humans read
+# the front, machines read the back.
+_EMAIL_ACTIONS = {
+    "order_cancel_race": "Cancellation did not complete — call the customer back",
+    "order_cancel_email_failed": "Order cancelled, but no confirmation reached "
+                                 "the customer",
+    "order_cancel_unexpected_status": "Order in an unexpected state — needs a "
+                                      "decision",
+    "order_cancel_unverified": "Caller could not be verified — call them back",
+    "customer_requested_human": "Customer asked to speak to a person",
+}
+
+_EMAIL_REASONS = {
+    "order_cancel_race",
+    "order_cancel_email_failed",
+    "order_cancel_unexpected_status",
+    "order_cancel_unverified",
+    "customer_requested_human",
 }
 
 # Priority → SLA multiplier. Urgent work gets a tighter deadline, not just a
@@ -292,6 +354,15 @@ def open(reason: str, source: str, *,
                 f"priority={priority} reachable={known}")
     if NOTIFY and priority in ("high", "urgent"):
         _notify(eid, reason, priority, summary, channel, handle, known)
+
+    # DELIBERATELY NOT nested in the block above. The in-app notice is gated on
+    # PRIORITY; the email is gated on REASON, and the two answer different
+    # questions — "is this urgent" versus "must a person do something". Nesting
+    # them silently dropped the email for order_cancel_email_failed and
+    # order_cancel_unverified, both of which open at priority 'normal' and both
+    # of which need a human. Caught by the tests, not by review.
+    _email_escalation(eid, reason, priority, summary, channel, handle,
+                      known, transcript_excerpt, metadata)
     out = {"ok": True, "escalation_id": eid, "created": True,
            "contact_known": known, "reason": reason,
            "sla_due_at": due.isoformat() if due else None}
@@ -314,6 +385,134 @@ def open(reason: str, source: str, *,
     except Exception as exc:
         logger.warning(f"[escalation] case bridge skipped for {eid[:8]}: {exc}")
     return out
+
+
+def _email_escalation(escalation_id: str, reason: str, priority: str,
+                      summary: str, channel: Optional[str],
+                      handle: Optional[str], contact_known: bool,
+                      transcript_excerpt: str = "",
+                      metadata: Optional[Dict[str, Any]] = None) -> None:
+    """Email the on-call ROLE mailbox about an escalation a human must action.
+
+    WHY A ROLE MAILBOX AND NOT A PERSON. The obvious answer — "tell whoever owns
+    the order" — does not exist in this database and cannot be faked:
+
+        orders.owner_id on cancellable orders : 0 of 42
+        accounts.owner_id                     : 42 of 42, but every one of them
+                                                classifies as customer_contact
+        assignable_identity (real staff)      : 4 (the executives)
+
+    So the account "owner" is a CUSTOMER, and the eight people with
+    @emp.agentorc.ca mailboxes are the demo-seed cohort that assignable.py
+    describes as "never granted". Emailable is not the same as routable, and
+    inventing a routing rule from job titles is exactly the inference that
+    module exists to refuse. A role mailbox is honest about that: it survives
+    someone leaving, and it does not pretend the system knows whose desk this
+    belongs on.
+
+    When ownership becomes real — orders owned, staff granted assignability —
+    this function is where "prefer the owner, fall back to the role mailbox"
+    goes, and nothing else has to change.
+
+    NEVER RAISES, and never blocks the caller: an escalation is already durable
+    in its own table before this runs. The send outcome is written back to the
+    escalation's metadata, so a reader can tell "we emailed" from "we meant to".
+    """
+    if not EMAIL_ENABLED or reason not in _EMAIL_REASONS:
+        return
+    to = (ESCALATION_EMAIL_TO or "").strip()
+    if not to:
+        logger.warning("[escalation] ESCALATION_EMAIL_TO is empty — not sending")
+        return
+
+    md = metadata or {}
+    who = handle if contact_known else "an unidentified caller"
+    order = md.get("order_number") or "—"
+    lines = [
+        f"Reason:      {reason} — {REASONS.get(reason, '')}",
+        f"Priority:    {priority}",
+        f"Order:       {order}",
+        f"Channel:     {channel or 'unknown'}",
+        f"Customer:    {who}",
+        f"Escalation:  {escalation_id}",
+    ]
+    if md.get("internal_reason"):
+        lines.append(f"Detail:      {md['internal_reason']}")
+    if transcript_excerpt:
+        lines.append(f"Heard:       {transcript_excerpt[:300]}")
+    if not contact_known:
+        lines.append("NOTE:        we hold no way to reach this person.")
+
+    body_text = (
+        f"{summary or REASONS.get(reason, reason)}\n\n"
+        + "\n".join(lines)
+        + "\n\nThis is an EXCEPTION notice: the AI agent stopped and a person "
+          "needs to act. Successful automated actions are not emailed — they "
+          "are in the console with their audit trail.\n"
+    )
+    body_html = (
+        f"<p>{html_escape(summary or REASONS.get(reason, reason))}</p>"
+        "<table style='border-collapse:collapse;font-family:system-ui,sans-serif;"
+        "font-size:0.92rem'>"
+        + "".join(
+            f"<tr><td style='padding:2px 12px 2px 0;color:#6b7280'>"
+            f"{html_escape(l.split(':', 1)[0])}</td>"
+            f"<td style='padding:2px 0'>{html_escape(l.split(':', 1)[1].strip())}</td></tr>"
+            for l in lines if ':' in l)
+        + "</table>"
+        "<p style='color:#6b7280;font-size:0.85rem'>This is an <b>exception</b> "
+        "notice: the AI agent stopped and a person needs to act. Successful "
+        "automated actions are not emailed — they are in the console with their "
+        "audit trail.</p>")
+
+    state, detail = "failed", ""
+    try:
+        from app.agents.email.smtp_imap import send_email
+        res = send_email(
+            to=to,
+            subject=(f"[Action needed] "
+                     f"{_EMAIL_ACTIONS.get(reason, reason)}"
+                     + (f" — {order}" if order and order != "—" else "")
+                     + f" ({reason})"),
+            body_html=body_html,
+            body_text=body_text,
+            from_name="Conscestra Agent Ops",
+        )
+        # Same evidence rule the customer emails use: success requires the
+        # provider to say so, not merely the absence of an exception.
+        if isinstance(res, dict) and res.get("success") is True:
+            state = "accepted"
+            detail = str(res.get("message") or "")[:200]
+        else:
+            detail = str((res or {}).get("error")
+                         or (res or {}).get("message")
+                         or "provider did not confirm acceptance")[:200]
+    except Exception as exc:                                  # noqa: BLE001
+        detail = f"{type(exc).__name__}: {exc}"[:200]
+
+    if state == "accepted":
+        logger.info(f"[escalation] {escalation_id[:8]} emailed to {to}")
+    else:
+        logger.warning(f"[escalation] {escalation_id[:8]} email {state}: {detail}")
+
+    # Record the outcome ON the escalation. Without this the only evidence an
+    # email was attempted is a log line, and a log line is not a record.
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE escalations
+                          SET metadata = COALESCE(metadata,'{}'::jsonb)
+                                         || %s::jsonb
+                        WHERE escalation_id = %s::uuid""",
+                    (json.dumps({"email_state": state, "email_to": to,
+                                 "email_detail": detail}), escalation_id))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:                                  # noqa: BLE001
+        logger.debug(f"[escalation] could not record email outcome: {exc}")
 
 
 def _notify(escalation_id: str, reason: str, priority: str, summary: str,
