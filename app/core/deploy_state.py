@@ -75,14 +75,6 @@ REQUIRED_MIGRATIONS: List[str] = [
     "backfill_contact_shipping_addresses.sql",
     "order_lifecycle_notifications.sql",
     "order_cancellation_voice.sql",
-    # Must follow order_cancellation_voice.sql: it warns (not fails) when
-    # 'order.cancelled' is not yet a registered event type, and the ordering
-    # here is what stops that warning being the normal case on a fresh database.
-    "order_status_self_service.sql",
-    # Extends the file above. A separate migration rather than an edit to it:
-    # that one is already recorded with a checksum everywhere, and migrate.py
-    # reports a changed file as drifted instead of re-running it.
-    "order_cancel_reason.sql",
     # verify_order_test_contacts.sql is DELIBERATELY NOT DECLARED, and this is
     # not the same reason as tier1 below. It is not a schema requirement at all
     # — it flips is_email_verified on a handful of contacts so live sends can be
