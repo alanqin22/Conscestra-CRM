@@ -53,7 +53,19 @@ logger = logging.getLogger("dsar")
 # Columns that identify a data subject anywhere in the schema. The coverage
 # check scans for these, so a new table holding one is detected automatically.
 SUBJECT_COLUMNS = ("contact_id", "account_id", "lead_id", "customer_id",
-                   "email", "phone", "person_id", "subject_id", "user_email")
+                   "email", "phone", "person_id", "subject_id", "user_email",
+                   # `recipient_email` added 2026-08-21. It was NOT here, and
+                   # the consequence was silent: order_cancel_verifications
+                   # stores the address a cancellation code was mailed to, and
+                   # coverage() could not see the table at all -- so it was
+                   # neither declared nor reported as undeclared. A blind spot
+                   # is worse than a failure, because a failure gets fixed.
+                   #
+                   # This is the same shape as the `identifier` note on
+                   # consent_state below: the matcher finds columns by NAME, so
+                   # any new spelling of "an address belonging to a person" is
+                   # invisible until it is listed here.
+                   "recipient_email")
 
 # account_id identifies an ORGANISATION, which may contain other people.
 # Everything else identifies the individual.
@@ -88,6 +100,12 @@ DIRECT: Dict[str, Tuple[str, ...]] = {
     "payments":                   ("contact_id", "account_id"),
     "coupon_redemptions":         ("contact_id", "account_id"),
     "price_match_requests":       ("contact_id", "account_id"),
+    # What we sent them about their orders. Undeclared from 2026-08-15 (when the
+    # table shipped) until 2026-08-21 -- caught by this check on both databases,
+    # which is the check doing its job, just late. It records every lifecycle
+    # email: which address, which template, whether the provider accepted it.
+    # A subject asking what we hold about them is entitled to that.
+    "order_notifications":        ("contact_id", "account_id", "recipient_email"),
     # Marketing and consent
     "marketing_sends":            ("contact_id", "account_id", "email"),
     "email_suppression":          ("email",),
@@ -108,6 +126,20 @@ DIRECT: Dict[str, Tuple[str, ...]] = {
     # data IS there; flagged because a backup table is not a place personal
     # data should live indefinitely, and erasure routines do not know about it.
     "invoices_backup_v5e4":       ("contact_id", "account_id"),
+    # NOT LISTED HERE, deliberately: accounts_email_backup_seed,
+    # contacts_email_backup_seed, leads_email_backup_seed and
+    # contacts_owner_backup_d4. They were migration safety nets from the
+    # seed-email rename and the owner backfill, holding ~643 rows of stale
+    # addresses and owner links, and they were DROPPED from both databases on
+    # 2026-08-21 rather than declared.
+    #
+    # Dropping beat exporting, and the reason is worth keeping: erasure routines
+    # did not know about them, so a subject's deletion would complete while
+    # their old address survived in a backup nobody would think to look in. An
+    # exported copy of that is a correct answer to the wrong question.
+    #
+    # Declaring them now would be a defect in the other direction --
+    # phantom_manifest_entries, an entry whose export silently does nothing.
     # Their own request history. Art. 15 covers processing carried out ON the
     # subject, and answering their access requests is such processing — so the
     # register of those requests is disclosable to them. Found by the coverage
@@ -141,6 +173,12 @@ CHILD: Dict[str, Tuple[str, str, str]] = {
     "escalations":                 ("conversation_id", "conversations", "conversation_id"),
     "case_comments":               ("case_id", "cases", "case_id"),
     "order_items":                 ("order_id", "orders", "order_id"),
+    # Self-service cancellation verifications. CHILD rather than DIRECT: the
+    # row carries recipient_email but no contact_id, and order_id is the only
+    # honest link back to a person. Rows are swept after 30 days, so an export
+    # legitimately shows only recent ones -- which is retention working, not
+    # data being withheld.
+    "order_cancel_verifications":  ("order_id", "orders", "order_id"),
     "order_items_backup_v5e4":     ("order_id", "orders", "order_id"),
     "invoice_orders":              ("invoice_id", "invoices", "invoice_id"),
     "opportunity_lines":           ("opportunity_id", "opportunities", "opportunity_id"),
@@ -178,7 +216,22 @@ EXCLUDED: Dict[str, str] = {
 # useful sense — disclosing it only creates risk.
 BINARY_TYPES = {"bytea", "vector", "USER-DEFINED"}
 SECRET_COLUMNS = {"password_hash", "password", "secret", "token", "token_hash",
-                  "api_key", "signature", "embedding", "vector"}
+                  "api_key", "signature", "embedding", "vector",
+                  # `code_hash` added 2026-08-21, after an export of a real
+                  # subject was read and found to contain it.
+                  #
+                  # It is the SHA-256 of a SIX-DIGIT order-cancellation code,
+                  # and six digits is a million candidates — recovering the code
+                  # from the hash takes milliseconds, which is how the test
+                  # suite does it on purpose. A spent row is harmless, but a row
+                  # still unconsumed and unexpired would let anyone holding the
+                  # export file finish cancelling that order. Exports get
+                  # emailed, stored and forwarded.
+                  #
+                  # The row itself stays in the export — that a code was sent,
+                  # to which address, when, and whether it was used is genuinely
+                  # the subject's data. Only the credential is withheld.
+                  "code_hash"}
 
 
 class IncompleteExport(RuntimeError):

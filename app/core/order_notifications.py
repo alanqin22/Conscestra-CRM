@@ -368,6 +368,50 @@ def _footer_text() -> str:
             f"{SUPPORT_HOURS}\n")
 
 
+def _status_button(order_id: str) -> Tuple[str, str]:
+    """(text, html) for the Order Status button, or ('', '') when the link
+    cannot be signed.
+
+    OMISSION IS THE CORRECT FAILURE. order_status.order_status_url returns None
+    when no signing secret is configured, and the only alternatives to omitting
+    the button would be to print an unsigned link (which the page must reject,
+    so the customer clicks through to an error) or to sign with something
+    guessable (which would let anyone open anyone's order). The email still
+    sends, and every other route to us is unchanged.
+
+    The button is a table, not a styled <a>, because Outlook renders CSS
+    padding on inline anchors inconsistently and would otherwise produce a bare
+    word where a button should be. The URL is repeated as text underneath for
+    clients that strip the button entirely.
+    """
+    try:
+        from app.core.order_status import order_status_url
+        url = order_status_url(order_id)
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning(f"[order_notifications] status link unavailable: {exc}")
+        url = None
+    if not url:
+        return "", ""
+
+    safe = html.escape(url, quote=True)
+    text = (f"\n\nTrack or manage this order:\n  {url}\n"
+            f"  You can view its current status there, cancel it while it has "
+            f"not yet shipped, or read our return policy once it has.")
+    button = (
+        f'<table role="presentation" cellpadding="0" cellspacing="0" '
+        f'border="0" style="margin:24px 0"><tr>'
+        f'<td align="center" bgcolor="#0d9488" style="border-radius:6px">'
+        f'<a href="{safe}" style="display:inline-block;padding:12px 28px;'
+        f'font-family:system-ui,-apple-system,sans-serif;font-size:0.95rem;'
+        f'font-weight:600;color:#ffffff;text-decoration:none;border-radius:6px">'
+        f'Order Status</a></td></tr></table>'
+        f'<p style="color:#6b7280;font-size:0.8rem;margin:-12px 0 0">'
+        f'View the current status, cancel it while it has not yet shipped, or '
+        f'read our return policy once it has.<br>'
+        f'If the button does not work, copy this link: {html.escape(url)}</p>')
+    return text, button
+
+
 def _refund_block(ctx: Dict[str, Any]) -> Tuple[str, str]:
     """(text, html) describing the refund — or ('', '') when there is nothing
     truthful to say.
@@ -411,6 +455,11 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
     name = _greeting_name(ctx)
     num = ctx["order_number"]
     cur = ctx["currency"]
+    # The self-service link. Present on the three lifecycle emails; deliberately
+    # absent from the cancellation email, which is terminal — there is nothing
+    # left to manage, and a button inviting the customer back to a dead order
+    # would read as though the cancellation had not taken.
+    btn_t, btn_h = _status_button(ctx["order_id"])
     total = _money(ctx.get("total_amount"), cur)
     ship = ctx.get("shipping_address") or []
 
@@ -444,7 +493,7 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
             f'<tfoot><tr><td colspan="2" style="padding:8px;text-align:right">'
             f'<strong>Order total</strong></td>'
             f'<td style="padding:8px;text-align:right"><strong>{total}</strong></td></tr></tfoot>'
-            f'</table>{addr_h}',
+            f'</table>{addr_h}{btn_h}',
             "What happens next: we will prepare your order for dispatch and email "
             "you again as soon as it ships.")
 
@@ -477,7 +526,7 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
             f'<thead><tr><th align="left" style="padding:8px;border-bottom:2px solid #0d9488">Item shipped</th>'
             f'<th style="padding:8px;border-bottom:2px solid #0d9488">Qty</th>'
             f'<th align="right" style="padding:8px;border-bottom:2px solid #0d9488">Total</th></tr></thead>'
-            f'<tbody>{_items_html(ctx["items"], cur)}</tbody></table>{addr_h}',
+            f'<tbody>{_items_html(ctx["items"], cur)}</tbody></table>{addr_h}{btn_h}',
             "Carrier and tracking details are not recorded for this order. If you "
             "need them, reply to this email and we will follow up.")
 
@@ -506,7 +555,7 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
             f'<thead><tr><th align="left" style="padding:8px;border-bottom:2px solid #0d9488">Item delivered</th>'
             f'<th style="padding:8px;border-bottom:2px solid #0d9488">Qty</th>'
             f'<th align="right" style="padding:8px;border-bottom:2px solid #0d9488">Total</th></tr></thead>'
-            f'<tbody>{_items_html(ctx["items"], cur)}</tbody></table>{addr_h}',
+            f'<tbody>{_items_html(ctx["items"], cur)}</tbody></table>{addr_h}{btn_h}',
             "If anything is missing or damaged, reply to this email or contact "
             "customer service below and we will put it right.")
     elif event_type == "order.cancelled":
@@ -546,6 +595,19 @@ def compose(ctx: Dict[str, Any], event_type: str) -> Tuple[str, str, str]:
 
     else:
         raise ValueError(f"not a customer lifecycle event: {event_type!r}")
+
+    # The plain-text half of the button. Appended by matching the footer this
+    # module itself produced, rather than by rebuilding four message bodies —
+    # and guarded by endswith, so a future template that ends differently
+    # silently keeps its text intact instead of being corrupted.
+    if btn_t and event_type != "order.cancelled":
+        footer = _footer_text()
+        if body_text.endswith(footer):
+            body_text = body_text[:-len(footer)] + btn_t + footer
+        else:
+            logger.warning("[order_notifications] %s text body does not end "
+                           "with the standard footer — status link omitted "
+                           "from the plain-text part", event_type)
 
     return subject, body_text, body_html
 
