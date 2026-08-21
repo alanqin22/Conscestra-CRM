@@ -691,31 +691,6 @@ def _run_pipeline_hygiene() -> None:
         logger.error(f"[PipelineHygiene] tick failed: {exc}", exc_info=True)
 
 
-def _run_verification_sweep() -> None:
-    """Scheduled job: drop expired order-cancellation verification records.
-
-    BOTH tables, because neither was being swept. order_cancel_verifications
-    holds a recipient email per issued code and voice_verification_attempts
-    holds hashed destination counters; left alone they grow forever, and the
-    first of them quietly accumulates customer addresses in a table whose only
-    purpose was to be short-lived. Retention is a property of the data, not of
-    whether anyone remembered to schedule the function.
-
-    Both sweep on `created_at`, which no sweep writes — so this never ages rows
-    off a timestamp it stamped itself.
-    """
-    try:
-        from app.core.order_status import sweep_verifications
-        from app.core.voice_support import sweep_verification_attempts
-        codes = sweep_verifications(days=30)
-        counters = sweep_verification_attempts(days=30)
-        if codes or counters:
-            logger.info(f"[VerificationSweep] removed {codes} verification "
-                        f"record(s) and {counters} rate counter(s)")
-    except Exception as exc:
-        logger.error(f"[VerificationSweep] failed: {exc}", exc_info=True)
-
-
 def _run_ceo_briefing() -> None:
     """Scheduled job: email the CEO the morning strategic briefing (08:00 ET).
     No-op unless CEO_BRIEFING_ENABLED=1 and CEO_BRIEFING_EMAIL is set. Internal
@@ -1117,17 +1092,6 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             misfire_grace_time=3600,
         )
-        # Verification-record sweep — daily 03:20 ET, deliberately in the quiet
-        # hours: it is pure deletion and competes with nothing. A full-day grace
-        # window means a restart anywhere in the day still runs it, and a missed
-        # day costs only a day of extra retention.
-        _scheduler.add_job(
-            _run_verification_sweep,
-            trigger=CronTrigger(hour=3, minute=20),
-            id="verification_sweep",
-            replace_existing=True,
-            misfire_grace_time=86400,
-        )
         # CEO morning briefing — daily 08:00 ET. Self-gates on CEO_BRIEFING_ENABLED
         # + CEO_BRIEFING_EMAIL (recipient is env config, not a contact/account).
         _scheduler.add_job(
@@ -1512,17 +1476,6 @@ app.include_router(auth_router)
 #    so the endpoint can't be used to unsubscribe arbitrary addresses).
 from app.core.consent import router as consent_router
 app.include_router(consent_router)
-
-# -- Self-service order status / cancellation from the emailed link. MUST stay
-#    open for the same reason as consent above: the customer arrives from their
-#    inbox, not from a CRM login, and a great many of them have no account at
-#    all (store checkout does not require one). The link is HMAC-signed, so the
-#    endpoint cannot be used to read an arbitrary order; the CANCEL path adds an
-#    email OTP to the address on the order, so the link alone can look but not
-#    act. Registering this with _DATA would make every Order Status button in
-#    every confirmation email dead on arrival.
-from app.core.order_status import router as order_status_router
-app.include_router(order_status_router)
 
 # -- Email agent (SMTP/IMAP + LangGraph) — ADMIN-ONLY regardless of the data
 #    posture: this module reads the info@agentorc.ca mailbox and sends mail as
