@@ -510,7 +510,9 @@ A verified caller can hear their balance and open invoices, check recent
 orders, get payment help grounded in approved policy — with a payment
 summary emailed to the address on file — and ask to change their contact
 details, which becomes a **governed proposal a human approves**, never a
-direct write. The security is structural: while a verified-customer session
+direct write. There is exactly one thing the line changes on its own — a
+cancellation, under conditions the database enforces rather than the agent
+(*The Agent Cancels the Order*, below). The security is structural: while a verified-customer session
 is active, the database layer refuses every general query outright — the
 caller can only reach explicitly account-scoped lookups, and the tier is
 decided by deterministic code before any language model runs.
@@ -585,6 +587,82 @@ worse than one that never offered.
 
 **Every call is a conversation with the whole CRM, in the caller's own
 language, on exactly the terms each caller has earned.**
+
+## The Agent Cancels the Order — the Database Decides Whether It May
+
+A customer calls to cancel an order, and it is cancelled **while they are still
+on the line**. Not a ticket, not a callback, not *someone will be in touch*: the
+order number, three questions, a code to the phone on file, and it is done —
+with a confirmation email in their inbox before they hang up.
+
+The interesting part is everything the agent is **not permitted** to do.
+
+An order that has already shipped cannot be cancelled — and that rule does not
+live in the agent's instructions, where a persuasive caller or a confused model
+could reach it. It lives in the `WHERE` clause of the update itself. The
+database is asked to change the order *only if* it is still pending, processing
+or ready; if it is not, nothing changes. That distinction matters more than it
+sounds. A rule written into a prompt is a request. A rule written into the
+statement is a guarantee, and it holds against a prompt injection, a model slip,
+and — the case nobody plans for — an order that ships in the seconds between
+looking it up and cancelling it.
+
+The agent is also not allowed to *claim* it happened. Success is not "the
+function returned" or "no error was raised"; it is **the database reporting that
+exactly one row changed**. When that count is zero, the caller is told plainly
+that it could not be completed and a colleague will call them back. An assistant
+that says "cancelled" while the record disagrees is worse than one that cannot
+cancel at all.
+
+The confirmation email follows the same rule. It is composed only after the
+cancellation has committed, sent only to the **verified address on the order** —
+never to one offered during the call — and the agent may only repeat what the
+mail system actually recorded. There is no "sent" and no "delivered" in that
+vocabulary, because without delivery receipts neither can be known. If the mail
+fails, the order **stays cancelled**, the customer is told the confirmation did
+not go out, and a person picks it up. The cancellation is the customer's
+outcome; the email is an artefact of it, and one must never be rolled back for
+the other.
+
+Identity is checked before anything is read back. The caller answers for the
+name, the address and the phone on the record, and the code goes to the number
+**on file** — not to the number they are calling from, so a borrowed or spoofed
+handset gains nothing. And whichever question fails, the caller hears the same
+sentence. That uniformity is not politeness: order numbers run in sequence, so
+an assistant that responds differently to *"that order doesn't exist"* than to
+*"that name doesn't match"* has become a tool for discovering which orders exist.
+One sentence for every failure, and the real reason recorded where the colleague
+picking it up can see it.
+
+What speech recognition taught us here is worth saying out loud, because it
+changed the design. Exact matching against transcribed speech refuses **honest
+customers as a matter of course**: *Alan* comes back as *Allen*, a dictated email
+address collapses into nonsense, and a postcode arrives as two separate answers
+because people pause in the middle of saying one. So the questions became the
+ones a recogniser gets right — a single word and short runs of digits — and the
+matching became phonetic and tolerant. That is a real loosening, and it is
+affordable for one reason: those answers authorise nothing. The gate is the code
+sent to the phone. Their job is only to make sure a stranger cannot make someone
+else's phone ring.
+
+Every cancellation leaves a trail that can be read without the application: what
+changed, from which state, **how the caller was verified**, when the provider
+accepted the email, and which colleague was told. The record of *how* identity
+was established is written into every one of those rows — so a cancellation made
+under a weaker regime can never later be mistaken for one where somebody proved
+who they were.
+
+And a successful cancellation deliberately emails **nobody internally**. It has
+an audit trail, a customer confirmation and an entry in the console; asking a
+colleague to read about it adds nothing. What does reach a person is the
+exception — a cancellation that could not complete, a confirmation that never
+sent, an order in a state the agent refused to guess about. An alerting channel
+that carries things needing no action stops being read, and then it carries
+nothing.
+
+The whole conversation runs in the caller's own language, end to end.
+
+**The model chooses the words. The database chooses the outcome.**
 
 ## One Customer Memory, Every Channel
 
