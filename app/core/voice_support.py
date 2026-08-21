@@ -2710,7 +2710,22 @@ def cancel_order_sp(p: Dict[str, Any]) -> Dict[str, Any]:
                      "before": {"status": prior},
                      "after": {"status": "cancelled"},
                      "verified_via": p.get("verified_via"),
-                     "channel": "voice-support",
+                     # NOT a constant. This function is now the single
+                     # cancellation write for every channel — the phone line
+                     # and the self-service order-status page both call it —
+                     # and the audit row is the record of WHO did what HOW. A
+                     # hardcoded 'voice-support' told an auditor that a
+                     # cancellation confirmed by email OTP on the website had
+                     # come from a phone call, which is the one thing an audit
+                     # trail must never do. Defaulted, so the voice callers
+                     # that omit it are unchanged.
+                     "channel": p.get("channel") or "voice-support",
+                     # Self-service cancellations carry the reason the customer
+                     # chose. The phone line does not ask for one yet, so this
+                     # is absent rather than guessed -- an audit row that
+                     # invented a reason would be worse than one with none.
+                     "reason": p.get("reason"),
+                     "reason_detail": p.get("reason_detail"),
                      "call_sid": p.get("call_sid"),
                  })})
         conn.commit()
@@ -2766,7 +2781,9 @@ def undo_order_cancel(ap: Dict[str, Any]) -> Dict[str, Any]:
 def _notify_employee_of_cancellation(order: Dict[str, Any], result: Dict[str, Any],
                                      verified_via: str, email_state: str,
                                      email_detail: str, approval_uuid: str,
-                                     call_sid: str) -> bool:
+                                     call_sid: str,
+                                     channel: str = "voice-support",
+                                     reason_label: str = "") -> bool:
     """In-app notification to the linked executives.
 
     THIS IS NOT EVIDENCE, and it is written so a reader cannot mistake it for
@@ -2805,8 +2822,8 @@ def _notify_employee_of_cancellation(order: Dict[str, Any], result: Dict[str, An
                          "prior_status": result.get("prior_status"),
                          "verified_via": verified_via,
                          "cancelled_by": "ai-agent",
-                         "channel": "voice-support"}}),
-                     None, "voice-support"))
+                         "channel": channel}}),
+                     None, channel))
                 event_uuid = cur.fetchone()[0]
 
                 cur.execute("""SELECT employee_uuid::text FROM executives
@@ -2826,7 +2843,11 @@ def _notify_employee_of_cancellation(order: Dict[str, Any], result: Dict[str, An
                     f"Customer:       {who} ({account})\n"
                     f"Status:         cancelled (was: {result.get('prior_status')})\n"
                     f"Verified via:   {verified_via}\n"
-                    f"Cancelled at:   {result.get('cancelled_at')}\n"
+                    # Absent, not blank, when the channel does not collect one.
+                    # A "Reason: —" line reads as "the customer declined to say"
+                    # when the truth is "we never asked".
+                    + (f"Reason given:   {reason_label}\n" if reason_label else "")
+                    + f"Cancelled at:   {result.get('cancelled_at')}\n"
                     f"Confirmation email: {email_state}"
                     + (f" — {email_detail}" if email_detail else "") + "\n"
                     f"Follow-up:      "
@@ -2848,11 +2869,12 @@ def _notify_employee_of_cancellation(order: Dict[str, Any], result: Dict[str, An
                         {"o": owner, "ev": event_uuid, "t": title, "b": body,
                          "m": _json.dumps({
                              "kind": "order_cancelled_by_agent",
-                             "source": "voice-support",
+                             "source": channel,
                              "order_id": result.get("order_id"),
                              "order_number": result.get("order_number"),
                              "approval_uuid": approval_uuid,
                              "verified_via": verified_via,
+                             "reason": reason_label or None,
                              "email_state": email_state,
                              "call_sid": call_sid,
                              "follow_up_required": not ok_email,

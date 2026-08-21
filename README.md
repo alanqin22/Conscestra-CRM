@@ -664,6 +664,66 @@ The whole conversation runs in the caller's own language, end to end.
 
 **The model chooses the words. The database chooses the outcome.**
 
+## A Link in the Email Can Look. It Cannot Act.
+
+The order confirmation now carries an **Order Status** button, and it opens the
+same order the email describes — number, items, total, shipping address, where
+it has got to — without a password, an account, or a sign-up. Most people who
+buy something never create an account, and a self-service page that begins by
+asking them to make one is not self-service.
+
+The link is signed, so it cannot be edited into somebody else's order. Change a
+character and it stops resolving; the response is the same for a tampered link,
+an order that does not exist, and one that was deleted. Order numbers run in
+sequence, and a page that answers *"no such order"* differently from *"not your
+order"* has become a way to find out which orders exist.
+
+But holding the link is **not** permission to change anything, and that is the
+distinction the whole design rests on. Confirmation emails get forwarded.
+Purchasing mailboxes are shared. So the link opens a page that can only be read,
+and cancelling requires a code sent to the address **on the order** — never to
+one the request supplies. Someone who has the link but not the mailbox can ask
+for codes all afternoon; every one of them lands with the customer, where it is
+evidence rather than access.
+
+What happens next is not a second implementation of anything. Whether an order
+may still be cancelled is decided by the same `WHERE` clause the phone line uses,
+in the same function — pending, processing or ready, checked by the database
+under a row lock at the moment of writing, not by the page and not by the agent.
+The website and the phone cannot give a customer two different answers about the
+same order, because there is only one answer and neither of them owns it. Ship
+the order between loading the page and confirming the code, and the cancellation
+simply does not happen; the customer is told so, and nothing is left half-done.
+
+An order that has shipped is not met with a refusal and nothing else. It is met
+with the **return policy** — and that text is not written into the page. It is
+read from the same published article the phone assistant reads aloud, so editing
+it once moves the website, the phone line, the chat and the order page together.
+A policy that exists in two places is a policy that will eventually contradict
+itself in front of a customer who is trying to get their money back.
+
+Before the code is sent, the customer is asked **why**. Not as a formality — the
+answer is written into the audit record alongside the cancellation, so the
+question *"why are people cancelling?"* is answerable from the data rather than
+from anecdote. The options come from the server, never from the page, and the
+browser sends back a key rather than a sentence; otherwise the answers arrive as
+a hundred near-identical strings that no report can add up. *I'd rather not say*
+is one of the choices, because a required field with no way out would stop
+someone cancelling their own order over a market-research question.
+
+There is a chat box on the page, and it is worth saying exactly what it can do.
+It reads the order, it answers questions from approved knowledge, and when
+someone types *"I've changed my mind"* it does not cancel anything — it walks
+them to the same code-verification gate the button uses. A second path to a write
+is a second gate, and the weaker of the two would be the one that decides.
+
+The reason a cancellation was made, how the customer proved who they were, and
+**which channel they came through** are recorded on every one of them. A
+cancellation confirmed by a code in an inbox must never be readable, later, as
+one somebody made over the phone.
+
+**Two front doors. One lock, and the database still holds the key.**
+
 ## One Customer Memory, Every Channel
 
 A customer who explains a problem on the phone should not start over in the
