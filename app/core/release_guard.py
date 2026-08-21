@@ -291,8 +291,27 @@ def _check_public_url() -> Dict[str, Any]:
     not a comment. Advisory, not blocking: an unreachable link is a broken
     workflow, not an unsafe one, and refusing to boot over it would be worse.
     """
+    def _is_local(u: str) -> bool:
+        return any(h in u.lower() for h in ("localhost", "127.0.0.1", "0.0.0.0"))
+
     url = (os.getenv("APP_URL") or "").strip()
-    local = any(h in url.lower() for h in ("localhost", "127.0.0.1", "0.0.0.0"))
+    # SINCE 2026-08-21 THERE ARE TWO EMAILED-LINK ORIGINS, and checking only one
+    # reopens exactly the hole this control was built to close.
+    #
+    #   APP_URL          the API. Approval/verification links are ENDPOINTS and
+    #                    must resolve here.
+    #   PUBLIC_SITE_URL  the static host. The Order Status button in every order
+    #                    email is a PAGE, and the app cannot serve pages in
+    #                    production (`*.html` is gitignored, so Railway has none
+    #                    of them). See order_status._public_site.
+    #
+    # If PUBLIC_SITE_URL were unset or local while APP_URL was fine, this check
+    # would have printed "emailed links resolve to <api>" and been green while
+    # every Order Status button led somewhere without the page -- a control
+    # whose failure looks exactly like success, which is the whole reason the
+    # paragraph above exists.
+    site = (os.getenv("PUBLIC_SITE_URL") or "").strip()
+
     if not is_deployed():
         return {"control": "public_url", "ok": True, "severity": "ok",
                 "message": f"APP_URL={url or '(unset → localhost)'} — local"}
@@ -301,12 +320,26 @@ def _check_public_url() -> Dict[str, Any]:
                 "message": "APP_URL is UNSET in a deployed environment — every "
                            "emailed approval/verification link will point at "
                            "http://localhost:8000 and fail for the recipient"}
-    if local:
+    if _is_local(url):
         return {"control": "public_url", "ok": False, "severity": "advisory",
                 "message": f"APP_URL={url} in a deployed environment — emailed "
                            f"links point at the recipient's own machine"}
+    if site and _is_local(site):
+        return {"control": "public_url", "ok": False, "severity": "advisory",
+                "message": f"PUBLIC_SITE_URL={site} in a deployed environment — "
+                           f"the Order Status button in every order email points "
+                           f"at the recipient's own machine"}
+    if not site:
+        # Not an error: one process CAN serve both, and the fallback is
+        # deliberate. But on a deployment where it does not, every Order Status
+        # button lands on a host that has no page, so say which case this is
+        # rather than reporting a single origin as though it covered both.
+        return {"control": "public_url", "ok": True, "severity": "advisory",
+                "message": f"endpoint links resolve to {url}; PUBLIC_SITE_URL is "
+                           f"unset so page links fall back to it — correct only "
+                           f"if this host also serves the HTML"}
     return {"control": "public_url", "ok": True, "severity": "ok",
-            "message": f"emailed links resolve to {url}"}
+            "message": f"endpoint links resolve to {url}; page links to {site}"}
 
 
 CHECKS = (_check_calendar_feed, _check_api_auth, _check_admin_token,
