@@ -1215,6 +1215,12 @@ def _gather_digits(prompt_inner: str, num_digits: int = 6,
 _BRAND_ALIASES = (
     # observed in the 2026-08-18 call
     "concentra", "concessor", "concessionaire",
+    # observed 2026-08-21 (Deepgram, on the agent's own greeting echoed back).
+    # Note "consessra" was already listed and did NOT match this: the heard
+    # form carries the second 'c'. Near-miss spellings are separate entries,
+    # not variants — which is the cost of a fixed list and the reason the
+    # transcript is mined rather than guessed at.
+    "concessra",
     # nonsense strings, no ordinary meaning to collide with
     "conscentra", "consestra", "consessra", "conchestra", "constestra",
     "conquestra", "consultra", "con sistra", "con sestra", "kon sestra",
@@ -2131,6 +2137,80 @@ _CANCEL_RE = _intent_re(
 
 # ── Normalisation: spoken text is not typed text ────────────────────────────
 
+# ── Chinese surnames, said in Chinese ───────────────────────────────────────
+# _fold strips every non-ASCII character, so 张 folds to the EMPTY STRING and
+# Soundex is ASCII-only besides. A Mandarin caller who gives their surname in
+# characters — the natural thing to do on a Mandarin line — could therefore
+# never match a romanised record. A live call proved it: the caller said 张 for
+# a contact stored as "Zhang" and the name factor had nothing to compare.
+# 王Wang worked on the same call ONLY because the recogniser happened to emit
+# both the character and the romanisation. That is luck, not a design.
+#
+# A FIXED TABLE, for the same reason _BRAND_ALIASES is one: a transliteration
+# library would eventually rewrite a word the caller meant. These are the
+# common surnames of the 百家姓, with the romanisations a record might actually
+# hold — Mandarin pinyin, Wade-Giles, and the Cantonese spellings used across
+# Hong Kong and much of the Canadian diaspora, which is who this line serves.
+#
+# NOT A LOOSENING. Each entry is one surname's own spellings, so 张 matches
+# Zhang/Chang/Cheung and nothing else. It cannot make two different names match.
+_HAN_SURNAMES = {
+    "王": ("wang", "wong"), "李": ("li", "lee", "lei"),
+    "张": ("zhang", "chang", "cheung"), "刘": ("liu", "lau", "lew"),
+    "陈": ("chen", "chan", "chin"), "杨": ("yang", "yeung"),
+    "黄": ("huang", "wong", "hwang"), "赵": ("zhao", "chiu", "chao"),
+    "吴": ("wu", "ng", "ng"), "周": ("zhou", "chow", "chau"),
+    "徐": ("xu", "tsui", "hsu"), "孙": ("sun", "suen"),
+    "马": ("ma", "mah"), "朱": ("zhu", "chu"), "胡": ("hu", "wu"),
+    "郭": ("guo", "kwok", "kuo"), "何": ("he", "ho"),
+    "高": ("gao", "ko", "kao"), "林": ("lin", "lam", "lim"),
+    "罗": ("luo", "law", "lo"), "郑": ("zheng", "cheng", "chang"),
+    "梁": ("liang", "leung"), "谢": ("xie", "tse", "hsieh"),
+    "宋": ("song", "sung"), "唐": ("tang", "tong"),
+    "许": ("xu", "hui", "hsu"), "邓": ("deng", "tang"),
+    "冯": ("feng", "fung"), "韩": ("han", "hon"),
+    "曹": ("cao", "tso", "cho"), "曾": ("zeng", "tsang"),
+    "彭": ("peng", "pang"), "萧": ("xiao", "siu", "hsiao"),
+    "蔡": ("cai", "choi", "tsai"), "潘": ("pan", "poon"),
+    "田": ("tian", "tin"), "董": ("dong", "tung"),
+    "袁": ("yuan", "yuen"), "于": ("yu", "yue"), "余": ("yu", "yee"),
+    "叶": ("ye", "yip", "yeh"), "程": ("cheng", "ching"),
+    "苏": ("su", "so"), "魏": ("wei", "ngai"), "吕": ("lv", "lui", "lu"),
+    "丁": ("ding", "ting"), "任": ("ren", "yam"), "沈": ("shen", "sum"),
+    "姚": ("yao", "yiu"), "卢": ("lu", "lo"), "姜": ("jiang", "keung"),
+    "崔": ("cui", "chui"), "钟": ("zhong", "chung"), "谭": ("tan", "tam"),
+    "陆": ("lu", "luk"), "汪": ("wang", "wong"), "范": ("fan", "fan"),
+    "金": ("jin", "kam", "kim"), "石": ("shi", "shek"),
+    "廖": ("liao", "liu"), "贾": ("jia", "ka"), "夏": ("xia", "ha"),
+    "韦": ("wei", "wai"), "付": ("fu", "foo"), "方": ("fang", "fong"),
+    "白": ("bai", "pak"), "邹": ("zou", "chow"), "孟": ("meng", "mang"),
+    "熊": ("xiong", "hung"), "秦": ("qin", "chun"), "邱": ("qiu", "yau"),
+    "江": ("jiang", "kong"), "尹": ("yin", "wan"), "薛": ("xue", "sit"),
+    "闫": ("yan", "yim"), "段": ("duan", "tuen"), "雷": ("lei", "louie"),
+    "侯": ("hou", "hau"), "龙": ("long", "lung"), "史": ("shi", "sze"),
+    "陶": ("tao", "to"), "黎": ("li", "lai"), "贺": ("he", "ho"),
+    "顾": ("gu", "koo"), "毛": ("mao", "mo"), "郝": ("hao", "kok"),
+    "龚": ("gong", "kung"), "邵": ("shao", "siu"), "万": ("wan", "man"),
+    "钱": ("qian", "chin"), "严": ("yan", "yim"), "覃": ("qin", "hom"),
+    "武": ("wu", "mo"), "戴": ("dai", "tai"), "莫": ("mo", "mok"),
+    "孔": ("kong", "hung"), "向": ("xiang", "heung"), "汤": ("tang", "tong"),
+}
+
+
+def _han_name_variants(text: str) -> List[str]:
+    """Romanisations of any Chinese surname characters in `text`.
+
+    Only the FIRST character of a run is looked up: a Chinese name is
+    surname-first, and this factor compares the surname alone.
+    """
+    out: List[str] = []
+    for run in re.findall(r"[一-鿿]+", text or ""):
+        for spelling in _HAN_SURNAMES.get(run[0], ()):
+            if spelling not in out:
+                out.append(spelling)
+    return out
+
+
 def _fold(text: str) -> str:
     """Casefold + strip accents and punctuation. STT does not reproduce
     hyphens, apostrophes or accents reliably, so comparing raw strings fails
@@ -2160,6 +2240,107 @@ _TEEN_WORDS = {
 }
 
 
+# ── Numbers said in the caller's own language ───────────────────────────────
+# _words_to_digits below was written for English and the line speaks four
+# languages. A live Mandarin call died on exactly this: the caller was asked
+# for their street number, said "一" (one) FOUR TIMES, and every attempt was
+# refused. STT was blameless — Azure returned '一。' and Deepgram '一', in
+# perfect agreement. The verifier simply had no idea that 一 is a number, so
+# `re.findall(r"\d+", ...)` found nothing and the address factor could never
+# pass. Spanish "uno" and French "un" failed the same way.
+#
+# SAFETY. Widening this cannot create a false ACCEPT: the comparison downstream
+# is still an exact match against the stored street number or postcode. All it
+# does is let more true answers be understood. The narrow context that
+# justifies the English homophone mapping — this runs ONLY on answers to "what
+# is your street number / postcode", never on free prose — covers these too.
+_CJK_DIGITS = {"〇": 0, "零": 0, "一": 1, "壹": 1, "二": 2, "两": 2, "貳": 2,
+               "贰": 2, "三": 3, "叁": 3, "四": 4, "五": 5, "六": 6, "七": 7,
+               "八": 8, "九": 9}
+_CJK_UNITS = {"十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000,
+              "万": 10000}
+_CJK_ALL = set(_CJK_DIGITS) | set(_CJK_UNITS)
+
+
+def _cjk_value(run: str) -> Optional[int]:
+    """一百零二 -> 102, 二十三 -> 23, 十 -> 10. None if it will not parse."""
+    total = section = number = 0
+    seen = False
+    for ch in run:
+        if ch in _CJK_DIGITS:
+            number = _CJK_DIGITS[ch]
+            seen = True
+        elif ch in _CJK_UNITS:
+            unit = _CJK_UNITS[ch]
+            seen = True
+            if unit == 10000:
+                section = (section + number) * unit
+                total += section
+                section = 0
+            else:
+                # A bare 十 means ten, not zero-times-ten.
+                section += (number or 1) * unit
+            number = 0
+        else:
+            return None
+    return (total + section + number) if seen else None
+
+
+def _cjk_to_digits(text: str) -> str:
+    """Append ASCII readings of any CJK numerals, leaving the original intact.
+
+    Both readings are emitted for a run without unit characters, because
+    people read a street number BOTH ways: 一二三 is "one two three" = 123,
+    while 一百二十三 is "one hundred twenty-three" = 123. A run containing 十/
+    百/千 is only ever a value, so digit-by-digit is not offered for it — that
+    would turn 一百零二 into a spurious '1002'.
+    """
+    if not text or not any(ch in _CJK_ALL for ch in text):
+        return text
+    extra: List[str] = []
+    for run in re.findall("[" + "".join(_CJK_ALL) + "]+", text):
+        has_unit = any(ch in _CJK_UNITS for ch in run)
+        if has_unit:
+            # A value reading, and ONLY that: 一百零二 is 102, never '1 0 2'.
+            val = _cjk_value(run)
+            if val is not None:
+                extra.append(str(val))
+        else:
+            # Digits read out one by one. The value parser must NOT be used
+            # here: with no unit it simply returns the last digit, so 二〇二六
+            # yielded a stray '6' alongside the correct '2026' — and a stray
+            # digit against a street number of "6" would be a false ACCEPT,
+            # which is the one direction this code must never fail in.
+            extra.append("".join(str(_CJK_DIGITS[ch]) for ch in run))
+    return text + (" " + " ".join(dict.fromkeys(extra)) if extra else "")
+
+
+# French and Spanish digit words. Deliberately digits and teens only: "cent",
+# "mille", "ciento" and friends are compounds this does not need, and every
+# extra rule is another chance to mis-read a real answer.
+_DIGIT_WORDS_INTL = {
+    # French
+    "zéro": "0", "zero": "0", "un": "1", "une": "1", "deux": "2",
+    "trois": "3", "quatre": "4", "cinq": "5", "sept": "7", "huit": "8",
+    "neuf": "9", "dix": "10", "onze": "11", "douze": "12", "treize": "13",
+    "quatorze": "14", "quinze": "15", "seize": "16",
+    # Spanish
+    "cero": "0", "uno": "1", "una": "1", "dos": "2", "tres": "3",
+    "cuatro": "4", "cinco": "5", "seis": "6", "siete": "7", "ocho": "8",
+    "nueve": "9", "diez": "10", "once": "11", "doce": "12", "trece": "13",
+    "catorce": "14", "quince": "15", "dieciséis": "16", "dieciseis": "16",
+    # "six" is already mapped by the English table and means 6 in French too,
+    # which is the happy case: the same token, the same value.
+}
+
+
+# The English table is the base; the other languages extend it without
+# overriding, so a token that already means a digit in English keeps that
+# meaning ("six" is 6 in both English and French).
+for _w, _d in _DIGIT_WORDS_INTL.items():
+    _DIGIT_WORDS.setdefault(_w, _d)
+
+
 def _words_to_digits(text: str) -> str:
     """'M five C one S six' → 'M 5 C 1 S 6'.
 
@@ -2180,7 +2361,8 @@ def _words_to_digits(text: str) -> str:
     a converter that only knows single digits refuses it. So are teens
     ("sixteen" -> 16) and the British "double six" -> 66.
     """
-    tokens = [t for t in re.split(r"(\W+)", text or "")]
+    text = _cjk_to_digits(text or "")
+    tokens = [t for t in re.split(r"(\W+)", text)]
     out: List[str] = []
     i = 0
     while i < len(tokens):
@@ -2401,8 +2583,16 @@ def _parse_order_number(heard: str) -> Optional[str]:
 
     Returns the digit suffix, not a full order number: the lookup matches on it
     and refuses if more than one row comes back, so uniqueness is verified
-    against the data rather than assumed from the format."""
-    digits = re.sub(r"\D", "", heard or "")
+    against the data rather than assumed from the format.
+
+    Number WORDS are converted first, in every language the line speaks. This
+    step used to strip non-digits from the raw transcript, so it only worked
+    when the recogniser happened to return numerals — which it does for a
+    briskly read "102026" and does NOT for a caller reading the same number out
+    slowly, or for "一〇二〇二六". The verification step downstream had exactly
+    this gap and it cost a live Mandarin caller their cancellation; fixing it
+    there and not here would just move the failure one question earlier."""
+    digits = re.sub(r"\D", "", _words_to_digits(heard or ""))
     return digits[-6:] if len(digits) >= 6 else None
 
 
@@ -2595,10 +2785,20 @@ def _verify_identity(spoken: Dict[str, str],
     #        first name added nothing but failure modes ('Alan' -> 'Allen').
     stored_last = _fold(order.get("last_name") or "")
     stored_account = _fold(order.get("account_name") or "")
-    said_name = _fold(spoken.get("last_name") or "")
+    said_variants = [_fold(spoken.get("last_name") or "")]
+    said_variants += [_fold(a) for a in (spoken.get("last_name_alts") or [])]
+    # A surname given in Chinese characters folds to nothing, so its
+    # romanisations are added explicitly — otherwise a Mandarin caller on a
+    # Mandarin line can never match a record spelled in Latin script.
+    for raw in [spoken.get("last_name") or ""] + list(spoken.get("last_name_alts") or []):
+        said_variants += _han_name_variants(raw)
+    said_variants = [v for v in dict.fromkeys(said_variants) if v]
     if not (stored_last or stored_account):
         return False, "no name on the order's contact or account record"
-    if not any(_name_matches(said_name, c)
+    # Each variant is a different TRANSCRIPT of the same words, not a different
+    # answer, so the matching rule is unchanged — only the input it is given.
+    if not any(_name_matches(v, c)
+               for v in said_variants
                for c in (stored_last, stored_account) if c):
         return False, "last name did not match the order's contact or account"
 
@@ -2909,8 +3109,14 @@ def _escalate_cancel(sess: Dict[str, Any], reason: str, internal: str,
         from app.core import escalation
         res = escalation.open(
             reason, "voice-support",
+            # The summary is what an operator sees in a queue without opening
+            # anything, so it carries the CLASS of failure. "no such order"
+            # means ring back and check the number; anything else means the
+            # number was real and the identity answers did not match it.
             summary=(f"Order cancellation could not be completed"
-                     + (f" for {order_number}" if order_number else "")),
+                     + (f" for {order_number}" if order_number else "")
+                     + (" — order number not found"
+                        if "no such order" in (order_number or "") else "")),
             # Labels must name the question that was ACTUALLY ASKED. This said
             # "postcode" for two rounds after the question became the street
             # number, so a real escalation email read "postcode: 88" — telling
@@ -2918,7 +3124,10 @@ def _escalate_cancel(sess: Dict[str, Any], reason: str, internal: str,
             # correctly. The session key stays `postal` for compatibility; the
             # human-facing label is what had to change.
             transcript_excerpt=("caller said — "
-                                f"last name: {heard.get('last_name') or '(not reached)'} | "
+                                f"last name: {heard.get('last_name') or '(not reached)'}"
+                                + (f" (also heard: {', '.join(heard.get('last_name_alts') or [])})"
+                                   if heard.get('last_name_alts') else "")
+                                + " | "
                                 f"street no: {heard.get('postal') or '(not reached)'} | "
                                 f"phone last4: {heard.get('phone') or '(not reached)'}")[:400],
             channel="voice", handle=sess.get("from"),
@@ -3093,6 +3302,23 @@ async def _cancel_turn(sess: Dict[str, Any], heard: str) -> Tuple[str, str]:
     # ---- 2-4. the three factors, collected from EVERY caller
     if state == "awaiting_name":
         c["spoken"]["last_name"] = heard
+        # A surname is the one answer in this flow that is a PROPER NOUN, and
+        # proper nouns are where recognisers diverge most — especially across
+        # languages. A live call had a caller say "Graham" to the Mandarin
+        # recogniser: Azure heard "Greyhound" (no match), the shadow heard
+        # "greyham" (matches). Keep both readings of the same audio; the
+        # comparison itself is not loosened, it just stops depending on one
+        # vendor getting a foreign name right.
+        try:
+            from app.core import speech as _sp
+            alts = [a for a in _sp.alternates(sess.get("call_sid") or "",
+                                              wait_ms=400)
+                    if a and a != heard]
+            c["spoken"]["last_name_alts"] = alts[-2:]
+            if alts:
+                logger.info(f"[voice] name alternates for this call: {alts[-2:]}")
+        except Exception:
+            c["spoken"]["last_name_alts"] = []
         c["state"] = "awaiting_postal"
         # STREET NUMBER, not postcode.
         #
@@ -3164,8 +3390,17 @@ async def _cancel_decide(sess: Dict[str, Any]) -> Tuple[str, str]:
     if not order:
         # No such order. Identical wording, identical timing, identical point in
         # the conversation as a wrong name.
+        # The SPOKEN suffix is passed through so the escalation names it. The
+        # caller still hears the same sentence as every other refusal — the
+        # anti-oracle property is about what the CALLER learns, not about
+        # keeping the operator in the dark. Without it the queue entry read
+        # "Order cancellation could not be completed" with a null order number,
+        # and an operator could not tell a caller who misremembered their order
+        # number from one who failed the identity check. Those need opposite
+        # callbacks: read the number back, versus do not.
         return _cancel_fail(sess, f"no order matched the spoken suffix "
-                                  f"…{c.get('suffix')}")
+                                  f"…{c.get('suffix')}",
+                            order_number=f"…{c.get('suffix')} (no such order)")
 
     ok, why = _verify_identity(c["spoken"], order)
     if not ok:
