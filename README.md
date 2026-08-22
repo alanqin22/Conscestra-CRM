@@ -532,6 +532,17 @@ already being composed, the half-formed reply is abandoned and the two halves
 are rejoined, so the caller is answered once, on what they actually asked,
 rather than twice on fragments of it.
 
+It also knows **its own voice when it hears it**. On a speakerphone the
+handset plays the agent's reply back into its own microphone, and the line
+receives it as though the caller had spoken — so the agent interrupts itself,
+transcribes itself, and then tries to answer itself. The fix is not to ignore
+quiet audio, which would leave a softly-spoken caller unable to interrupt at
+all. It is that **the agent knows exactly what it just sent**, so a quarter
+second of incoming sound can be compared against the audio still playing.
+Something that matches is the agent's own voice returning and is discarded, at
+any volume; something that does not is the caller, and interrupting is exactly
+what they should be able to do.
+
 The line also **senses how a call felt**, not just what was said: a caller
 who repeatedly talks over the agent or speaks fast and long reads as urgent,
 and that urgency lands on the customer's profile as a signal every other
@@ -571,6 +582,24 @@ English, and a Mandarin question reaches the English article that answers it
 because retrieval compares **meaning**, not words. Approve an article once
 and it serves all four languages the same minute.
 
+Answering in a language is the easy half. The hard half is **understanding
+what the caller says back**, and that is where a multilingual line usually
+quietly stops being multilingual. A Mandarin caller asked for their street
+number says *一*. A Mandarin caller giving their surname says *张*. Both are
+exactly right, and both used to be worth nothing: the number reader knew only
+English words, and the name comparison stripped every non-Latin character
+before it compared anything — so a Chinese surname became an empty string and
+could never match the record it belonged to. The caller was told their details
+did not match, four times, while saying the correct thing each time.
+
+So the line now reads numbers as they are actually spoken — *一* and *一百零二*
+and *uno* and *quatorze* — and knows that *张* is the surname stored as Zhang,
+Chang or Cheung, the spellings a Canadian record actually holds. A customer
+has now cancelled a real order start to finish in Mandarin, giving their
+surname in Chinese characters, and received the confirmation email. **A line
+that cannot understand a number or a name in the language it just offered was
+only ever pretending to speak it.**
+
 When a human takes the call over from the console, the AI **stands down** —
 it stops answering, plays a hold message in the caller's language, and keeps
 the line open for the person joining. The customer is never talking to two
@@ -587,6 +616,33 @@ worse than one that never offered.
 
 **Every call is a conversation with the whole CRM, in the caller's own
 language, on exactly the terms each caller has earned.**
+
+## The Voice Vendor Is a Setting, Not a Dependency
+
+Speech is the expensive part of a phone call. Not the AI — measured on real
+traffic, the language model is about **one percent** of what a call costs,
+while recognizing the caller and speaking back is roughly **sixty**. That
+makes the speech vendor a commercial decision, and for a long time it was
+written into the code in four places, so changing it meant changing software.
+
+It is now a line of configuration. Recognition and synthesis each walk an
+ordered list of providers, **per language**, and fall through to the next one
+when a provider fails or is not configured. That per-language part is not a
+refinement: a vendor that transcribes English and French beautifully can be
+useless in Mandarin, and the honest answer is often to use different engines
+for different languages rather than accept the worst of one across all four.
+
+Because the vendors sit behind one seam, a second recognizer can listen to
+every call **alongside** the one actually serving it, and the pair of
+transcripts is kept. That is how a change like this gets decided on evidence
+instead of vendor claims — and it has already earned its keep twice: once
+proving a caller had been understood perfectly when the system said otherwise,
+and once producing the correct reading of a name the serving engine had
+mangled.
+
+**The intelligence is ours; the microphone is a supplier.** Nothing above the
+seam — the tier ladder, the verification, the knowledge base, the governed
+writes, the audit trail — knows or cares which company heard the words.
 
 ## The Agent Cancels the Order — the Database Decides Whether It May
 

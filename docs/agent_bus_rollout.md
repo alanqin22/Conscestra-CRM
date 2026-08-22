@@ -39,8 +39,16 @@ Pre-flight (already verified): Railway has the base event bus
 > ONE conversation on prod. Remaining 🧑: confirm `SUPERVISOR_AUTOACT_CONF=0.75`
 > + `INTENT_PLAN_ROUTING=1` + `OBJECTIVES_AUTOACT=1` in Railway env (not
 > introspectable via API), review 3 pending `/governance/queue` approvals,
-> token rotation, publish HTML. `VOICE_STREAM_ENABLED` stays OFF on Railway
-> (known live-call breakage) — the voice urgency proxy is dormant until then.
+> token rotation, publish HTML. ~~`VOICE_STREAM_ENABLED` stays OFF on Railway
+> (known live-call breakage) — the voice urgency proxy is dormant until then.~~
+>
+> **SUPERSEDED 2026-08-21:** `VOICE_STREAM_ENABLED=1` has been live on Railway
+> for several weeks — the breakage was fixed and the flag flipped, cutting
+> agent response time by >60% on both local and Railway. The urgency proxy is
+> therefore ACTIVE, not dormant. This line is left struck through rather than
+> deleted because it was cited as evidence in a later cost assessment and the
+> correction matters more than the tidy text: a stale "known broken" note is
+> how a working feature gets planned around instead of used.
 
 ## 📦 CUTOVER ADDENDUM 2026-07-18 — everything added since the 07-10 bundle
 

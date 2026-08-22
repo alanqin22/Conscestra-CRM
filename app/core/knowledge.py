@@ -325,7 +325,30 @@ def _answerable(fts: List[Dict[str, Any]], sem: List[Dict[str, Any]]) -> bool:
         return True
     fts_ids = {h["article_uuid"] for h in fts}
     corroborated = any(h["article_uuid"] in fts_ids for h in sem)
-    return best >= ANSWERABILITY_LO and corroborated
+    if best >= ANSWERABILITY_LO and corroborated:
+        return True
+    # MONOTONICITY. Above this line the gate was non-monotonic in evidence: a
+    # query with NO semantic hit returned bool(fts) and was answered, while the
+    # same query with a WEAK one was refused — so adding marginal supporting
+    # evidence DELETED an answer the system would otherwise have given.
+    #
+    # Live example. "Tell me something about your company" and "about your
+    # company" produce identical FTS hits (both find "What is Conscestra
+    # CRM?"). Filler words dilute the embedding, so the padded form scores
+    # 0.363 against the terse form's 0.429 — below LO, above nothing. The
+    # padded form was refused twice on a real call; the terse form is answered.
+    # The caller hears that as the agent not understanding plain English.
+    #
+    # The distinction that still carries information is AGREEMENT, not
+    # strength. When the top semantic hit is an article the keyword half also
+    # found, the two halves point the same way and merely disagree on
+    # confidence — that is no reason to discard what the keyword half, which
+    # already passed term-count precision, would have answered alone. When the
+    # semantic leg points somewhere ELSE, that disagreement is real evidence
+    # the question is out of scope, and the gate still refuses.
+    if corroborated:
+        return bool(fts)
+    return False
 
 
 def _fuse(fts: List[Dict[str, Any]], sem: List[Dict[str, Any]],
