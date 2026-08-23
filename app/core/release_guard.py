@@ -342,9 +342,27 @@ def _check_public_url() -> Dict[str, Any]:
             "message": f"endpoint links resolve to {url}; page links to {site}"}
 
 
+def _check_email_call_sites() -> Dict[str, Any]:
+    """Every `send_email` caller must be declared, because staff mail has a
+    governance layer and a direct call walks past it.
+
+    Unlike every other check here this one inspects CODE, not configuration —
+    and it belongs here for the same reason the others do. The alternative was
+    a test, and `.github/workflows/ci.yml` says outright that "the tests/
+    directory is also outside this repository by policy, so CI cannot run any
+    test at all." A guard that only runs when somebody remembers to run pytest
+    is a habit, not a control. This one runs on every boot.
+
+    See app/core/email_call_sites.py for the allowlist and what to do when this
+    fails."""
+    from app.core.email_call_sites import check
+    return check()
+
+
 CHECKS = (_check_calendar_feed, _check_api_auth, _check_admin_token,
           _check_training_ack, _check_secret_strength,
-          _check_configuration_integrity, _check_public_url)
+          _check_configuration_integrity, _check_public_url,
+          _check_email_call_sites)
 
 
 def audit() -> Dict[str, Any]:

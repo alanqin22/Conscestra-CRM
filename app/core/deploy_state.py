@@ -96,6 +96,18 @@ REQUIRED_MIGRATIONS: List[str] = [
     # unauthorized migration turns `migrate --check` red for a decision nobody
     # has taken — it states a proposal as a requirement. Add the line in the
     # same change that applies the migration, not before.
+
+    # Staff email (docs/employee_email_notifications_design.md). Declared
+    # 2026-08-22, the day they were applied to BOTH local and Railway — which
+    # is the rule above, honoured in the other direction. They were held
+    # undeclared through four stages of local development precisely because
+    # this list means "the schema must have this", and until Railway had them
+    # that statement was false.
+    #
+    # Ordered: the ledger creates staff_email_ledger and adds
+    # notification_messages.tier, and stage2's trigger writes that column.
+    "staff_email_ledger.sql",
+    "staff_email_stage2.sql",
 ]
 
 # The parameters that decide what an agent may SAY. A difference in any of these

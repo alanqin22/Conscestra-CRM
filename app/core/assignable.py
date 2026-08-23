@@ -117,9 +117,63 @@ def directory(include_inactive: bool = False) -> List[Dict[str, Any]]:
     where = "" if include_inactive else "WHERE is_active"
     return _rows(f"""SELECT assignable_id::text, email, owner_id::text,
                             source, source_ref, display_name, is_active,
-                            languages, skills, added_by, added_at
+                            languages, skills, added_by, added_at,
+                            preferred_channel, auto_email_enabled
                      FROM assignable_identity {where}
                      ORDER BY display_name, email""")
+
+
+# ============================================================================
+# CONTACT PREFERENCE — how somebody who may receive work wants to hear about it
+# ============================================================================
+
+# Fail-closed. A person with no preference row does not receive operational
+# email, because "we have no record of what they want" is not consent. Every
+# other default here would mean an identity acquires email by existing.
+_NO_PREFERENCE: Dict[str, Any] = {
+    "preferred_channel": "in_app",
+    "auto_email_enabled": False,
+    "source": "none",
+}
+
+
+def email_preference(owner_id: Optional[str]) -> Dict[str, Any]:
+    """How this person wants operational mail — ONE read path, two tables.
+
+    `executives` already carried `preferred_channel` + `auto_email_enabled` and
+    already drove the approval fan-out, so those four people keep their existing
+    settings rather than acquiring a second, contradictory set.
+    `assignable_identity` carries the same two columns for everyone granted
+    later — with the DEFAULTS INVERTED ('in_app' / false against the executive
+    table's 'all' / true), because being granted assignability must not
+    silently grant email.
+
+    Executives win where a person is in both. That is not arbitrary: their row
+    is the one an admin has actually been editing, and a preference the user
+    set must outrank a column default they have never seen.
+
+    Never raises; an unreadable table degrades to no-preference, which is the
+    safe direction.
+    """
+    oid = (owner_id or "").strip()
+    if not _UUID_RE.match(oid):
+        return dict(_NO_PREFERENCE)
+
+    for row in _rows("""SELECT preferred_channel, auto_email_enabled
+                        FROM executives
+                        WHERE employee_uuid = %s::uuid AND is_active""", (oid,)):
+        return {"preferred_channel": (row["preferred_channel"] or "in_app"),
+                "auto_email_enabled": bool(row["auto_email_enabled"]),
+                "source": "executive"}
+
+    for row in _rows("""SELECT preferred_channel, auto_email_enabled
+                        FROM assignable_identity
+                        WHERE owner_id = %s::uuid AND is_active""", (oid,)):
+        return {"preferred_channel": (row["preferred_channel"] or "in_app"),
+                "auto_email_enabled": bool(row["auto_email_enabled"]),
+                "source": "assignable"}
+
+    return dict(_NO_PREFERENCE)
 
 
 # ============================================================================

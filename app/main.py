@@ -716,6 +716,31 @@ def _run_verification_sweep() -> None:
         logger.error(f"[VerificationSweep] failed: {exc}", exc_info=True)
 
 
+def _run_staff_email_digest() -> None:
+    """Scheduled job: the daily Tier 2 worklist digest for everyone authorized
+    to receive work (07:30 ET). Today that is four people.
+
+    Double-gated and quiet by construction: no-op unless STAFF_EMAIL_ENABLED=1,
+    composes-without-sending unless STAFF_EMAIL_APPLY=1, and skips any recipient
+    whose worklist is empty rather than mailing them an empty list. A digest
+    that arrives saying nothing is how a recipient learns to ignore the sender.
+
+    Logged at INFO with the send count, so `sent 0 of 4` is visible as a normal
+    outcome rather than looking like a failure — on a quiet day it IS the
+    correct outcome.
+    """
+    try:
+        from app.core import staff_email
+        res = staff_email.run_digest()
+        if res.get("skipped"):
+            logger.debug(f"[StaffEmailDigest] {res['skipped']}")
+        else:
+            logger.info(f"[StaffEmailDigest] sent {res.get('sent')} of "
+                        f"{res.get('recipients')} (apply={res.get('applying')})")
+    except Exception as exc:
+        logger.error(f"[StaffEmailDigest] pass failed: {exc}", exc_info=True)
+
+
 def _run_ceo_briefing() -> None:
     """Scheduled job: email the CEO the morning strategic briefing (08:00 ET).
     No-op unless CEO_BRIEFING_ENABLED=1 and CEO_BRIEFING_EMAIL is set. Internal
@@ -1134,6 +1159,20 @@ async def lifespan(app: FastAPI):
             _run_ceo_briefing,
             trigger=CronTrigger(hour=8, minute=0),  # 8:00 AM ET — strategic CEO briefing
             id="ceo_briefing",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        # Staff worklist digest — daily 07:30 ET, deliberately BEFORE the CEO
+        # briefing so a reader meets their own queue before the strategic
+        # summary. Self-gates twice: STAFF_EMAIL_ENABLED decides whether it
+        # thinks, STAFF_EMAIL_APPLY decides whether it sends, and a recipient
+        # with nothing actionable is skipped entirely rather than sent an empty
+        # list. Grace of one hour: a digest delivered late in the morning is
+        # still useful; one delivered at midnight is not.
+        _scheduler.add_job(
+            _run_staff_email_digest,
+            trigger=CronTrigger(hour=7, minute=30),
+            id="staff_email_digest",
             replace_existing=True,
             misfire_grace_time=3600,
         )
@@ -1651,6 +1690,15 @@ app.include_router(portal_router)
 #    the no-code/embedded agents (#3/#6) into the takeover console (#1).
 from app.core.escalation import router as escalation_router
 app.include_router(escalation_router, dependencies=_ADMIN)
+
+# -- Staff email attention budget (Stage 1) — DECIDE ONLY. This module has no
+#    send path: it classifies, resolves a recipient through explicit membership,
+#    checks preference and budget, and can explain every yes and every no. Both
+#    endpoints are read-only; /staff-email/explain justifies a decision WITHOUT
+#    taking it, which is the surface Stage 2 observes before anything is sent.
+#    docs/employee_email_notifications_design.md
+from app.core.staff_email import router as staff_email_router
+app.include_router(staff_email_router, dependencies=_ADMIN)
 
 # -- Agent-Program Operations Analytics (blindspot #4) — the AI fleet as a
 #    service operation: containment / escalation / CSAT proxy / cost per convo.
@@ -2253,6 +2301,23 @@ async def health():
     _payload = {
         "status":  _status,
         "version": "2.2.0",
+        # WHICH BUILD IS THIS, ACTUALLY.
+        #
+        # `version` above is a hand-maintained string. It said 2.2.0 through a
+        # deploy audit that could not answer "is the new code live?" from the
+        # application at all — the only available proof was that a route which
+        # should exist returned 404. That works, but it is inference about
+        # absence rather than a statement of identity.
+        #
+        # Railway injects RAILWAY_GIT_COMMIT_SHA at build time. Reporting it
+        # makes deployment truth CHECKABLE instead of inferred, which is the
+        # whole lesson of that audit: never infer application state from
+        # anything but the running application.
+        #
+        # 'unknown' locally, which is honest — a laptop has no build identity.
+        "commit": (os.getenv("RAILWAY_GIT_COMMIT_SHA")
+                   or os.getenv("GIT_COMMIT_SHA") or "unknown")[:12],
+        "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID", "") or None,
         "database": _db,
         "scheduler": _sched,
         "connections": _pool,
