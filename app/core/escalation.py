@@ -361,8 +361,35 @@ def open(reason: str, source: str, *,
     # them silently dropped the email for order_cancel_email_failed and
     # order_cancel_unverified, both of which open at priority 'normal' and both
     # of which need a human. Caught by the tests, not by review.
+    # ── Staff-email Stage 2: SHADOW OBSERVATION ─────────────────────────────
+    # Records what the new tier/recipient/budget rules WOULD decide. The
+    # existing email behaviour below is untouched either way, and this sits in
+    # its own guard because an observer that can break its host is worse than
+    # no observer — the host here is a customer's escalation.
+    #
+    # IT MUST RUN BEFORE _email_escalation, AND THAT WAS WRONG FOR A WHILE.
+    # Stage 3 gave _email_escalation a ledger claim. With the observation after
+    # it, decide() correctly answered "already in the ledger in a terminal
+    # state" — so every Tier 1 escalation recorded as `already_handled` instead
+    # of as the decision actually taken.
+    #
+    # It was LATENT: with ESCALATION_EMAIL=0 the send returns before claiming,
+    # so the observation looked right. It would have activated on exactly the
+    # flag Stage 5 turns on, corrupting Stage 5's evidence from its first day.
+    # Found by an adversarial audit, not by a test — hence test_45b now covers
+    # both this call site and governance's.
+    try:
+        from app.core import staff_email
+        staff_email.observe(kind="escalation",
+                            tier=staff_email.tier_for_escalation(reason),
+                            ref=eid,
+                            assignee=None)   # nothing owns it at open() time
+    except Exception as exc:                                   # noqa: BLE001
+        logger.debug(f"[escalation] staff-email observation skipped: {exc}")
+
     _email_escalation(eid, reason, priority, summary, channel, handle,
                       known, transcript_excerpt, metadata)
+
     out = {"ok": True, "escalation_id": eid, "created": True,
            "contact_known": known, "reason": reason,
            "sla_due_at": due.isoformat() if due else None}
@@ -465,19 +492,64 @@ def _email_escalation(escalation_id: str, reason: str, priority: str,
         "automated actions are not emailed — they are in the console with their "
         "audit trail.</p>")
 
+    subject = (f"[Action needed] {_EMAIL_ACTIONS.get(reason, reason)}"
+               + (f" — {order}" if order and order != "—" else "")
+               + f" ({reason})")
+
+    # ── Staff-email Stage 3: claim BEFORE the provider call ─────────────────
+    # The composition, the recipient and the send below are unchanged. What is
+    # new is a ledger row around the attempt, so this send has an idempotency
+    # key and a recorded provider outcome instead of only a log line and a
+    # metadata note.
+    #
+    # FAIL-OPEN ON BOOKKEEPING, FAIL-CLOSED ON DUPLICATES. If the ledger is
+    # unavailable — which it is on any database where the migration has not
+    # been applied yet — we send anyway and say so. If another worker already
+    # holds this send, we stop. Those two look alike and are opposites.
+    claim_info = {"proceed": True, "recorded": False, "email_id": None,
+                  "why": "staff-email ledger not consulted"}
+    try:
+        from app.core import staff_email
+        claim_info = staff_email.begin_send(
+            kind="escalation",
+            tier=staff_email.tier_for_escalation(reason),
+            ref=escalation_id,
+            recipient_email=to,
+            recipient_kind="role_mailbox",
+            subject=subject,
+            subject_ref_type="escalation",
+            subject_ref_id=escalation_id,
+            decision_reason=f"exception reason {reason}")
+    except Exception as exc:                                   # noqa: BLE001
+        logger.debug(f"[escalation] staff-email claim skipped: {exc}")
+
+    if not claim_info.get("proceed"):
+        logger.info(f"[escalation] {escalation_id[:8]} email not sent: "
+                    f"{claim_info.get('why')}")
+        _record_email_outcome(escalation_id, "skipped", to,
+                              str(claim_info.get("why"))[:200])
+        return
+
     state, detail = "failed", ""
     try:
         from app.agents.email.smtp_imap import send_email
         res = send_email(
             to=to,
-            subject=(f"[Action needed] "
-                     f"{_EMAIL_ACTIONS.get(reason, reason)}"
-                     + (f" — {order}" if order and order != "—" else "")
-                     + f" ({reason})"),
+            subject=subject,
             body_html=body_html,
             body_text=body_text,
             from_name="Conscestra Agent Ops",
         )
+        staff_email_outcome = None
+        try:
+            from app.core import staff_email
+            staff_email_outcome = staff_email.finish_send(
+                claim_info.get("email_id"), res)
+        except Exception as exc:                               # noqa: BLE001
+            logger.debug(f"[escalation] staff-email outcome skipped: {exc}")
+        if staff_email_outcome:
+            logger.info(f"[escalation] {escalation_id[:8]} ledger outcome: "
+                        f"{staff_email_outcome}")
         # Same evidence rule the customer emails use: success requires the
         # provider to say so, not merely the absence of an exception.
         if isinstance(res, dict) and res.get("success") is True:
@@ -495,8 +567,33 @@ def _email_escalation(escalation_id: str, reason: str, priority: str,
     else:
         logger.warning(f"[escalation] {escalation_id[:8]} email {state}: {detail}")
 
-    # Record the outcome ON the escalation. Without this the only evidence an
-    # email was attempted is a log line, and a log line is not a record.
+    # If the send raised before finish_send() could run, the ledger row is
+    # stranded in 'attempted' and would only be reclaimed after the lease
+    # expires. Close it honestly instead: the attempt did not complete, which
+    # is exactly what 'failed' means, and failed is reclaimable.
+    if state != "accepted" and claim_info.get("email_id"):
+        try:
+            from app.core import staff_email
+            if staff_email.get(
+                    staff_email.idempotency_key("escalation", escalation_id)
+            ) is not None:
+                staff_email.mark_failed(claim_info["email_id"], detail)
+        except Exception as exc:                              # noqa: BLE001
+            logger.debug(f"[escalation] ledger failure note skipped: {exc}")
+
+    _record_email_outcome(escalation_id, state, to, detail)
+
+
+def _record_email_outcome(escalation_id: str, state: str, to: str,
+                          detail: str) -> None:
+    """Record the outcome ON the escalation. Without this the only evidence an
+    email was attempted is a log line, and a log line is not a record.
+
+    Extracted in Stage 3 so the new 'we did not send, because the ledger says
+    it is already handled' path records itself the same way every other outcome
+    does — a non-send that leaves no trace is the failure mode this function
+    exists to prevent, and a second, quieter copy of it would have been easy to
+    introduce."""
     try:
         conn = get_connection()
         try:

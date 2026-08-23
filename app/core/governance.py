@@ -726,15 +726,81 @@ def route_approval(approval_uuid: str, action_type: str,
     finally:
         conn.close()
 
+    # ── Staff-email Stage 2: SHADOW OBSERVATION ─────────────────────────────
+    # An assigned approval is the archetypal Tier 1 interrupt: a named person
+    # must click Approve or Reject, and nothing else makes that happen. This
+    # records what the new rules WOULD decide; the existing email below is
+    # unchanged either way.
+    #
+    # ORDER MATTERS HERE, AND GETTING IT WRONG WAS SILENT. This block first sat
+    # AFTER the email. By the time it ran, Stage 3 had already claimed the
+    # ledger key, so decide() correctly answered "already in the ledger in a
+    # terminal state" — and every approval observed as `already_handled`
+    # instead of as the decision actually taken. The Stage 2 evidence for
+    # approvals was quietly worthless, and no test failed; it was caught by
+    # reading one live counter row.
+    #
+    # Passes executive_id rather than a name: this is the one path in the
+    # codebase that already carries a properly typed identity, with no
+    # free-text assignee to discard.
+    try:
+        from app.core import staff_email
+        staff_email.observe(kind="approval", tier=staff_email.TIER_INTERRUPT,
+                            ref=approval_uuid,
+                            executive_id=chosen["executive_id"])
+    except Exception as exc:                                   # noqa: BLE001
+        logger.debug(f"[governance] staff-email observation skipped: {exc}")
+
     if want_email and GOV_ROUTE_EMAIL and chosen.get("auto_email_enabled") \
             and chosen.get("email"):
         try:
             from app.agents.email.smtp_imap import send_email
             subject, body_html, body_text = _build_approval_email(
                 action_type, params, amount, label, approval_uuid, critique)
-            send_email(to=chosen["email"], subject=subject,
-                       body_html=body_html, body_text=body_text)
-            # internal/administrative — transactional, not commercial
+
+            # ── Staff-email Stage 3 ────────────────────────────────────────
+            # The recipient, the template and the send are unchanged. The
+            # ledger row around them is what is new: this approval email now
+            # carries an idempotency key and a recorded provider outcome
+            # instead of a bare call whose result was discarded.
+            #
+            # FAIL-OPEN ON BOOKKEEPING. If the ledger table is absent — as it
+            # is anywhere the migration has not been applied yet — the approval
+            # still goes out. No executive may miss a decision because our
+            # audit table was missing.
+            #
+            # renotify_pending() is DELIBERATELY not wired: that is a human
+            # explicitly asking to re-send with a better template, the one case
+            # where suppressing a duplicate would be the wrong answer.
+            claim_info = {"proceed": True, "recorded": False, "email_id": None}
+            try:
+                from app.core import staff_email
+                claim_info = staff_email.begin_send(
+                    kind="approval", tier=staff_email.TIER_INTERRUPT,
+                    ref=approval_uuid,
+                    recipient_email=chosen["email"],
+                    recipient_kind="executive",
+                    recipient_owner_id=emp_uuid,
+                    subject=subject,
+                    subject_ref_type="approval",
+                    subject_ref_id=approval_uuid,
+                    decision_reason=f"routed to {label}")
+            except Exception as exc:                          # noqa: BLE001
+                logger.debug(f"[governance] staff-email claim skipped: {exc}")
+
+            if not claim_info.get("proceed"):
+                logger.info(f"[governance] approval {approval_uuid[:8]} email "
+                            f"not sent: {claim_info.get('why')}")
+            else:
+                res = send_email(to=chosen["email"], subject=subject,
+                                 body_html=body_html, body_text=body_text)
+                # internal/administrative — transactional, not commercial
+                try:
+                    from app.core import staff_email
+                    staff_email.finish_send(claim_info.get("email_id"), res)
+                except Exception as exc:                      # noqa: BLE001
+                    logger.debug(f"[governance] staff-email outcome "
+                                 f"skipped: {exc}")
         except Exception as exc:
             logger.warning(f"[governance] route email failed: {exc}")
 

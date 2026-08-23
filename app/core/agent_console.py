@@ -18,6 +18,9 @@ adds that seat on top of the existing Unified Conversation Object
   takeover()/release() flip `handling` between 'ai' and 'human'. While a human
                        holds it, the autonomous responders stand down
                        (is_human_handled(), checked by the email auto-reply).
+                       takeover() is a COMPARE-AND-SWAP: exactly one rep can
+                       claim a conversation, and a loser gets
+                       {ok: False, conflict: True, assigned_to: <winner>}.
   send_reply()         the human's message: screened by the SAME outbound guard
                        that gates the agents, delivered on the customer's channel
                        (email / SMS), threaded into the conversation, logged.
@@ -209,17 +212,67 @@ def transcript(conversation_id: str) -> Dict[str, Any]:
 
 def _set_handling(conversation_id: str, handling: str,
                   agent: Optional[str]) -> Dict[str, Any]:
+    """Move the conversation between AI and human handling.
+
+    TAKEOVER IS A COMPARE-AND-SWAP, NOT AN UPDATE.
+
+    The claim used to be `WHERE conversation_id=… AND status='open'` — no
+    predicate on who, if anyone, already held it. Two reps clicking "Take over"
+    on the same queue row therefore BOTH succeeded: the second overwrote the
+    first's `assigned_to`, and both were told `ok: True`. Nothing told the
+    loser, and nothing told the customer's thread which of them owned it.
+
+    That is the same shape `order_notifications.acquire()` documents on the
+    send path — *"8 concurrent notify() calls for one business event produced
+    8 emails and 1 ledger row"* — and it is fixed the same way: the CHECK MUST
+    BE THE CLAIM. PostgreSQL takes a row lock for the UPDATE, and under READ
+    COMMITTED a waiting statement re-evaluates its WHERE against the committed
+    new version, so exactly one caller can move a conversation out of an
+    unheld state.
+
+    It matters beyond tidiness. "Claiming an escalation stops its reminder
+    email" is only a promise the console can keep if claiming has ONE winner —
+    otherwise two people each believe the other's silence means it is handled.
+
+    Re-taking your OWN conversation stays idempotent (`assigned_to = who`), so
+    a double-click or a page refresh is not an error. `assigned_at` is
+    refreshed only when the holder actually changes, so "how long have they
+    had it" survives a re-click.
+
+    Release is deliberately NOT swapped: handing work back to the AI is a
+    recovery path, and requiring the original holder would strand a
+    conversation whose rep has gone home.
+    """
+    who = agent or "agent"
+    holder: Optional[tuple] = None
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             if handling == "human":
                 cur.execute(
                     """UPDATE conversations
-                       SET handling='human', assigned_to=%s, assigned_at=now(),
+                       SET handling='human',
+                           assigned_to=%(who)s,
+                           assigned_at = CASE
+                               WHEN assigned_to IS DISTINCT FROM %(who)s
+                               THEN now() ELSE assigned_at END,
                            escalated=true, updated_at=now()
-                       WHERE conversation_id=%s::uuid AND status='open'
+                       WHERE conversation_id=%(cid)s::uuid AND status='open'
+                         AND (handling <> 'human'
+                              OR assigned_to IS NULL
+                              OR assigned_to = %(who)s)
                        RETURNING conversation_id""",
-                    (agent or "agent", conversation_id))
+                    {"who": who, "cid": conversation_id})
+                ok = cur.fetchone() is not None
+                if not ok:
+                    # A miss is two different situations and the caller must be
+                    # able to tell them apart: "someone else has it" is a
+                    # conflict a rep can act on; "closed or gone" is not.
+                    cur.execute(
+                        """SELECT handling, assigned_to, status
+                           FROM conversations WHERE conversation_id=%s::uuid""",
+                        (conversation_id,))
+                    holder = cur.fetchone()
             else:
                 cur.execute(
                     """UPDATE conversations
@@ -228,7 +281,7 @@ def _set_handling(conversation_id: str, handling: str,
                        WHERE conversation_id=%s::uuid
                        RETURNING conversation_id""",
                     (conversation_id,))
-            ok = cur.fetchone() is not None
+                ok = cur.fetchone() is not None
         conn.commit()
     except Exception as exc:
         conn.rollback()
@@ -237,6 +290,11 @@ def _set_handling(conversation_id: str, handling: str,
     finally:
         conn.close()
     if not ok:
+        if holder and holder[0] == "human" and holder[2] == "open":
+            return {"ok": False, "conflict": True,
+                    "conversation_id": conversation_id,
+                    "handling": "human", "assigned_to": holder[1],
+                    "error": f"already taken over by {holder[1]}"}
         return {"ok": False, "error": "conversation not found or already closed"}
     return {"ok": True, "conversation_id": conversation_id, "handling": handling}
 
