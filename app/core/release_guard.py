@@ -436,10 +436,33 @@ def _check_sql_disposition() -> Dict[str, Any]:
                 "message": f"could not classify the SQL corpus: {exc}"}
 
     if not c.get("present"):
+        # THE CORPUS IS ABSENT BY DESIGN, so say what WAS checked rather than
+        # only what was not. sql/ is neither shipped nor version-controlled, so
+        # file presence can never be evaluated in a deployed container. The
+        # MANIFEST ships regardless, and half the invariant is a property of the
+        # manifest alone -- a filename in both lists, a duplicate, an entry with
+        # no reason. A guard whose only output is "not evaluated" is one people
+        # stop reading, which is how a real finding gets missed later.
+        if not c.get("manifest_ok", True):
+            bits = []
+            if c.get("both"):
+                bits.append(f"{len(c['both'])} in BOTH manifests")
+            if c.get("duplicates"):
+                bits.append(f"{len(c['duplicates'])} duplicated")
+            if c.get("unreasoned"):
+                bits.append(f"{len(c['unreasoned'])} with no reason")
+            return {"control": "sql_disposition", "ok": False,
+                    "severity": "advisory",
+                    "message": ("SQL manifest is inconsistent: "
+                                + "; ".join(bits))}
+        review = f", {len(c.get('needs_review') or [])} awaiting a human "                  f"disposition" if c.get("needs_review") else ""
         return {"control": "sql_disposition", "ok": True, "severity": "ok",
-                "message": ("sql/ not present — classification NOT EVALUATED "
-                            "here (this is not the same as clean; the gate is "
-                            "migrate.py, which runs where sql/ exists)")}
+                "message": (f"SQL manifest consistent "
+                            f"({c.get('declared')} governed, "
+                            f"{c.get('out_of_band')} out-of-band){review}; "
+                            f"file presence NOT EVALUATED here — sql/ is not "
+                            f"shipped, and the blocking gate is migrate.py, "
+                            f"which runs where sql/ exists")}
     if not c["ok"]:
         bits = []
         if c["unclassified"]:
