@@ -29,7 +29,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
@@ -108,7 +110,539 @@ REQUIRED_MIGRATIONS: List[str] = [
     # notification_messages.tier, and stage2's trigger writes that column.
     "staff_email_ledger.sql",
     "staff_email_stage2.sql",
+    # Declared 2026-08-25, the day it was applied to BOTH databases — verified
+    # by query, not by the apply command's own output: 2 of 2 columns, both
+    # CHECK constraints and the partial index are present on each. Held
+    # undeclared until then precisely because this list means "the schema MUST
+    # have this", and while Railway had 0 of 2 columns that statement was false.
+    #
+    # It was applied through the out-of-band path, which records nothing, so
+    # neither ledger has a row for it yet. Declaring it is what lets
+    # `migrate.py` adopt it: the next run finds it missing from the ledger,
+    # re-runs it (every statement is IF NOT EXISTS / guarded, so a no-op) and
+    # records the row with the real checksum. That is provenance completed, not
+    # invented — the file on disk is the file that was applied.
+    "a2a_outcome_and_principal.sql",
+    # APPROVED 2026-08-25. Self-contained: it creates coupons,
+    # coupon_redemptions and price_match_requests plus their indexes, and its
+    # only foreign-key prerequisite is a table it creates itself, so a clean
+    # database can execute it truthfully. All three tables were verified present
+    # on BOTH databases before declaring it.
+    #
+    # Its Railway ledger row is the one written by railway_catchup_20260805.sql
+    # with checksum='' -- that row is historical fact and is NOT rewritten.
+    # migrate.py reports it as CHECKSUM UNVERIFIABLE and leaves it alone, which
+    # is the honest outcome: the file was applied by hand and nobody knows what
+    # its bytes were that day.
+    #
+    # Declared late for the reason this whole list exists: its absence from
+    # Railway once caused a fifteen-day outage in which every valid coupon was
+    # refused, and nothing detected it. Now a clean deployment must have it.
+    "promotions_coupons.sql",
 ]
+
+
+
+# ============================================================================
+# SQL DISPOSITION -- every file in sql/ declares which path it belongs to
+# ============================================================================
+#
+# THE GAP THIS CLOSES. Every integrity mechanism here was computed from the
+# ledger and this manifest, so a SQL file that changed production without
+# entering either was invisible to all of them -- and nothing required a file
+# to enter either. `migrate.py --check` iterates REQUIRED_MIGRATIONS,
+# `ledger_health()` divides by REQUIRED_MIGRATIONS, and `postdeploy_verify`
+# compared tables only. A schema change applied through apply_sql.py passed all
+# four in silence. It has already happened at least three times: the
+# trg_fn_events_after_insert chain below.
+#
+# The fix is not a second ledger and not a new table. It is that "not declared"
+# stops meaning "nobody thought about it" and becomes a STATEMENT. A file in
+# neither list is now an ERROR, not the default.
+#
+# OUT-OF-BAND IS NOT A DEMOTION. It records a true fact -- this file is not
+# replayed by migrate.py -- and for 101 of these files it is the only correct
+# answer: a backfill repairs rows a clean database does not have, and replaying
+# it would be actively wrong. Declaring everything a migration would turn
+# one-time repairs into permanent obligations.
+#
+# WHY MOST HISTORICAL FILES ARE OUT-OF-BAND. Not judgement, observation: none
+# of them is in the governed chain today. Adopting them would assert "a clean
+# database should execute this", a stronger claim than "this once ran in
+# production" and one the evidence does not support file by file. The six
+# entries whose reason begins REVIEW are exactly where that claim may in fact
+# be true, and they are named rather than quietly resolved.
+
+_SCHEMA_OOB = (
+    "Historical schema operation applied out-of-band; it never entered the "
+    "governed chain. This records what is true, not that the objects are "
+    "unimportant.")
+_BACKFILL = (
+    "Data backfill -- repairs rows that already exist. A clean database has "
+    "nothing to repair, so replaying it would be wrong.")
+_CORRECTION = (
+    "One-time data correction -- targets rows that exist only in this "
+    "database's history.")
+_SEED = (
+    "Data seed -- content, not schema. Seeding is an environment choice; a "
+    "clean database is not incorrect without it.")
+_DIAGNOSTIC = (
+    "Diagnostic -- reads only and changes no state.")
+
+# CORRECTED 2026-08-25 after re-examination. The earlier reason given here was
+# "an incremental chain cannot be adopted one link at a time". That mechanism is
+# WRONG: CREATE OR REPLACE FUNCTION is a TOTAL replacement, and
+# notification_headline.sql carries a complete body byte-identical to the live
+# function (4641 chars). Applying that file alone on a clean database would
+# reproduce trg_fn_events_after_insert() exactly. These three files are a
+# HISTORY, not an incremental dependency.
+#
+# THE REAL REASON THEY CANNOT BE ADOPTED is prerequisites. Between them they
+# also define emit_event(), trgfn_events_emit_guard() and
+# trg_events_before_insert -- and the tables they all attach to (events,
+# event_queue, notifications, notification_messages, agent_event_subscriptions)
+# are created by NO FILE IN THE CORPUS AT ALL, declared or otherwise. They exist
+# only in the live databases. `CREATE TRIGGER ... ON events` cannot run where
+# `events` does not exist, so declaring these would put a migration in the
+# governed set that a clean database cannot execute.
+#
+# Same disposition as before, for a sounder reason. Adoption becomes possible
+# only if the base schema enters the corpus -- which is the /sql/ provenance
+# decision, not this one.
+_CHAIN_1 = (
+    "REVIEW -- defines emit_event() and replaces trg_fn_events_after_insert(). "
+    "Cannot be governed while its prerequisite tables (events, event_queue) "
+    "are absent from the entire corpus; a clean database could not execute it.")
+_CHAIN_2 = (
+    "REVIEW -- defines trgfn_events_emit_guard() and trg_events_before_insert "
+    "ON events, and replaces trg_fn_events_after_insert(). Same prerequisite "
+    "gap as fix_event_queue_double_enqueue.sql.")
+_CHAIN_3 = (
+    "REVIEW -- the CURRENT production body of trg_fn_events_after_insert(), "
+    "verified byte-identical on both databases and complete in itself. It is "
+    "held out-of-band NOT because it is the newest of three, but because the "
+    "event subsystem it belongs to has no governed base schema to attach to.")
+_ENCODING_REPAIR = (
+    "Repairs seven functions whose non-ASCII literals were mangled on Railway "
+    "-- five in executable literals, two in comments only. Out-of-band because "
+    "it repairs damage on one database; a clean installation gets these "
+    "functions from sp/. NOT a deploy-path fix: psql was tested through both "
+    "shells and does not corrupt, so the damage is historical.")
+_TRIGGER_BIND = (
+    "Binds two business-rule triggers whose FUNCTIONS are already deployed on "
+    "Railway but which were never attached there. Out-of-band because it "
+    "repairs one database's missing bindings, and the base tables involved are "
+    "not in this corpus at all.")
+
+_CATCHUP = (
+    "Catch-up operation -- a one-time reconciliation of Railway against local "
+    "on 2026-08-05, by name and by purpose. A clean database must never replay "
+    "it. Ledgered with an empty checksum, which stays as recorded.")
+
+# filename -> why it is NOT a governed migration. Reasons beginning REVIEW are
+# open questions for a human, not settled answers.
+OUT_OF_BAND_SQL: Dict[str, str] = {
+    "account_intelligence.sql": _SCHEMA_OOB,
+    "accounts_enrichment_columns.sql": _SCHEMA_OOB,
+    "accounts_firmographics_columns.sql": _SCHEMA_OOB,
+    "activities_account_fk.sql": _SCHEMA_OOB,
+    "addresses table.sql": _SCHEMA_OOB,
+    "agent_bus_watermark.sql": _SCHEMA_OOB,
+    "agent_capabilities.sql": _SCHEMA_OOB,
+    "agent_console.sql": _SCHEMA_OOB,
+    "agent_event_subscriptions_seed.sql": _SEED,
+    "agent_playbooks.sql": _SCHEMA_OOB,
+    "agent_sequences.sql": _SCHEMA_OOB,
+    "agent_tuning.sql": _SCHEMA_OOB,
+    "append_only_revokes.sql": _SCHEMA_OOB,
+    "append_only_revokes_fix.sql": _SCHEMA_OOB,
+    "ar_aging_realism.sql": _SCHEMA_OOB,
+    "ar_collections_settle_88pct.sql": _CORRECTION,
+    "assignable_identity.sql": _SCHEMA_OOB,
+    "audit_log_immutability.sql": _SCHEMA_OOB,
+    "auth_sessions.sql": _SCHEMA_OOB,
+    "autocomplete_communication_activities.sql": _SCHEMA_OOB,
+    "backfill_account_addresses.sql": _BACKFILL,
+    "backfill_account_contact_info.sql": _BACKFILL,
+    "backfill_account_firmographics.sql": _BACKFILL,
+    "backfill_contact_addresses.sql": _BACKFILL,
+    "backfill_contacts_data_quality.sql": _BACKFILL,
+    "backfill_created_updated_by.sql": _BACKFILL,
+    "backfill_lead_credentials.sql": _BACKFILL,
+    "backfill_lead_firmographics.sql": _SCHEMA_OOB,
+    "backfill_lead_owner_ids.sql": _BACKFILL,
+    "backfill_missing_accounts.sql": _BACKFILL,
+    "backfill_open_opp_margins.sql": _SCHEMA_OOB,
+    "backfill_opportunity_amounts.sql": _BACKFILL,
+    "backfill_order_totals.sql": _DIAGNOSTIC,
+    "backfill_ownership.sql": _BACKFILL,
+    "backfill_pending_orders_invoice.sql": _BACKFILL,
+    "backfill_products_audit_seed.sql": _SEED,
+    "backfill_reduce_ar_outstanding_90pct.sql": _BACKFILL,
+    "backfill_reduce_ar_outstanding_round2.sql": _BACKFILL,
+    "backfill_shipping_from_billing.sql": _BACKFILL,
+    "backfill_synthetic_amounts.sql": _BACKFILL,
+    "BACKFILL_zero_amount_orders_and_invoices.sql": _BACKFILL,
+    "balance_account_statistics.sql": _CORRECTION,
+    "breach_register.sql": _SCHEMA_OOB,
+    "business_objectives.sql": _SCHEMA_OOB,
+    "cancelled_invoices_are_not_receivable.sql": _SCHEMA_OOB,
+    "case_escalation_bridge.sql": _SCHEMA_OOB,
+    "case_lifecycle.sql": _SCHEMA_OOB,
+    "ck_ar_digest_dedup_key.sql": _SCHEMA_OOB,
+    "cleanup_20260725_migration_alert_flood.sql": _CORRECTION,
+    "cleanup_order_statuses.sql": _CORRECTION,
+    "cleanup_soft_deleted_payments.sql": _CORRECTION,
+    "cleanup_status_case.sql": _CORRECTION,
+    "consent_channels.sql": _SCHEMA_OOB,
+    "create_sp_products_list_categories.sql": _SCHEMA_OOB,
+    "crm_agent_memory.sql": _SCHEMA_OOB,
+    "custom_agent_versions.sql": _SCHEMA_OOB,
+    "custom_agents.sql": _SCHEMA_OOB,
+    "custom_field_provenance.sql": _SCHEMA_OOB,
+    "custom_field_typed.sql": _SCHEMA_OOB,
+    "custom_fields.sql": _SCHEMA_OOB,
+    "customer_memory.sql": _SCHEMA_OOB,
+    "dedupe_accounts_by_name.sql": _CORRECTION,
+    "dedupe_accounts_merge_ltd_variants.sql": _CORRECTION,
+    "dedupe_addresses_by_parent_label.sql": _SCHEMA_OOB,
+    "dedupe_contacts_by_name.sql": _CORRECTION,
+    "delete_my_test_account.sql": _CORRECTION,
+    "diag2_product_counts.sql": _DIAGNOSTIC,
+    "diag_grocery_toys_categories.sql": _DIAGNOSTIC,
+    "disable_lead_auto_credentials.sql": _SCHEMA_OOB,
+    "dsar_requests.sql": _SCHEMA_OOB,
+    "dsar_subject_requests.sql": _SCHEMA_OOB,
+    "email_received_event.sql": _CORRECTION,
+    "email_templates.sql": _SCHEMA_OOB,
+    "embed_keys.sql": _SCHEMA_OOB,
+    "employee_emails_to_emp_subdomain.sql": _CORRECTION,
+    "employee_service_seed.sql": _SCHEMA_OOB,
+    "escalations.sql": _SCHEMA_OOB,
+    "event_types_voice_learning.sql": _CORRECTION,
+    "executive_intelligence.sql": _SCHEMA_OOB,
+    "expire_moot_courtesy_tasks.sql": _CORRECTION,
+    "f915_contact_email_verified.sql": _SCHEMA_OOB,
+    "f915_live_names.sql": _SCHEMA_OOB,
+    "fix_all_mismatched_invoices.sql": _CORRECTION,
+    "fix_bottleneck_backlog_2026_07.sql": _CORRECTION,
+    "fix_category_assignments.sql": _CORRECTION,
+    "fix_event_emit_guard.sql": _CHAIN_2,
+    "fix_encoding_corrupted_functions.sql": _ENCODING_REPAIR,
+    "bind_missing_business_rule_triggers.sql": _TRIGGER_BIND,
+    "fix_event_queue_double_enqueue.sql": _CHAIN_1,
+    "fix_image_urls_snacks_personal_pet.sql": _CORRECTION,
+    "fix_inflated_invoices.sql": _CORRECTION,
+    "fix_invoice_after_item_added.sql": _CORRECTION,
+    "fix_lucas_tremblay_encoding.sql": _CORRECTION,
+    "fix_mangled_dashes.sql": _SCHEMA_OOB,
+    "fix_notification_lifecycle_trigger.sql": _SCHEMA_OOB,
+    "fix_office_supplies_image_urls.sql": _CORRECTION,
+    "fix_opportunity_closed_paid_status.sql": _CORRECTION,
+    "fix_orphan_open_deals.sql": _CORRECTION,
+    "fix_payment_received_event.sql": _SCHEMA_OOB,
+    "fix_product_images.sql": _CORRECTION,
+    "fix_relative_image_urls.sql": _CORRECTION,
+    "governance_critic.sql": _SCHEMA_OOB,
+    "governance_history_audit.sql": _SCHEMA_OOB,
+    "governance_routing.sql": _SCHEMA_OOB,
+    "guardrails_acl.sql": _SCHEMA_OOB,
+    "identity_links.sql": _SCHEMA_OOB,
+    "identity_trgm.sql": _SCHEMA_OOB,
+    "improve_account_statistics.sql": _CORRECTION,
+    "insert_30_electronics.sql": _CORRECTION,
+    "insert_31_office_supplies.sql": _CORRECTION,
+    "insert_32_grocery.sql": _CORRECTION,
+    "insert_35_apparel.sql": _CORRECTION,
+    "insert_35_health.sql": _CORRECTION,
+    "insert_35_home.sql": _CORRECTION,
+    "insert_50_electronics2.sql": _CORRECTION,
+    "insert_electronics_images.sql": _CORRECTION,
+    "insert_new_electronics.sql": _CORRECTION,
+    "insert_product_images.sql": _CORRECTION,
+    "insert_products.sql": _CORRECTION,
+    "intelligence_v2.sql": _SCHEMA_OOB,
+    "invoice_balance_drift_guard.sql": _SCHEMA_OOB,
+    "job_ledger.sql": _SCHEMA_OOB,
+    "kb_documents.sql": _SCHEMA_OOB,
+    "kb_enrichment.sql": _SCHEMA_OOB,
+    "kb_fix_automation_overreach.sql": _CORRECTION,
+    "kb_fix_false_capability_claims.sql": _CORRECTION,
+    "kb_gaps.sql": _SCHEMA_OOB,
+    "kb_search_aliases.sql": _CORRECTION,
+    "kb_seed_crm_product_docs.sql": _SEED,
+    "kb_seed_crm_product_docs_round2.sql": _SEED,
+    "kb_semantic.sql": _SCHEMA_OOB,
+    "kb_update_cancel_policy.sql": _CORRECTION,
+    "knowledge_base.sql": _SCHEMA_OOB,
+    "lead_scoring_model.sql": _SCHEMA_OOB,
+    "leads table.sql": _SCHEMA_OOB,
+    "leads_enrichment_columns.sql": _SCHEMA_OOB,
+    "leads_signup_consent.sql": _SCHEMA_OOB,
+    "llm_usage.sql": _SCHEMA_OOB,
+    "llm_usage_failover.sql": _SCHEMA_OOB,
+    "lock_writes_to_admins.sql": _SCHEMA_OOB,
+    "mark_old_notifications_read.sql": _CORRECTION,
+    "mark_old_notifications_read_8k.sql": _CORRECTION,
+    "marketing_ab.sql": _SCHEMA_OOB,
+    "marketing_campaigns.sql": _SCHEMA_OOB,
+    "mcp_servers.sql": _SCHEMA_OOB,
+    "metric_decision_tz_fix.sql": _SCHEMA_OOB,
+    "migration_add_role_to_leads.sql": _SCHEMA_OOB,
+    "migration_auth_credentials_lead_id.sql": _SCHEMA_OOB,
+    "migration_auth_credentials_nullable_account.sql": _SCHEMA_OOB,
+    "migration_fix_endash_in_activities.sql": _CORRECTION,
+    "migration_leads_soft_delete.sql": _SCHEMA_OOB,
+    "migration_products_add_audit_columns.sql": _SCHEMA_OOB,
+    "normalize_phones_to_e164.sql": _CORRECTION,
+    "notification_headline.sql": _CHAIN_3,
+    "opportunity_decided_at.sql": _SCHEMA_OOB,
+    "owners_employee_link.sql": _SCHEMA_OOB,
+    "product_image_table.sql": _SCHEMA_OOB,
+    "promote_account_billing_address.sql": _CORRECTION,
+    "provenance_expand.sql": _SCHEMA_OOB,
+    "quotes.sql": _SCHEMA_OOB,
+    "railway_catchup_20260805.sql": _CATCHUP,
+    "railway_cutover_2026_07.sql": _SCHEMA_OOB,
+    "railway_insert_ring_replacement.sql": _CORRECTION,
+    "railway_insert_sony.sql": _CORRECTION,
+    "rbac_roles.sql": _SCHEMA_OOB,
+    "rebrand_email_templates_conscestra.sql": _CORRECTION,
+    "redistribute_shipped_orders.sql": _CORRECTION,
+    "registry_policies_trace.sql": _SCHEMA_OOB,
+    "remove_personal_care_category.sql": _CORRECTION,
+    "reorganize_personal_care.sql": _CORRECTION,
+    "repair_stale_invoice_balances.sql": _CORRECTION,
+    "replace_amazon_products.sql": _CORRECTION,
+    "replace_ring_kindle.sql": _CORRECTION,
+    "replace_synthetic_products.sql": _CORRECTION,
+    "rescale_open_opportunity_amounts.sql": _CORRECTION,
+    "reset_synthetic_email_verified.sql": _CORRECTION,
+    "resolve_owner_id_fix.sql": _SCHEMA_OOB,
+    "resolve_stale_overdue_events.sql": _CORRECTION,
+    "restore_all_contacts_active.sql": _CORRECTION,
+    "restore_synthetic_images.sql": _CORRECTION,
+    "resync_lead_ratings.sql": _CORRECTION,
+    "retire_n8n_legacy.sql": _SCHEMA_OOB,
+    "retire_sp_admin_broken_modes.sql": _SCHEMA_OOB,
+    "retire_sp_admin_data_cleanup.sql": _SCHEMA_OOB,
+    "routing_rules.sql": _SCHEMA_OOB,
+    "routing_signals.sql": _SCHEMA_OOB,
+    "sdr_sessions.sql": _SCHEMA_OOB,
+    "seed_account_activities.sql": _SEED,
+    "seed_contact_activities.sql": _SEED,
+    "seed_contact_activities_topup.sql": _SEED,
+    "seed_email_migration.sql": _SCHEMA_OOB,
+    "seed_kb_articles.sql": _SEED,
+    "seed_kb_articles_round2.sql": _SEED,
+    "session_memory.sql": _SCHEMA_OOB,
+    "settle_immaterial_overdue.sql": _CORRECTION,
+    "telephony.sql": _CORRECTION,
+    "tenants.sql": _SCHEMA_OOB,
+    "tier1_audit_instrumentation.sql": _SCHEMA_OOB,
+    "unified_comms_conversations.sql": _SCHEMA_OOB,
+    "unified_comms_identity.sql": _SCHEMA_OOB,
+    "update_product_images.sql": _CORRECTION,
+    "update_product_images2.sql": _CORRECTION,
+    "update_product_images_new.sql": _CORRECTION,
+    "update_product_pricing.sql": _CORRECTION,
+    "update_product_pricing_new.sql": _CORRECTION,
+    "update_products.sql": _CORRECTION,
+    "update_products_new.sql": _CORRECTION,
+    "verify_contacts_with_orders.sql": _CORRECTION,
+    "verify_order_test_contacts.sql": _CORRECTION,
+    "voice_echo_probe.sql": _SCHEMA_OOB,
+    "voice_flux_turn.sql": _SCHEMA_OOB,
+    "voice_stt_shadow.sql": _SCHEMA_OOB,
+    "welcome_letter_copy_v2.sql": _CORRECTION,
+    "workflow_chain.sql": _SCHEMA_OOB,
+    "workflow_idempotency.sql": _SCHEMA_OOB,
+    "workflow_placeholders.sql": _SCHEMA_OOB,
+    "workflow_revival.sql": _SCHEMA_OOB,
+}
+
+_SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
+
+
+def _dollar_quoted_spans(sql: str) -> "list[tuple[int, int]]":
+    """Character ranges covered by $$...$$ / $tag$...$tag$ bodies.
+
+    Needed because a function body or DO block may legitimately contain the
+    words BEGIN and COMMIT -- PL/pgSQL's BEGIN is a block opener, not
+    transaction control -- and rewriting those would corrupt the function."""
+    spans, pos = [], 0
+    tag_re = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+    while True:
+        m = tag_re.search(sql, pos)
+        if not m:
+            return spans
+        close = sql.find(m.group(0), m.end())
+        if close == -1:                       # unterminated; treat as to-EOF
+            spans.append((m.start(), len(sql)))
+            return spans
+        spans.append((m.start(), close + len(m.group(0))))
+        pos = close + len(m.group(0))
+
+
+def _outside(spans, i: int) -> bool:
+    return not any(a <= i < b for a, b in spans)
+
+
+_TXN_STMT = re.compile(r"^[ \t]*(BEGIN|COMMIT|END)[ \t]*;[ \t]*$",
+                       re.IGNORECASE | re.MULTILINE)
+
+
+def strip_outer_transaction(sql: str) -> "tuple[str, bool]":
+    """Remove a file's OWN transaction control so the caller owns the transaction.
+
+    SHARED BY BOTH APPLY PATHS ON PURPOSE. apply_sql.py discovered this first:
+    our .sql files wrap themselves in BEGIN;...COMMIT; so they are atomic under
+    psql and pgAdmin, which are autocommit by default. psycopg2 is NOT -- it has
+    already opened a transaction, so the file's BEGIN is a no-op that merely
+    warns and the file's COMMIT commits OUR transaction. A later rollback then
+    warns 'no transaction in progress' and does nothing, so `--dry-run` printed
+    "ROLLED BACK -- nothing changed" while having applied the file in full.
+
+    IT REMOVES EVERY TOP-LEVEL STATEMENT, NOT JUST A MATCHED OUTER PAIR, and
+    that widening was not cosmetic. The first version stripped a leading BEGIN
+    and a COMMIT only at end-of-file. sql/metric_registry_migration.sql has
+    BEGIN on line 31 and COMMIT on line 150 with 62 lines after it, so the
+    BEGIN was removed and the COMMIT was left -- strictly worse than doing
+    nothing, because the marker went and the early commit stayed. 15 of the 34
+    declared migrations were in that shape, which means the atomicity guarantee
+    migrate.py had just been given was false for nearly half of them.
+
+    THIS WAS FOUND THE EXPENSIVE WAY. A mutation experiment routed that file
+    through apply_sql.py with `--dry-run`; the mid-file COMMIT ended the
+    transaction, the rollback covered only the tail, and a view silently
+    reverted to an older definition -- caught by an unrelated metric test two
+    steps later.
+
+    Dollar-quoted bodies are skipped: PL/pgSQL BEGIN is a block opener, not
+    transaction control, and rewriting a function body would corrupt it.
+
+    Safe to merge into one transaction because every declared migration was
+    checked for statements PostgreSQL forbids inside a transaction block
+    (CREATE INDEX CONCURRENTLY, VACUUM, REINDEX, ALTER TYPE ADD VALUE): there
+    are none. A future migration needing one must be applied deliberately
+    outside the runner, not by loosening this.
+
+    Returns (body, had_transaction_control). The file on disk is never modified
+    and stays correct under psql."""
+    spans = _dollar_quoted_spans(sql)
+    out, last, had = [], 0, False
+    for m in _TXN_STMT.finditer(sql):
+        if not _outside(spans, m.start()):
+            continue                          # inside a function body
+        if m.group(1).upper() == "END":
+            continue                          # END; is ambiguous -- leave it
+        out.append(sql[last:m.start()])
+        last = m.end()
+        had = True
+    out.append(sql[last:])
+    return ("".join(out), had) if had else (sql, False)
+
+
+def residual_transaction_control(sql: str) -> "list[str]":
+    """Top-level BEGIN/COMMIT still present after stripping.
+
+    The fail-closed companion. A caller promising atomicity must refuse a file
+    that can still end its transaction mid-way, rather than promise something
+    it cannot deliver -- an unverified guarantee is worse than none, because it
+    stops people looking."""
+    spans = _dollar_quoted_spans(sql)
+    return [m.group(1).upper() for m in _TXN_STMT.finditer(sql)
+            if _outside(spans, m.start()) and m.group(1).upper() != "END"]
+
+
+class SqlDispositionError(RuntimeError):
+    """A SQL file has no disposition, or two. Fail closed."""
+
+
+def classify_sql_corpus(sql_dir: Optional[str] = None) -> Dict[str, Any]:
+    """THE COMPLETENESS INVARIANT.
+
+        set(sql/*.sql) == REQUIRED_MIGRATIONS union OUT_OF_BAND_SQL
+        REQUIRED_MIGRATIONS intersect OUT_OF_BAND_SQL == empty
+
+    Four ways to fail, each naming a different mistake:
+
+      unclassified   a file nobody assigned a path -- the silent default this
+                     mechanism exists to abolish
+      both           a file claiming to be governed and not, which is not a
+                     disposition but a contradiction
+      missing_*      a name declared with no file behind it -- the manifest
+                     describing something that does not exist
+
+    Returns a report rather than raising, so each caller chooses its severity:
+    `migrate.py --check` treats it as fatal, the release guard as advisory.
+
+    THE DIRECTORY IS THE DENOMINATOR, deliberately. Computing this from the
+    ledger would reproduce the blind spot, because the population at issue is
+    exactly the files the ledger never saw.
+
+    SKIPS CLEANLY WHERE sql/ IS ABSENT. /sql/ is gitignored, so a deployed
+    container has no corpus. `present: False` means "not evaluated", which is
+    not "clean" and must never be reported as passing."""
+    d = Path(sql_dir) if sql_dir else _SQL_DIR
+    if not d.is_dir():
+        return {"present": False, "ok": None, "reason": f"no sql dir at {d}"}
+
+    on_disk = {p.name for p in d.glob("*.sql")}
+    declared = set(REQUIRED_MIGRATIONS)
+    out_of_band = set(OUT_OF_BAND_SQL)
+
+    unclassified = sorted(on_disk - declared - out_of_band)
+    both = sorted(declared & out_of_band)
+    missing_declared = sorted(declared - on_disk)
+    missing_oob = sorted(out_of_band - on_disk)
+    ok = not (unclassified or both or missing_declared or missing_oob)
+    return {
+        "present": True,
+        "ok": ok,
+        "on_disk": len(on_disk),
+        "declared": len(declared),
+        "out_of_band": len(out_of_band),
+        "unclassified": unclassified,
+        "both": both,
+        "missing_declared": missing_declared,
+        "missing_out_of_band": missing_oob,
+        # Named, not hidden: the open governance questions inside the
+        # out-of-band set. Appearing here is not a failure.
+        "needs_review": sorted(k for k, v in OUT_OF_BAND_SQL.items()
+                               if v.startswith("REVIEW")),
+    }
+
+
+def disposition_of(filename: str) -> str:
+    """'governed' | 'out_of_band' | 'unclassified' -- the whole vocabulary."""
+    if filename in set(REQUIRED_MIGRATIONS):
+        return "governed"
+    if filename in OUT_OF_BAND_SQL:
+        return "out_of_band"
+    return "unclassified"
+
+
+def require_disposition(filename: str, expected: str) -> None:
+    """Refuse to apply a file down the wrong path. Raises SqlDispositionError.
+
+    THIS IS THE BOUNDARY, not the manifest. A list nothing consults is
+    documentation; the refusal is what makes the two paths real."""
+    actual = disposition_of(filename)
+    if actual == "unclassified":
+        raise SqlDispositionError(
+            f"{filename} has NO disposition. Add it to REQUIRED_MIGRATIONS "
+            f"(governed schema definition, applied by migrate.py) or to "
+            f"OUT_OF_BAND_SQL with the reason it is not one. Refusing to "
+            f"guess -- guessing is how the trg_fn_events_after_insert chain "
+            f"reached production unrecorded.")
+    if actual != expected:
+        other = "migrate.py" if actual == "governed" else "apply_sql.py"
+        raise SqlDispositionError(
+            f"{filename} is classified '{actual}' and this is the "
+            f"'{expected}' path. Apply it with {other}, or change its "
+            f"disposition deliberately -- in the same change that applies it.")
+
 
 # The parameters that decide what an agent may SAY. A difference in any of these
 # between two replicas is a policy difference, not a config nuance.
@@ -255,15 +789,49 @@ def _missing_objects() -> List[str]:
 
 def record_migration(filename: str, applied_by: str = "manual",
                      checksum: str = "") -> bool:
+    """Record a manually-applied migration. A CHECKSUM IS NOW REQUIRED.
+
+    THE SECOND WRITER. The empty-checksum defect was fixed in migrate.py, and
+    this function was missed -- it took `checksum=""` as its DEFAULT and
+    inserted it unguarded, so `record_migration("x.sql")` minted a brand new
+    row carrying no integrity information at all. Two of the rows on Railway
+    are in exactly that state, and nothing prevented a third.
+
+    An empty string is the harmful middle of the vocabulary:
+
+        NULL             never recorded, and reads honestly as absent
+        'abc123...'      the content hash at apply time
+        ''               satisfies NOT NULL while guaranteeing nothing --
+                         the constraint looks enforced and is not
+
+    So this refuses rather than writes. NULL is not the fallback either:
+    Railway declares `checksum NOT NULL`, so "unknown" cannot be represented
+    there at all, which is precisely why '' exists in its history. Refusing
+    keeps a caller from minting more of them.
+
+    A genuinely unknown checksum means the row should not be written by this
+    function. Record the application out of band and leave the ledger silent,
+    rather than adding a row that asserts nothing.
+
+    The existing empty rows are NOT touched. Adopting today's hash for a
+    2026-08-05 application would fabricate a historical claim -- see the
+    specification's §8.6."""
+    if not (checksum or "").strip():
+        logger.error(
+            f"[deploy] refusing to record {filename} with an empty checksum. "
+            f"Pass the sha256 of the file as applied, or do not record the "
+            f"row -- an entry that asserts nothing is worse than no entry.")
+        return False
     ensure_table()
     try:
         conn = get_connection()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO schema_migrations (filename, applied_by, checksum)
+                    """INSERT INTO public.schema_migrations
+                         (filename, applied_by, checksum)
                        VALUES (%s,%s,%s) ON CONFLICT (filename) DO NOTHING""",
-                    (filename, applied_by, checksum))
+                    (filename, applied_by, checksum.strip()))
             conn.commit()
             return True
         finally:

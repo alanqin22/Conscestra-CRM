@@ -79,8 +79,87 @@ def _run(label: str, module: str, env: dict,
     return label, proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
+# ---------------------------------------------------------------------------
+# THE SUPPORTED SCHEMA-OBJECT INVENTORY
+# ---------------------------------------------------------------------------
+# Explicit, not "everything PostgreSQL knows about". Comparing every internal
+# object would produce diffs nobody can act on and would train people to ignore
+# the output -- the same way a permanently-red check invites falsifying history
+# to recover green. These eight classes are the ones a Conscestra schema change
+# actually lands in.
+#
+# WHY IT GREW. This compared `relkind='r'` -- ordinary tables and nothing else.
+# That caught sql/promotions_coupons.sql, a missing TABLE, which is why it was
+# written. It could not have caught sql/notification_headline.sql, which
+# replaces the BODY of trg_fn_events_after_insert() and creates no object at
+# all. Three files replaced that function on the way to production and every
+# mechanism in the system was blind to all three.
+#
+# Functions and views are compared BY BODY, not by name. A name-only comparison
+# reports "present on both" for a function whose logic silently diverged, which
+# is worse than not looking: it is a check that answers the wrong question
+# confidently.
+_INVENTORY = {
+    "tables": """
+        SELECT c.relname FROM pg_class c JOIN pg_namespace n
+          ON n.oid = c.relnamespace
+         WHERE n.nspname='public' AND c.relkind='r'""",
+    # Nullability rides here, not in `constraints`, because it is the only
+    # portable place to compare it -- see the NOT NULL note below.
+    "columns": """
+        SELECT table_name || '.' || column_name || ':' || data_type
+               || CASE WHEN is_nullable='NO' THEN ' NOT NULL' ELSE '' END
+          FROM information_schema.columns WHERE table_schema='public'""",
+    "indexes": """
+        SELECT indexname FROM pg_indexes WHERE schemaname='public'""",
+    # contype='n' (NOT NULL) is EXCLUDED, and the exclusion is load-bearing.
+    # PostgreSQL 18 materialises every NOT NULL as a pg_constraint row; 17 does
+    # not. Local is 17.9 and Railway is 18.6, so including them reported 965
+    # phantom "on target only" constraints on every single run -- a server
+    # version difference dressed up as schema drift. A check that cries wolf
+    # 965 times is one nobody reads, and the real signal would be buried in it.
+    # Nullability is still compared, portably, via the `columns` class above.
+    "constraints": """
+        SELECT conrelid::regclass::text || '.' || conname
+          FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace
+         WHERE n.nspname='public' AND c.contype <> 'n'""",
+    # md5 of the body: a changed function must not read as unchanged.
+    "functions": """
+        SELECT p.proname || ':' || md5(coalesce(p.prosrc,''))
+          FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+         WHERE n.nspname='public'""",
+    "triggers": """
+        SELECT c.relname || '.' || t.tgname FROM pg_trigger t
+          JOIN pg_class c ON c.oid=t.tgrelid
+          JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname='public' AND NOT t.tgisinternal""",
+    "views": """
+        SELECT table_name || ':' || md5(coalesce(view_definition,''))
+          FROM information_schema.views WHERE table_schema='public'""",
+    "grants": """
+        SELECT grantee || ':' || table_name || ':' || privilege_type
+          FROM information_schema.role_table_grants WHERE table_schema='public'""",
+}
+
+
+def _schema_inventory(dsn: str) -> dict:
+    """One read-only snapshot per object class."""
+    import psycopg2
+    conn = psycopg2.connect(dsn)
+    try:
+        conn.set_session(readonly=True)
+        out = {}
+        with conn.cursor() as cur:
+            for name, sql in _INVENTORY.items():
+                cur.execute(sql)
+                out[name] = {r[0] for r in cur.fetchall()}
+        return out
+    finally:
+        conn.close()
+
+
 def _schema_drift(target_dsn: str) -> Optional[str]:
-    """Tables present in the working schema but missing from the deploy target.
+    """Objects present in the working schema but missing from the deploy target.
 
     This check exists because of a real fifteen-day outage. sql/promotions_
     coupons.sql was applied locally on 2026-07-21 and never to Railway; the
@@ -88,49 +167,50 @@ def _schema_drift(target_dsn: str) -> Optional[str]:
     which is exactly what a wrong code produces, so every valid coupon a
     customer typed was refused and nothing looked wrong from either side.
 
-    The migration ledger did not catch it and could not: schema_migrations held
-    25 rows against 194 files in sql/, because migrations applied by hand in
-    pgAdmin never call record_migration(). It also reported three migrations as
+    The migration ledger did not catch it and could not: migrations applied by
+    hand never called record_migration(). It also reported three migrations as
     missing from production that were in fact applied there. Wrong in both
-    directions is worse than absent — so this compares the LIVE SCHEMAS and
+    directions is worse than absent -- so this compares the LIVE SCHEMAS and
     ignores the ledger entirely.
+
+    IT NOW COMPARES EIGHT OBJECT CLASSES, not just tables. A schema change that
+    bypasses the ledger has to be detectable even when it creates no table --
+    which is the whole class of change the ledger cannot see. See _INVENTORY.
 
     Returns None when it cannot run (one DSN, or both pointing at the same
     database). 'Could not compare' is reported as skipped, never as clean."""
-    import psycopg2
-
     working = (os.getenv("DB_DSN") or "").strip()
     if not working or working == target_dsn:
         return None
 
-    def tables(dsn: str) -> set:
-        conn = psycopg2.connect(dsn)
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""SELECT c.relname FROM pg_class c
-                                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                                WHERE n.nspname='public' AND c.relkind='r'""")
-                return {r[0] for r in cur.fetchall()}
-        finally:
-            conn.close()
-
     try:
-        here, there = tables(working), tables(target_dsn)
+        here, there = _schema_inventory(working), _schema_inventory(target_dsn)
     except Exception as exc:                                    # noqa: BLE001
         return f"SKIPPED — could not compare schemas: {type(exc).__name__}: {exc}"
 
-    missing = sorted(here - there)
-    extra = sorted(there - here)
-    if not missing and not extra:
-        return f"OK — {len(here)} public tables, identical on both"
-    parts = []
-    if missing:
-        parts.append("MISSING FROM TARGET (code may reference these): "
-                     + ", ".join(missing))
-    if extra:
-        parts.append("present on target only: " + ", ".join(extra))
-    return " | ".join(parts)
+    parts, total_missing = [], 0
+    for cls in _INVENTORY:
+        missing = sorted(here[cls] - there[cls])
+        extra = sorted(there[cls] - here[cls])
+        total_missing += len(missing)
+        if not missing and not extra:
+            continue
+        bit = f"{cls}: "
+        if missing:
+            bit += (f"{len(missing)} MISSING FROM TARGET "
+                    f"({', '.join(missing[:4])}"
+                    f"{', …' if len(missing) > 4 else ''})")
+        if extra:
+            bit += (f"{' | ' if missing else ''}{len(extra)} on target only "
+                    f"({', '.join(extra[:4])}{', …' if len(extra) > 4 else ''})")
+        parts.append(bit)
 
+    if not parts:
+        counts = ", ".join(f"{len(here[c])} {c}" for c in _INVENTORY)
+        return f"OK — identical on both ({counts})"
+    lead = ("SCHEMA DRIFT — code may reference objects the target lacks"
+            if total_missing else "schema differs (target has extra objects)")
+    return lead + " || " + " || ".join(parts)
 
 def _app_identity(app_url: str) -> Optional[str]:
     """Ask the RUNNING APPLICATION which database role it connects as.

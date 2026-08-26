@@ -359,10 +359,115 @@ def _check_email_call_sites() -> Dict[str, Any]:
     return check()
 
 
+def _check_capability_registry() -> Dict[str, Any]:
+    """An EMPTY capability registry is a permissive gate, and must say so.
+
+    `dispatch` refuses any intent the registry does not name — but only once the
+    registry has rows. With none, it falls through to the documented exception
+    that treats an unseeded database as "the seed has not run yet", because
+    refusing every capability on a fresh checkout would make a missing migration
+    a total outage.
+
+    That exception is defensible and it is also exactly where this control goes
+    to die quietly: the previous audit found ZERO rows on both databases, so the
+    kill switch and agent RBAC had never once fired in production. Reporting the
+    state at startup is what stops "armed" and "unarmed" looking identical.
+
+    ADVISORY, not blocking. A permissive capability mesh is the behaviour the
+    system has always had; refusing to start over it would be a new outage in
+    the name of a control that has never yet been needed. It becomes blocking
+    the day agents stop being first-party — see the RBAC trigger in
+    docs/deployment_gate_audit.md §14."""
+    try:
+        from app.core.a2a import registry_state
+        st = registry_state()
+    except Exception as exc:                                  # pragma: no cover
+        return {"control": "capability_registry", "ok": False,
+                "severity": "advisory",
+                "message": f"could not read the capability registry: {exc}"}
+
+    if not st["seeded"]:
+        return {"control": "capability_registry", "ok": False,
+                "severity": "advisory",
+                "message": (f"capability registry is EMPTY — the closed-by-"
+                            f"default gate and the operator kill switch are "
+                            f"both INERT ({st['declared']} capabilities "
+                            f"declared). Seed with POST /a2a/registry/sync.")}
+    if st["unregistered"]:
+        return {"control": "capability_registry", "ok": False,
+                "severity": "advisory",
+                "message": (f"{len(st['unregistered'])} declared capability(ies) "
+                            f"have no registry row and will be REFUSED: "
+                            f"{', '.join(st['unregistered'][:5])}. Run "
+                            f"POST /a2a/registry/sync.")}
+    disabled = f", {len(st['disabled'])} disabled by an operator" \
+        if st["disabled"] else ""
+    return {"control": "capability_registry", "ok": True, "severity": "ok",
+            "message": (f"{st['registered']} of {st['declared']} capabilities "
+                        f"registered; closed-by-default ACTIVE{disabled}")}
+
+
+def _check_sql_disposition() -> Dict[str, Any]:
+    """Is every SQL artifact classified as governed or out-of-band?
+
+    THE FAILURE THIS REPORTS. Until now "not in REQUIRED_MIGRATIONS" was the
+    default state of a SQL file, not a decision about it, so a schema change
+    applied through apply_sql.py changed production and no mechanism noticed:
+    `migrate --check` iterates the manifest, `ledger_health()` divides by the
+    manifest, and the live-schema comparison looked only at tables. The
+    trg_fn_events_after_insert chain went down that path three times.
+
+    ADVISORY, NOT BLOCKING, and the reason is specific. The blocking gate is
+    `migrate.py`, which refuses to apply anything while the corpus is
+    unclassified -- that is where an unclassified file can still be stopped
+    before it reaches a database. By the time this runs the database is already
+    whatever it is, so refusing to boot would convert a bookkeeping gap into an
+    outage without protecting anything.
+
+    SKIPS ON A DEPLOYED HOST, HONESTLY. /sql/ is gitignored, so a Railway
+    container has no corpus to classify. That is reported as 'not evaluated',
+    never as clean -- an absent denominator producing a confident pass is the
+    exact mistake `ledger_health()` already made once and documents."""
+    try:
+        from app.core.deploy_state import classify_sql_corpus
+        c = classify_sql_corpus()
+    except Exception as exc:                                  # pragma: no cover
+        return {"control": "sql_disposition", "ok": False, "severity": "advisory",
+                "message": f"could not classify the SQL corpus: {exc}"}
+
+    if not c.get("present"):
+        return {"control": "sql_disposition", "ok": True, "severity": "ok",
+                "message": ("sql/ not present — classification NOT EVALUATED "
+                            "here (this is not the same as clean; the gate is "
+                            "migrate.py, which runs where sql/ exists)")}
+    if not c["ok"]:
+        bits = []
+        if c["unclassified"]:
+            bits.append(f"{len(c['unclassified'])} unclassified "
+                        f"({', '.join(c['unclassified'][:3])})")
+        if c["both"]:
+            bits.append(f"{len(c['both'])} in BOTH manifests")
+        if c["missing_declared"]:
+            bits.append(f"{len(c['missing_declared'])} declared but absent")
+        if c["missing_out_of_band"]:
+            bits.append(f"{len(c['missing_out_of_band'])} classified but absent")
+        return {"control": "sql_disposition", "ok": False, "severity": "advisory",
+                "message": ("SQL corpus is not fully classified: "
+                            + "; ".join(bits)
+                            + ". migrate.py will refuse to run.")}
+    review = f", {len(c['needs_review'])} awaiting a human disposition" \
+        if c["needs_review"] else ""
+    return {"control": "sql_disposition", "ok": True, "severity": "ok",
+            "message": (f"{c['on_disk']} SQL files classified "
+                        f"({c['declared']} governed, {c['out_of_band']} "
+                        f"out-of-band){review}")}
+
+
 CHECKS = (_check_calendar_feed, _check_api_auth, _check_admin_token,
           _check_training_ack, _check_secret_strength,
           _check_configuration_integrity, _check_public_url,
-          _check_email_call_sites)
+          _check_email_call_sites, _check_capability_registry,
+          _check_sql_disposition)
 
 
 def audit() -> Dict[str, Any]:

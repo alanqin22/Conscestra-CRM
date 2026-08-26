@@ -791,6 +791,35 @@ def _run_capture_forecast_snapshot() -> None:
 async def lifespan(app: FastAPI):
     logger.info("=== CRM Agent starting up (all 12 modules + home index + auth + email) ===")
 
+    # Capability registry seed — arms the closed-by-default gate.
+    #
+    # BEFORE the guard, deliberately. The gate refuses any intent the registry
+    # does not name, which only means something once the registry HAS rows; an
+    # unseeded database falls through to the permissive exception. Seeding here
+    # rather than by hand is what stops a fresh environment sitting in that
+    # exception forever, with the operator kill switch having nothing to switch.
+    #
+    # The ordering is the whole point. Placed after `enforce()`, the guard reads
+    # an empty registry and reports the gate INERT five milliseconds before this
+    # arms it — a false alarm on the FIRST boot of every new environment, which
+    # is the one boot anybody actually reads. A check that cries wolf exactly
+    # once, at the moment of maximum attention, is a check people learn to skip.
+    # So the seed runs first and the guard reports what is true afterwards.
+    #
+    # Safe on every replica: INSERT … ON CONFLICT DO NOTHING, so concurrent
+    # boots cannot duplicate and an operator's `enabled=false` survives a
+    # deploy. Never raises: a seed that cannot run (migration not yet applied)
+    # leaves the registry empty, which is permissive rather than an outage, and
+    # the guard then reports that honestly.
+    try:
+        from app.core.a2a import sync_capability_registry
+        _seed = sync_capability_registry("startup")
+        if _seed.get("ok"):
+            logger.info(f"[a2a] capability registry: {_seed['added']} added, "
+                        f"{_seed['existing']} present, {_seed['declared']} declared")
+    except Exception as exc:                                  # noqa: BLE001
+        logger.warning(f"[a2a] capability registry seed skipped: {exc}")
+
     # Release configuration guard — BEFORE anything binds or serves. A deployed
     # environment missing a blocking control does not start; a laptop only gets
     # a log line. See app/core/release_guard.py for why refusing beats warning.
@@ -798,6 +827,7 @@ async def lifespan(app: FastAPI):
     release_guard.enforce()
 
     db_ok = test_connection()
+
     logger.info(f"Database: {'OK' if db_ok else 'FAILED -- check DB_DSN in .env'}")
 
     # HA leader election (#7): the scheduler, IMAP poller and agent-bus consumer

@@ -45,6 +45,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import psycopg2                                            # noqa: E402
 
 from app.core.config import get_settings                   # noqa: E402  (loads .env)
+from app.core.deploy_state import (                        # noqa: E402
+    SqlDispositionError, disposition_of, require_disposition,
+    strip_outer_transaction)
 
 
 def _dsn(target: str | None) -> tuple[str, str]:
@@ -62,37 +65,17 @@ def _dsn(target: str | None) -> tuple[str, str]:
     return get_settings().db_dsn, "LOCAL"
 
 
-def _strip_outer_transaction(sql: str) -> tuple[str, bool]:
-    """Remove the file's own outer BEGIN;/COMMIT; and report whether it had them.
+def _strip_outer_transaction(sql: str) -> "tuple[str, bool]":
+    """Delegates to app.core.deploy_state.strip_outer_transaction.
 
-    THE BUG THIS FIXES, found the first time this script ran. Our .sql files
-    wrap themselves in BEGIN;…COMMIT; so they are atomic under psql and pgAdmin,
-    which are autocommit by default. psycopg2 is NOT: it has already opened a
-    transaction, so the file's BEGIN is a no-op that merely warns, and the
-    file's COMMIT commits OUR transaction. The subsequent conn.rollback() then
-    warns 'no transaction in progress' and does nothing.
-
-    So `--dry-run` printed "ROLLED BACK — nothing changed" while having applied
-    the file in full. A safety flag that silently does the dangerous thing is
-    worse than no flag, and it is the same shape as everything else this feature
-    was built to remove: a reassuring message with no mechanism behind it.
-
-    Stripping the outer pair puts the transaction back under this script's
-    control, so commit and rollback both mean what they say. The file is left
-    unchanged on disk and stays correct under psql.
-    """
-    import re
-    body = sql
-    had = False
-    m = re.match(r"\A(\s*(?:--[^\n]*\n|\s)*)BEGIN\s*;", body, re.IGNORECASE)
-    if m:
-        body = body[:m.start()] + m.group(1) + body[m.end():]
-        had = True
-    m = re.search(r"COMMIT\s*;\s*\Z", body, re.IGNORECASE)
-    if m and had:
-        body = body[:m.start()] + body[m.end():]
-    return body, had
-
+    THE LOGIC MOVED, THE REASONING DID NOT. This rule was discovered here --
+    our .sql files wrap themselves in BEGIN;...COMMIT;, psycopg2 has already
+    opened a transaction, so the file's COMMIT committed OURS and `--dry-run`
+    printed "ROLLED BACK -- nothing changed" while having applied the file in
+    full. migrate.py needs exactly the same rule to make its schema-plus-ledger
+    transaction atomic, and two copies of a rule this subtle is how the copies
+    come to disagree. See the shared function for the full account."""
+    return strip_outer_transaction(sql)
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -109,6 +92,20 @@ def main() -> int:
     path = Path(args.file)
     if not path.exists():
         raise SystemExit(f"no such file: {path}")
+    # ---- THE PATH BOUNDARY ------------------------------------------------
+    # apply_sql.py applies OUT-OF-BAND operations and nothing else. A governed
+    # migration routed through here would change the database and leave no
+    # ledger row -- which is precisely how the trg_fn_events_after_insert chain
+    # reached production unrecorded, three times, with no mechanism noticing.
+    #
+    # Unclassified refuses too, and that is the point: the failure mode being
+    # removed is not "the operator chose wrong", it is "nobody chose".
+    try:
+        require_disposition(path.name, "out_of_band")
+    except SqlDispositionError as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 2
+
     sql, wrapped = _strip_outer_transaction(path.read_text(encoding="utf-8"))
 
     dsn, label = _dsn(args.target)
@@ -157,8 +154,9 @@ def main() -> int:
         print("ROLLED BACK — nothing changed.")
     else:
         print(f"APPLIED to {label}.")
-    print("NOT recorded in schema_migrations — this is a deliberate one-off, "
-          "not a tracked migration.")
+    print(f"NOT recorded in schema_migrations — {path.name} is classified "
+          f"'{disposition_of(path.name)}'. That classification is the "
+          f"provenance record; the ledger deliberately has no row.")
     return 0
 
 

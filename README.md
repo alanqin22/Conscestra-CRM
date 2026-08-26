@@ -1665,6 +1665,112 @@ now runs inside an explicit tenant and system-actor context, so proactive
 intelligence can never quietly serve only the first organization — and every
 automated action remains attributable to the job that took it.
 
+## Every Schema Change Declares Which Path It Took
+
+A database can be correct and its history still be unreadable. The schema
+answers *what is true now*; nothing answered *why*, or *whether anyone meant
+it*. This platform now requires every piece of SQL to say which of two paths it
+belongs to, and refuses the ones that say nothing.
+
+**The silent path is closed.** Two ways of applying SQL had always existed, and
+both are right: a **governed migration** is schema definition every database
+must have, while an **out-of-band operation** is a one-time repair a fresh
+database must never replay. What was missing was anything deciding which a given
+file *was*. The choice was made implicitly, by whichever command someone typed,
+and nothing recorded that a choice had been made. A schema change applied the
+informal way changed production and passed every check in silence — the
+migration checker iterates the manifest, the health report divides by the
+manifest, and the schema comparison looked only at tables.
+
+Every one of the **253 SQL files now carries exactly one disposition**: 36
+governed migrations and 217 explicitly-classified operations, each with a
+written reason. A file in neither list is an **error**, not a default, and the
+migration runner refuses to touch a database while one exists. The two tools
+also refuse each other's work: a governed migration handed to the one-off path
+is rejected by name, and vice versa.
+
+**Out-of-band is not a demotion.** For 101 of those files it is the only correct
+answer — a backfill repairs rows a clean database does not have, and replaying
+it would be actively wrong. Declaring everything a migration would convert
+one-time repairs into permanent obligations. The classification records what is
+true, not what is important.
+
+**What the checksum does and does not prove.** The SQL corpus is deliberately kept
+out of source control — it carries operational history and seeded data that does not
+belong in a published repository. A recorded checksum therefore proves that an
+applied migration has not been altered since it ran; it does not prove *this matches
+an independently reviewed artifact*, because no second copy exists to disagree with.
+That limit is stated plainly rather than glossed over — and it is why the disposition
+manifest above, which *is* in source control, carries the written reason for every
+file it declares. The reasoning is published even where the SQL is not.
+
+## A Migration and Its Record Commit Together
+
+A migration that is applied but unrecorded is indistinguishable from one that
+never ran. That window was real: the schema change and its ledger entry
+committed separately, so a crash between them left the database changed and the
+record silent.
+
+They now share one transaction — the change and the proof of the change land
+together or not at all. Making that true required more than a wrapper. **Most
+migrations wrap themselves** in their own transaction, which is correct under a
+psql session and quietly destructive under a driver that has already opened one:
+the file's own `COMMIT` ends the *caller's* transaction, and everything after it
+runs unprotected. One migration turned out to commit itself halfway through,
+with sixty-two lines still to go. The runner now takes ownership of the
+transaction, and **refuses outright** to apply any file whose transaction
+control it cannot fully account for — an unverified guarantee is worse than
+none, because it stops people looking.
+
+**A checksum is never invented.** Where a historical migration was applied by
+hand and its content is genuinely unknown, the record says *unverifiable* and
+stays that way. The tooling used to quietly adopt today's file hash into such a
+row, which reads as diligence and is in fact a fabricated claim about the past.
+Every writer that can create a ledger entry — including one that lives in SQL
+rather than code — now either records a real hash or records nothing.
+
+## The Audit Trail Names Who Acted
+
+"Who did this?" is only answerable if the answer is allowed to be *not a
+person*. Approvals arrive from people, from named policies, from a scheduled
+expiry sweep, and from one-click links where the mailbox is proven and the
+individual is not. All four were once recorded identically, as a user.
+
+Every action now carries a **principal** with its category told truthfully —
+`user`, `customer`, `service`, `policy`, or `token` — and the invariant is
+blunt: **no automatic decision may be attributed to a human.** The distinction
+between a staff member and a portal customer survives the same way, and it fails
+*toward* the cautious answer rather than inventing a new one.
+
+**A refusal is not a failure.** Results now record an outcome —
+*accepted*, *rejected*, *failed*, or *unknown* — because an operator reading
+"failed" against an authorization refusal will retry it, and should not. The
+capability mesh is **closed by default**: an unregistered capability is refused,
+the registry arms itself at startup so a fresh deployment is never accidentally
+permissive, and an operator's decision to disable something survives every
+subsequent deploy.
+
+## Drift Is Visible Beyond Tables
+
+Comparing two databases by their tables answers a narrower question than it
+appears to. A stored function whose logic silently diverged has the same name on
+both sides, so a name-level comparison reports agreement — confidently, and
+wrongly.
+
+Verification now covers an explicit inventory of **eight object classes** —
+tables, columns, indexes, constraints, functions, triggers, views and grants —
+with functions and views compared **by the digest of their bodies**, not their
+names. The first run found what the older check had called identical: seven
+functions whose text had been damaged in an old hand-deployment, and two
+business rules whose enforcement existed on one database and was simply never
+attached on the other. Both have since been repaired.
+
+The inventory is deliberately explicit rather than exhaustive. PostgreSQL 18
+records every `NOT NULL` as a catalogue row where PostgreSQL 17 does not, and
+including them produced nine hundred phantom differences per run — a version
+difference dressed up as drift. Nullability is compared where it is portable
+instead. A check that cries wolf nine hundred times is one nobody reads.
+
 ## Executive Awareness in Real Time
 
 Every morning, leadership receives a personalized executive briefing.

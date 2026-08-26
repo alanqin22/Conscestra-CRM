@@ -47,12 +47,20 @@ def build(correlation_id: str) -> Dict[str, Any]:
     steps: List[Dict[str, Any]] = []
 
     for r in _rows(
-            """SELECT at, from_agent, agent, intent, kind, ok, error, latency_ms
+            """SELECT at, from_agent, agent, intent, kind, ok, error, latency_ms,
+                      outcome, principal
                FROM a2a_dispatches WHERE correlation_id=%s""", (cid,)):
         steps.append({
             "at": r[0].isoformat(), "source": "a2a",
             "label": f"{r[1] or '?'} → {r[2] or '?'}.{r[3]}",
-            "detail": {"kind": r[4], "ok": r[5], "error": r[6],
+            # `outcome` is the authoritative result; `ok` answers a narrower
+            # question and is kept so existing readers do not break. A consumer
+            # deciding whether to RETRY must read outcome — `rejected` mixes
+            # retryable and non-retryable causes and `failed` does not.
+            "detail": {"kind": r[4], "ok": r[5],
+                       "outcome": (r[8] if len(r) > 8 else None),
+                       "principal": (r[9] if len(r) > 9 else None),
+                       "error": r[6],
                        "latency_ms": r[7]}})
 
     for r in _rows(

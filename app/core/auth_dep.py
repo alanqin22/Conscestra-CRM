@@ -303,6 +303,23 @@ async def require_data_access(request: Request) -> Optional[Dict[str, Any]]:
     if sess:
         request.state.session = sess
 
+    # Principal (architecture review P1-2). The session was already resolved
+    # here and then discarded below the HTTP edge: `write_guard` kept only the
+    # ROLE, so two staff users with the same role were indistinguishable to
+    # every layer underneath, and `a2a_dispatches` could not answer "who
+    # initiated this".
+    #
+    # Stamped on a request-scoped ContextVar for the same reason the role is —
+    # the orchestrator hands work to agents over an in-process ASGI transport,
+    # and anything not carried in context is lost at that hop. `a2a.dispatch`
+    # reads it when the caller supplied none.
+    #
+    # An anonymous read leaves it None, deliberately: reads may proceed without
+    # a named initiator, WRITES MAY NOT, and that refusal belongs at the write
+    # gate rather than here where it would break public browsing.
+    from app.core.a2a import Principal, set_principal
+    set_principal(Principal.from_session(sess))
+
     mode = await _request_mode(request)
     is_write = bool(mode and mode in WRITE_MODES)
 
