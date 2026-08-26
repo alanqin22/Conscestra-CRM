@@ -1034,7 +1034,8 @@ async def _agent_answer(question: str) -> Optional[str]:
     """Ask the OWNING module agent for the answer, over the typed A2A layer.
     Routed by the intent router (LLM, keyword fallback); runs on a read-only
     channel so a question-shaped write can never execute from here."""
-    from app.core.a2a import A2ARequest, dispatch, query_intent_for_endpoint
+    from app.core.a2a import (A2ARequest, Principal, current_principal,
+                              dispatch, query_intent_for_endpoint)
     from app.core.intent_router import aroute
     from app.core.write_guard import set_readonly_channel
 
@@ -1043,8 +1044,16 @@ async def _agent_answer(question: str) -> Optional[str]:
     intent = query_intent_for_endpoint(endpoint)
     if not intent:
         return None
+    # Keep the caller's identity where there is one, and name this service
+    # where there is not. `dispatch()` already inherits the ambient principal
+    # when none is passed, so the first half of this is belt-and-braces; the
+    # `or` is the part that matters, because the KB answer path also runs from
+    # background work where nothing has stamped one and the dispatch would
+    # otherwise be recorded as having no initiator at all.
     res = await dispatch(A2ARequest(intent=intent, from_agent="knowledge",
-                                    params={"message": question}))
+                                    params={"message": question},
+                                    principal=(current_principal()
+                                               or Principal.service("knowledge"))))
     out = (res.output or "").strip()
     if not res.ok or not out or out.lstrip().startswith("### ERROR"):
         return None

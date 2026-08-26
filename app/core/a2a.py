@@ -527,7 +527,21 @@ def _sp_crm_context(p: Dict[str, Any]) -> Any:
     """Context hydration: the compact 360 pack any agent starts work with."""
     from app.core import context as crm_context
     et = str(p.get("entity_type") or "account")
-    eid = str(p.get("entity_id") or p.get("account_id") or p.get("lead_id") or "")
+    # ABSENT IS NOT THE EMPTY STRING, and this line used to conflate them. The
+    # `or ""` chain turned "no id was supplied" into `eid=""`, hydrate passed it
+    # to `WHERE account_id=''::uuid`, PostgreSQL raised, hydrate swallowed the
+    # error and returned an empty pack -- and the dispatch was recorded
+    # ACCEPTED. An agent asking for context about nothing got a successful
+    # answer about nothing, which is the exact shape this codebase keeps
+    # finding: absence of an error read as evidence of success.
+    #
+    # Refused the same way _sp_account_context already refuses, so the outcome
+    # is REJECTED (the request was never answerable) rather than FAILED (the
+    # server broke) or ACCEPTED (it did not).
+    eid = str(p.get("entity_id") or p.get("account_id")
+              or p.get("lead_id") or "").strip()
+    if not eid:
+        return {"error": "entity_id required (or account_id / lead_id)"}
     pack = crm_context.hydrate(et, eid)
     return {"pack": pack, "rendered": crm_context.render(pack)}
 
@@ -645,10 +659,26 @@ async def delegate(parent: "A2ARequest", sub_intent: str,
                    params: Optional[Dict[str, Any]] = None,
                    prose: bool = False) -> "A2AResult":
     """Hand a sub-intent off to its owning agent, propagating the parent's
-    correlation_id so the whole multi-agent play shares one lineage."""
+    correlation_id so the whole multi-agent play shares one lineage — AND its
+    principal, so the play keeps its initiator.
+
+    THE PRINCIPAL USED TO STOP HERE, and production showed it. Of 22 dispatches
+    after the 2026-08-26 deploy, 20 carried a principal and 2 did not:
+    `accounting.summary` and `leads.list`, both fanned out from a composite.
+    They inherited `from_agent` and the correlation id and lost the one field
+    that answers *who initiated this* — so a trace could follow the play and
+    still not say whose play it was.
+
+    IT IS ALSO A LATENT FUNCTIONAL BREAK, not only an audit gap. A write
+    capability refuses to run without a principal. Every composite today fans
+    out to reads, so the omission is invisible; the first composite that
+    delegates to a write would be REJECTED in any background context, where
+    there is no ambient principal for `dispatch()` to fall back on. That failure
+    would arrive far from this line.
+    """
     sub = A2ARequest(intent=sub_intent, from_agent=parent.from_agent or "a2a",
                      params=params or {}, correlation_id=parent.correlation_id,
-                     prose=prose)
+                     principal=parent.principal, prose=prose)
     return await dispatch(sub)
 
 
@@ -888,13 +918,22 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                sp=_sp_crm_simulate),
     # Intelligent channel selection (Unified Communication Layer, Phase 4):
     # the best communication ACTION for an objective + party. Read-only.
+    # party_id is REQUIRED and must be non-blank. Production recorded this
+    # dispatch as FAILED with `invalid input syntax for type uuid: ""` — the
+    # planner omitted the party, `_sp_select_channel`'s `or ""` turned that into
+    # an empty string, and the empty string reached
+    # `WHERE contact_id=%s::uuid`. A request that names no party cannot be
+    # answered, and saying so is a REJECTION, not a server failure.
     Capability("comms.select_channel", "orchestrator", "", "read",
                lambda p: (f"select channel for {p.get('objective','?')} to "
                           f"{p.get('party_type','contact')} {p.get('party_id','')}"),
                "pick the best channel/action for an objective + party (intent + "
                "identity + urgency + learned preference + authorization) — decides, "
                "never sends; the vision's 'what's the best way to accomplish this?'",
-               sp=_sp_select_channel),
+               sp=_sp_select_channel,
+               params_schema=(("party_id",),
+                              ("objective", "party_type", "urgency",
+                               "sensitive", "entity_id"))),
     # Composite (peer handoff): fans out to Accounting + Leads and composes.
     Capability("crm.pipeline_snapshot", "orchestrator", "", "read",
                lambda p: "", "financial + hot-lead snapshot composed from peers",
@@ -1340,16 +1379,28 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
                                    f"principal; none was supplied and none is in "
                                    f"request context. Background callers must "
                                    f"pass Principal.service('<name>').")
-        # WHAT. Required fields present, no unexpected fields. Deliberately NOT
-        # types, ranges or business rules — those belong in the SP and in the
-        # SQL predicate, where they are enforced against the committed row.
-        if cap.params_schema:
-            bad = validate_params(cap, req.params)
-            if bad:
-                return A2AResult(False, req.intent, cap.agent, cid,
-                                 outcome=REJECTED,
-                                 error=f"invalid parameters for '{req.intent}': "
-                                       f"{bad}")
+    # WHAT. Required fields present, no unexpected fields. Deliberately NOT
+    # types, ranges or business rules — those belong in the SP and in the SQL
+    # predicate, where they are enforced against the committed row.
+    #
+    # THIS RUNS FOR ANY CAPABILITY THAT DECLARES A SCHEMA, not only writes, and
+    # production is why. `comms.select_channel` is a READ, so it skipped this
+    # gate entirely; the planner dispatched it with no party_id, an upstream
+    # `or ""` turned absent into an empty string, and PostgreSQL was handed
+    # `WHERE contact_id=''::uuid`. The dispatch was recorded FAILED — a server
+    # error — when the truth was that the request was never valid.
+    #
+    # Opt-in, so nothing changes for the capabilities that declare no schema:
+    # `params_schema` is None for all of them and this block is skipped. Reads
+    # are not being made to validate by default; the ones whose parameters
+    # actually matter can now say so.
+    if cap.params_schema and not dry_run:
+        bad = validate_params(cap, req.params)
+        if bad:
+            return A2AResult(False, req.intent, cap.agent, cid,
+                             outcome=REJECTED,
+                             error=f"invalid parameters for '{req.intent}': "
+                                   f"{bad}")
 
     structured = cap.sp is not None and not req.prose
     if dry_run:

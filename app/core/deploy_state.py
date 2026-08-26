@@ -584,19 +584,43 @@ def classify_sql_corpus(sql_dir: Optional[str] = None) -> Dict[str, Any]:
     SKIPS CLEANLY WHERE sql/ IS ABSENT. /sql/ is gitignored, so a deployed
     container has no corpus. `present: False` means "not evaluated", which is
     not "clean" and must never be reported as passing."""
-    d = Path(sql_dir) if sql_dir else _SQL_DIR
-    if not d.is_dir():
-        return {"present": False, "ok": None, "reason": f"no sql dir at {d}"}
-
-    on_disk = {p.name for p in d.glob("*.sql")}
+    # ---- the half that is checkable WITHOUT the corpus ---------------------
+    # sql/ is deliberately not shipped and deliberately not in source control,
+    # so a deployed container can never evaluate file presence. The MANIFEST
+    # ships regardless, and two of the four failure modes are properties of the
+    # manifest alone: a filename in both lists, or an entry with no usable
+    # reason. Checking those in production turns a bare "not evaluated" line
+    # into a real assertion -- a guard that only ever prints a skip is one
+    # people stop reading.
     declared = set(REQUIRED_MIGRATIONS)
     out_of_band = set(OUT_OF_BAND_SQL)
+    both = sorted(declared & out_of_band)
+    dupes = sorted({m for m in REQUIRED_MIGRATIONS
+                    if REQUIRED_MIGRATIONS.count(m) > 1})
+    unreasoned = sorted(k for k, v in OUT_OF_BAND_SQL.items()
+                        if not isinstance(v, str) or len(v.strip()) < 30)
+
+    d = Path(sql_dir) if sql_dir else _SQL_DIR
+    if not d.is_dir():
+        return {"present": False,
+                # None, never True: file presence was NOT evaluated, and an
+                # absent denominator must not produce a confident pass.
+                "ok": None,
+                "manifest_ok": not (both or dupes or unreasoned),
+                "declared": len(declared), "out_of_band": len(out_of_band),
+                "both": both, "duplicates": dupes, "unreasoned": unreasoned,
+                "needs_review": sorted(k for k, v in OUT_OF_BAND_SQL.items()
+                                       if isinstance(v, str)
+                                       and v.startswith("REVIEW")),
+                "reason": f"no sql dir at {d} — file presence not evaluated"}
+
+    on_disk = {p.name for p in d.glob("*.sql")}
 
     unclassified = sorted(on_disk - declared - out_of_band)
-    both = sorted(declared & out_of_band)
     missing_declared = sorted(declared - on_disk)
     missing_oob = sorted(out_of_band - on_disk)
-    ok = not (unclassified or both or missing_declared or missing_oob)
+    ok = not (unclassified or both or missing_declared or missing_oob
+              or dupes or unreasoned)
     return {
         "present": True,
         "ok": ok,
@@ -607,6 +631,8 @@ def classify_sql_corpus(sql_dir: Optional[str] = None) -> Dict[str, Any]:
         "both": both,
         "missing_declared": missing_declared,
         "missing_out_of_band": missing_oob,
+        "duplicates": dupes,
+        "unreasoned": unreasoned,
         # Named, not hidden: the open governance questions inside the
         # out-of-band set. Appearing here is not a failure.
         "needs_review": sorted(k for k, v in OUT_OF_BAND_SQL.items()
