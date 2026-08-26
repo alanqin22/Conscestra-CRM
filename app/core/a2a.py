@@ -23,6 +23,7 @@ with (e.g. 'accounting summary', 'list leads:'), so routing is deterministic.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import random
@@ -48,6 +49,121 @@ class EntityRef:
     id: str
 
 
+@dataclass(frozen=True)
+class Principal:
+    """WHO initiated this, as opposed to WHICH AGENT is carrying it.
+
+    `from_agent` was doing both jobs and could only do one. It answers "which
+    component is calling", which is what `allowed_callers` needs; it cannot
+    answer "on whose authority", which is what an audit trail needs and what
+    every per-user feature will need. Two staff users with the same role were
+    indistinguishable below the HTTP edge.
+
+    FROZEN, AND NEVER BUILT FROM PROSE. A principal is stamped at an
+    authenticated boundary (`from_session`) or declared by a named background
+    caller (`service`). There is no path from `params`, from an LLM's output,
+    or from anything a user typed — which is why this is a dataclass and not a
+    dict the request could carry ad hoc.
+
+    Deliberately NOT a permission set. It carries identity and the role that
+    identity already had; authorization stays where it is (write_guard at the
+    SQL choke point, allowed_callers at the mesh, governance at the write).
+    The point is that identity TRAVELS, not that a new policy engine decides.
+    """
+    # 'user'     an authenticated person
+    # 'service'   a named background caller (scheduler, agent-bus, expiry)
+    # 'customer'  a portal customer (source_table='contacts'), id=contact_id
+    # 'policy'    an automatic decision by a named policy — NOT a person
+    # 'token'     authorised by possession of a signed link; the mailbox is
+    #             proven, the individual is not
+    #
+    # The last two exist because an approval's `decided_by` is frequently a
+    # policy or a channel, and recording those as `user` put a false category
+    # into the one column that answers "who initiated this".
+    kind: str
+    id: str
+    display: str = ""
+    role: str = ""
+    tenant_id: Optional[str] = None
+
+    def __str__(self) -> str:       # the audit representation
+        return f"{self.kind}:{self.id}"
+
+    @staticmethod
+    def service(name: str) -> "Principal":
+        """A named background caller — scheduler, agent-bus, a migration.
+
+        Background work is not anonymous work. Requiring writes to carry a
+        principal would break every scheduled job unless "no principal" were
+        allowed to mean "system", and that is precisely the ambiguity worth
+        removing: an unattended write must say which unattended thing did it.
+        """
+        return Principal(kind="service", id=name, display=name, role="system")
+
+    @staticmethod
+    def from_session(sess: Optional[Dict[str, Any]]) -> Optional["Principal"]:
+        """Build from an `auth_sessions` row. None when there is no session —
+        the caller decides whether that is allowed, because a read may proceed
+        anonymously and a write may not."""
+        if not sess:
+            return None
+        ident = (sess.get("identifier") or sess.get("credential_id")
+                 or sess.get("contact_id") or "")
+        if not ident:
+            return None
+        name = " ".join(x for x in (sess.get("first_name"),
+                                    sess.get("last_name")) if x).strip()
+        role = str(sess.get("role") or "")
+
+        # A CUSTOMER IS NOT A STAFF USER, and this used to record both as
+        # `user`. That is B1's defect in the other half of the vocabulary: the
+        # column that answers "who initiated this" could not distinguish the
+        # person who works here from the person who bought something.
+        #
+        # THE DISCRIMINATOR IS NOT `source_table` ALONE. Every session on this
+        # database is source_table='leads' with role='admin' — staff sign in
+        # through lead-backed credential rows — so keying on the table would
+        # relabel real administrators as customers and invent a false category
+        # while removing one. `source_table='contacts'` is set only where an
+        # account_id resolved (see agents/auth/router.py), which is the portal
+        # customer path.
+        #
+        # The role condition makes the rule FAIL TOWARD `user`: anything that
+        # can write is staff, so a misread can only land on the previous
+        # behaviour, never on a new falsehood. The id is the contact_id, which
+        # is what the column comment promises for this kind.
+        from app.core.auth_dep import WRITE_ROLES
+        if str(sess.get("source_table") or "") == "contacts"                 and role not in WRITE_ROLES and sess.get("contact_id"):
+            return Principal(kind="customer", id=str(sess["contact_id"]),
+                             display=name, role=role or "customer",
+                             tenant_id=(str(sess["tenant_id"])
+                                        if sess.get("tenant_id") else None))
+
+        return Principal(kind="user", id=str(ident), display=name,
+                         role=role,
+                         tenant_id=(str(sess["tenant_id"])
+                                    if sess.get("tenant_id") else None))
+
+
+# The principal for the CURRENT request, stamped at the authenticated boundary.
+#
+# A ContextVar rather than a parameter threaded through every call site, for the
+# same reason write_guard uses one: the orchestrator hands work to agents over an
+# in-process ASGI transport, and anything not carried in context is lost at that
+# hop. `dispatch()` reads this when the caller did not pass one explicitly, so an
+# existing caller inherits the right identity without being rewritten.
+_principal_ctx: "contextvars.ContextVar[Optional[Principal]]" = \
+    contextvars.ContextVar("a2a_principal", default=None)
+
+
+def set_principal(p: Optional[Principal]) -> None:
+    _principal_ctx.set(p)
+
+
+def current_principal() -> Optional[Principal]:
+    return _principal_ctx.get()
+
+
 @dataclass
 class A2ARequest:
     """A typed agent-to-agent request."""
@@ -63,6 +179,11 @@ class A2ARequest:
                                      # path when the capability declares one.
     govern_bypass: bool = False      # True = skip Phase 5 confidence-gating
                                      # (set when an approved action re-dispatches)
+    principal: Optional["Principal"] = None
+                                     # WHO, not which agent. Defaults from the
+                                     # request-scoped context when unset, so an
+                                     # existing caller inherits the right
+                                     # identity without being rewritten.
 
 
 # ── Outcome of a dispatch ───────────────────────────────────────────────────
@@ -184,10 +305,70 @@ class Capability:
     # sub-intents to peer agents and returns (data, hops). Set for capabilities
     # whose value comes from orchestrating several agents.
     compose: Optional[Callable[["A2ARequest"], Any]] = None
+    # Optional PARAMETER CONTRACT for write capabilities: (required, optional).
+    #
+    # DELIBERATELY THE SMALLEST USEFUL SHAPE. Not types, not ranges, not
+    # enums — those belong in the stored procedure and in the SQL predicate,
+    # where they are checked against the committed row under a lock rather than
+    # against a dict in Python. A second business-rule engine here would be two
+    # places to change one rule, and the copy that drifts is the one nobody
+    # watches.
+    #
+    # What it DOES add was measured before it was written: of the twelve
+    # resolvable write targets, five guard their required fields and SEVEN DO
+    # NOT, and NONE rejects an unexpected key. So a missing parameter currently
+    # travels into the domain layer to be discovered late or not at all, and an
+    # LLM-supplied stray key travels all the way in. This stops both at the
+    # boundary, and gives the planner a contract it can read.
+    params_schema: Optional[tuple] = None       # (required: tuple, optional: tuple)
 
 
 def _reg(*caps: Capability) -> Dict[str, Capability]:
     return {c.intent: c for c in caps}
+
+
+# Params every caller may send that are never part of a capability's own
+# contract — routing and audit metadata that `dispatch` and the agents thread
+# through. Listing them once here keeps each schema to the fields that are
+# actually the capability's business.
+_AMBIENT_PARAMS = frozenset({
+    "message", "correlation_id", "session_id", "sessionId",
+    "actor", "created_by", "updated_by", "reason", "source",
+})
+
+
+def validate_params(cap: "Capability", params: Optional[Dict[str, Any]]) -> str:
+    """'' when the parameters satisfy the capability's contract, else why not.
+
+    Two checks only, and the second is the one that did not exist anywhere:
+
+      MISSING  a declared-required field is absent or blank. Seven of twelve
+               write targets had no such guard, so the omission surfaced deep
+               in the domain layer or not at all.
+      UNKNOWN  a field nobody declared. NOTHING rejected these before. An LLM
+               that hallucinates `{"order_id": …, "force": true}` had `force`
+               carried all the way to the domain function, where an unrelated
+               `p.get("force")` somewhere would silently honour it.
+
+    Blank counts as missing: `{"order_id": ""}` is not a call that supplied an
+    order id, and treating it as present is how an empty string reaches a WHERE
+    clause.
+    """
+    if not cap.params_schema:
+        return ""
+    required, optional = cap.params_schema
+    p = params or {}
+    missing = [k for k in required
+               if k not in p or p[k] is None or str(p[k]).strip() == ""]
+    known = set(required) | set(optional) | _AMBIENT_PARAMS
+    unknown = sorted(k for k in p if k not in known)
+    parts = []
+    if missing:
+        parts.append(f"missing required {sorted(missing)}")
+    if unknown:
+        parts.append(f"unexpected {unknown} (declared: "
+                     f"{sorted(set(required) | set(optional))})")
+    return "; ".join(parts)
 
 
 # ---- structured (direct-SP) capability handlers ----------------------------
@@ -561,7 +742,8 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "to churn_band=high; content LLM-drafted with template fallback; "
                "CASL-gated, drafts unless AUTOSEND). Proposed by the supervisor "
                "on churn spikes; executes on governance approval",
-               sp=_sp_campaign_winback),
+               sp=_sp_campaign_winback,
+               params_schema=((), ('segment', 'name', 'goal', 'proposed_by'))),
     Capability("supervisor.emit_dunning", "supervisor", "", "write",
                lambda p: "emit overdue-invoice dunning events",
                "kick the Accounting dunning loop (supervisor auto-action; "
@@ -592,7 +774,8 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "owner's calendar (ET business hours, preferred-hour aware), "
                "meeting activity + signed .ics invite link; invite emails "
                "only under AUTOSEND to verified addresses; undo cancels",
-               sp=_sp_meeting_book),
+               sp=_sp_meeting_book,
+               params_schema=((), ('start', 'duration_min', 'entity_type', 'entity_id', 'account_id', 'lead_id', 'notes', 'booked_by'))),
     Capability("kb.publish", "email", "", "write",
                lambda p: f"publish KB article: {p.get('title', '')}",
                "publish a knowledge-base article (mined from a resolved "
@@ -612,7 +795,8 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "send one SMS via the Twilio channel (drafts as an owner task "
                "unless SMS_AUTOSEND=1; trial accounts only reach verified "
                "numbers; irreversible once sent)",
-               sp=_sp_sms_send),
+               sp=_sp_sms_send,
+               params_schema=((), ('to', 'body', 'from', 'from_number', 'account_id', 'lead_id', 'sent_by'))),
     Capability("quote.generate", "email", "", "write",
                lambda p: (f"send a quotation to account "
                           f"{p.get('account_id', '?')} for "
@@ -622,7 +806,8 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "pricing, deterministic totals (LLM never touches a number), "
                "30-day validity; emailed only under AUTOSEND to a verified "
                "address, otherwise drafted as an owner task; CASL-compliant",
-               sp=_sp_quote_generate),
+               sp=_sp_quote_generate,
+               params_schema=((), ('account_id', 'opportunity_id', 'items', 'discount_pct'))),
     Capability("web.consult", "orchestrator", "", "read",
                lambda p: f"search the web for {p.get('query', '')}",
                "consult the live internet with cited sources (ddgs/Tavily "
@@ -637,7 +822,8 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "possession-verified support caller (voice OTP); ALWAYS "
                "proposed — never auto-executed from a call — validated again "
                "at execution time, undo restores the before-value",
-               sp=_sp_contact_update_profile),
+               sp=_sp_contact_update_profile,
+               params_schema=(('contact_id', 'field', 'new_value'), ('channel', 'verified_via', 'call_sid'))),
     Capability("order.cancel", "orders", "", "write",
                lambda p: (f"cancel order {p.get('order_number') or p.get('order_id', '?')} "
                           f"(verified {p.get('verified_via', '?')})"),
@@ -648,14 +834,16 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "UPDATE, not by the caller, so a shipped or delivered order "
                "cannot be cancelled through this capability by anyone; "
                "undo restores the prior status",
-               sp=_sp_order_cancel),
+               sp=_sp_order_cancel,
+               params_schema=(('order_id',), ('reason', 'reason_detail', 'channel', 'verified_via', 'call_sid', 'updated_by', 'order_number'))),
     Capability("scoring.activate", "leads", "", "write",
                lambda p: f"activate lead-scoring model v{p.get('version', '?')}",
                "make a trained predictive lead-scoring candidate the active "
                "model (trained weekly on settled leads, proposed with holdout "
                "evidence, executes on governance approval, undo restores the "
                "previous version)",
-               sp=_sp_scoring_activate),
+               sp=_sp_scoring_activate,
+               params_schema=((), ('version',))),
     Capability("data.normalize_phones", "contacts", "", "write",
                lambda p: "normalize contact/lead phones to E.164",
                "data-quality fix: normalize unnormalized phone numbers "
@@ -828,6 +1016,116 @@ def capability_enabled(intent: str) -> bool:
 _TRACE_RETENTION_DAYS = int(os.getenv("TRACE_RETENTION_DAYS", "30"))
 
 
+def sync_capability_registry(actor: str = "startup") -> Dict[str, Any]:
+    """Seed the operator control plane from the code's own manifest.
+
+    CAPABILITIES is authoritative — it is what `dispatch` resolves against. A
+    hand-written SQL seed would be a second copy of that manifest, and the copy
+    that drifts is always the one nobody is watching. Same reasoning as
+    `notification_tier_rules`.
+
+    `allowed_callers` IS SEEDED NULL — UNRESTRICTED — AND THAT IS DELIBERATE.
+
+    The first version of this function seeded it as {owning agent, orchestrator,
+    system}, which looks prudent and is wrong: `cap.agent` names who IMPLEMENTS
+    a capability, not who may CALL it. `accounting` legitimately dispatches
+    `email.send_payment_reminder` — cross-agent delegation is the entire point
+    of the mesh — and that seed refused it. Fourteen tests caught it.
+
+    The lesson generalises: an RBAC policy cannot be DERIVED from the manifest,
+    because the manifest describes ownership and the policy describes traffic.
+    Guessing one produces a control that breaks real work, which is how controls
+    get switched off. So this seeds the half that IS derivable — every capability
+    registered, which makes the closed-by-default gate and the `enabled` kill
+    switch real — and leaves the half that is not to an operator, who can narrow
+    it against `observed_callers()` rather than against a guess.
+
+    Only INSERTS. An operator who disabled a capability or narrowed its callers
+    must not have that decision reverted by the next deploy — so an existing row
+    is left exactly as it is, and only genuinely new intents are added.
+    """
+    import json as _json
+    from app.core.database import get_connection
+    added, existing = 0, 0
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            for cap in CAPABILITIES.values():
+                cur.execute(
+                    """INSERT INTO capability_registry
+                         (intent, enabled, notes, updated_by, allowed_callers)
+                       VALUES (%s, true, %s, %s, NULL)
+                       ON CONFLICT (intent) DO NOTHING""",
+                    (cap.intent, f"{cap.kind} · owned by {cap.agent}", actor))
+                if cur.rowcount:
+                    added += 1
+                else:
+                    existing += 1
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        logger.warning(f"[a2a] registry sync failed "
+                       f"(apply sql/a2a_outcome_and_principal.sql?): {exc}")
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+    _reg_cache["at"] = 0.0        # force the TTL cache to re-read on next gate
+    logger.info(f"[a2a] capability registry: {added} added, {existing} already "
+                f"present, {len(CAPABILITIES)} declared")
+    return {"ok": True, "added": added, "existing": existing,
+            "declared": len(CAPABILITIES)}
+
+
+def observed_callers(days: int = 90) -> Dict[str, List[str]]:
+    """intent → the agents that have ACTUALLY dispatched it, from the trace.
+
+    The evidence an operator needs before narrowing `allowed_callers`, and the
+    reason this function exists at all: seeding that policy from the manifest
+    guessed wrong and refused a legitimate cross-agent call. Ownership is
+    declared in code; TRAFFIC is only knowable by looking.
+
+    Reads accepted dispatches only. A refused call is not evidence that a caller
+    is legitimate — including, circularly, one refused by an earlier version of
+    this very policy.
+    """
+    out: Dict[str, List[str]] = {}
+    try:
+        from app.core.database import get_connection
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT intent, from_agent, count(*)
+                         FROM a2a_dispatches
+                        WHERE at > now() - make_interval(days => %s)
+                          AND (outcome = 'accepted' OR (outcome IS NULL AND ok))
+                        GROUP BY 1, 2 ORDER BY 1, 3 DESC""", (int(days),))
+                for intent, agent, _n in cur.fetchall():
+                    out.setdefault(intent, []).append(agent)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug(f"[a2a] observed_callers unavailable: {exc}")
+    return out
+
+
+def registry_state() -> Dict[str, Any]:
+    """What the operator control plane currently says — the observable half of
+    the guardrail. A gate nobody can inspect is a gate nobody trusts."""
+    rows = _registry_rows()
+    declared = set(CAPABILITIES)
+    seeded = set(rows)
+    return {
+        "seeded": bool(rows),
+        "declared": len(declared),
+        "registered": len(seeded),
+        "unregistered": sorted(declared - seeded),   # would be REFUSED
+        "orphaned": sorted(seeded - declared),       # row with no capability
+        "disabled": sorted(i for i, r in rows.items() if not r.get("enabled", True)),
+        "closed_by_default": bool(rows),
+    }
+
+
 def _log_dispatch(req: "A2ARequest", res: "A2AResult", ms: int) -> None:
     """Best-effort insert into a2a_dispatches — the spine of GET /trace/{cid}.
     Never raises; a missing table just means no trace rows."""
@@ -839,10 +1137,18 @@ def _log_dispatch(req: "A2ARequest", res: "A2AResult", ms: int) -> None:
             with conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO a2a_dispatches (correlation_id, intent,
-                         from_agent, agent, kind, ok, error, latency_ms)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                         from_agent, agent, kind, ok, outcome, principal,
+                         error, latency_ms)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (res.correlation_id, req.intent, req.from_agent,
                      res.agent, cap.kind if cap else None, res.ok,
+                     # THE FIX. `ok` answers "did it work"; `outcome` answers
+                     # "and if not, in which of the three ways". This function
+                     # previously wrote only the boolean — so the trace could
+                     # not tell an authorization refusal from a server error,
+                     # and an operator reading it might retry a refusal.
+                     res.outcome or None,
+                     str(req.principal) if req.principal else None,
                      (res.error or "")[:500] or None, ms))
                 if random.random() < 0.01:      # opportunistic GC
                     cur.execute("DELETE FROM a2a_dispatches WHERE at < now() "
@@ -910,6 +1216,14 @@ def _summarize(intent: str, data: Any) -> str:
 async def dispatch(req: A2ARequest, dry_run: bool = False) -> A2AResult:
     """Public entry — dispatch + best-effort trace logging (a2a_dispatches,
     read back by GET /trace/{correlation_id}). Logging can never fail a call."""
+    # WHO, inherited before anything else runs. A caller that constructed its
+    # request without a principal gets the one stamped at the authenticated
+    # boundary — which is how ~40 existing call sites acquire identity without
+    # being rewritten. An explicitly supplied principal always wins: a
+    # background job saying `Principal.service("agent-bus")` must not be
+    # silently re-attributed to whichever request happened to be in flight.
+    if req.principal is None:
+        req.principal = current_principal()
     t0 = time.time()
     res = await _dispatch(req, dry_run)
     if not dry_run:
@@ -943,17 +1257,41 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
     if not cap:
         # Negotiation: no exact capability — offer the closest matches.
         sugg = _suggest(req.intent)
-        return A2AResult(False, req.intent, "none", cid,
+        return A2AResult(False, req.intent, "none", cid, outcome=REJECTED,
                          error=f"No capability registered for intent '{req.intent}'"
                                + (f". Did you mean: {', '.join(sugg)}?" if sugg else ""),
                          data={"suggestions": sugg} if sugg else None)
 
-    # Registry-as-data gate: an operator-disabled capability refuses cleanly
-    # (structured error, traced) instead of executing.
-    reg = _registry_rows().get(req.intent) or {}
+    # ── Registry-as-data gate — CLOSED BY DEFAULT once the registry is seeded ─
+    #
+    # This gate was `reg.get("enabled", True)` against a table holding ZERO rows
+    # on both local and Railway. A missing row permitted everything, so agent
+    # RBAC and the operator kill-switch had never fired in production. A control
+    # that has never fired is a control nobody has tested.
+    #
+    # Now: a seeded registry that does not name this intent REFUSES it. The
+    # registry is populated from CAPABILITIES itself (sync_capability_registry),
+    # so the only way to be missing is to be genuinely unregistered.
+    #
+    # The empty-registry case is the one deliberate exception, and it is NOT
+    # fail-open dressed up: an unseeded database cannot distinguish "nothing is
+    # permitted" from "nobody has run the seed", and refusing every capability
+    # on a fresh checkout would make the failure mode of a missing migration a
+    # total outage. It logs loudly and `release_guard` reports it, so the state
+    # is visible rather than silent.
+    _reg_all = _registry_rows()
+    reg = _reg_all.get(req.intent) or {}
+    if _reg_all and req.intent not in _reg_all:
+        logger.warning(f"[a2a] '{req.intent}' is not in the capability registry "
+                       f"— refused (closed by default)")
+        return A2AResult(False, req.intent, cap.agent, cid, outcome=REJECTED,
+                         error=f"capability '{req.intent}' is not registered in "
+                               f"the capability registry — refused. Run "
+                               f"POST /a2a/registry/sync if this is a new "
+                               f"capability.")
     if not reg.get("enabled", True):
         notes = reg.get("notes")
-        return A2AResult(False, req.intent, cap.agent, cid,
+        return A2AResult(False, req.intent, cap.agent, cid, outcome=REJECTED,
                          error=f"capability '{req.intent}' is disabled in the "
                                f"capability registry"
                                + (f" — {notes}" if notes else ""))
@@ -964,7 +1302,7 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
     allowed = reg.get("allowed_callers")
     if (isinstance(allowed, list) and allowed
             and req.from_agent not in allowed and not req.govern_bypass):
-        return A2AResult(False, req.intent, cap.agent, cid,
+        return A2AResult(False, req.intent, cap.agent, cid, outcome=REJECTED,
                          error=f"caller '{req.from_agent}' is not permitted to "
                                f"dispatch '{req.intent}' (allowed: "
                                f"{', '.join(allowed)})")
@@ -983,6 +1321,35 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
         return A2AResult(True, req.intent, cap.agent, cid, data=data,
                          output=f"{req.intent}: composed from {len(hops)} agent(s)",
                          hops=hops)
+
+    # ── WRITE PRECONDITIONS — identity, then parameters, then governance ─────
+    #
+    # Ordered cheapest-and-most-certain first, and deliberately BEFORE the
+    # governance confidence gate: a write with no named initiator or a malformed
+    # parameter set should be refused on its own terms, not queued for an
+    # executive to approve. Approving a proposal whose caller is unknown is
+    # exactly the rubber-stamp this platform's governance exists to avoid.
+    if cap.kind == "write" and not dry_run:
+        # WHO. `from_agent` names the component, never the authority. A write
+        # with no principal is refused rather than attributed to "system" —
+        # background work is not anonymous work, and Principal.service() exists
+        # so an unattended write says which unattended thing did it.
+        if req.principal is None:
+            return A2AResult(False, req.intent, cap.agent, cid, outcome=REJECTED,
+                             error=f"write capability '{req.intent}' requires a "
+                                   f"principal; none was supplied and none is in "
+                                   f"request context. Background callers must "
+                                   f"pass Principal.service('<name>').")
+        # WHAT. Required fields present, no unexpected fields. Deliberately NOT
+        # types, ranges or business rules — those belong in the SP and in the
+        # SQL predicate, where they are enforced against the committed row.
+        if cap.params_schema:
+            bad = validate_params(cap, req.params)
+            if bad:
+                return A2AResult(False, req.intent, cap.agent, cid,
+                                 outcome=REJECTED,
+                                 error=f"invalid parameters for '{req.intent}': "
+                                       f"{bad}")
 
     structured = cap.sp is not None and not req.prose
     if dry_run:
@@ -1013,6 +1380,7 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
                                 f"${hitl:,.0f} → forced propose")
             if d == "skip":
                 return A2AResult(False, req.intent, cap.agent, cid,
+                                 outcome=REJECTED,
                                  error=f"skipped by governance — confidence "
                                        f"{req.confidence} < {governance.propose_min()}")
             if d == "propose":
@@ -1146,6 +1514,45 @@ def a2a_registry():
     disabled = sorted(c["intent"] for c in caps if not c["enabled"])
     return {"count": len(caps), "disabled": disabled, "capabilities": caps,
             **({"orphan_rows": orphans} if orphans else {})}
+
+
+# ROUTE ORDER MATTERS. These two must stay ABOVE "/a2a/registry/{intent}":
+# Starlette matches in declaration order, so a parameterised route declared
+# first captures "/a2a/registry/sync" as intent="sync" — answering 422 for the
+# body that handler requires, or "unknown capability" with a 200 if one is
+# sent. Either way the endpoint looks present and does nothing.
+@router.post("/a2a/registry/sync")
+def a2a_registry_sync():
+    """Seed the capability registry from the code's own manifest.
+
+    THE GAP THIS CLOSES. The registry gate is closed-by-default — a seeded
+    registry that does not name an intent refuses it — but nothing could
+    perform the seed on a deployed environment. It is not called at startup,
+    the rows come from `CAPABILITIES` (which lives in the application, so SQL
+    cannot produce them), and the migration's own output instructed operators
+    to call this endpoint, which did not exist. The control was armed on one
+    laptop and unreachable everywhere else.
+
+    Idempotent and non-destructive: INSERT … ON CONFLICT DO NOTHING, so a
+    disabled capability stays disabled and a narrowed `allowed_callers` stays
+    narrowed. It adds genuinely new intents and nothing else.
+
+    NOTE FOR A RUNBOOK: sync is not a reset. Restoring a registry an operator
+    has edited means DELETE then sync — calling this alone will not undo their
+    changes, which is the point.
+    """
+    return {**sync_capability_registry("api"), "state": registry_state()}
+
+
+@router.get("/a2a/registry/observed-callers")
+def a2a_observed_callers(days: int = 90):
+    """intent → the agents that have actually dispatched it.
+
+    The evidence an operator needs before narrowing `allowed_callers`. Seeding
+    that policy from the manifest guessed wrong once and refused a legitimate
+    cross-agent call: ownership is declared in code, traffic is only knowable
+    by looking. Reads accepted dispatches only."""
+    return {"days": days, "callers": observed_callers(days)}
 
 
 @router.post("/a2a/registry/{intent}")

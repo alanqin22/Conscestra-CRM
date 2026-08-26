@@ -292,8 +292,13 @@ async def run_plan(goal: str, plan: Optional[Dict[str, Any]] = None) -> Dict[str
 
     async def _read(i: int, intent: str, params: Dict[str, Any]) -> Dict[str, Any]:
         try:
+            from app.core.a2a import Principal
             res = await dispatch(A2ARequest(
                 intent=intent, from_agent="planner", params=params,
+                # Reads do not require a principal — the write gate does. Named
+                # here anyway so the trace can attribute a plan's read fan-out,
+                # which is otherwise a burst of dispatches with no initiator.
+                principal=Principal.service("planner"),
                 correlation_id=cid))
             return {"step": i, "intent": intent, "kind": "read", "ok": res.ok,
                     "output": (res.output or "")[:500], "error": res.error}

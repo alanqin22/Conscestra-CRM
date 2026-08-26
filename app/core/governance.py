@@ -983,12 +983,70 @@ def _set(approval_uuid: str, status: str, decided_by: Optional[str] = None,
         conn.close()
 
 
+def principal_for_decider(decided_by: Optional[str]) -> "Any":
+    """The approving authority, WITH ITS CATEGORY TOLD TRUTHFULLY.
+
+    THE DEFECT THIS REPLACES. The first version asserted
+    `Principal(kind="user", id=decided_by)` on the reasoning that "the approver
+    is the authority". The authority part is right; the `user` part is false
+    most of the time. Measured across 118 approvals:
+
+        policy:web_order_cancel     46   a POLICY decided it, not a person
+        system                      36   the expiry sweep
+        email-link                  13   a CHANNEL — one-click, HMAC-authorised
+        admin@conscestra.local      12   an actual identity
+        policy:voice_order_cancel    3
+        ui-test@local                1
+
+    Only 12 of 111 decided approvals name a human. Stamping `user:` on the other
+    99 puts a false category into the one column that exists to answer "who
+    initiated this" — and by this codebase's own doctrine a FALSE record is
+    worse than an absent one, which is what the field was before.
+
+    `decided_by` is caller-supplied (`_Decision.decided_by`, default "human")
+    on an admin-gated endpoint, or the literal "email-link" on the HMAC path.
+    So AUTHORIZATION is genuine either way — a gate always precedes execution —
+    but the VALUE is not an authenticated identity, and the kind must not claim
+    it is. Shape is the only honest signal available.
+    """
+    from app.core.a2a import Principal
+    d = (decided_by or "").strip()
+    if not d:
+        return Principal.service("governance")
+    if d.startswith("policy:"):
+        # An auto-decision by a named policy. Not a person, and recording it as
+        # one would hide that no human looked.
+        # The kind already carries "policy"; keeping the prefix in the id too
+        # renders as `policy:policy:web_order_cancel`.
+        return Principal(kind="policy", id=d.split(":", 1)[1] or d,
+                         display=d, role="auto-approver")
+    if d == "system":
+        return Principal.service("governance-expiry")
+    if d == "email-link":
+        # Authorised by possession of an HMAC token mailed to the assigned
+        # executive. A real authorisation, an unknown person: the token proves
+        # the mailbox was reached, not who clicked.
+        return Principal(kind="token", id="email-link",
+                         display="one-click approval link", role="approver")
+    return Principal(kind="user", id=d, display=d, role="approver")
+
+
 async def _execute(ap: Dict[str, Any]) -> Dict[str, Any]:
     """Run an approved action by re-dispatching it through A2A (gate bypassed)."""
     from app.core.a2a import A2ARequest, EntityRef, dispatch
     params = ap.get("params") or {}
+    # THE APPROVER IS THE AUTHORITY, and its CATEGORY is told truthfully —
+    # see principal_for_decider. Not "governance", which is the mechanism, and
+    # not the agent that proposed it, which was refused permission to act alone.
+    #
+    # Found by the write gate refusing this path outright: the first version of
+    # that gate would have broken every approved execution, because
+    # `govern_bypass=True` skips the CONFIDENCE gate and was silently assumed to
+    # skip identity too. Bypassing "is the agent sure enough" must not bypass
+    # "on whose authority".
     req = A2ARequest(
         intent=ap["action_type"], from_agent="governance", params=params,
+        principal=principal_for_decider(ap.get("decided_by")),
         entity=EntityRef(ap["entity_type"], ap["entity_id"]) if ap.get("entity_type") else None,
         confidence=1.0, govern_bypass=True,
         # reuse the originating play's lineage so the approved execution lands

@@ -654,6 +654,11 @@ async def handle_invoice_overdue(event: Dict[str, Any]) -> Dict[str, Any]:
             from app.core.a2a import A2ARequest, EntityRef, dispatch
             res = await dispatch(A2ARequest(
                 from_agent="accounting",
+                # The bus is unattended, so it names itself. `from_agent` says
+                # which agent's reaction this is; the principal says on whose
+                # authority — and a write capability now refuses without one
+                # rather than being silently attributed to "system".
+                principal=a2a_mod.Principal.service("agent-bus"),
                 intent="email.send_payment_reminder",
                 entity=EntityRef("invoice", invoice_id),
                 params={

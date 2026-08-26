@@ -88,6 +88,7 @@ Requires sql/staff_email_ledger.sql.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -491,6 +492,84 @@ def idempotency_key(kind: str, ref: str, ordinal: Optional[int] = None) -> str:
     deliveries of one event, which is exactly when the collision must happen."""
     base = f"{kind}:{ref}"
     return f"{base}:remind:{ordinal}" if ordinal is not None else base
+
+
+def alert_key(rule: Optional[str], headline: Optional[str]) -> str:
+    """A CONTENT-ADDRESSED idempotency ref for an alert-driven interrupt.
+
+    THE PROBLEM THIS SOLVES, measured on Railway over 30 days. 76 Tier 1
+    `supervisor.alert` notifications were raised by 8 distinct rules — but two
+    of those rules fired 14 times each with **exactly one distinct headline**
+    between them:
+
+        14x  unbilled_orders   "5 shipped orders unbilled · $1,468 revenue leakage"
+        14x  unworked_leads    "72 leads unworked — pipeline coverage at risk"
+
+    That is 28 of 76 (37%) which are the same sentence, roughly one every two
+    days. Keyed the ordinary way — on the event uuid — each is a fresh
+    interrupt, and a channel that says the same thing fourteen times is one
+    nobody reads.
+
+    So the key is derived from WHAT IS BEING SAID, not from which row said it.
+    The rule stays in clear text because a human reading the ledger should be
+    able to tell what recurred; the headline is hashed because it can be long
+    and the key is an index entry, not a message.
+
+    A stable digest, deliberately: `hash()` is salted per process, so two
+    workers would key the same alert differently and both would send.
+
+    STATUS: NOT WIRED. NOTHING IN `app/` CALLS THIS.
+
+    Stated plainly because a helper that looks shipped is worse than an absent
+    one — the 28-of-76 duplicate-interrupt problem measured above IS NOT SOLVED
+    by this module's presence. There is no sender to attach it to: the repeats
+    are `supervisor.alert` NOTIFICATIONS, `EMAIL_KINDS` has no `alert` member,
+    and `escalation_remind` has no producer either.
+
+    It is not wired into the escalation sender instead, and that restraint is
+    the point. Escalation ledger rows are keyed per escalation uuid, which is
+    what makes each event independently idempotent; re-keying them by content
+    would make two genuinely distinct escalations that share a summary collide
+    PERMANENTLY rather than for a cooldown. Railway has also never recorded a
+    single escalation, so that wiring would suppress nothing and would only
+    look like a fix.
+
+    Before using this, a caller must key its ledger row so the content ref is a
+    PREFIX of the idempotency key — `recent_duplicate` matches on
+    `kind:ref%` — and must keep whatever suffix preserves per-event
+    idempotency.
+    """
+    r = (rule or "unruled").strip().lower()[:60]
+    h = hashlib.sha256((headline or "").strip().lower().encode("utf-8")).hexdigest()[:16]
+    return f"{r}:{h}"
+
+
+def recent_duplicate(kind: str, ref: str, *, cooldown_minutes: int) -> bool:
+    """Has this exact thing already been said recently, whatever its outcome?
+
+    DELIBERATELY BROADER THAN `is_already_handled`. That one asks whether a
+    specific decision reached a terminal state; this asks whether the same
+    SENTENCE has gone out inside a window — which is the question that stops
+    fourteen identical interrupts, because each of them is a legitimately new
+    business event and would pass every other gate.
+
+    Counts any non-refused row: an `attempted` that never resolved still means
+    somebody may have received it, and re-sending on the strength of our own
+    incomplete bookkeeping is the failure this module exists to avoid.
+
+    STATUS: NOT WIRED — see `alert_key` for why, and for what a caller must do
+    to its idempotency key before this function can see anything.
+    """
+    if cooldown_minutes <= 0:
+        return False
+    row = _one(
+        f"""SELECT 1 FROM staff_email_ledger
+             WHERE idempotency_key LIKE %s
+               AND state <> 'skipped'
+               AND created_at > now() - make_interval(mins => {int(cooldown_minutes)})
+             LIMIT 1""",
+        (f"{kind}:{ref}%",))
+    return row is not None
 
 
 def decide(*, kind: str, tier: str, ref: str,

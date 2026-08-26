@@ -471,9 +471,14 @@ async def _dispatch_plan(goal: str, cid: str) -> Dict[str, Any]:
     """Execute the plan through the typed A2A layer (crm.plan_execute) so the
     play is audited + correlation-chained in one place — reads run, writes queue
     for governance. Never sends anything outbound."""
-    from app.core.a2a import A2ARequest, dispatch
+    from app.core.a2a import A2ARequest, Principal, dispatch
     res = await dispatch(A2ARequest(
         intent="crm.plan_execute", from_agent="supervisor",
+        # Unattended work is not anonymous work. `from_agent` names the
+        # component; the principal names the authority, and a write now
+        # requires one. A scheduled supervisor tick that could not say who it
+        # was would be indistinguishable from a request with a lost identity.
+        principal=Principal.service("supervisor"),
         params={"goal": goal}, correlation_id=cid))
     return {"ok": res.ok, "error": res.error, "data": res.data}
 
