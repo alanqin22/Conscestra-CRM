@@ -413,10 +413,43 @@ def _critic_line(critique: Optional[Dict[str, Any]]) -> str:
             f"{critique.get('summary', '')}")
 
 
-# Internal/bookkeeping params not worth showing the approver.
-_HIDE_PARAMS = {"_revised", "_correlation_id", "plan_correlation_id",
-                "plan_goal", "govern_bypass",
-                "confidence"}
+# BOOKKEEPING THE PLATFORM INJECTS — never any capability's own business.
+#
+# These are written INTO a proposal's params by the platform itself:
+# `_correlation_id` by the a2a gate, `plan_goal`/`plan_correlation_id` by the
+# planner, `_revised` by the critic's revise loop. They exist so the stored row
+# can be found again — `trace.build` selects on params->>'_correlation_id' and
+# `supervisor` selects on params->>'plan_goal', both against the TABLE.
+#
+# Nothing reads them from the params dict at execution time, which is what makes
+# it safe to remove them before re-dispatching an approved action. That removal
+# is not cosmetic: `a2a.validate_params` rejects any field a capability did not
+# declare, so passing these through refuses the approved execution of every
+# capability that has a schema. Measured: three `campaign.winback` approvals are
+# currently un-executable for exactly this reason.
+_INTERNAL_PARAMS = {"_revised", "_correlation_id", "plan_correlation_id",
+                    "plan_goal", "govern_bypass", "confidence"}
+
+
+def strip_internal(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """A copy of `params` with the platform's own bookkeeping removed.
+
+    Deliberately a WHITELIST OF NAMES rather than a `startswith('_')` rule. A
+    prefix rule would silently swallow any future underscore-prefixed field a
+    capability legitimately declares, and — more importantly — it would let a
+    caller suppress the critic's revision by sending `_revised` itself. Those
+    keys must still be REFUSED when they come from outside; they are only
+    removed here, on the way out of a row this system wrote.
+    """
+    return {k: v for k, v in (params or {}).items()
+            if k not in _INTERNAL_PARAMS}
+
+
+# Internal/bookkeeping params not worth showing the approver. Same set: what
+# the approver should not be bothered with is what the executor should not be
+# handed. Kept as a separate name so the display rule can diverge later without
+# quietly changing what gets executed.
+_HIDE_PARAMS = set(_INTERNAL_PARAMS)
 
 # Plain-language description of what each action DOES — shown when the params
 # alone don't convey it (e.g. planner-proposed batch actions carry only a goal).
@@ -1044,8 +1077,20 @@ async def _execute(ap: Dict[str, Any]) -> Dict[str, Any]:
     # `govern_bypass=True` skips the CONFIDENCE gate and was silently assumed to
     # skip identity too. Bypassing "is the agent sure enough" must not bypass
     # "on whose authority".
+    # THE APPROVED ACTION IS DISPATCHED WITH THE CAPABILITY'S OWN PARAMETERS,
+    # not with the row's bookkeeping. `params` is what was STORED — it carries
+    # the platform's own tagging (see _INTERNAL_PARAMS) — and `validate_params`
+    # refuses any field the capability did not declare. Passing the row through
+    # verbatim therefore made a capability reject its own approved execution:
+    # three `campaign.winback` approvals sit un-executable today because the
+    # planner tagged them with plan_goal/plan_correlation_id.
+    #
+    # The correlation id is read out FIRST (below) so the lineage survives the
+    # strip, and the stored row is untouched — trace and supervisor both select
+    # against the table, not against this dict.
     req = A2ARequest(
-        intent=ap["action_type"], from_agent="governance", params=params,
+        intent=ap["action_type"], from_agent="governance",
+        params=strip_internal(params),
         principal=principal_for_decider(ap.get("decided_by")),
         entity=EntityRef(ap["entity_type"], ap["entity_id"]) if ap.get("entity_type") else None,
         confidence=1.0, govern_bypass=True,

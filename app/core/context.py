@@ -28,6 +28,7 @@ side effects; set 0 to kill instantly).
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 from datetime import datetime, timezone
@@ -50,11 +51,29 @@ _NOTE_CHARS = 70      # blackboard note preview length in the rendered block
 _MAX_SIGNALS = 6
 
 
-def _rows(sql: str, params=None) -> List[Dict[str, Any]]:
+# Sections that could not be read while assembling the CURRENT pack.
+#
+# G-08, applied to context. Every section here is best-effort: `_rows` swallows
+# its exception and returns [], so a section that FAILED is indistinguishable
+# from a section that was genuinely EMPTY. An agent then opens a conversation
+# confidently under-informed — "no open invoices" and "I could not read the
+# invoices" produce the same prompt.
+#
+# Request-scoped rather than passed through every helper, because _rows is
+# called from a dozen private section builders that have no other reason to
+# thread a status object. Reset at the top of hydrate().
+_degraded: "contextvars.ContextVar[Optional[List[str]]]" = contextvars.ContextVar(
+    "context_degraded", default=None)
+
+
+def _rows(sql: str, params=None, section: str = "") -> List[Dict[str, Any]]:
     try:
         return execute_sp(sql, params)
     except Exception as exc:
         logger.debug(f"[context] section skipped: {exc}")
+        d = _degraded.get()
+        if d is not None:
+            d.append(section or "unnamed")
         return []
 
 
@@ -86,14 +105,16 @@ def _cadences(entity_type: str, entity_id: str) -> List[Dict[str, Any]]:
     return _rows(
         "SELECT playbook, step_no, next_step_at::date::text AS next_step_at "
         "FROM agent_sequences WHERE entity_type=%(t)s AND entity_uuid=%(id)s::uuid "
-        "AND status='active'", {"t": entity_type, "id": entity_id})
+        "AND status='active'", {"t": entity_type, "id": entity_id},
+        section="cadences")
 
 
 def _approvals(entity_id: str) -> List[Dict[str, Any]]:
     return _rows(
         "SELECT action_type, critique->>'stance' AS critic FROM action_approvals "
         "WHERE entity_id=%(id)s::uuid AND status='pending' "
-        "AND (expires_at IS NULL OR expires_at > now())", {"id": entity_id})
+        "AND (expires_at IS NULL OR expires_at > now())", {"id": entity_id},
+        section="pending_approvals")
 
 
 def _touches(col: str, entity_id: str) -> Dict[str, Any]:
@@ -104,7 +125,7 @@ def _touches(col: str, entity_id: str) -> Dict[str, Any]:
             f"created_at::date::text AS on_date FROM activities "
             f"WHERE {col}=%(id)s::uuid AND direction=%(d)s "
             f"ORDER BY created_at DESC LIMIT 1",
-            {"id": entity_id, "d": direction})
+            {"id": entity_id, "d": direction}, section="last_touches")
         if r:
             out[direction] = r[0]
     return out
@@ -114,7 +135,7 @@ def _hydrate_account(account_id: str) -> Optional[Dict[str, Any]]:
     ident = _rows(
         "SELECT account_name, status, industry FROM accounts "
         "WHERE account_id=%(id)s::uuid AND COALESCE(is_deleted,false)=false",
-        {"id": account_id})
+        {"id": account_id}, section="identity")
     if not ident:
         return None
     pack: Dict[str, Any] = {
@@ -128,23 +149,24 @@ def _hydrate_account(account_id: str) -> Optional[Dict[str, Any]]:
         "       next_purchase_due::text AS next_purchase_due, "
         "       open_ar_balance::float AS open_ar_balance, overdue_invoices "
         "FROM account_intelligence WHERE account_id=%(id)s::uuid",
-        {"id": account_id})
+        {"id": account_id}, section="profile")
     if prof:
         pack["profile"] = prof[0]
 
     open_items: Dict[str, Any] = {}
     r = _rows("SELECT count(*) AS n, COALESCE(SUM(amount),0)::float AS value "
               "FROM opportunities WHERE account_id=%(id)s::uuid AND status='open'",
-              {"id": account_id})
+              {"id": account_id}, section="open_deals")
     if r and int(r[0].get("n") or 0):
         open_items["open_deals"] = r[0]
     r = _rows("SELECT count(*) AS n, COALESCE(SUM(balance_due),0)::float AS value "
               "FROM invoices WHERE account_id=%(id)s::uuid AND status='overdue' "
-              "AND deleted_at IS NULL", {"id": account_id})
+              "AND deleted_at IS NULL", {"id": account_id}, section="overdue_invoices")
     if r and int(r[0].get("n") or 0):
         open_items["overdue_invoices"] = r[0]
     r = _rows("SELECT count(*) AS n FROM activities "
-              "WHERE account_id=%(id)s::uuid AND status='open'", {"id": account_id})
+              "WHERE account_id=%(id)s::uuid AND status='open'", {"id": account_id},
+              section="open_activities")
     if r and int(r[0].get("n") or 0):
         open_items["open_activities"] = int(r[0]["n"])
     pack["open_items"] = open_items
@@ -161,7 +183,8 @@ def _hydrate_lead(lead_id: str) -> Optional[Dict[str, Any]]:
         "SELECT COALESCE(NULLIF(TRIM(COALESCE(first_name,'')||' '||"
         "COALESCE(last_name,'')),''), company) AS display, company, email, "
         "score, status, rating FROM leads "
-        "WHERE lead_id=%(id)s::uuid AND deleted_at IS NULL", {"id": lead_id})
+        "WHERE lead_id=%(id)s::uuid AND deleted_at IS NULL", {"id": lead_id},
+        section="identity")
     if not ident:
         return None
     pack: Dict[str, Any] = {
@@ -323,7 +346,26 @@ def hydrate(entity_type: str, entity_id: str,
             topic: Optional[str] = None,
             audience: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Compact context pack for an entity. Contacts resolve to their account.
-    None when the entity doesn't exist (or the type is unsupported)."""
+    None when the entity doesn't exist (or the type is unsupported).
+
+    A returned pack carries `degraded`: the sections that could not be read.
+    Empty means the pack is complete — which is the claim a caller needs before
+    treating a missing section as an absent fact.
+    """
+    tok = _degraded.set([])
+    try:
+        pack = _hydrate(entity_type, entity_id, topic, audience)
+        failed = _degraded.get() or []
+        if pack is not None:
+            pack["degraded"] = sorted(set(failed))
+        return pack
+    finally:
+        _degraded.reset(tok)
+
+
+def _hydrate(entity_type: str, entity_id: str,
+             topic: Optional[str] = None,
+             audience: Optional[str] = None) -> Optional[Dict[str, Any]]:
     et = (entity_type or "").lower()
     if et == "contact":
         r = _rows("SELECT account_id::text AS account_id FROM contacts "

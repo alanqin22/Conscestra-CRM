@@ -384,7 +384,7 @@ def execute_sp(query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict
     # Block read-only callers from write SPs (catches NL-driven writes the HTTP
     # gate misses). No-op outside a request / when auth is off — see write_guard.
     from app.core.write_guard import (WritePermissionError, customer_scope,
-                                      guard_query, readonly_channel)
+                                      guard_query, readonly_context)
 
     # Verified-customer channel: FAIL CLOSED. SPs are CRM-wide by construction
     # and cannot be row-scoped from here, so a customer-scoped context gets no
@@ -397,16 +397,21 @@ def execute_sp(query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict
             http_status=403)
 
     guard_query(query)
-    _chan = readonly_channel()
+    _ro = readonly_context()
 
     try:
         conn = get_connection()
         try:
-            # A read-only channel (public SMS) runs inside a PostgreSQL
-            # read-only transaction, so any write inside the SP is refused by
-            # the database itself. guard_query's mode blocklist is incomplete
-            # by construction; this does not depend on the mode's name.
-            if _chan:
+            # A context that may not write runs inside a PostgreSQL read-only
+            # transaction, so any write inside the SP is refused by the
+            # DATABASE — not by a list of mode names. Two contexts qualify: a
+            # read-only channel (public SMS) and a caller whose ROLE may not
+            # write (anonymous / viewer under an enforcing posture).
+            #
+            # guard_query's mode blocklist is incomplete by construction, so it
+            # must not be the last line of defence for either. This does not
+            # depend on what the mode is called.
+            if _ro:
                 conn.set_session(readonly=True)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(query, params)
@@ -433,13 +438,24 @@ def execute_sp(query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict
             conn.close()
 
     except psycopg2.errors.ReadOnlySqlTransaction as e:
-        # The SP tried to write on a read-only channel. Nothing was written —
-        # PostgreSQL rejected it — so surface it as the permission error the
-        # agents already know how to re-raise past their -500 handler.
-        logger.warning(f"[write_guard] {_chan} channel blocked a write: {e}")
-        raise WritePermissionError(
-            f"Read-only channel ({_chan}): create, update and delete are not "
-            "permitted here.", http_status=403) from e
+        # The SP tried to write from a context that may not. Nothing was
+        # written — PostgreSQL rejected it — so surface it as the permission
+        # error the agents already know how to re-raise past their -500
+        # handler. The message and status come from the SAME decision that
+        # opened the transaction, so the caller is never told about a channel
+        # when it was their role, or vice versa.
+        #
+        # This branch reaching the log is worth attention: it means a write
+        # got past guard_query's blocklist and only the database stopped it.
+        # That is the control working, AND a drift signal for WRITE_MODES.
+        _r = _ro or {"reason": "unknown", "subject": "?",
+                     "message": "This operation is not permitted here.",
+                     "http_status": 403}
+        logger.warning(f"[write_guard] read-only {_r['reason']} "
+                       f"({_r['subject']}) blocked a write the mode blocklist "
+                       f"did not catch: {e}")
+        raise WritePermissionError(_r["message"],
+                                   http_status=_r["http_status"]) from e
     except psycopg2.Error as e:
         logger.error(f"Database error: {e}")
         raise

@@ -1,37 +1,49 @@
 # CI — WHAT THIS DOES AND DOES NOT VERIFY
 #
-# The migration files live outside this repository by policy, so a runner
-# cannot build the schema: `scripts/migrate.py` finds 0 of 15 files. Even with
-# them present they are incremental against an existing CRM schema — a blank
-# Postgres fails with `relation "opportunities" does not exist`.
+# HOW THIS PIPELINE USED TO LIE. tests/, sql/, sp/ and schema/ were gitignored,
+# so a runner received none of them. The integration job below was written but
+# guarded by `if: … has_base_schema == 'true'`, which was permanently false, so
+# it was SKIPPED on every run — and GitHub counts a skipped required check as a
+# PASSING one. The workflow reported success having verified imports and a
+# frozen benchmark, under a header claiming coverage figures nobody re-derived.
 #
-# So this pipeline deliberately claims LESS than the suite proves locally. It
-# runs what is meaningful without a database, and it is named so that nobody
-# mistakes a green tick for a verified safety case.
-#
-# The tests/ directory is also outside this repository by policy, so CI cannot
-# run any test at all.
+# Those artefacts now arrive through the private `governance` submodule, the
+# condition is deleted, and the gate actually runs.
 #
 # COVERED HERE
-#   * every app module imports (222 of them) — catches syntax errors, broken
-#     imports and circular dependencies across the whole codebase
-#   * the Phase 4 memory benchmark: the derivation pipeline run against a
-#     frozen corpus with its own embeddings, so clustering, statements,
-#     evidence selection and trust scores are all regression-gated WITHOUT a
-#     database
+#   * every app module imports — syntax errors, broken imports, cycles
+#   * the Phase 4 memory benchmark against a frozen corpus (no database)
+#   * scripts/verify_gate.py — a database built from schema/00_base_schema.sql,
+#     the declared migration chain applied and verified complete, the knowledge
+#     base seeded, and the control suite run against THAT database. A stage
+#     that cannot run is a FAILURE there, never a skip.
+#   * scripts/verify_invariants.py — the SQL-layer controls, asserted against a
+#     database built from the migrations rather than from a dev history
 #
-# NOT COVERED HERE — all 1039 tests, verified locally against Postgres and on
-# Railway by `python -m scripts.verify_invariants` after every deployment:
-#   * GDPR erasure actually deleting
-#   * append-only enforcement on the verification trail
-#   * assertion-gate convergence between explain() and recall()
-#   * signature validation and key rotation
-#   * the deletion undo log
+# NOT COVERED HERE, and each omission is deliberate
+#   * THE WIDER TEST SUITE. It reads ambient business rows and fails on a
+#     freshly built database for reasons unrelated to the code under test — so
+#     running it here would be red for the wrong cause and get switched off,
+#     which is worse than not running it. verify_gate.py::CONTROL_TESTS is the
+#     measured subset that IS gate-viable; the remainder is run by a person
+#     against a populated database.
+#   * grants and privilege separation — the baseline is dumped
+#     --no-privileges because CI has no auth_owner or crm_app role to grant to.
+#     Owned by scripts/postdeploy_verify.py after deployment.
+#   * retrieval quality — a property of an EMBEDDED corpus, needing an API key,
+#     network and spend. Run `python -m app.core.eval_suite` where the corpus
+#     is embedded.
 #
-# TO GET FULL COVERAGE: publish tests/, the 15 declared migrations, and a base
-# schema (sql/00_base_schema.sql, ~1.7 MiB, 200 tables + 165 stored
-# procedures). The integration job below activates on its own once the base
-# schema is present.
+# NO COUNTS IN THIS HEADER, deliberately. It previously asserted 222 modules,
+# 1039 tests, 1088 tests and 15 migrations. Three of those were wrong, and all
+# were believed precisely because they were specific. Ask the repository:
+#
+#     python -m scripts.control_inventory
+#
+# REQUIRES a GOVERNANCE_TOKEN secret with read access to the private governance
+# repository. GITHUB_TOKEN cannot see it and yields an EMPTY checkout, which is
+# indistinguishable from "no base schema" — so `checks` fails loudly on that
+# rather than letting the gate be quietly skipped again.
 name: CI
 
 on:
@@ -48,7 +60,19 @@ jobs:
       # gate the job below.
       has_base_schema: ${{ steps.detect_schema.outputs.present }}
     steps:
+      # `submodules: recursive` needs a token that can read the PRIVATE
+      # governance repository. GITHUB_TOKEN is scoped to this repository only
+      # and silently yields an EMPTY governance/ directory, which would look
+      # exactly like "no base schema" and skip the gate -- the original defect.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GOVERNANCE_TOKEN }}
+          # By default checkout leaves the token in .git/config as an auth
+          # header for the rest of the job, where every later step -- and
+          # anything a dependency pulls in -- can read it. The submodule fetch
+          # happens inside the action, so dropping it afterwards costs nothing.
+          persist-credentials: false
       - uses: actions/setup-python@v5
         # 3.12 OR NEWER IS REQUIRED — do not lower this.
         #
@@ -64,10 +88,17 @@ jobs:
       - name: Detect base schema
         id: detect_schema
         run: |
-          if [ -f sql/00_base_schema.sql ]; then
+          # Not `-d governance`: `git submodule add` leaves the directory
+          # present but EMPTY when the fetch fails, so directory existence is
+          # not evidence. The file is.
+          if [ -f governance/schema/00_base_schema.sql ]; then
             echo "present=true"  >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::error::governance/ is empty or missing. The verification"
+            echo "::error::gate cannot run. Set the GOVERNANCE_TOKEN secret to"
+            echo "::error::a token with read access to Conscestra-CRM-governance."
+            exit 1
           fi
 
       - run: pip install -r requirements.txt -r requirements-dev.txt
@@ -92,6 +123,20 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      # THE GUARD MUST NOT LIVE INSIDE THE THING IT GUARDS. These assertions
+      # forbid a job-level `if:` on a verification job -- but they used to run
+      # only inside the gate, so adding a false condition to the gate skipped
+      # the very test that would have objected. Measured on PR #53: the gate
+      # reported SKIPPED, and mergeStateStatus went to CLEAN.
+      #
+      # `checks` carries no condition and is required, so running them here
+      # means a condition added to the gate is caught even when the gate does
+      # not run. They need only PyYAML and the checkout.
+      - name: Workflow cannot be made skippable
+        run: >-
+          python -m pytest -q -p no:cacheprovider
+          governance/tests/test_workflow_cannot_skip_verification.py
+
       # Phase 4 gate. Runs the derivation pipeline end to end against a FROZEN
       # corpus that carries its own embeddings — no database, so this is the
       # only behavioural coverage CI has. Any movement in clustering,
@@ -102,24 +147,37 @@ jobs:
       - name: State what was not verified
         if: always()
         run: |
-          echo "::warning::CI verifies imports + the frozen memory benchmark."
-          echo "::warning::tests/ is not published, so all 1088 tests and every"
-          echo "::warning::database-layer control are verified locally and on"
-          echo "::warning::Railway. Extrinsic quality (topic precision, cluster"
-          echo "::warning::validity, usefulness) needs human labels and is"
-          echo "::warning::blocked on real data. See this workflow's header."
+          echo "::warning::This job verifies imports + the frozen memory"
+          echo "::warning::benchmark. The database-layer controls are verified"
+          echo "::warning::by the gate in the integration job, which requires"
+          echo "::warning::this one. NOT verified anywhere in CI: the wider test"
+          echo "::warning::suite (needs a populated database), grants/privilege"
+          echo "::warning::separation (post-deploy), and retrieval quality"
+          echo "::warning::(needs an embedded corpus). See this workflow header."
 
-  # Dormant. Needs BOTH a base schema and a published tests/ directory; neither
-  # is in the repository today, so this never runs. Kept rather than deleted so
-  # the path back to real coverage stays written down.
+  # THE GATE. Formerly dormant and formerly conditional -- and a SKIPPED
+  # required check counts as a PASSING one, which is how this workflow reported
+  # success while verifying nothing. The artefacts now arrive via the
+  # `governance` submodule, so the condition has no remaining justification and
+  # has been removed. If the submodule cannot be fetched, `checks` fails above
+  # and this never gets the chance to be silently green.
   integration:
     name: full suite (needs base schema)
     runs-on: ubuntu-latest
     needs: checks
-    if: needs.checks.outputs.has_base_schema == 'true'
     services:
       postgres:
-        image: postgres:16
+        # pgvector, not stock postgres: the baseline issues CREATE EXTENSION
+        # vector, and on stock postgres that aborts the restore.
+        #
+        # pg18 BECAUSE THAT IS WHAT PRODUCTION RUNS (Railway 18.4, see
+        # docs/runbook_restore.md). This was pg16 for one run and the baseline
+        # failed to apply at line 62: `SET transaction_timeout = 0`, a GUC that
+        # did not exist before PostgreSQL 17, emitted by the 17.9 pg_dump that
+        # produced the file. Testing a database the product does not run on is
+        # the same mistake this workflow already made once with Python 3.11 --
+        # see the setup-python comment. Do not lower this to match the dump.
+        image: pgvector/pgvector:pg18
         env:
           POSTGRES_PASSWORD: ci
           POSTGRES_DB: crmdb
@@ -131,17 +189,135 @@ jobs:
       DATABASE_URL: postgresql://postgres:ci@localhost:5432/crmdb
       # An environment-shaped skip becomes a failure here.
       CRM_REQUIRE_DB: '1'
+      # WITHOUT THIS, THE POSTURE DEFAULTS TO `open` AND FOUR ROLE-ENFORCEMENT
+      # CONTROLS SKIP THEMSELVES -- correctly, since there is no role
+      # enforcement to test in `open` mode. One of them is
+      # test_anonymous_cannot_execute_a_write_the_blocklist_misses, the
+      # regression test for the anonymous-write defect. It did not run in the
+      # first green build, and nothing said so.
+      #
+      # Either enforcing posture makes those four assertions identical: they
+      # assert that anonymous and viewer are refused WRITES and told the reason
+      # is "role", which `locked` and `public-read` handle the same way. The
+      # difference between the two is read access, which they do not touch --
+      # so this is not the "test the version production runs" trap.
+      API_SECURITY_MODE: public-read
       MEMORY_SIGNING_KEY: ci-signing-key-not-for-production
       MEMORY_SIGNING_KEY_ID: ci1
       DB_POOL_MAX: '8'
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GOVERNANCE_TOKEN }}
+          # By default checkout leaves the token in .git/config as an auth
+          # header for the rest of the job, where every later step -- and
+          # anything a dependency pulls in -- can read it. The submodule fetch
+          # happens inside the action, so dropping it afterwards costs nothing.
+          persist-credentials: false
       - uses: actions/setup-python@v5
         # 3.12+ required — see the import-check job above.
         with: { python-version: '3.12', cache: pip }
       - run: pip install -r requirements.txt -r requirements-dev.txt
-      - run: psql "$DATABASE_URL" -f sql/00_base_schema.sql
+
+      # Build the CI database from the declared chain. verify_invariants below
+      # asserts SQL-layer controls and must see a schema built from MIGRATIONS
+      # rather than from anyone's local history -- that is the whole point of
+      # running it here.
+      - name: Build the database from the baseline
+        # ON_ERROR_STOP and --single-transaction are both load-bearing: psql
+        # exits 0 by default even when individual statements ERROR, so without
+        # them a half-applied baseline would report success and every later
+        # step would verify a schema nobody has. --single-transaction makes the
+        # failure all-or-nothing rather than leaving a partial database behind.
+        run: >-
+          psql "$DATABASE_URL" --single-transaction --set ON_ERROR_STOP=1
+          -f governance/schema/00_base_schema.sql
       - run: python -m scripts.migrate
       - run: python -m scripts.migrate --check
-      - run: python -m pytest tests/ -q --tb=short
+
+      # WHAT THE BASELINE CANNOT CARRY. `app_role.sql` is a declared migration
+      # and the baseline's schema_migrations ledger records it as applied, so
+      # `migrate` above correctly skips it. But its effect is `CREATE ROLE
+      # crm_app`, and a role is CLUSTER-level: a --no-owner --no-privileges
+      # dump of one DATABASE cannot contain it. The migration is therefore
+      # marked done while its object does not exist here, and
+      # verify_invariants fails with "FAILED: app role crm_app exists".
+      #
+      # The file is idempotent (CREATE ROLE ... IF NOT EXISTS), NOLOGIN and
+      # needs no password, so re-applying it is safe and gives the privilege
+      # checks below something real to assert against.
+      - name: Recreate cluster-level objects the dump cannot hold
+        run: >-
+          psql "$DATABASE_URL" --single-transaction --set ON_ERROR_STOP=1
+          -f governance/sql/app_role.sql
+
       - run: python -m scripts.verify_invariants
+
+      # The gate provisions its OWN scratch database and drops it, so it is
+      # independent of everything above -- it must start from a known-clean
+      # server, not from whatever the steps before it happened to leave behind.
+      #
+      # One command, fail-closed: provision, baseline, migrations, seed,
+      # controls. A stage that cannot run is a FAILURE there, never a skip, so
+      # it cannot report success having verified less than it claims.
+      - name: Verification gate
+        run: python -m scripts.verify_gate
+
+      # DELIBERATELY NOT `python -m pytest` OVER THE WHOLE SUITE.
+      #
+      # The wider suite reads ambient business rows. On a database built from
+      # the baseline alone it fails for reasons that have nothing to do with
+      # the code under test -- red for the wrong cause, and a gate that is red
+      # for the wrong cause gets switched off. CONTROL_TESTS is the measured
+      # subset that survives a fresh build, and the gate above runs exactly it.
+      #
+      # If you are tempted to add the full suite here, populate the database
+      # first and prove it green twice; otherwise you are trading a real gate
+      # for a broader-looking one.
+
+      # Any control count in a report must be DERIVED from the repository, not
+      # typed into it. Non-zero if a gate artefact is untracked.
+      - run: python -m scripts.control_inventory
+
+
+  # WHY THIS JOB EXISTS, and why it is the check that matters.
+  #
+  # GitHub treats a SKIPPED required status check as a PASSING one. That is not
+  # a theory here: PR #53 was pushed a one-line `if:` on the gate, the gate
+  # reported SKIPPED, and the pull request went to mergeStateStatus CLEAN with
+  # the gate having verified nothing.
+  #
+  # A required check therefore cannot defend against its own skipping. This job
+  # can, because `if: always()` runs it even when everything it needs was
+  # skipped or failed, and it then FAILS on any result that is not `success`.
+  # A skip upstream becomes a red check here, which is the semantics the
+  # ruleset needed and does not have.
+  #
+  # RESIDUAL RISK, stated rather than papered over: this is still a job defined
+  # in the repository, so anyone who can edit `.github/workflows/` can edit
+  # this too. No arrangement of required checks can survive an author who is
+  # willing to disable them; the honest defence for that is review on
+  # `.github/**`, which needs a second maintainer. What this DOES close is the
+  # realistic case -- a condition added for a good reason by someone who does
+  # not know it silently disarms the gate.
+  gate-report:
+    name: gate ran
+    runs-on: ubuntu-latest
+    needs: [checks, integration]
+    if: always()
+    steps:
+      - name: Every required job must have actually succeeded
+        run: |
+          echo "checks      = ${{ needs.checks.result }}"
+          echo "integration = ${{ needs.integration.result }}"
+          fail=0
+          for pair in "checks:${{ needs.checks.result }}"                       "integration:${{ needs.integration.result }}"; do
+            job="${pair%%:*}"; res="${pair##*:}"
+            if [ "$res" != "success" ]; then
+              echo "::error::$job did not succeed (result: $res). A skipped or"
+              echo "::error::failed verification is not a passing one."
+              fail=1
+            fi
+          done
+          exit $fail

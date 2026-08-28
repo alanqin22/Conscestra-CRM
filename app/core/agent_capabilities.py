@@ -323,8 +323,24 @@ def invoke(slug: str, capability: str, params: Dict[str, Any],
     try:
         import asyncio
         from app.core import a2a
-        req = a2a.A2ARequest(capability=capability, params=params,
-                             caller=f"agent:{slug}")
+        # THE FIELD NAMES ARE `intent` AND `from_agent`. This constructed
+        # A2ARequest(capability=…, caller=…) — three keywords the dataclass
+        # does not have — so every granted READ raised TypeError on the first
+        # line, was swallowed by the `except Exception` below, and audited as
+        # ERROR. U4's write path proposes correctly and its MCP path calls
+        # correctly, which is why "authored agents can act" looked true: the
+        # only branch that executes anything was the broken one.
+        #
+        # Latent rather than live when found: `agent_capability_grants` holds
+        # zero rows, and `describe_for_prompt` returns nothing without a
+        # grant, so the whole action block is skipped. It would have fired the
+        # first time an admin granted a read capability to any agent.
+        #
+        # `from_agent` is what `allowed_callers` checks, so the caller keeps
+        # the `agent:<slug>` identity the audit row and the write branch's
+        # `proposed_by` already use — one name for this actor everywhere.
+        req = a2a.A2ARequest(intent=capability, params=params,
+                             from_agent=f"agent:{slug}")
         result = asyncio.run(a2a.dispatch(req))
         data = getattr(result, "data", None)
         if data is None and hasattr(result, "__dict__"):

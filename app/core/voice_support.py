@@ -1895,11 +1895,38 @@ _PROFILE_COLUMNS = {"phone": "phone", "email": "email"}   # strict whitelist
 
 
 def _apply_profile_value(contact_id: str, field: str, value: str,
-                         applied_by: str) -> Dict[str, Any]:
+                         applied_by: str,
+                         action: str = "update_profile_by_agent",
+                         provenance: Optional[Dict[str, Any]] = None,
+                         before: Optional[str] = None) -> Dict[str, Any]:
+    """Write ONE whitelisted profile field, and record that it happened.
+
+    THE AUDIT ROW IS NOT OPTIONAL, for the same reason cancel_order_sp writes
+    one: this UPDATE bypasses sp_contacts, and sp_contacts audits every contact
+    update (seven audit_log writes; 15 'contact/update' rows exist). Without
+    this, the GOVERNED path — the one that required an OTP and a human
+    approval — was the ONLY way to change a customer's email or phone that left
+    no entity-level trail, while every ordinary edit left one. An auditor
+    asking "who changed this customer's email address" would see every routine
+    change and miss precisely the one that arrived by telephone.
+
+    That matters more here than almost anywhere else: `email` and `phone` ARE
+    the identifiers this platform verifies people with — the OTP destination
+    and the address an order-status link is mailed to. A change to them is a
+    change to who can later prove they are this customer.
+
+    PROVENANCE IS CARRIED, NEVER INVENTED. `verified_via`, `channel` and
+    `call_sid` are supplied by the caller that actually did the verifying
+    (voice_support proposes verified_via='voice-otp'). Absent values stay
+    absent rather than being defaulted to a channel that did not happen —
+    a hardcoded channel is exactly the defect that told an auditor a
+    web-confirmed order cancellation had come from a phone call.
+    """
     col = _PROFILE_COLUMNS.get(field)
     if not col:
         return {"ok": False, "error": f"field {field!r} is not updatable here "
                                       "(phone or email only)"}
+    prov = provenance or {}
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -1910,11 +1937,31 @@ def _apply_profile_value(contact_id: str, field: str, value: str,
                     RETURNING contact_id::text""",
                 (value, contact_id))
             r = cur.fetchone()
+            if not r:
+                conn.rollback()
+                return {"ok": False, "error": f"contact {contact_id} not found"}
+            # Same transaction as the UPDATE: a committed change with no trail
+            # is the state this exists to prevent, so they commit together or
+            # neither does.
+            cur.execute(
+                """INSERT INTO audit_log (entity, entity_id, action, payload,
+                                          created_at)
+                   VALUES ('contact', %(id)s::uuid, %(a)s, %(p)s::jsonb, now())""",
+                {"id": contact_id, "a": action,
+                 "p": _json.dumps({
+                     "field": field,
+                     "before": before,
+                     "after": value,
+                     "applied_by": applied_by,
+                     "verified_via": prov.get("verified_via"),
+                     "channel": prov.get("channel"),
+                     "call_sid": prov.get("call_sid"),
+                     "requested_from": prov.get("requested_from"),
+                 })})
         conn.commit()
-        if not r:
-            return {"ok": False, "error": f"contact {contact_id} not found"}
         logger.info(f"[voice] contact {contact_id[:8]} {field} updated "
-                    f"by {applied_by}")
+                    f"by {applied_by} (verified_via="
+                    f"{prov.get('verified_via') or 'unrecorded'})")
         return {"ok": True, "contact_id": contact_id, "field": field}
     finally:
         conn.close()
@@ -1955,7 +2002,14 @@ def profile_update_sp(p: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": f"contact {contact_id} not found"}
     before = r[0]
 
-    res = _apply_profile_value(contact_id, field, new_value, "governance")
+    # The provenance the PROPOSER established travels to the audit row. These
+    # are declared optional parameters of `contact.update_profile` and were
+    # being dropped here — the capability advertised them, the voice path sent
+    # verified_via='voice-otp', and nothing recorded it.
+    res = _apply_profile_value(
+        contact_id, field, new_value, "governance", before=before,
+        provenance={k: p.get(k) for k in
+                    ("verified_via", "channel", "call_sid", "requested_from")})
     if not res.get("ok"):
         return res
     return {"ok": True, "contact_id": contact_id, "field": field,
@@ -1968,8 +2022,16 @@ def undo_profile_update(ap: Dict[str, Any]) -> Dict[str, Any]:
     contact_id, field = data.get("contact_id"), data.get("field")
     if not (contact_id and field and "before" in data):
         return {"ok": False, "error": "no before-value recorded on the approval"}
-    return _apply_profile_value(contact_id, field, data["before"],
-                                f"undo {ap['approval_uuid'][:8]}")
+    # An undo is a second change to the same identifier, not the erasure of
+    # the first. It gets its own audit row, with its own action name, so the
+    # trail reads as two events rather than one that quietly reverted.
+    return _apply_profile_value(
+        contact_id, field, data["before"],
+        f"undo {ap['approval_uuid'][:8]}",
+        action="undo_profile_update",
+        before=data.get("after"),
+        provenance={"channel": "governance-undo",
+                    "verified_via": f"approval:{ap['approval_uuid'][:8]}"})
 
 
 # ============================================================================

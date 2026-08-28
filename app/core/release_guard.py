@@ -486,11 +486,102 @@ def _check_sql_disposition() -> Dict[str, Any]:
                         f"out-of-band){review}")}
 
 
+def _check_write_call_sites() -> Dict[str, Any]:
+    """Is every module that writes directly to the database declared?
+
+    R-03. `execute_sp` is guarded — role, customer scope, forbidden procedures.
+    `get_connection()` is not, and 75 modules use it for DML. That is not a
+    defect on its own: the scheduler, the agent bus and governance execution
+    must be able to write, and every public module that writes directly carries
+    its own control (HMAC link, OTP, provider signature, a status predicate
+    inside the UPDATE). What was missing is that nobody could ENUMERATE the
+    set, so it could not be reviewed and could grow unnoticed.
+
+    ADVISORY, not blocking, and deliberately so for now. The detector is a
+    static scan of `.execute(<sql>)`, so it will produce a false positive
+    before it produces none — and a control that stops a deployed start on its
+    first false positive is a control somebody switches off. It earns
+    'blocking' the way the write-mode coverage check did: by being right for a
+    while first.
+    """
+    try:
+        from app.core import write_call_sites
+        a = write_call_sites.audit()
+    except Exception as exc:
+        return {"control": "write_call_sites", "ok": True, "severity": "advisory",
+                "message": f"could not audit direct-write sites: {exc}"}
+
+    if a["undeclared"]:
+        return {
+            "control": "write_call_sites", "ok": False, "severity": "advisory",
+            "message": (f"{len(a['undeclared'])} module(s) write to the "
+                        f"database directly without being declared in "
+                        f"app/core/write_call_sites.py: "
+                        f"{', '.join(a['undeclared'][:5])}"
+                        f"{' …' if len(a['undeclared']) > 5 else ''}. "
+                        f"Declare them with the control that protects them.")}
+    return {"control": "write_call_sites", "ok": True, "severity": "ok",
+            "message": (f"{a['modules_writing_directly']} modules write "
+                        f"directly ({a['call_sites']} sites); all declared, "
+                        f"{a['public_surface']} on a public surface")}
+
+
+def _check_db_privileges() -> Dict[str, Any]:
+    """Does the application actually connect as a non-superuser?
+
+    WHY THIS IS A CHECK AND NOT A COMMENT. `write_guard.FORBIDDEN_PROCEDURES`
+    carried a prose note reading "the application connects as `postgres`, which
+    both OWNS the function and is a SUPERUSER … UNTIL THE APPLICATION RUNS AS A
+    NON-SUPERUSER ROLE, THIS GUARD IS THE ONLY EFFECTIVE CONTROL."
+
+    That stopped being true when privilege separation shipped — production runs
+    as `crm_app` — and nobody updated the comment. A stale claim about a
+    defence layer is dangerous in both directions: it told the next engineer to
+    ignore a control that now works, and the same comment left unchanged after
+    a rollback would invite reliance on one that had stopped working.
+
+    So the question is asked of the database instead of asserted in prose. The
+    answer moves on its own when the deployment does.
+
+    ADVISORY, not blocking: a superuser connection is a weakened defence in
+    depth, not an open door — `guard_query` still refuses the forbidden paths
+    in the application, and refusing to start over it could take down a working
+    system during a credential rollback.
+    """
+    try:
+        from app.core.database import get_connection
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT current_user, "
+                            "(SELECT usesuper FROM pg_user "
+                            "  WHERE usename = current_user)")
+                user, is_super = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"control": "db_privileges", "ok": True, "severity": "advisory",
+                "message": f"could not determine the database role: {exc}"}
+
+    if is_super:
+        return {
+            "control": "db_privileges", "ok": False, "severity": "advisory",
+            "message": (f"the application connects as {user!r}, a SUPERUSER. "
+                        f"PostgreSQL superusers bypass privilege checks, so "
+                        f"REVOKEs on the forbidden legacy procedures are inert "
+                        f"and write_guard is the only effective control. Run "
+                        f"as a least-privilege role (crm_app).")}
+    return {"control": "db_privileges", "ok": True, "severity": "ok",
+            "message": f"connected as {user!r} (not a superuser) — the "
+                       f"database-privilege layer is live"}
+
+
 CHECKS = (_check_calendar_feed, _check_api_auth, _check_admin_token,
           _check_training_ack, _check_secret_strength,
           _check_configuration_integrity, _check_public_url,
           _check_email_call_sites, _check_capability_registry,
-          _check_sql_disposition)
+          _check_sql_disposition, _check_db_privileges,
+          _check_write_call_sites)
 
 
 def audit() -> Dict[str, Any]:

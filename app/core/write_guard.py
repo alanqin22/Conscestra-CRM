@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 from contextvars import ContextVar
-from typing import Optional
+from typing import Any, Dict, Optional
 
 # Per-request caller role. None = no request context (system/background) → allowed.
 _role: ContextVar[Optional[str]] = ContextVar("request_role", default=None)
@@ -117,6 +117,75 @@ def current_role() -> Optional[str]:
     return _role.get()
 
 
+# ============================================================================
+# THE READ-ONLY DECISION — one question, asked once, at the DB chokepoint
+# ============================================================================
+# WHY THIS EXISTS. `guard_query` decides "may this role run this write?" by
+# matching the resolved p_mode against WRITE_MODES — a hand-maintained
+# BLOCKLIST that this file already documents as incomplete by construction.
+# For a read-only CHANNEL that incompleteness was survivable, because
+# execute_sp also opened a PostgreSQL read-only transaction and the database
+# refused the write whatever the mode was called.
+#
+# An ANONYMOUS HTTP caller had no such backstop. `readonly_channel()` is None
+# on a web request, so no read-only transaction was opened, and the blocklist
+# was the ONLY thing between the open internet and a mutation under the
+# `public-read` posture. A write mode missing from the list was an
+# authorization bypass, and the list's sole coverage proof was a script in a
+# gitignored directory that was not run by the test suite.
+#
+# So the same guarantee is extended to the caller's ROLE. A role that may not
+# write gets the same read-only transaction a read-only channel gets, and the
+# blocklist stops being load-bearing: it degrades from "the control" to "a
+# courtesy check that produces a friendlier error message earlier".
+#
+# MEASURED SAFE, not assumed. Every list/get/summary/report mode across the 20
+# reachable stored procedures was executed inside a read-only transaction: all
+# 20 succeeded, so no read path performs an incidental write that this would
+# newly refuse. The only behaviour that changes is a write that was previously
+# permitted BECAUSE IT WAS MISSING FROM THE LIST.
+#
+# Deliberately NOT applied when the role is None. That is the system/background
+# context (scheduler, agent-bus, governance execution, the public governance
+# email-link router, the store, the portal, telephony) — none of which passes
+# through require_data_access, and all of which must be able to write.
+
+def readonly_context() -> Optional[Dict[str, Any]]:
+    """Why this context must run inside a PostgreSQL read-only transaction,
+    or None when it may write.
+
+    Returns the refusal to raise if the database does reject a write, so the
+    caller never has to re-derive who it was talking to:
+
+        {"reason": 'channel'|'role', "subject": <name>,
+         "message": <what the caller is told>, "http_status": 401|403}
+    """
+    chan = _readonly_channel.get()
+    if chan:
+        return {"reason": "channel", "subject": chan,
+                "message": (f"Read-only channel ({chan}): create, update and "
+                            f"delete are not permitted here."),
+                "http_status": 403}
+
+    role = _role.get()
+    if role is None:
+        return None                      # system / background — never gated
+
+    from app.core.auth_dep import API_AUTH_ENABLED, WRITE_ROLES
+    if not API_AUTH_ENABLED or role in WRITE_ROLES:
+        return None
+
+    if role == "anonymous":
+        return {"reason": "role", "subject": role,
+                "message": "Please sign in to create, update, or delete records.",
+                "http_status": 401}
+    return {"reason": "role", "subject": role,
+            "message": ("Read-only access: only Admin or authorized users may "
+                        "create, update, or delete records. Please sign in with "
+                        "a writer account to make changes."),
+            "http_status": 403}
+
+
 class WritePermissionError(Exception):
     """Raised when a read-only caller attempts a write SP (no partial write occurs
     — the guard runs before the SQL executes). Agents' db_node re-raise it past
@@ -147,12 +216,21 @@ _MODE_RE = re.compile(r"p_(?:mode|action)\s*:?=\s*'([a-z_]+)'", re.IGNORECASE)
 # state machine, owner validation and field history in a single call — the
 # governed path is app/core/cases.py and there is no legitimate second one.
 #
-# NOTE ON DEPTH: the database-privilege half of this defence is currently
-# INERT. The application connects as `postgres`, which both OWNS the function
-# and is a SUPERUSER, and PostgreSQL superusers bypass privilege checks — a
-# REVOKE empties the ACL and changes nothing (verified empirically). Until the
-# application runs as a non-superuser role, THIS GUARD IS THE ONLY EFFECTIVE
-# CONTROL. Do not weaken it on the assumption that the database is backstopping.
+# NOTE ON DEPTH: whether the database-privilege half of this defence is live
+# depends on the role the application connects as, and THAT IS NOT SOMETHING
+# THIS COMMENT CAN KNOW. It used to try: it stated that the application
+# connects as `postgres` — a superuser, whose privilege-check bypass makes a
+# REVOKE inert — and concluded "THIS GUARD IS THE ONLY EFFECTIVE CONTROL."
+# Privilege separation later shipped and production moved to `crm_app`, and
+# the comment did not move with it. It then spent months telling readers to
+# discount a defence layer that was working.
+#
+# The question is now asked of the database at startup by
+# `release_guard._check_db_privileges`, which reports the REAL role and
+# whether it is a superuser. Read that, not this.
+#
+# What has not changed: do not weaken this guard on the assumption that the
+# database is backstopping it. This is the control that holds in either case.
 FORBIDDEN_PROCEDURES = {
     "sp_cases": ("Case mutations must go through app/core/cases.py, which "
                  "enforces the lifecycle state machine, owner validation and "

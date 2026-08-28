@@ -147,6 +147,28 @@ CHECKS: List[Dict[str, Any]] = [
            f"{{bad_pct}}% of open deals are stale (>{FRESH_DAYS} days untouched)"),
 
     # ── orders ────────────────────────────────────────────────────────────
+    # WHY OWNERSHIP IS MEASURED HERE NOW. This dimension covered acc_owner and
+    # opp_owner — the two entities whose ownership is healthy (97% / 87%) — and
+    # not orders, which sat at 3% (58 of 1,888) and had been at zero for every
+    # order created since 6 January 2026. Neither order-creation path
+    # (sp_orders p_mode='create', fn_generate_orders) writes owner_id at all,
+    # so this is a WRITE-PATH REGRESSION, not gradual data decay.
+    #
+    # It went unseen for seven months because the readiness report measured the
+    # entities that were fine. A completeness dimension that skips an entity
+    # cannot report that entity degrading — and "Rep accountability" scored
+    # well while the largest transactional table had no reps on it.
+    #
+    # NOTE FOR WHOEVER FIXES THE WRITE PATH: do NOT backfill owner_id from
+    # accounts.owner_id. All 58 genuinely-owned orders have an owner that
+    # DIFFERS from their account's owner, so order ownership is independent by
+    # design; deriving it would fabricate 1,809 ownership facts and quietly
+    # reassign accountability. Who owns an order is a product decision.
+    _check("orders", "ord_owner", "completeness", "Orders have an owner",
+           "SELECT count(*) FILTER (WHERE owner_id IS NOT NULL), count(*) "
+           "FROM orders WHERE deleted_at IS NULL",
+           "{bad_pct}% of orders are unowned (blocks rep accountability and "
+           "any owner-scoped read policy)"),
     _check("orders", "ord_amount", "completeness", "Orders have a total amount",
            "SELECT count(*) FILTER (WHERE total_amount IS NOT NULL AND total_amount>0), count(*) "
            "FROM orders WHERE deleted_at IS NULL",
@@ -160,6 +182,53 @@ CHECKS: List[Dict[str, Any]] = [
            "SELECT count(*) FILTER (WHERE p.product_id IS NOT NULL), count(*) "
            "FROM order_items oi LEFT JOIN products p ON p.product_id=oi.product_id",
            "{bad} order line(s) reference a missing product"),
+
+    # ── cases ─────────────────────────────────────────────────────────────
+    # DELIBERATELY CONDITIONAL. Raw case ownership is 26% (183/704), but that
+    # number is not a defect: 487 cases are status='new', and an untriaged
+    # case sitting in the queue with no owner is the CORRECT state. A flat
+    # ownership check here would report a 74% failure that nobody should act
+    # on — and a check that fires on normal operation is one whose next true
+    # finding gets waved through.
+    #
+    # What is genuinely wrong is a case being WORKED with nobody working it.
+    # Measured: 48 of 69 'in_progress' cases have no owner.
+    _check("cases", "case_owner_active", "completeness",
+           "Cases being worked have an owner",
+           "SELECT count(*) FILTER (WHERE owner_id IS NOT NULL), count(*) "
+           "FROM cases WHERE status IN ('in_progress','waiting')",
+           "{bad} case(s) are in progress with no owner (nobody is "
+           "accountable for them)"),
+
+    # ── OWNERSHIP INTEGRITY — does the owner actually EXIST? ───────────────
+    # COMPLETENESS ASKS "IS IT SET"; INTEGRITY ASKS "DOES IT RESOLVE", and
+    # reading one as the other is how an audit reported "activities 100%
+    # owned" about a column where 2,304 of 11,553 values point at an owner
+    # that is not in the `owners` table.
+    #
+    # `orders`, `activities`, `leads` and `cases` carry owner_id with NO
+    # FOREIGN KEY (accounts, contacts, opportunities and invoices have one),
+    # so nothing has ever prevented a value that resolves to nobody. Every one
+    # of the 58 populated `orders.owner_id` values is a single id that does
+    # not exist — which is why they all differ from their account's owner, and
+    # why that difference is not evidence of an independent ownership design.
+    #
+    # This matters beyond tidiness: owner_id is the subject of the deferred
+    # row-level read policy. A predicate joining `owners` would silently
+    # exclude these rows from everyone; one that omits the join would include
+    # them for everyone. Both are wrong and neither is visible.
+    _check("orders", "ord_owner_valid", "integrity",
+           "Order owners exist in the owners table",
+           "SELECT count(*) FILTER (WHERE w.owner_id IS NOT NULL), count(*) "
+           "FROM orders o LEFT JOIN owners w ON w.owner_id=o.owner_id "
+           "WHERE o.deleted_at IS NULL AND o.owner_id IS NOT NULL",
+           "{bad} order(s) name an owner that does not exist"),
+    _check("activities", "act_owner_valid", "integrity",
+           "Activity owners exist in the owners table",
+           "SELECT count(*) FILTER (WHERE w.owner_id IS NOT NULL), count(*) "
+           "FROM activities a LEFT JOIN owners w ON w.owner_id=a.owner_id "
+           "WHERE a.owner_id IS NOT NULL",
+           "{bad} activity/activities name an owner that does not exist"),
 
     # ── CONSISTENCY — fields that must AGREE with each other ───────────────
     # Distinct from completeness (a value exists) and validity (it's well-formed):
@@ -233,7 +302,12 @@ CHECKS: List[Dict[str, Any]] = [
 DECISIONS: List[Dict[str, Any]] = [
     {"name": "Revenue reporting", "checks": ["opp_amount", "opp_account", "ord_amount", "ord_account", "ord_line_product"]},
     {"name": "Pipeline & forecast", "checks": ["opp_amount", "opp_close_date", "opp_freshness"]},
-    {"name": "Rep accountability", "checks": ["opp_owner", "acc_owner"]},
+    # ord_owner / case_owner_active are here because this decision was scoring
+    # on the two entities whose ownership is healthy while the largest
+    # transactional table had no reps on it at all. A decision-reliability map
+    # that omits the weakest input reports confidence it has not earned.
+    {"name": "Rep accountability",
+     "checks": ["opp_owner", "acc_owner", "ord_owner", "case_owner_active"]},
     {"name": "Customer segmentation", "checks": ["acc_name_unique", "acc_industry", "con_account"]},
     {"name": "Email outreach", "checks": ["con_reachable", "con_email_valid", "lead_email_valid"]},
     {"name": "Contactability (calls/SMS)", "checks": ["con_reachable", "con_phone_valid", "lead_reachable"]},
