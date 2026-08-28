@@ -175,6 +175,19 @@ jobs:
       DATABASE_URL: postgresql://postgres:ci@localhost:5432/crmdb
       # An environment-shaped skip becomes a failure here.
       CRM_REQUIRE_DB: '1'
+      # WITHOUT THIS, THE POSTURE DEFAULTS TO `open` AND FOUR ROLE-ENFORCEMENT
+      # CONTROLS SKIP THEMSELVES -- correctly, since there is no role
+      # enforcement to test in `open` mode. One of them is
+      # test_anonymous_cannot_execute_a_write_the_blocklist_misses, the
+      # regression test for the anonymous-write defect. It did not run in the
+      # first green build, and nothing said so.
+      #
+      # Either enforcing posture makes those four assertions identical: they
+      # assert that anonymous and viewer are refused WRITES and told the reason
+      # is "role", which `locked` and `public-read` handle the same way. The
+      # difference between the two is read access, which they do not touch --
+      # so this is not the "test the version production runs" trap.
+      API_SECURITY_MODE: public-read
       MEMORY_SIGNING_KEY: ci-signing-key-not-for-production
       MEMORY_SIGNING_KEY_ID: ci1
       DB_POOL_MAX: '8'

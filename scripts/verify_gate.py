@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -97,6 +98,32 @@ class Stage:
     def __init__(self, name: str, detail: str = ""):
         self.name, self.detail, self.ok, self.ran = name, detail, False, False
         self.secs = 0.0
+        self.skips: List[Tuple[str, str]] = []
+        self.undeclared: List[Tuple[str, str]] = []
+
+
+# SKIPS THIS GATE TOLERATES, each with the reason it is acceptable. Any skip
+# whose reason is not listed here FAILS the controls stage.
+#
+# WHY THIS EXISTS. The stage used to report "208 passed, 6 skipped" and pass.
+# Six is not zero: those controls did not run. CI skipped five that pass
+# locally because the posture defaulted to `open` there, and among them was
+# the regression test for the anonymous-write defect this project was started
+# to fix. Nothing failed. Nothing looked wrong.
+#
+# A skip is only acceptable when someone has written down why, in the same
+# spirit as NOT_GATED_HERE below: an absence that is declared is a decision,
+# and an absence that is not is an accident wearing a green tick.
+DECLARED_SKIPS: List[Tuple[str, str]] = [
+    ("no contacts in this database",
+     "the gate builds its database from the baseline and seeds only the "
+     "knowledge base, so it holds no business rows. This control needs one "
+     "contact. It runs locally and against production; it does not run here."),
+    ("filesystem rejected every name containing a space",
+     "the adversarial-filename fixture cannot be built where the filesystem "
+     "refuses spaces. Not expected on Linux or Windows; declared so a genuinely "
+     "hostile filesystem degrades visibly rather than silently."),
+]
 
 
 def _psql() -> Optional[str]:
@@ -265,12 +292,32 @@ def main() -> int:
         # ---- controls ------------------------------------------------------
         t = time.time()
         by["controls"].ran = True
-        rc, out = _run([sys.executable, "-m", "pytest", "-q",
+        # -rs: report skip REASONS. Without it the stage prints "208 passed,
+        # 6 skipped" and passes -- and a skipped control is a control that did
+        # not run. CI skipped five that pass locally, including
+        # test_anonymous_cannot_execute_a_write_the_blocklist_misses, the
+        # regression test for the anonymous-write defect. The gate was green.
+        rc, out = _run([sys.executable, "-m", "pytest", "-q", "-rs",
                         "-p", "no:cacheprovider", *CONTROL_TESTS], env)
         by["controls"].secs = time.time() - t
         tail = [l for l in out.splitlines() if "passed" in l or "failed" in l]
-        by["controls"].ok = rc == 0
-        by["controls"].detail = (tail[-1][:110] if tail else "no result line")
+
+        skips = re.findall(r"^SKIPPED \[\d+\] (.+?): (.+)$", out, re.M)
+        undeclared = [(loc, why) for loc, why in skips
+                      if not any(d in why for d, _ in DECLARED_SKIPS)]
+        by["controls"].skips = skips
+        by["controls"].undeclared = undeclared
+        by["controls"].ok = (rc == 0) and not undeclared
+        detail = tail[-1][:90] if tail else "no result line"
+        if undeclared:
+            detail += f"  | {len(undeclared)} UNDECLARED SKIP(S)"
+        by["controls"].detail = detail
+        if undeclared:
+            print(f"  controls: {len(undeclared)} control(s) did not run, and "
+                  f"the reason is not declared:")
+            for loc, why in undeclared:
+                print(f"    {loc}")
+                print(f"      {why[:120]}")
         if rc != 0:
             print("  controls: FAILED")
             for l in out.splitlines():
