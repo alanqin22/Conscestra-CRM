@@ -139,6 +139,14 @@ REQUIRED_MIGRATIONS: List[str] = [
     # Railway once caused a fifteen-day outage in which every valid coupon was
     # refused, and nothing detected it. Now a clean deployment must have it.
     "promotions_coupons.sql",
+    # PROMOTED 2026-08-28, and only after Railway had it. It sat in
+    # OUT_OF_BAND_SQL marked PENDING DEPLOYMENT while it was applied
+    # locally but not to production, because this list is a claim about
+    # what production has RUN -- putting it here first would have made
+    # migrate --check report a chain production had not executed.
+    # Verified before promotion: all six canonical triggers present on
+    # Railway, zero legacy triggers surviving.
+    "touch_updated_at_convergence.sql",
 ]
 
 
@@ -173,6 +181,28 @@ REQUIRED_MIGRATIONS: List[str] = [
 # entries whose reason begins REVIEW are exactly where that claim may in fact
 # be true, and they are named rather than quietly resolved.
 
+# THE LIFECYCLE MARKER, kept after its first use rather than deleted.
+# A governed schema change passes through three states, and the middle one
+# had no name until 2026-08-28:
+#
+#   1. authored + classified here, applied locally  -> PENDING DEPLOYMENT
+#   2. applied to production                        -> verified directly
+#   3. moved into REQUIRED_MIGRATIONS               -> claimed as run
+#
+# Skipping straight to (3) is the failure this prevents: REQUIRED_MIGRATIONS
+# is a claim about what PRODUCTION has executed, and migrate --check reads
+# it as one. The next migration of this shape should reuse this marker.
+_PENDING_DEPLOYMENT = (
+    "PENDING DEPLOYMENT -- authored 2026-08-28 and applied to LOCAL; it is a "
+    "governed schema change and belongs in REQUIRED_MIGRATIONS, but it is not "
+    "there yet because Railway does not have it. Adding it earlier would make "
+    "migrate --check report a chain this database has not run, which is the "
+    "verifier claiming a state production is not in. Move it to "
+    "REQUIRED_MIGRATIONS in the SAME change that records its Railway "
+    "application, and not before. Binds the canonical trg_<table>_touch "
+    "trigger on accounts, contacts, leads, customers, employees and "
+    "product_pricing, retiring four legacy-named triggers.")
+
 _SCHEMA_OOB = (
     "Historical schema operation applied out-of-band; it never entered the "
     "governed chain. This records what is true, not that the objects are "
@@ -206,22 +236,41 @@ _DIAGNOSTIC = (
 # `events` does not exist, so declaring these would put a migration in the
 # governed set that a clean database cannot execute.
 #
-# Same disposition as before, for a sounder reason. Adoption becomes possible
-# only if the base schema enters the corpus -- which is the /sql/ provenance
-# decision, not this one.
-_CHAIN_1 = (
-    "REVIEW -- defines emit_event() and replaces trg_fn_events_after_insert(). "
-    "Cannot be governed while its prerequisite tables (events, event_queue) "
-    "are absent from the entire corpus; a clean database could not execute it.")
-_CHAIN_2 = (
-    "REVIEW -- defines trgfn_events_emit_guard() and trg_events_before_insert "
-    "ON events, and replaces trg_fn_events_after_insert(). Same prerequisite "
-    "gap as fix_event_queue_double_enqueue.sql.")
-_CHAIN_3 = (
-    "REVIEW -- the CURRENT production body of trg_fn_events_after_insert(), "
-    "verified byte-identical on both databases and complete in itself. It is "
-    "held out-of-band NOT because it is the newest of three, but because the "
-    "event subsystem it belongs to has no governed base schema to attach to.")
+# RESOLVED 2026-08-28. The paragraph above ends "adoption becomes possible only
+# if the base schema enters the corpus", and it now has -- not in sql/, but as
+# schema/00_base_schema.sql, the canonical baseline CI builds every run. It
+# carries events, event_queue, emit_event() and the current
+# trg_fn_events_after_insert body, so the prerequisite gap these three cited is
+# gone and their REVIEW reason has expired.
+#
+# THE DISPOSITION IS STILL NOT "ADOPT", and the distinction matters. A clean
+# database now receives those objects FROM THE BASELINE, already at their
+# current bodies. Replaying these files on top would be redundant at best and
+# conflicting at worst -- they are a record of how production reached that
+# state, not a way to reproduce it. So they move to the historical category:
+# not governed, not replayed, retained as evidence.
+#
+# WHAT THIS EPISODE SHOWS. The reason above named a checkable condition and
+# nothing checked it; the condition changed and the text kept reading as
+# current. A justification that can expire should be verified by something that
+# runs, which is why the accompanying tests now assert the BASELINE contains
+# these prerequisites rather than that sql/ does not.
+_EVENT_HISTORY = (
+    "Historical schema operation applied out-of-band; it never entered the "
+    "governed chain. DISPOSITIONED 2026-08-28: the prerequisite gap that held "
+    "the event trio in REVIEW is closed -- schema/00_base_schema.sql carries "
+    "events, event_queue, emit_event() and the current "
+    "trg_fn_events_after_insert body, so a clean database receives them from "
+    "the baseline. Not adopted: replaying would be redundant or conflicting. "
+    "Retained as historical record -- not governed, not replayed. ")
+_CHAIN_1 = _EVENT_HISTORY + (
+    "This file defines emit_event() and replaces trg_fn_events_after_insert().")
+_CHAIN_2 = _EVENT_HISTORY + (
+    "This file defines trgfn_events_emit_guard() and trg_events_before_insert "
+    "ON events, and replaces trg_fn_events_after_insert().")
+_CHAIN_3 = _EVENT_HISTORY + (
+    "This file is the CURRENT production body of trg_fn_events_after_insert(), "
+    "verified byte-identical on both databases and complete in itself.")
 _ENCODING_REPAIR = (
     "Repairs seven functions whose non-ASCII literals were mangled on Railway "
     "-- five in executable literals, two in comments only. Out-of-band because "
