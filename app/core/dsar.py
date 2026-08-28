@@ -206,10 +206,110 @@ EXCLUDED: Dict[str, str] = {
                             "absent.",
     "sdr_sessions": "Keyed by session id with no subject link — see "
                     "agent_session_memory.",
+    # STAFF NOTIFICATION LEDGER. Every row is an email sent TO A STAFF MEMBER,
+    # and no column links one to a customer:
+    #
+    #   recipient_email / recipient_owner_id  the STAFF recipient. Third-party
+    #     data relative to any customer, and disclosing it because a row is
+    #     technically adjacent to their record is precisely the Art. 15(4)
+    #     failure the account-scope logic exists to prevent.
+    #   subject_ref_type / subject_ref_id     the INTERNAL WORK OBJECT the mail
+    #     was about. Measured, not assumed: the only values the writers emit
+    #     are 'approval', 'escalation' and 'digest' (governance.py:818,
+    #     escalation.py:520, staff_email.py:1382), and the ledger holds only
+    #     those. An approval id is not a person.
+    #
+    # So this is a staff record and belongs to a staff subject, exactly like
+    # employees/owners/executives above.
+    #
+    # THE PROMISE THOSE ENTRIES MAKE IS NOT KEPT, and repeating it here would
+    # be dishonest: they say "a separate request against subject_type='employee'",
+    # but _resolve() accepts only contact/lead/account/email and raises
+    # ValueError on anything else. There is no staff DSAR path. That is a real
+    # gap, recorded here rather than implied — the same discipline
+    # agent_session_memory gets.
+    #
+    # THE EXCLUSION RESTS ON A DATA PROPERTY, so it is verified against data:
+    # see EXCLUSION_PREMISES. If subject_ref_type ever names a customer-shaped
+    # entity, the premise is false and the exclusion must be reopened.
+    "staff_email_ledger":
+        "Staff notification ledger — every row is mail sent TO staff. "
+        "recipient_email/recipient_owner_id identify the staff recipient "
+        "(third-party data under Art. 15(4)); subject_ref_id names an internal "
+        "work object (approval/escalation/digest), never a person. No column "
+        "links a row to a customer, so nothing here belongs in a customer's "
+        "Art. 15 or Art. 20 export. KNOWN LIMITATION: the staff-subject path "
+        "these records would belong to is not implemented — _resolve() accepts "
+        "only contact/lead/account/email. Premise verified by "
+        "EXCLUSION_PREMISES.",
     "n8n_chat_histories": "Legacy n8n chat log, retired 2026-08-05. Retained "
                           "read-only pending deletion; searched manually on "
                           "request because its session key has no subject link.",
 }
+
+# ============================================================================
+# EXCLUSIONS THAT REST ON DATA, not on schema alone
+# ============================================================================
+# coverage() is deliberately structural: it reads pg_attribute and never a row.
+# That is right for "is this table declared", and useless for "is the REASON
+# still true". Some exclusions are justified by a property of the CONTENT --
+# staff_email_ledger is excluded because its subject_ref_type never names a
+# person -- and a justification of that shape decays silently when the data
+# changes.
+#
+# The event-trio disposition failed exactly this way: it cited a condition, the
+# condition changed, and nothing re-checked it because the tripwire watched the
+# wrong surface. So a premise stated here is CHECKED WHERE THE DATA LIVES, and
+# checked in production, because that is where new values appear first.
+#
+# table -> {column, allowed values, why the exclusion depends on them}
+EXCLUSION_PREMISES: Dict[str, Dict[str, Any]] = {
+    "staff_email_ledger": {
+        "column": "subject_ref_type",
+        # The complete vocabulary the writers can emit, verified by grep across
+        # app/: governance.py 'approval', escalation.py 'escalation',
+        # staff_email.py 'digest'. NULL is permitted -- a row about nothing in
+        # particular still links to no person.
+        "allowed": ("approval", "escalation", "digest"),
+        "why": "the table is EXCLUDED from customer exports because "
+               "subject_ref_id names an internal work object rather than a "
+               "data subject. A value outside this set may identify a person, "
+               "which would make the exclusion an under-disclosure.",
+    },
+}
+
+
+def exclusion_premises() -> Dict[str, Any]:
+    """Are the data-dependent reasons behind EXCLUDED still true?
+
+    Fail-closed and cheap: one DISTINCT per declared premise. A violation is
+    not "tidy the list" -- it means a table currently withheld from subjects
+    may now contain their data, so the exclusion has to be re-argued.
+    """
+    violations: List[Dict[str, Any]] = []
+    conn = get_connection()
+    try:
+        conn.set_session(readonly=True)
+        with conn.cursor() as cur:
+            for table, spec in EXCLUSION_PREMISES.items():
+                cur.execute("SELECT to_regclass(%s)", (f"public.{table}",))
+                if cur.fetchone()[0] is None:
+                    continue            # phantom entries are coverage()'s job
+                col = spec["column"]
+                cur.execute(f'SELECT DISTINCT "{col}" FROM public."{table}" '
+                            f'WHERE "{col}" IS NOT NULL')
+                seen = {r[0] for r in cur.fetchall()}
+                unexpected = sorted(seen - set(spec["allowed"]))
+                if unexpected:
+                    violations.append({"table": table, "column": col,
+                                       "unexpected": unexpected,
+                                       "allowed": list(spec["allowed"]),
+                                       "why": spec["why"]})
+    finally:
+        conn.close()
+    return {"checked": sorted(EXCLUSION_PREMISES),
+            "violations": violations, "ok": not violations}
+
 
 # Never emit these column types/names even from an included table: a vector is
 # not intelligible to a subject, and a credential hash is not their data in any
@@ -830,8 +930,27 @@ def main() -> int:
             for t in c["phantom_manifest_entries"]:
                 print(f"  manifest entry with no table: {t}")
             return 1
-        print("\nmanifest covers every subject-linked table "
-              "(STRUCTURAL only — run --content-coverage for the other half)")
+        # A declared manifest is not a correct one. Some exclusions are
+        # justified by a property of the CONTENT, and structural coverage
+        # cannot see content -- so the premises are checked here, against
+        # the database being verified, which in the deployed case is
+        # production, where a new value appears first.
+        prem = exclusion_premises()
+        print(json.dumps({"exclusion_premises": prem}, indent=2))
+        if not prem["ok"]:
+            print("")
+            print("EXCLUSION PREMISE VIOLATED - a table withheld from "
+                  "subjects may now hold their data:")
+            for v in prem["violations"]:
+                print(f"  {v['table']}.{v['column']} has unexpected "
+                      f"value(s) {v['unexpected']}; declared: {v['allowed']}")
+                print(f"    {v['why']}")
+            print("Re-argue the exclusion, or link the table into the "
+                  "manifest. Do not widen `allowed` to make this pass.")
+            return 1
+        print("")
+        print("manifest covers every subject-linked table, and every "
+              "data-dependent exclusion premise still holds")
         return 0
 
     if a.content_coverage:

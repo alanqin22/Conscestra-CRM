@@ -49,6 +49,35 @@ sys.path.insert(0, str(ROOT))
 from app.core import config as _config          # noqa: E402,F401
 
 
+def build_parser() -> "argparse.ArgumentParser":
+    """The parser, separated so --help can be answered without touching a DSN.
+
+    WHY THIS EXISTS. Arguments used to be read by scanning sys.argv, so
+    `--help` matched nothing, fell through to the default branch, and RAN A
+    FULL VERIFICATION against whatever DATABASE_URL happened to be set. For a
+    tool whose normal mode targets production that is not a cosmetic defect:
+    the safest thing a user can type did the second-most dangerous thing the
+    program does. argparse handles --help itself and exits 0 before main()
+    reaches any connection.
+    """
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="python -m scripts.postdeploy_verify",
+        description="Post-deployment verification. Read-only: it opens "
+                    "read-only transactions and never writes to the target.",
+        epilog="With no --target it verifies the DSN in DATABASE_URL/DB_DSN. "
+               "Railway is never a default; it must be named explicitly.")
+    ap.add_argument("--target", choices=("railway",), default=None,
+                    help="verify a named deployment instead of the configured "
+                         "DSN. Requires RAILWAY_DB_URL with sslmode.")
+    ap.add_argument("--app-url", default="",
+                    help="base URL of the RUNNING application, e.g. "
+                         "https://example.up.railway.app. Used to ask /health "
+                         "which database role the app actually connects as -- "
+                         "the only place that fact exists.")
+    return ap
+
+
 def _target_dsn(argv) -> tuple[str, str]:
     """Return (label, dsn). Railway is opt-in and explicit — never a default."""
     if "--target" in argv:
@@ -227,6 +256,91 @@ def _schema_inventory(dsn: str) -> dict:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# DECLARED DRIFT — differences that have been decided, with the reason
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS, and the line it must not cross. Every schema difference used
+# to be a failure. That is the right default, and it made this check
+# permanently red: the corpus carries genuine dead local cruft that will never
+# be deployed, and a verifier that cannot say so trains people to skim past it.
+# A permanently-red check is a switched-off check with extra steps.
+#
+# THE LINE. A declared entry is a DECISION WITH A REASON, in the same idiom as
+# dsar.EXCLUDED and verify_gate.DECLARED_SKIPS. It is not a place to put
+# differences nobody has explained. Two differences found on 2026-08-28 are
+# deliberately ABSENT from this list, because they are real:
+#
+#   * generate_random_orders — local carries an order-ceiling fix that
+#     production lacks, and production runs the nightly job. A missing
+#     deployment is not an exception; excusing it would hide exactly the class
+#     of defect this check was built after (the fifteen-day coupon outage).
+#   * the updated_at triggers — not a naming difference. accounts/contacts
+#     locally, and customers/employees/product_pricing IN PRODUCTION, carry an
+#     updated_at column that NO trigger maintains. Behaviour differs, so the
+#     behaviour is what needs fixing.
+#
+# key: (object class, exact inventory string) -> why the difference is correct
+DECLARED_DRIFT: dict = {
+    # -- dead local cruft: an abandoned vector-column experiment ------------
+    ("columns", "content_embeddings.embedding_v:USER-DEFINED"):
+        "LOCAL-ONLY. Abandoned vector-column experiment: no file in sql/ "
+        "creates it and no code reads it (content_index.py writes `embedding`). "
+        "Not deployed, deliberately -- removing a diff is not a reason to ship "
+        "dead code to production. It IS in the baseline, so CI builds it too.",
+    ("indexes", "idx_ce_hnsw"):
+        "LOCAL-ONLY. HNSW index over content_embeddings.embedding_v, the dead "
+        "column above. Same disposition.",
+
+    # -- the ledger nullability: BLOCKED, and blocked for a good reason -----
+    ("columns", "schema_migrations.applied_by:text"):
+        "LOCAL-ONLY (nullable). scripts/migrate.py is canonical and declares "
+        "NOT NULL; PRODUCTION SATISFIES IT. Local predates the constraint and "
+        "holds 24 rows with NULLs. Not remediated: adding the constraint would "
+        "require inventing checksums for migrations whose applied bytes nobody "
+        "knows, or deleting ledger rows -- both forbidden. The invariant holds "
+        "where it protects anything.",
+    ("columns", "schema_migrations.checksum:text"):
+        "LOCAL-ONLY (nullable). See schema_migrations.applied_by.",
+    ("columns", "schema_migrations.applied_by:text NOT NULL"):
+        "TARGET-ONLY. The CANONICAL definition per scripts/migrate.py. It "
+        "appears as drift only because local is behind, not production.",
+    ("columns", "schema_migrations.checksum:text NOT NULL"):
+        "TARGET-ONLY. Canonical -- see schema_migrations.applied_by.",
+
+    # -- dead local functions ----------------------------------------------
+    # Each appears only in governance/sp/crm_db.sql and crm_db_tables.sql,
+    # historical whole-database dumps rather than live code. No migration,
+    # trigger, stored procedure or Python module calls them.
+    ("functions", "cm_test:0a5ed9a2890c39cb7b9b32b2b9459e96"):
+        "LOCAL-ONLY. Dead: referenced only by the historical whole-database "
+        "dumps in sp/. Never deployed, and should not be.",
+    ("functions", "customer_management:27a1785dfed2284687ed4f78db7f4719"):
+        "LOCAL-ONLY. Dead: a demo CRUD wrapper from the pre-agent schema, referenced on"
+        "ly by the historical dumps in sp/. No caller anywhere.",
+    ("functions", "get_user_name:978177d7cad82a3b85949b428f7acde7"):
+        "LOCAL-ONLY. Dead: superseded by the employees/owners identity model; reference"
+        "d only by the historical dumps in sp/.",
+    ("functions", "is_user_active:2df68b72c1713f62d6ff9fb00333eb58"):
+        "LOCAL-ONLY. Dead: superseded by the auth_credentials/session model; referenced"
+        " only by the historical dumps in sp/.",
+    ("functions", "product_management:cf38f310d15576f91e6f8ed8ed3bf2cf"):
+        "LOCAL-ONLY. Dead: a demo CRUD wrapper for products, superseded by the Products"
+        " agent and its stored procedures. Only in the sp/ dumps.",
+
+    # -- production orphans left by the trigger consolidation ---------------
+    ("orphan_functions", "increment_workflow_version"):
+        "TARGET-ONLY orphan: defined, bound to no trigger. Inert residue.",
+    ("orphan_functions", "set_lead_updated_at"):
+        "TARGET-ONLY orphan: superseded by trgfn_touch_updated_at.",
+    ("orphan_functions", "update_updated_at_column"):
+        "TARGET-ONLY orphan: superseded by trgfn_touch_updated_at.",
+    ("orphan_functions", "update_updated_datetime_column"):
+        "TARGET-ONLY orphan: superseded by trgfn_touch_updated_at.",
+    ("orphan_functions", "update_users_timestamp"):
+        "TARGET-ONLY orphan: superseded by trgfn_touch_updated_at.",
+}
+
+
 def _schema_drift(target_dsn: str) -> Optional[str]:
     """Objects present in the working schema but missing from the deploy target.
 
@@ -257,10 +371,19 @@ def _schema_drift(target_dsn: str) -> Optional[str]:
     except Exception as exc:                                    # noqa: BLE001
         return f"SKIPPED — could not compare schemas: {type(exc).__name__}: {exc}"
 
-    parts, total_missing = [], 0
+    parts, total_missing, excused = [], 0, 0
+    stale = set(DECLARED_DRIFT)
     for cls in _INVENTORY:
         missing = sorted(here[cls] - there[cls])
         extra = sorted(there[cls] - here[cls])
+        # Remove DECLARED differences from the verdict, and COUNT them, so the
+        # report states how much was excused instead of quietly shrinking.
+        for seq in (missing, extra):
+            for item in list(seq):
+                if (cls, item) in DECLARED_DRIFT:
+                    seq.remove(item)
+                    excused += 1
+                    stale.discard((cls, item))
         total_missing += len(missing)
         if not missing and not extra:
             continue
@@ -274,12 +397,20 @@ def _schema_drift(target_dsn: str) -> Optional[str]:
                     f"({', '.join(extra[:4])}{', …' if len(extra) > 4 else ''})")
         parts.append(bit)
 
+    # AN EXCEPTION MATCHING NOTHING IS ITSELF A DEFECT: the difference was
+    # resolved and the excuse outlived it, which is how a list of reasons
+    # becomes a list nobody rereads.
+    if stale:
+        parts.append("STALE DECLARED_DRIFT (matches nothing; delete): "
+                     + ", ".join(f"{c}:{i}" for c, i in sorted(stale)))
+
+    suffix = f" [{excused} declared exception(s) excused]" if excused else ""
     if not parts:
         counts = ", ".join(f"{len(here[c])} {c}" for c in _INVENTORY)
-        return f"OK — identical on both ({counts})"
+        return (f"OK — no undeclared drift ({counts}){suffix}")
     lead = ("SCHEMA DRIFT — code may reference objects the target lacks"
             if total_missing else "schema differs (target has extra objects)")
-    return lead + " || " + " || ".join(parts)
+    return lead + suffix + " || " + " || ".join(parts)
 
 def _app_identity(app_url: str) -> Optional[str]:
     """Ask the RUNNING APPLICATION which database role it connects as.
@@ -369,8 +500,15 @@ def _report_connected_roles(dsn: str) -> None:
         conn.close()
 
 
-def main() -> int:
-    label, dsn = _target_dsn(sys.argv)
+def main(argv: Optional[list] = None) -> int:
+    # PARSE FIRST, CONNECT LATER. Everything below this line can touch a
+    # production database; nothing above it may. argparse exits here for
+    # --help (status 0) and for a bad argument (status 2), in both cases
+    # before a DSN is read, let alone opened.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(argv)
+
+    label, dsn = _target_dsn(["_"] + argv)
 
     env = dict(os.environ)
     # Both variables are set, because different modules read different ones and
@@ -388,11 +526,10 @@ def main() -> int:
     # Learn the application's real role BEFORE the red team runs, so the
     # trigger-disable attack can be judged against the app rather than against
     # this admin connection.
-    app_url = ""
-    if "--app-url" in sys.argv:
-        i = sys.argv.index("--app-url")
-        app_url = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
-    app_url = app_url or os.getenv("RAILWAY_APP_URL", "") or ""
+    # From the parsed namespace, not a second scan of sys.argv: two readers of
+    # the same flag drift, and this one decides whether the app's real database
+    # role is learned at all.
+    app_url = args.app_url or os.getenv("RAILWAY_APP_URL", "") or ""
     app_role = _app_identity(app_url) if app_url else None
     if app_role:
         env["REDTEAM_APP_ROLE"] = app_role
