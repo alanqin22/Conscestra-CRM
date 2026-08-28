@@ -1,37 +1,49 @@
 # CI — WHAT THIS DOES AND DOES NOT VERIFY
 #
-# The migration files live outside this repository by policy, so a runner
-# cannot build the schema: `scripts/migrate.py` finds 0 of 15 files. Even with
-# them present they are incremental against an existing CRM schema — a blank
-# Postgres fails with `relation "opportunities" does not exist`.
+# HOW THIS PIPELINE USED TO LIE. tests/, sql/, sp/ and schema/ were gitignored,
+# so a runner received none of them. The integration job below was written but
+# guarded by `if: … has_base_schema == 'true'`, which was permanently false, so
+# it was SKIPPED on every run — and GitHub counts a skipped required check as a
+# PASSING one. The workflow reported success having verified imports and a
+# frozen benchmark, under a header claiming coverage figures nobody re-derived.
 #
-# So this pipeline deliberately claims LESS than the suite proves locally. It
-# runs what is meaningful without a database, and it is named so that nobody
-# mistakes a green tick for a verified safety case.
-#
-# The tests/ directory is also outside this repository by policy, so CI cannot
-# run any test at all.
+# Those artefacts now arrive through the private `governance` submodule, the
+# condition is deleted, and the gate actually runs.
 #
 # COVERED HERE
-#   * every app module imports (222 of them) — catches syntax errors, broken
-#     imports and circular dependencies across the whole codebase
-#   * the Phase 4 memory benchmark: the derivation pipeline run against a
-#     frozen corpus with its own embeddings, so clustering, statements,
-#     evidence selection and trust scores are all regression-gated WITHOUT a
-#     database
+#   * every app module imports — syntax errors, broken imports, cycles
+#   * the Phase 4 memory benchmark against a frozen corpus (no database)
+#   * scripts/verify_gate.py — a database built from schema/00_base_schema.sql,
+#     the declared migration chain applied and verified complete, the knowledge
+#     base seeded, and the control suite run against THAT database. A stage
+#     that cannot run is a FAILURE there, never a skip.
+#   * scripts/verify_invariants.py — the SQL-layer controls, asserted against a
+#     database built from the migrations rather than from a dev history
 #
-# NOT COVERED HERE — all 1039 tests, verified locally against Postgres and on
-# Railway by `python -m scripts.verify_invariants` after every deployment:
-#   * GDPR erasure actually deleting
-#   * append-only enforcement on the verification trail
-#   * assertion-gate convergence between explain() and recall()
-#   * signature validation and key rotation
-#   * the deletion undo log
+# NOT COVERED HERE, and each omission is deliberate
+#   * THE WIDER TEST SUITE. It reads ambient business rows and fails on a
+#     freshly built database for reasons unrelated to the code under test — so
+#     running it here would be red for the wrong cause and get switched off,
+#     which is worse than not running it. verify_gate.py::CONTROL_TESTS is the
+#     measured subset that IS gate-viable; the remainder is run by a person
+#     against a populated database.
+#   * grants and privilege separation — the baseline is dumped
+#     --no-privileges because CI has no auth_owner or crm_app role to grant to.
+#     Owned by scripts/postdeploy_verify.py after deployment.
+#   * retrieval quality — a property of an EMBEDDED corpus, needing an API key,
+#     network and spend. Run `python -m app.core.eval_suite` where the corpus
+#     is embedded.
 #
-# TO GET FULL COVERAGE: publish tests/, the 15 declared migrations, and a base
-# schema (sql/00_base_schema.sql, ~1.7 MiB, 200 tables + 165 stored
-# procedures). The integration job below activates on its own once the base
-# schema is present.
+# NO COUNTS IN THIS HEADER, deliberately. It previously asserted 222 modules,
+# 1039 tests, 1088 tests and 15 migrations. Three of those were wrong, and all
+# were believed precisely because they were specific. Ask the repository:
+#
+#     python -m scripts.control_inventory
+#
+# REQUIRES a GOVERNANCE_TOKEN secret with read access to the private governance
+# repository. GITHUB_TOKEN cannot see it and yields an EMPTY checkout, which is
+# indistinguishable from "no base schema" — so `checks` fails loudly on that
+# rather than letting the gate be quietly skipped again.
 name: CI
 
 on:
@@ -121,12 +133,13 @@ jobs:
       - name: State what was not verified
         if: always()
         run: |
-          echo "::warning::CI verifies imports + the frozen memory benchmark."
-          echo "::warning::tests/ is not published, so all 1088 tests and every"
-          echo "::warning::database-layer control are verified locally and on"
-          echo "::warning::Railway. Extrinsic quality (topic precision, cluster"
-          echo "::warning::validity, usefulness) needs human labels and is"
-          echo "::warning::blocked on real data. See this workflow's header."
+          echo "::warning::This job verifies imports + the frozen memory"
+          echo "::warning::benchmark. The database-layer controls are verified"
+          echo "::warning::by the gate in the integration job, which requires"
+          echo "::warning::this one. NOT verified anywhere in CI: the wider test"
+          echo "::warning::suite (needs a populated database), grants/privilege"
+          echo "::warning::separation (post-deploy), and retrieval quality"
+          echo "::warning::(needs an embedded corpus). See this workflow header."
 
   # THE GATE. Formerly dormant and formerly conditional -- and a SKIPPED
   # required check counts as a PASSING one, which is how this workflow reported
@@ -172,16 +185,45 @@ jobs:
         with: { python-version: '3.12', cache: pip }
       - run: pip install -r requirements.txt -r requirements-dev.txt
 
+      # Build the CI database from the declared chain. verify_invariants below
+      # asserts SQL-layer controls and must see a schema built from MIGRATIONS
+      # rather than from anyone's local history -- that is the whole point of
+      # running it here.
+      - name: Build the database from the baseline
+        # ON_ERROR_STOP and --single-transaction are both load-bearing: psql
+        # exits 0 by default even when individual statements ERROR, so without
+        # them a half-applied baseline would report success and every later
+        # step would verify a schema nobody has. --single-transaction makes the
+        # failure all-or-nothing rather than leaving a partial database behind.
+        run: >-
+          psql "$DATABASE_URL" --single-transaction --set ON_ERROR_STOP=1
+          -f governance/schema/00_base_schema.sql
+      - run: python -m scripts.migrate
+      - run: python -m scripts.migrate --check
+      - run: python -m scripts.verify_invariants
+
+      # The gate provisions its OWN scratch database and drops it, so it is
+      # independent of everything above -- it must start from a known-clean
+      # server, not from whatever the steps before it happened to leave behind.
+      #
       # One command, fail-closed: provision, baseline, migrations, seed,
-      # controls. A stage that cannot run is a FAILURE there, never a skip,
-      # so this cannot report success having verified less than it claims.
+      # controls. A stage that cannot run is a FAILURE there, never a skip, so
+      # it cannot report success having verified less than it claims.
       - name: Verification gate
         run: python -m scripts.verify_gate
 
-      # The wider suite, beyond the gate-viable controls.
-      - run: python -m pytest -q --tb=short
-      - run: python -m scripts.verify_invariants
+      # DELIBERATELY NOT `python -m pytest` OVER THE WHOLE SUITE.
+      #
+      # The wider suite reads ambient business rows. On a database built from
+      # the baseline alone it fails for reasons that have nothing to do with
+      # the code under test -- red for the wrong cause, and a gate that is red
+      # for the wrong cause gets switched off. CONTROL_TESTS is the measured
+      # subset that survives a fresh build, and the gate above runs exactly it.
+      #
+      # If you are tempted to add the full suite here, populate the database
+      # first and prove it green twice; otherwise you are trading a real gate
+      # for a broader-looking one.
 
-      # The count in any report must be derived from the repository, not typed
-      # into it. Non-zero if a gate artefact is untracked.
+      # Any control count in a report must be DERIVED from the repository, not
+      # typed into it. Non-zero if a gate artefact is untracked.
       - run: python -m scripts.control_inventory
