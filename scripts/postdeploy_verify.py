@@ -328,16 +328,15 @@ DECLARED_DRIFT: dict = {
         " agent and its stored procedures. Only in the sp/ dumps.",
 
     # -- production orphans left by the trigger consolidation ---------------
+    # REMOVED 2026-08-28, by the stale-declaration check rather than by
+    # anyone remembering: set_lead_updated_at, update_updated_at_column,
+    # update_updated_datetime_column and update_users_timestamp were declared
+    # TARGET-ONLY orphans. touch_updated_at_convergence.sql retired the legacy
+    # triggers on LOCAL too, so all four became orphans on both sides and the
+    # declarations matched nothing. An exception that outlives its difference
+    # is exactly what the stale check exists to surface.
     ("orphan_functions", "increment_workflow_version"):
         "TARGET-ONLY orphan: defined, bound to no trigger. Inert residue.",
-    ("orphan_functions", "set_lead_updated_at"):
-        "TARGET-ONLY orphan: superseded by trgfn_touch_updated_at.",
-    ("orphan_functions", "update_updated_at_column"):
-        "TARGET-ONLY orphan: superseded by trgfn_touch_updated_at.",
-    ("orphan_functions", "update_updated_datetime_column"):
-        "TARGET-ONLY orphan: superseded by trgfn_touch_updated_at.",
-    ("orphan_functions", "update_users_timestamp"):
-        "TARGET-ONLY orphan: superseded by trgfn_touch_updated_at.",
 }
 
 

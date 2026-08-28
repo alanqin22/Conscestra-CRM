@@ -173,6 +173,17 @@ REQUIRED_MIGRATIONS: List[str] = [
 # entries whose reason begins REVIEW are exactly where that claim may in fact
 # be true, and they are named rather than quietly resolved.
 
+_PENDING_DEPLOYMENT = (
+    "PENDING DEPLOYMENT -- authored 2026-08-28 and applied to LOCAL; it is a "
+    "governed schema change and belongs in REQUIRED_MIGRATIONS, but it is not "
+    "there yet because Railway does not have it. Adding it earlier would make "
+    "migrate --check report a chain this database has not run, which is the "
+    "verifier claiming a state production is not in. Move it to "
+    "REQUIRED_MIGRATIONS in the SAME change that records its Railway "
+    "application, and not before. Binds the canonical trg_<table>_touch "
+    "trigger on accounts, contacts, leads, customers, employees and "
+    "product_pricing, retiring four legacy-named triggers.")
+
 _SCHEMA_OOB = (
     "Historical schema operation applied out-of-band; it never entered the "
     "governed chain. This records what is true, not that the objects are "
@@ -459,6 +470,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "telephony.sql": _CORRECTION,
     "tenants.sql": _SCHEMA_OOB,
     "tier1_audit_instrumentation.sql": _SCHEMA_OOB,
+    "touch_updated_at_convergence.sql": _PENDING_DEPLOYMENT,
     "unified_comms_conversations.sql": _SCHEMA_OOB,
     "unified_comms_identity.sql": _SCHEMA_OOB,
     "update_product_images.sql": _CORRECTION,
