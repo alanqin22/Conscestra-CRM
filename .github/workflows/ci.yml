@@ -56,6 +56,11 @@ jobs:
         with:
           submodules: recursive
           token: ${{ secrets.GOVERNANCE_TOKEN }}
+          # By default checkout leaves the token in .git/config as an auth
+          # header for the rest of the job, where every later step -- and
+          # anything a dependency pulls in -- can read it. The submodule fetch
+          # happens inside the action, so dropping it afterwards costs nothing.
+          persist-credentials: false
       - uses: actions/setup-python@v5
         # 3.12 OR NEWER IS REQUIRED — do not lower this.
         #
@@ -157,6 +162,11 @@ jobs:
         with:
           submodules: recursive
           token: ${{ secrets.GOVERNANCE_TOKEN }}
+          # By default checkout leaves the token in .git/config as an auth
+          # header for the rest of the job, where every later step -- and
+          # anything a dependency pulls in -- can read it. The submodule fetch
+          # happens inside the action, so dropping it afterwards costs nothing.
+          persist-credentials: false
       - uses: actions/setup-python@v5
         # 3.12+ required — see the import-check job above.
         with: { python-version: '3.12', cache: pip }
