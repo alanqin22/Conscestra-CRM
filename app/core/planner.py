@@ -51,16 +51,36 @@ _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 # ============================================================================
 
 def _vocabulary() -> Dict[str, Dict[str, Any]]:
-    """intent → {kind, description} for every registered capability."""
+    """intent → {kind, description, required} for every capability.
+
+    `required` was missing here, and production paid for it. The drafter was
+    handed a capability list with no parameter contract, so it planned
+    `comms.select_channel` with no party_id; validate_plan checked only that
+    `params` was an object; and the omission surfaced four layers away as a
+    PostgreSQL uuid error. The capability already declares what it needs --
+    this makes that declaration visible to the two places that can act on it:
+    the prompt that drafts the plan, and the validator that accepts it."""
     from app.core.a2a import CAPABILITIES
-    return {c.intent: {"kind": c.kind, "description": c.description}
+    return {c.intent: {"kind": c.kind, "description": c.description,
+                       "required": list(c.params_schema[0])
+                                   if c.params_schema else []}
             for c in CAPABILITIES.values()}
 
 
 def _manifest_lines() -> str:
+    """The capability list the drafter sees.
+
+    Required parameters are named inline. Telling the model what a
+    capability NEEDS is what stops it planning a call that cannot be
+    executed -- validation alone would only reject the plan afterwards."""
     vocab = _vocabulary()
-    return "\n".join(f"- {intent} [{v['kind'].upper()}]: {v['description'][:140]}"
-                     for intent, v in sorted(vocab.items()))
+    out = []
+    for intent, v in sorted(vocab.items()):
+        req = (f" REQUIRES params: {', '.join(v['required'])}."
+               if v["required"] else "")
+        out.append(f"- {intent} [{v['kind'].upper()}]:{req} "
+                   f"{v['description'][:140]}")
+    return "\n".join(out)
 
 
 # ============================================================================
@@ -99,6 +119,15 @@ def validate_plan(plan: Any) -> List[str]:
             continue
         if not isinstance(s.get("params", {}), dict):
             errs.append(f"step {i}: params must be an object")
+        # A MISSING REQUIRED PARAM IS DELIBERATELY *NOT* AN ERROR HERE.
+        #
+        # An earlier version of this fix made it one, and that was wrong in
+        # a way worth recording: validate_plan rejects the WHOLE plan, so a
+        # single under-specified step killed four good ones. This wall is
+        # for problems that make a plan untrustworthy as a whole -- a
+        # hallucinated intent, a write count over the safety bound. A step
+        # that merely lacks an identifier is a LOCAL defect, and dropping
+        # just that step (see draft_plan) is both safer and more useful.
         if vocab[intent]["kind"] == "write":
             writes += 1
     max_writes = _cap("planner.max_writes", MAX_WRITES)
@@ -179,7 +208,26 @@ _TEMPLATE_RE = re.compile(r"^\s*(?:<.*>|\{\{.*\}\}|\[.*\])\s*$")
 #     campaign.winback) that needs no per-record params — those are unaffected.
 # Discovery reads (summaries/lists) and param-free writes are untouched. intent →
 # the param aliases that satisfy the requirement (any ONE is enough).
-_REQUIRES_PARAMS: Dict[str, tuple] = {
+# HAND-MAINTAINED, and deliberately "at least one of": these capabilities
+# accept alternative identifiers (an account OR an entity OR a lead), which
+# a flat required-list cannot express.
+#
+# IT IS NO LONGER THE ONLY SOURCE. This dict silently drifted from the
+# capability declarations: comms.select_channel declares party_id required
+# via params_schema and was simply never added here, so the drop mechanism
+# below -- which worked correctly -- never learned the step was
+# under-specified. The step was planned, dispatched, and died on a
+# PostgreSQL uuid cast.
+#
+# `draft_plan` now applies TWO rules rather than merging them into one, and
+# the difference is semantic rather than cosmetic: this dict means "at least
+# one of these", because these capabilities accept alternative identifiers,
+# while a declared `params_schema` means "all of these". Collapsing them into
+# a single merged list would have to pick one meaning and would be wrong for
+# whichever source it did not pick. A capability that declares its own schema
+# is therefore covered the moment it declares, without anyone remembering
+# this file — but by the second rule, not by an entry here.
+_ALTERNATIVE_IDS: Dict[str, tuple] = {
     # reads
     "accounting.account_balance": ("account", "account_id", "accountId"),
     "account.context":            ("account_id", "entity_id"),
@@ -247,8 +295,17 @@ def draft_plan(goal: str) -> Dict[str, Any]:
         clean_params, stripped = _sanitize_params(s.get("params") or {})
         if stripped:
             stripped_all[str(intent)] = stripped
-        need = _REQUIRES_PARAMS.get(intent)
+        # Two rules, each matching the semantics of its source.
+        #   alternatives  -> at least one of them must be present
+        #   declared schema -> ALL of them must be present
+        # Blank values never reach here: _sanitize_params already strips an
+        # empty string as a placeholder, so absence is the only shape.
+        need = _ALTERNATIVE_IDS.get(intent)
         if need and not any(k in clean_params for k in need):
+            dropped.append(str(intent))
+            continue
+        declared = vocab.get(intent, {}).get("required") or []
+        if declared and not all(k in clean_params for k in declared):
             dropped.append(str(intent))
             continue
         steps.append({"intent": intent,

@@ -124,10 +124,79 @@ _INVENTORY = {
           FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace
          WHERE n.nspname='public' AND c.contype <> 'n'""",
     # md5 of the body: a changed function must not read as unchanged.
+    #
+    # TWO EXCLUSIONS, BOTH LOAD-BEARING, BOTH THE SAME LESSON AS contype='n'
+    # ABOVE. Measured against Railway on 2026-08-27, this class reported 90
+    # differences. Eighty-nine were noise:
+    #
+    #   EXTENSION MEMBERS (37). pgcrypto and uuid-ossp are installed into a
+    #   schema named `extensions` on Railway and into `public` locally, so
+    #   every armor/crypt/pgp_*/uuid_generate_* function read as "missing on
+    #   the target" while being perfectly present. They are not application
+    #   objects and a migration will never create them; `pg_depend` with
+    #   deptype='e' is how PostgreSQL itself distinguishes them.
+    #
+    #   LINE ENDINGS (52). Railway's stored bodies carry a BLANK LINE after
+    #   every line — the signature of an LF -> CRLF -> LF double conversion in
+    #   transfer. compute_payment_status is 167 characters here and 177 there,
+    #   the difference being exactly ten newlines in a ten-line function; the
+    #   line-level diff is nothing but empty insertions. Hashing with runs of
+    #   newlines collapsed keeps the check honest about LOGIC without being
+    #   fooled by how the text travelled.
+    #
+    #   WHAT THAT NORMALISATION HIDES, stated so nobody has to rediscover it:
+    #   a change consisting ONLY of blank lines inside a string literal. No
+    #   logic change can take that shape, which is why the trade is worth
+    #   making — but it is a trade, not a free win.
+    #
+    # What remained after both exclusions was the real signal, and it was
+    # small enough to act on. That is the whole point: this check decides
+    # which schema is canonical, so noise in it is not cosmetic — it is a
+    # false answer to the question the CI baseline depends on.
+    #   ORPHAN TRIGGER FUNCTIONS. A function returning `trigger` that no
+    #   trigger is bound to cannot run. `trgfn_payment_event` is one, on BOTH
+    #   databases, and its bodies differ — local's carries an extra
+    #   `payment.received` emission block. Compared as an object it looks like
+    #   production is missing a business event; checked for reachability it is
+    #   dead code on both sides, because the event is actually emitted by
+    #   `trgfn_payment_received_event`, which IS bound to payments and whose
+    #   body is identical in both environments.
+    #
+    #   That false positive cost a full audit cycle and was reported as "the
+    #   central blocker". Worse, the recommended remedy — deploy local's copy —
+    #   would have been actively harmful had the function ever been bound: two
+    #   emitters, one duplicate `payment.received` per confirmed payment.
+    #
+    #   AN UNREACHABLE OBJECT IS NOT DRIFT YOU CAN ACT ON — but it is NOT
+    #   excluded here, and the first attempt to exclude it made things worse.
+    #   `_schema_inventory` runs against one database at a time and cannot know
+    #   the other side, so filtering orphans per-database is ASYMMETRIC: a
+    #   function bound here and unbound there vanishes from one set and not the
+    #   other, manufacturing a difference and double-reporting the missing
+    #   trigger that already appears in the `triggers` class.
+    #
+    #   So the comparison stays symmetric and `orphan_functions` below reports
+    #   reachability as its own fact. A reviewer seeing a name in BOTH the
+    #   functions diff and both sides' orphan list knows the difference is dead
+    #   code. That is the judgement a person should make with the evidence in
+    #   front of them, not one this query should make for them.
     "functions": """
-        SELECT p.proname || ':' || md5(coalesce(p.prosrc,''))
+        SELECT p.proname || ':' || md5(
+                 regexp_replace(replace(coalesce(p.prosrc,''), chr(13), ''),
+                                chr(10) || '+', chr(10), 'g'))
           FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-         WHERE n.nspname='public'""",
+         WHERE n.nspname='public'
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                            WHERE d.objid = p.oid AND d.deptype = 'e')""",
+    # Reported, but as its own class: an unbound trigger function is dead code,
+    # not a behavioural difference. Naming them separately means a reviewer sees
+    # "these exist and run nowhere" instead of "production is missing logic".
+    "orphan_functions": """
+        SELECT p.proname
+          FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+         WHERE n.nspname='public' AND p.prorettype = 'trigger'::regtype
+           AND NOT EXISTS (SELECT 1 FROM pg_trigger t
+                            WHERE t.tgfoid = p.oid AND NOT t.tgisinternal)""",
     "triggers": """
         SELECT c.relname || '.' || t.tgname FROM pg_trigger t
           JOIN pg_class c ON c.oid=t.tgrelid

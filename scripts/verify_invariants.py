@@ -220,7 +220,7 @@ def check_migration_overlap() -> None:
     deploy."""
     import re
     from app.core.deploy_state import REQUIRED_MIGRATIONS
-    sql_dir = Path(__file__).resolve().parents[1] / "sql"
+    from app.core.artifact_paths import SQL_DIR as sql_dir
     seen: dict = {}
     for name in REQUIRED_MIGRATIONS:
         path = sql_dir / name

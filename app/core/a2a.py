@@ -334,6 +334,19 @@ def _reg(*caps: Capability) -> Dict[str, Capability]:
 _AMBIENT_PARAMS = frozenset({
     "message", "correlation_id", "session_id", "sessionId",
     "actor", "created_by", "updated_by", "reason", "source",
+    # JUSTIFICATION FOR THE APPROVER, not input for the capability.
+    #
+    # `data_quality.propose_fixes` attaches {"why": …, "evidence": {…}} to every
+    # proposal it raises, so a human deciding it can see the detector, the count
+    # and the reasoning. They are the same category as `reason`, which was
+    # already here: written by the PROPOSAL layer for the person reading the
+    # queue, never read by the handler that eventually executes.
+    #
+    # Added after declaring a contract for `data.merge_contacts` made a real
+    # 2026-07-10 approval un-executable — the same defect as R-11, reintroduced
+    # one capability over. Listing them here fixes it for every schema that
+    # gets written later rather than for the one that happened to be noticed.
+    "why", "evidence",
 })
 
 
@@ -795,7 +808,14 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "write a governed model parameter (churn-band thresholds); "
                "proposed by the learning loop from calibration evidence, "
                "bounds-enforced, executes on governance approval, undoable",
-               sp=_sp_tuning_adjust),
+               sp=_sp_tuning_adjust,
+               # PRESENCE AND SHAPE ONLY — the bounds stay in tuning.apply(),
+               # which enforces the hard limits and band ordering against the
+               # live parameter set. A range check here would be a second copy
+               # of a rule with one owner, and the copy that drifts is the one
+               # nobody watches. `value` is required so a missing one is
+               # refused at the boundary rather than reaching float(None).
+               params_schema=(("param", "value"), ("why",))),
     Capability("meeting.book", "activities", "", "write",
                lambda p: (f"book a meeting with "
                           f"{p.get('entity_type', 'lead')} "
@@ -811,7 +831,23 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "publish a knowledge-base article (mined from a resolved "
                "support thread, LLM-drafted, critic-checked); executes on "
                "governance approval; undo retires the article",
-               sp=_sp_kb_publish),
+               sp=_sp_kb_publish,
+               # knowledge.publish() already refuses a blank title/problem/
+               # answer and an answer below MIN_ANSWER_CHARS, and holds the
+               # source_ref idempotency. Declaring the contract here moves the
+               # PRESENCE check to the boundary — so a malformed draft is
+               # `rejected` before the handler runs rather than raising
+               # ValueError inside it — and gives the planner a contract it can
+               # read. The length rule stays where it can see the corpus.
+               # `audience` is declared because knowledge.publish() now HONOURS
+               # it. Declaring a field the handler ignores would be its own
+               # small lie — and writing this contract is what exposed that it
+               # was being ignored: the case-derived miner proposes
+               # audience='internal' precisely so a fresh candidate stays away
+               # from externally reachable agents, and the column default is
+               # 'public'. See R-12 in knowledge.publish.
+               params_schema=(("title", "problem", "answer"),
+                              ("keywords", "source", "source_ref", "audience"))),
     Capability("crm.context", "orchestrator", "", "read",
                lambda p: f"context: {p.get('entity_type', 'account')} "
                          f"{p.get('entity_id', '')}",
@@ -885,7 +921,16 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "data-quality fix: merge duplicate contacts (same account + "
                "email) into the oldest — activities reassigned, dupes "
                "soft-deleted, every move recorded, undoable",
-               sp=_sp_dq_merge_contacts),
+               sp=_sp_dq_merge_contacts,
+               # No required field: the handler selects its own duplicate set
+               # and takes no identifier. `limit` is the only knob, and it is
+               # already clamped to FIX_LIMIT inside merge_contacts_sp — so the
+               # value stays bounded there and the contract only says the field
+               # exists. Declaring the empty contract still buys the
+               # unexpected-key rejection, which is what stops an LLM handing
+               # this capability a stray `force` or `account_id` it would
+               # silently ignore.
+               params_schema=((), ("limit",))),
     Capability("data.erase_record", "lifecycle", "", "write",
                lambda p: f"erase personal data for {p.get('entity','record')} "
                          f"{str(p.get('record_id',''))[:8]}",
@@ -894,7 +939,15 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "links), de-link activity history, and redact the core record, "
                "while RETAINING financial, suppression and audit records by "
                "policy. IRREVERSIBLE — there is no undo",
-               sp=_sp_data_erase_record),
+               sp=_sp_data_erase_record,
+               # THE ONE WHERE THE BOUNDARY MATTERS MOST. There is no undo
+               # handler for this action by design, so a malformed request must
+               # be refused BEFORE the handler opens its transaction — not
+               # discovered by `erase_sp` raising LifecycleError partway in.
+               # Both fields are required: `_plan(entity)` decides what gets
+               # deleted, de-linked and retained, so an absent or blank entity
+               # is not a call this capability can safely interpret.
+               params_schema=(("entity", "record_id"), ())),
     Capability("identity.materialize_link", "identity_resolution", "", "write",
                lambda p: f"merge duplicate {p.get('entity', 'record')} into its primary",
                "identity resolution: physically merge an ALREADY-CONFIRMED duplicate "
@@ -1435,8 +1488,12 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
                                  error=f"skipped by governance — confidence "
                                        f"{req.confidence} < {governance.propose_min()}")
             if d == "propose":
-                # _correlation_id ties the approval to this play's trace
-                # (hidden from the approval UI, dropped before execution).
+                # _correlation_id ties the approval to this play's trace. It is
+                # hidden from the approval UI and removed again by
+                # `governance.strip_internal` before the approved action is
+                # re-dispatched — this comment previously claimed the removal
+                # happened and it did not, so every capability with a
+                # params_schema refused its own approved execution.
                 p = dict(req.params)
                 p["_correlation_id"] = cid
                 aid = governance.propose(

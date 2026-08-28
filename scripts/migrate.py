@@ -33,7 +33,7 @@ from app.core.deploy_state import (                      # noqa: E402
     require_disposition, residual_transaction_control,
     strip_outer_transaction)
 
-SQL_DIR = Path(__file__).resolve().parents[1] / "sql"
+from app.core.artifact_paths import SQL_DIR             # noqa: E402
 
 _LEDGER = """
 CREATE TABLE IF NOT EXISTS public.schema_migrations (

@@ -461,7 +461,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "workflow_revival.sql": _SCHEMA_OOB,
 }
 
-_SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
+from app.core.artifact_paths import SQL_DIR as _SQL_DIR
 
 
 def _dollar_quoted_spans(sql: str) -> "list[tuple[int, int]]":

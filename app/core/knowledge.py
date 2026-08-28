@@ -525,17 +525,56 @@ def publish(article: Dict[str, Any], created_by: str = "governance") -> Dict[str
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            # AUDIENCE IS CARRIED, NOT DROPPED (R-12).
+            #
+            # `draft_pass` proposes a case-derived candidate as
+            # audience='internal' on purpose: case text is customer-specific by
+            # origin, and U2's reach_invariant lets an externally reachable
+            # agent read only the `public` tier. That intent travelled all the
+            # way into the approval's params and then stopped here — this
+            # INSERT never named the column, so PostgreSQL applied its DEFAULT,
+            # which is 'public'. Approving such a draft would have published
+            # support-case material to customer-facing agents.
+            #
+            # Latent rather than live when found: no case-derived draft had yet
+            # been proposed in this database, so no article was mis-tiered.
+            #
+            # Absent audience still takes the column default, so the gap-miner
+            # path (FAQ answers genuinely meant for customers) is unchanged.
+            # Only an EXPLICIT tier is now honoured, and only the two values
+            # the retrieval layer recognises are accepted — an unrecognised
+            # tier falls back to the default rather than creating a third,
+            # invisible tier that `audience='public'` filters would never match.
+            # The column is conditional: `kb_enrichment.sql` may not be applied
+            # on every database, which is why _has_audience() exists at all.
+            # Naming it unconditionally would turn a missing migration into a
+            # failure to publish anything.
+            audience = str(article.get("audience") or "").strip().lower()
+            audience = audience if audience in ("public", "internal") else None
+            aud_col, aud_val, aud_arg = "", "", ()
+            if _has_audience():
+                aud_col, aud_val, aud_arg = ", audience", ", COALESCE(%s,'public')", (audience,)
+            elif audience == "internal":
+                # Refuse rather than silently publish an internal-tier article
+                # into a schema that cannot express the restriction. Failing to
+                # publish is recoverable; publishing case material to
+                # customer-facing agents is not.
+                return {"ok": False,
+                        "error": "this article is tiered 'internal' but the "
+                                 "audience column is absent (apply "
+                                 "sql/kb_enrichment.sql) — refusing to publish "
+                                 "it where the tier cannot be enforced"}
             cur.execute(
-                """INSERT INTO knowledge_articles
+                f"""INSERT INTO knowledge_articles
                      (title, problem, answer, keywords, source, source_ref,
-                      created_by)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s)
+                      created_by{aud_col})
+                   VALUES (%s,%s,%s,%s,%s,%s,%s{aud_val})
                    ON CONFLICT (source_ref) WHERE source_ref IS NOT NULL
                    DO NOTHING
                    RETURNING article_uuid::text""",
                 (title[:180], problem[:2000], answer[:4000], keywords,
                  article.get("source", "agent"), article.get("source_ref"),
-                 created_by))
+                 created_by) + aud_arg)
             r = cur.fetchone()
         conn.commit()
     finally:

@@ -18,7 +18,7 @@ Read-only; admin-gated in main.py.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
 
@@ -27,29 +27,66 @@ from app.core.database import get_connection
 logger = logging.getLogger("trace")
 
 
-def _rows(sql: str, args: tuple) -> List[tuple]:
-    """One best-effort query on its own connection ([] on any failure)."""
-    conn = get_connection()
+def _rows(sql: str, args: tuple, _status: Optional[Dict[str, Any]] = None,
+          _name: str = "") -> List[tuple]:
+    """One best-effort query on its own connection ([] on any failure).
+
+    When `_status` is supplied, the outcome is RECORDED there. That is the
+    whole of G-08: this function returns [] both when a source genuinely has no
+    rows for this play and when the source could not be read at all, and the
+    caller could not tell those apart. An incident review then reads a
+    four-step trace and concludes the play was simple, when in truth one source
+    was unreachable and contributed nothing, silently — the same
+    "absence of evidence read as evidence of absence" this codebase kills
+    everywhere else.
+
+    Still best-effort by construction: a trace that fails because one of its
+    sources is missing is a trace nobody can use during an incident.
+    """
+    # get_connection() IS INSIDE THE TRY, and that is a fix rather than a
+    # style choice. It used to sit above it, so this function tolerated a
+    # failing QUERY (a missing table) but not a failing CONNECTION — the
+    # module docstring promised best-effort and the code delivered it for only
+    # one of the two ways a source can be unavailable. A database blip took
+    # the whole trace down at precisely the moment someone needed it.
+    conn = None
     try:
+        conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(sql, args)
-            return cur.fetchall()
+            rows = cur.fetchall()
+        if _status is not None:
+            _status[_name] = {"ok": True, "rows": len(rows)}
+        return rows
     except Exception as exc:
         logger.debug(f"[trace] source skipped: {exc}")
+        if _status is not None:
+            _status[_name] = {"ok": False, "rows": 0, "error": str(exc)[:160]}
         return []
     finally:
-        conn.close()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:               # a broken connection cannot leak
+                pass
 
 
 def build(correlation_id: str) -> Dict[str, Any]:
-    """Stitch every recorded step for one correlation id, oldest first."""
+    """Stitch every recorded step for one correlation id, oldest first.
+
+    The result carries `sources`: per-source {ok, rows}. A trace that cannot
+    say which of its inputs it actually read is a trace that cannot be trusted
+    during the incident it exists for.
+    """
     cid = (correlation_id or "").strip()
     steps: List[Dict[str, Any]] = []
+    sources: Dict[str, Any] = {}
 
     for r in _rows(
             """SELECT at, from_agent, agent, intent, kind, ok, error, latency_ms,
                       outcome, principal
-               FROM a2a_dispatches WHERE correlation_id=%s""", (cid,)):
+               FROM a2a_dispatches WHERE correlation_id=%s""", (cid,),
+            sources, "a2a_dispatches"):
         steps.append({
             "at": r[0].isoformat(), "source": "a2a",
             "label": f"{r[1] or '?'} → {r[2] or '?'}.{r[3]}",
@@ -66,7 +103,8 @@ def build(correlation_id: str) -> Dict[str, Any]:
     for r in _rows(
             """SELECT created_at, event_type, entity_type, entity_uuid::text,
                       source_system
-               FROM events WHERE correlation_id::text=%s""", (cid,)):
+               FROM events WHERE correlation_id::text=%s""", (cid,),
+            sources, "events"):
         steps.append({
             "at": r[0].isoformat(), "source": "event",
             "label": f"{r[1]} ({r[2] or 'no entity'})",
@@ -77,7 +115,8 @@ def build(correlation_id: str) -> Dict[str, Any]:
                       status, decided_by, decided_at, confidence
                FROM action_approvals
                WHERE params->>'_correlation_id'=%s
-                  OR params->>'plan_correlation_id'=%s""", (cid, cid)):
+                  OR params->>'plan_correlation_id'=%s""", (cid, cid),
+            sources, "action_approvals"):
         steps.append({
             "at": r[0].isoformat(), "source": "approval",
             "label": f"{r[2]} [{r[4]}]",
@@ -88,7 +127,8 @@ def build(correlation_id: str) -> Dict[str, Any]:
 
     for r in _rows(
             """SELECT created_at, playbook, entity_type, step_no, status, outcome
-               FROM agent_sequences WHERE correlation_id=%s""", (cid,)):
+               FROM agent_sequences WHERE correlation_id=%s""", (cid,),
+            sources, "agent_sequences"):
         steps.append({
             "at": r[0].isoformat(), "source": "sequence",
             "label": f"{r[1]} ({r[2]}) step {r[3]} [{r[4]}]",
@@ -100,7 +140,8 @@ def build(correlation_id: str) -> Dict[str, Any]:
     # the model actually saw.
     try:
         from app.core import grounding
-        for g in grounding.for_correlation(cid):
+        found = grounding.for_correlation(cid)
+        for g in found:
             steps.append({
                 "at": g["at"], "source": "memory",
                 "label": (f"retrieved {g['result_count']} record(s) "
@@ -108,11 +149,22 @@ def build(correlation_id: str) -> Dict[str, Any]:
                           f"{g.get('entity_type') or '?'} — {(g.get('query') or '')[:60]}"),
                 "detail": {"audience": g["audience"], "sources": g["sources"],
                            "entity_id": g.get("entity_id")}})
+        sources["memory_retrievals"] = {"ok": True, "rows": len(found)}
     except Exception as exc:
         logger.debug(f"[trace] grounding section skipped: {exc}")
+        sources["memory_retrievals"] = {"ok": False, "rows": 0,
+                                        "error": str(exc)[:160]}
 
     steps.sort(key=lambda s: s["at"])
-    return {"correlation_id": cid, "entries": len(steps), "trace": steps}
+    unread = sorted(n for n, s in sources.items() if not s["ok"])
+    return {"correlation_id": cid, "entries": len(steps), "trace": steps,
+            # WHAT THIS TRACE COULD AND COULD NOT SEE. `complete` is the single
+            # field a reader must check before concluding anything from the
+            # absence of a step: a short trace and a partially-read trace look
+            # identical without it.
+            "sources": sources,
+            "complete": not unread,
+            "unread_sources": unread}
 
 
 router = APIRouter(tags=["trace"])

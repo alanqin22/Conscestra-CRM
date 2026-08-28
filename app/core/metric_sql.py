@@ -58,7 +58,8 @@ from app.core.metrics import (
 )
 
 # sql/ sits beside app/ at the repo root.
-OUT_PATH = Path(__file__).resolve().parents[2] / "sql" / "metric_registry.sql"
+from app.core.artifact_paths import SQL_DIR as _SQL_DIR
+OUT_PATH = _SQL_DIR / "metric_registry.sql"
 
 _BANNER = """\
 -- ===========================================================================
