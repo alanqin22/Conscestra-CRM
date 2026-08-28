@@ -123,6 +123,20 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      # THE GUARD MUST NOT LIVE INSIDE THE THING IT GUARDS. These assertions
+      # forbid a job-level `if:` on a verification job -- but they used to run
+      # only inside the gate, so adding a false condition to the gate skipped
+      # the very test that would have objected. Measured on PR #53: the gate
+      # reported SKIPPED, and mergeStateStatus went to CLEAN.
+      #
+      # `checks` carries no condition and is required, so running them here
+      # means a condition added to the gate is caught even when the gate does
+      # not run. They need only PyYAML and the checkout.
+      - name: Workflow cannot be made skippable
+        run: >-
+          python -m pytest -q -p no:cacheprovider
+          governance/tests/test_workflow_cannot_skip_verification.py
+
       # Phase 4 gate. Runs the derivation pipeline end to end against a FROZEN
       # corpus that carries its own embeddings — no database, so this is the
       # only behavioural coverage CI has. Any movement in clustering,
@@ -265,3 +279,45 @@ jobs:
       # Any control count in a report must be DERIVED from the repository, not
       # typed into it. Non-zero if a gate artefact is untracked.
       - run: python -m scripts.control_inventory
+
+
+  # WHY THIS JOB EXISTS, and why it is the check that matters.
+  #
+  # GitHub treats a SKIPPED required status check as a PASSING one. That is not
+  # a theory here: PR #53 was pushed a one-line `if:` on the gate, the gate
+  # reported SKIPPED, and the pull request went to mergeStateStatus CLEAN with
+  # the gate having verified nothing.
+  #
+  # A required check therefore cannot defend against its own skipping. This job
+  # can, because `if: always()` runs it even when everything it needs was
+  # skipped or failed, and it then FAILS on any result that is not `success`.
+  # A skip upstream becomes a red check here, which is the semantics the
+  # ruleset needed and does not have.
+  #
+  # RESIDUAL RISK, stated rather than papered over: this is still a job defined
+  # in the repository, so anyone who can edit `.github/workflows/` can edit
+  # this too. No arrangement of required checks can survive an author who is
+  # willing to disable them; the honest defence for that is review on
+  # `.github/**`, which needs a second maintainer. What this DOES close is the
+  # realistic case -- a condition added for a good reason by someone who does
+  # not know it silently disarms the gate.
+  gate-report:
+    name: gate ran
+    runs-on: ubuntu-latest
+    needs: [checks, integration]
+    if: always()
+    steps:
+      - name: Every required job must have actually succeeded
+        run: |
+          echo "checks      = ${{ needs.checks.result }}"
+          echo "integration = ${{ needs.integration.result }}"
+          fail=0
+          for pair in "checks:${{ needs.checks.result }}"                       "integration:${{ needs.integration.result }}"; do
+            job="${pair%%:*}"; res="${pair##*:}"
+            if [ "$res" != "success" ]; then
+              echo "::error::$job did not succeed (result: $res). A skipped or"
+              echo "::error::failed verification is not a passing one."
+              fail=1
+            fi
+          done
+          exit $fail
