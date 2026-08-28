@@ -114,11 +114,23 @@ class Stage:
 # A skip is only acceptable when someone has written down why, in the same
 # spirit as NOT_GATED_HERE below: an absence that is declared is a decision,
 # and an absence that is not is an accident wearing a green tick.
+# DELIBERATELY NOT DECLARED: "00_base_schema.sql is not present in this
+# checkout". That skip guards the baseline controls, and its cause would be a
+# `governance` submodule that failed to check out -- exactly the condition this
+# whole gate exists to catch. Declaring it would let a missing baseline turn
+# the strongest controls into quiet skips and still report PASS. Leaving it
+# undeclared means that day is a FAILURE, which is the point.
 DECLARED_SKIPS: List[Tuple[str, str]] = [
     ("no contacts in this database",
      "the gate builds its database from the baseline and seeds only the "
      "knowledge base, so it holds no business rows. This control needs one "
      "contact. It runs locally and against production; it does not run here."),
+    ("RAILWAY_DB_URL not configured",
+     "this control reads PRODUCTION read-only, to confirm a historical ledger "
+     "row was not tidied away. CI deliberately holds no production "
+     "credentials: handing a public repository's runner a production DSN to "
+     "raise a control count would be a bad trade. Runs from an operator "
+     "machine that has the DSN."),
     ("filesystem rejected every name containing a space",
      "the adversarial-filename fixture cannot be built where the filesystem "
      "refuses spaces. Not expected on Linux or Windows; declared so a genuinely "
