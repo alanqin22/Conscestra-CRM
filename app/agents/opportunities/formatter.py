@@ -309,10 +309,41 @@ def _render_contact_detail(out: list, contact: dict, report_data: dict, meta_raw
 
 # ── Subtable helper for multi-dimension reports ───────────────────────────────
 
+# How many valued rows a breakdown table lists before it stops. Beyond this the
+# ranking has stopped being a ranking and become a directory.
+BREAKDOWN_ROW_CAP = 20
+
+
+def _is_unvalued(r: dict) -> bool:
+    """No money attached yet -- as distinct from a genuine zero.
+
+    An opportunity created by converting a lead has a name, a stage and a
+    close date, but no amount and no product lines: nothing has been quoted.
+    That is a real and correct state, and it is NOT the same fact as "$0.00".
+    """
+    return all(_safe_num(r.get(k)) == 0 for k in
+               ('amount', 'weighted_amount', 'margin_dollars',
+                'weighted_margin_dollars'))
+
+
 def _render_breakdown_table(out: list, title: str, data: list, name_col: str, name_label: str, extra_cols: list = None):
     """
     Render a 6-column breakdown table (name, count, amount, weighted, margin$, w-margin$)
     with a running totals footer row.
+
+    TWO THINGS THIS DOES NOT DO, both learned from a report that showed 54
+    accounts as "1  $0.00  $0.00  $0.00  $0.00":
+
+    1. It does not list an unvalued row as a money row. 63 of 113 open
+       opportunities carry no amount because they were converted from leads and
+       nothing has been quoted yet. Printed as $0.00 they are indistinguishable
+       from an account that genuinely won nothing, and there were enough of
+       them to fill the screen and bury the accounts that matter.
+    2. It does not print an unbounded number of rows. A breakdown with 100
+       entries is a directory, not a ranking.
+
+    Both groups are still COUNTED in the totals footer, and both are announced
+    in words. A table that silently drops rows is worse than one that is long.
     """
     if not data:
         return
@@ -320,6 +351,12 @@ def _render_breakdown_table(out: list, title: str, data: list, name_col: str, na
     # what each owner/account/product/source contributes to the bottom line,
     # rather than the SP's default Weighted-Amount (revenue) ordering.
     data = sorted(data, key=lambda r: _safe_num(r.get('weighted_margin_dollars')), reverse=True)
+
+    valued = [r for r in data if not _is_unvalued(r)]
+    unvalued = [r for r in data if _is_unvalued(r)]
+    shown = valued[:BREAKDOWN_ROW_CAP]
+    hidden = valued[len(shown):]
+
     out.append(f'#### {title}')
     out.append('')
     out.append(_md_header([name_label, 'Count', 'Amount', 'Weighted Amount', 'Margin Dollars', 'Weighted Margin']))
@@ -335,9 +372,34 @@ def _render_breakdown_table(out: list, title: str, data: list, name_col: str, na
         totals['w_amt']  += w_amt
         totals['margin'] += margin
         totals['w_margin'] += w_mrg
-        label = r.get(name_col) or 'N/A'
-        out.append(_md_row([label, int(cnt), _fmt_currency(amt), _fmt_currency(w_amt), _fmt_currency(margin), _fmt_currency(w_mrg)]))
+        # Totals accumulate over EVERY row above; only the shown ones print.
+        if r in shown:
+            label = r.get(name_col) or 'N/A'
+            out.append(_md_row([label, int(cnt), _fmt_currency(amt), _fmt_currency(w_amt), _fmt_currency(margin), _fmt_currency(w_mrg)]))
+
+    # One line for everything held back, so nothing disappears silently.
+    if hidden:
+        h_cnt = sum(_safe_num(r.get('opportunity_count')) for r in hidden)
+        h_amt = sum(_safe_num(r.get('amount')) for r in hidden)
+        h_wamt = sum(_safe_num(r.get('weighted_amount')) for r in hidden)
+        h_mrg = sum(_safe_num(r.get('margin_dollars')) for r in hidden)
+        h_wmrg = sum(_safe_num(r.get('weighted_margin_dollars')) for r in hidden)
+        out.append(_md_row([f'_+{len(hidden)} more with value_', int(h_cnt),
+                            _fmt_currency(h_amt), _fmt_currency(h_wamt),
+                            _fmt_currency(h_mrg), _fmt_currency(h_wmrg)]))
+    if unvalued:
+        u_cnt = sum(_safe_num(r.get('opportunity_count')) for r in unvalued)
+        out.append(_md_row([f'_{len(unvalued)} not yet valued_', int(u_cnt),
+                            '—', '—', '—', '—']))
+
     out.append(_md_row(['**Total**', int(totals['cnt']), _fmt_currency(totals['amt']), _fmt_currency(totals['w_amt']), _fmt_currency(totals['margin']), _fmt_currency(totals['w_margin'])]))
+    if unvalued:
+        out.append('')
+        out.append(f'> {len(unvalued)} {name_label.lower()}(s) carry '
+                   f'{int(sum(_safe_num(r.get("opportunity_count")) for r in unvalued))} '
+                   f'opportunit(ies) with no amount yet — converted from leads '
+                   f'and not quoted. Shown as — rather than $0.00, which would '
+                   f'read as "won nothing".')
     out.append('')
 
 
