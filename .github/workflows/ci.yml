@@ -154,8 +154,16 @@ jobs:
     services:
       postgres:
         # pgvector, not stock postgres: the baseline issues CREATE EXTENSION
-        # vector, and on postgres:16 that aborts the restore.
-        image: pgvector/pgvector:pg16
+        # vector, and on stock postgres that aborts the restore.
+        #
+        # pg18 BECAUSE THAT IS WHAT PRODUCTION RUNS (Railway 18.4, see
+        # docs/runbook_restore.md). This was pg16 for one run and the baseline
+        # failed to apply at line 62: `SET transaction_timeout = 0`, a GUC that
+        # did not exist before PostgreSQL 17, emitted by the 17.9 pg_dump that
+        # produced the file. Testing a database the product does not run on is
+        # the same mistake this workflow already made once with Python 3.11 --
+        # see the setup-python comment. Do not lower this to match the dump.
+        image: pgvector/pgvector:pg18
         env:
           POSTGRES_PASSWORD: ci
           POSTGRES_DB: crmdb
