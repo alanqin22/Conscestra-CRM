@@ -208,6 +208,23 @@ jobs:
           -f governance/schema/00_base_schema.sql
       - run: python -m scripts.migrate
       - run: python -m scripts.migrate --check
+
+      # WHAT THE BASELINE CANNOT CARRY. `app_role.sql` is a declared migration
+      # and the baseline's schema_migrations ledger records it as applied, so
+      # `migrate` above correctly skips it. But its effect is `CREATE ROLE
+      # crm_app`, and a role is CLUSTER-level: a --no-owner --no-privileges
+      # dump of one DATABASE cannot contain it. The migration is therefore
+      # marked done while its object does not exist here, and
+      # verify_invariants fails with "FAILED: app role crm_app exists".
+      #
+      # The file is idempotent (CREATE ROLE ... IF NOT EXISTS), NOLOGIN and
+      # needs no password, so re-applying it is safe and gives the privilege
+      # checks below something real to assert against.
+      - name: Recreate cluster-level objects the dump cannot hold
+        run: >-
+          psql "$DATABASE_URL" --single-transaction --set ON_ERROR_STOP=1
+          -f governance/sql/app_role.sql
+
       - run: python -m scripts.verify_invariants
 
       # The gate provisions its OWN scratch database and drops it, so it is
