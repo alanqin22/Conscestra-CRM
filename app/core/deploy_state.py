@@ -139,6 +139,14 @@ REQUIRED_MIGRATIONS: List[str] = [
     # Railway once caused a fifteen-day outage in which every valid coupon was
     # refused, and nothing detected it. Now a clean deployment must have it.
     "promotions_coupons.sql",
+    # PROMOTED 2026-08-28, and only after Railway had it. It sat in
+    # OUT_OF_BAND_SQL marked PENDING DEPLOYMENT while it was applied
+    # locally but not to production, because this list is a claim about
+    # what production has RUN -- putting it here first would have made
+    # migrate --check report a chain production had not executed.
+    # Verified before promotion: all six canonical triggers present on
+    # Railway, zero legacy triggers surviving.
+    "touch_updated_at_convergence.sql",
 ]
 
 
@@ -173,6 +181,17 @@ REQUIRED_MIGRATIONS: List[str] = [
 # entries whose reason begins REVIEW are exactly where that claim may in fact
 # be true, and they are named rather than quietly resolved.
 
+# THE LIFECYCLE MARKER, kept after its first use rather than deleted.
+# A governed schema change passes through three states, and the middle one
+# had no name until 2026-08-28:
+#
+#   1. authored + classified here, applied locally  -> PENDING DEPLOYMENT
+#   2. applied to production                        -> verified directly
+#   3. moved into REQUIRED_MIGRATIONS               -> claimed as run
+#
+# Skipping straight to (3) is the failure this prevents: REQUIRED_MIGRATIONS
+# is a claim about what PRODUCTION has executed, and migrate --check reads
+# it as one. The next migration of this shape should reuse this marker.
 _PENDING_DEPLOYMENT = (
     "PENDING DEPLOYMENT -- authored 2026-08-28 and applied to LOCAL; it is a "
     "governed schema change and belongs in REQUIRED_MIGRATIONS, but it is not "
@@ -470,7 +489,6 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "telephony.sql": _CORRECTION,
     "tenants.sql": _SCHEMA_OOB,
     "tier1_audit_instrumentation.sql": _SCHEMA_OOB,
-    "touch_updated_at_convergence.sql": _PENDING_DEPLOYMENT,
     "unified_comms_conversations.sql": _SCHEMA_OOB,
     "unified_comms_identity.sql": _SCHEMA_OOB,
     "update_product_images.sql": _CORRECTION,
