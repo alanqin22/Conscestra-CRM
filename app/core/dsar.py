@@ -192,8 +192,14 @@ CHILD: Dict[str, Tuple[str, str, str]] = {
 # EXCLUDED: table -> why. A reason is mandatory. "We didn't think of it" is not
 # one of these, which is the point of making the list explicit.
 EXCLUDED: Dict[str, str] = {
-    "employees":    "Staff record, not customer data. A staff member's own DSAR "
-                    "is a separate request against subject_type='employee'.",
+    "employees":    "Staff record, not customer data. KNOWN LIMITATION: the "
+                    "staff-subject path this implies does NOT exist -- "
+                    "_resolve() accepts only contact/lead/account/email. See "
+                    "staff_personhood(), which answers the prerequisite "
+                    "question (13 of 21 rows are software agents, not people) "
+                    "and names the blocker: owners.employee_uuid is populated "
+                    "on 0 of 44 rows, so one person's ownership and authorship "
+                    "records cannot be assembled.",
     "owners":       "Staff record — see employees.",
     "executives":   "Staff record — see employees.",
     "professionals": "Staff record — see employees.",
@@ -332,6 +338,112 @@ SECRET_COLUMNS = {"password_hash", "password", "secret", "token", "token_hash",
                   # to which address, when, and whether it was used is genuinely
                   # the subject's data. Only the credential is withheld.
                   "code_hash"}
+
+
+# ============================================================================
+# WHICH STAFF ROWS ARE PEOPLE
+# ============================================================================
+# THE PREREQUISITE FOR A STAFF EXPORT, and the reason there is not one yet.
+# `employees`/`owners`/`executives`/`professionals` are EXCLUDED from customer
+# exports with the note "a staff member's own DSAR is a separate request
+# against subject_type='employee'". _resolve() has never accepted that value,
+# so the note describes a plan rather than a path. Before it can become one,
+# the system has to answer a question it currently cannot:
+#
+#     WHICH OF THESE ROWS IS A NATURAL PERSON?
+#
+# Measured 2026-08-28: of 21 `employees`, 13 are SOFTWARE -- agent identities
+# like agent.lead@system.internal. A software agent has no Art. 15 rights, and
+# an "employee export" that returned one would be a category error; one that
+# skipped a real person would be a breach. Neither available signal is
+# sufficient on its own:
+#
+#   role='agent'                misses `System Admin`, whose role reads
+#                               'Administrator' though it is a service account
+#   email LIKE '%@system.internal'  catches it, but keys identity off a MUTABLE
+#                               ATTRIBUTE -- the mistake that silently
+#                               re-labelled 39 customers during a seed
+#                               migration. An address is not an identity.
+#
+# So personhood is DECLARED, and anything the declaration cannot classify is a
+# failure rather than a guess. Same shape as EXCLUDED: a reason is mandatory,
+# and an unclassifiable row stops an export instead of being assumed one way.
+
+# Roles that denote software rather than a person.
+SERVICE_IDENTITY_ROLES: Tuple[str, ...] = ("agent",)
+
+# Service accounts whose ROLE does not give them away, declared individually
+# so each one is a decision somebody made. Keyed on employee_uuid -- the
+# primary key -- and never on the address, which can change.
+SERVICE_IDENTITY_EXCEPTIONS: Dict[str, str] = {
+    "admin@system.internal":
+        "the platform service account. Its role reads 'Administrator', which "
+        "is indistinguishable from a human administrator by role alone, so it "
+        "is named here instead. Resolved to a uuid at read time; the address "
+        "is the human-readable key, not the identity.",
+}
+
+
+def staff_personhood() -> Dict[str, Any]:
+    """Classify every staff row as a data subject or a service identity.
+
+    Fail-closed: `unclassifiable` being non-empty means a staff export cannot
+    be certified, exactly as `undeclared` does for the customer manifest.
+    """
+    people: List[Dict[str, Any]] = []
+    services: List[Dict[str, Any]] = []
+    unclassifiable: List[Dict[str, Any]] = []
+    conn = get_connection()
+    try:
+        conn.set_session(readonly=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.employees')")
+            if cur.fetchone()[0] is None:
+                return {"people": [], "services": [], "unclassifiable": [],
+                        "ok": True, "reason": "no employees table here"}
+            cur.execute("""SELECT employee_uuid::text, employee_id::text,
+                                  COALESCE(first_name,'') || ' ' ||
+                                  COALESCE(last_name,''), email, role
+                             FROM public.employees""")
+            for uuid_, eid, name, email, role in cur.fetchall():
+                row = {"employee_uuid": uuid_, "employee_id": eid,
+                       "name": name.strip(), "email": email, "role": role}
+                if (role or "").lower() in SERVICE_IDENTITY_ROLES:
+                    row["why"] = f"role={role!r} denotes software"
+                    services.append(row)
+                elif (email or "").lower() in SERVICE_IDENTITY_EXCEPTIONS:
+                    row["why"] = SERVICE_IDENTITY_EXCEPTIONS[(email or "").lower()]
+                    services.append(row)
+                elif not (name.strip() and email):
+                    row["why"] = "no name or no address -- cannot be addressed as a subject"
+                    unclassifiable.append(row)
+                else:
+                    people.append(row)
+    finally:
+        conn.close()
+    return {"people": people, "services": services,
+            "unclassifiable": unclassifiable, "ok": not unclassifiable}
+
+
+# THE OTHER HALF OF THE PREREQUISITE, and it is not solved here.
+#
+# A staff person has TWO identities in this schema and they are not joined:
+#
+#   owners.owner_id        ownership -- accounts, contacts, opportunities,
+#                          invoices. 39 owners own at least one account.
+#   employees.employee_uuid  authorship -- created_by / updated_by /
+#                          deleted_by on invoices, payments, products.
+#
+# `owners.employee_uuid` exists as a foreign key and is populated on 0 of 44
+# rows, so nothing links the two. One person's ownership records and their
+# authorship records currently cannot be assembled into a single export, and
+# an export that silently returned half would be worse than none.
+#
+# Do NOT bridge this by name or address. The two sets share exactly one name
+# and zero addresses (owners are @example.com seed identities, staff are
+# @emp.agentorc.ca), so a join on either would invent links that do not exist.
+# Populating owners.employee_uuid is a data decision for the product owner.
+STAFF_IDENTITY_LINK_COLUMN = "owners.employee_uuid"
 
 
 class IncompleteExport(RuntimeError):

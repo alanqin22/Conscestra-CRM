@@ -147,6 +147,15 @@ REQUIRED_MIGRATIONS: List[str] = [
     # Verified before promotion: all six canonical triggers present on
     # Railway, zero legacy triggers surviving.
     "touch_updated_at_convergence.sql",
+    # PROMOTED 2026-08-28, after Railway was verified: convert_lead absent,
+    # fn_update_opportunity_momentum absent, sp_leads intact. It removes a
+    # function that could not execute -- zero callers across twelve surfaces,
+    # four columns that no longer exist.
+    "drop_convert_lead.sql",
+    # PROMOTED 2026-08-28 after Railway verification: the fallback is present,
+    # confined to the opportunities insert (not invoices or activities), the
+    # trigger binding survived CREATE OR REPLACE and all three grants remain.
+    "fix_order_opportunity_owner_inheritance.sql",
 ]
 
 
@@ -489,6 +498,19 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "telephony.sql": _CORRECTION,
     "tenants.sql": _SCHEMA_OOB,
     "tier1_audit_instrumentation.sql": _SCHEMA_OOB,
+    # A DATA BACKFILL, so it stays out-of-band permanently rather than being
+    # promoted into REQUIRED_MIGRATIONS. I had planned to promote it; the
+    # repository's own vocabulary says otherwise, and it is right: a clean
+    # database built from the baseline has no unowned opportunities to repair,
+    # so replaying this there would be a no-op pretending to be a migration.
+    # 17 other files already carry exactly this disposition.
+    #
+    # Applied to both databases 2026-08-28. Kept SEPARATE from the write-path
+    # fix so either can be audited or reverted alone. Restores the documented
+    # opportunity invariant on OPEN rows only: 147 closed unowned
+    # opportunities are a deliberate exclusion, because assigning an owner to
+    # finished business rewrites who is recorded as having won or lost it.
+    "backfill_open_opportunity_owner.sql": _BACKFILL,
     "unified_comms_conversations.sql": _SCHEMA_OOB,
     "unified_comms_identity.sql": _SCHEMA_OOB,
     "update_product_images.sql": _CORRECTION,
