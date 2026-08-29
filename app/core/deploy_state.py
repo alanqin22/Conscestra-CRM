@@ -147,6 +147,11 @@ REQUIRED_MIGRATIONS: List[str] = [
     # Verified before promotion: all six canonical triggers present on
     # Railway, zero legacy triggers surviving.
     "touch_updated_at_convergence.sql",
+    # PROMOTED 2026-08-28, after Railway was verified: convert_lead absent,
+    # fn_update_opportunity_momentum absent, sp_leads intact. It removes a
+    # function that could not execute -- zero callers across twelve surfaces,
+    # four columns that no longer exist.
+    "drop_convert_lead.sql",
 ]
 
 
@@ -489,12 +494,6 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "telephony.sql": _CORRECTION,
     "tenants.sql": _SCHEMA_OOB,
     "tier1_audit_instrumentation.sql": _SCHEMA_OOB,
-    # Classified PENDING DEPLOYMENT, not governed: Railway still has the
-    # function. REQUIRED_MIGRATIONS is a claim about what production has RUN,
-    # so this moves there in the same change that records its application --
-    # together with regenerating the baseline, which still creates the
-    # function on every clean build.
-    "drop_convert_lead.sql": _PENDING_DEPLOYMENT,
     "unified_comms_conversations.sql": _SCHEMA_OOB,
     "unified_comms_identity.sql": _SCHEMA_OOB,
     "update_product_images.sql": _CORRECTION,
