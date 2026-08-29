@@ -787,6 +787,52 @@ def _run_capture_forecast_snapshot() -> None:
         logger.error(f"[ForecastSnapshot] capture failed: {exc}", exc_info=True)
 
 
+def _run_recompute_lead_scores() -> None:
+    """Scheduled job (weekly): re-evaluate every live lead's score.
+
+    WHY THIS EXISTS AT ALL, since the procedure long predates the job.
+    `recompute_all_lead_scores()` has been in both databases since June and was
+    never wired to anything. `sp_leads` scores a lead ONCE, at creation, and
+    nothing rescored it afterwards -- so lead scoring was frozen: on 2026-08-28
+    all 100 live leads on Railway carried a score last computed in June, and 12
+    local leads had never been scored at all.
+
+    That looked like a dead function with zero callers. It was the opposite:
+    the only mechanism that keeps scores current, missing its schedule. The
+    audit trail settled it -- the procedure writes one audit_log row per lead,
+    and those rows show five real bulk runs (100 and 70 rows on production, in
+    single seconds) with nothing since 2026-06-18.
+
+    IT IS NOT A SECOND SCORING RULE. It calls the same fn_score_lead that
+    sp_leads calls on create, so a rescored lead and a newly created one are
+    scored by one definition. That distinction is enforced by
+    tests/test_ai_assist_second_boundary.py::test_23.
+
+    COST, measured on 115 local leads in a rolled-back transaction: 115 rows
+    updated, 49 events queued (the lead trigger filters; it is not one per
+    row), one audit_log row per lead. p_actor is left NULL so `updated_by`
+    keeps whoever last touched the lead -- COALESCE(p_actor, updated_by) --
+    rather than attributing the row to a machine.
+
+    Kill switch: LEAD_SCORING_WEEKLY=0 stops it without a deploy. Default ON,
+    because a flag defaulting off would reproduce the exact defect this fixes.
+    """
+    if os.getenv("LEAD_SCORING_WEEKLY", "1").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        logger.info("[LeadScoring] weekly rescore disabled "
+                    "(LEAD_SCORING_WEEKLY=0)")
+        return
+    try:
+        from app.core.database import execute_sp
+        rows = execute_sp("SELECT * FROM recompute_all_lead_scores()")
+        row = rows[0] if rows else {}
+        logger.info(f"[LeadScoring] rescored {row.get('scored')} lead(s), "
+                    f"average score {row.get('avg_score')}")
+    except Exception as exc:
+        logger.error(f"[LeadScoring] weekly rescore failed: {exc}",
+                     exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("=== CRM Agent starting up (all 12 modules + home index + auth + email) ===")
@@ -1205,6 +1251,27 @@ async def lifespan(app: FastAPI):
             id="staff_email_digest",
             replace_existing=True,
             misfire_grace_time=3600,
+        )
+        # Weekly lead rescore — Monday 22:00 ET, THIRTY MINUTES BEFORE
+        # emit_hot_lead_events (22:30 daily). The ordering is the point: that
+        # job emits lead.scored for Hot leads, so running it against scores
+        # last computed in June was emitting stale news. Monday so the week's
+        # pipeline opens on fresh numbers.
+        #
+        # Clear of the other Monday-night work (tuning_proposals 23:15,
+        # scoring_train 23:30) — those propose model changes and should not
+        # share a window with a bulk data mutation.
+        #
+        # Full-day grace: a weekly job that misses its minute because of a
+        # deploy should still run that day rather than wait a week. The job
+        # ledger picks it up either way — instrument() wraps every cron job, so
+        # a run that silently stops firing shows up in the hourly audit.
+        _scheduler.add_job(
+            _run_recompute_lead_scores,
+            trigger=CronTrigger(day_of_week="mon", hour=22, minute=0),
+            id="recompute_lead_scores",
+            replace_existing=True,
+            misfire_grace_time=86400,
         )
         # Monthly forecast snapshot — 1st of the month, 00:30 ET — so the capture
         # predates the month it forecasts (builds forecast-accuracy history). A
