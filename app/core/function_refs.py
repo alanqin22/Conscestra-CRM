@@ -100,10 +100,9 @@ DECLARED_STALE: Dict[str, str] = {
     # check rather than by anyone remembering: drop_convert_lead.sql took the
     # function out and the declaration stopped matching anything the same run.
     # An excuse that outlives its defect is itself a defect.
-    "customer_management":
-        "DEAD, and so is its only caller. Reached solely from cm_test, itself "
-        "dispositioned local-only cruft in the drift audit. Writes to "
-        "customer_audit, a table that exists in neither database.",
+    # customer_management was REMOVED 2026-08-28 with the local-only
+    # fossil batch. The stale-declaration check reported it the same
+    # run the drop landed, which is what that check is for.
     "sp_cases":
         "SUPERSEDED. No SP or application caller; the case agent's own "
         "sql_builder states 'There are no case stored procedures'. Writes "
