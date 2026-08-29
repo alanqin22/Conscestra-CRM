@@ -511,12 +511,12 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # creates sp_cases, so there is nothing for a required migration to drop
     # -- that is why it stays out of REQUIRED_MIGRATIONS.
     #
-    # The difference: Railway DOES have it, and until the drop is applied
-    # there, production keeps a live ungoverned mutation path (five of the
-    # fourteen modes still execute; `assign` and `close` write cases.owner_id
-    # and cases.status with no record_field_history). A matching PENDING
-    # DEPLOYMENT entry sits in postdeploy_verify.DECLARED_DRIFT and must be
-    # deleted in the same change that records the Railway application.
+    # The difference: Railway HAD it, so unlike the drop above this one needed
+    # a production deployment. APPLIED TO RAILWAY 2026-08-28 and verified there
+    # by reading pg_proc directly (0 rows) -- not by trusting deploy_sp.ps1's
+    # own SUCCESS line. The stale-declaration check named the PENDING
+    # DEPLOYMENT entry on the first run afterwards, which is the independent
+    # signal; that entry is now deleted.
     "drop_sp_cases.sql":
         "One-time data correction -- targets rows that exist only in this "
         "database's history.",

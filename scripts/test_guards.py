@@ -277,6 +277,104 @@ def report_orphans(baseline: Dict[str, int]) -> Optional[str]:
     return "\n".join(lines)
 
 
+# ===========================================================================
+# THE OUTBOUND SEAL — a test run must not put mail on the wire
+# ===========================================================================
+# FOUND 2026-08-28, and found by accident. The orphan guard reported
+# `activities +30`. They were not test rows: they were `order.delivered`
+# notification activities for REAL orders placed on 19 August, and the same run
+# wrote 39 `order_notifications` rows with provider='smtp', state='accepted'.
+# A pytest run had composed and TRANSMITTED thirty-nine customer emails.
+#
+# Every recipient was on the @seed.agentorc.ca catch-all we own, so nothing
+# reached a person. That is luck about the corpus, not a control.
+#
+# HOW IT HAPPENS. The local environment sets AGENT_BUS_AUTOSEND=1, because that
+# is the posture being rehearsed. The local event_queue holds real pending
+# order events (142 at the time of writing, 37 of them order.delivered). Any
+# code path that drains the bus during a test run therefore hands real events
+# to order_notifications.notify(), which composes and calls send_email for
+# real. The tests that MEAN to exercise sending all install a FakeProvider and
+# never reach a socket; the damage comes from the paths that were never
+# thinking about mail at all.
+#
+# WHY THE SEAL IS AT THE TRANSPORT, not at send_email. Patching send_email
+# would collide with the fixtures that legitimately patch it, and would be
+# defeated by any module holding its own reference. smtplib is the last thing
+# before the socket: nothing gets past it, and a test that patches above it
+# never reaches it.
+#
+# WHY IT ALSO KEEPS A LEDGER. An exception can be swallowed -- and here it
+# would be: send_email catches SMTPException and retries STARTTLS, and
+# order_notifications catches Exception and records a failure. A guard whose
+# only signal is an exception is a guard the caller can decide to ignore. So
+# every attempt is recorded, and the session fails at the end whether or not
+# anyone caught the raise.
+#
+# WHAT IT DELIBERATELY DOES NOT DO. It does not force AGENT_BUS_AUTOSEND=0.
+# That would make the notification tests exercise the DRAFT path while still
+# passing -- the send path they exist to cover would quietly stop being tested,
+# and nothing would say so.
+
+class OutboundDuringTest(RuntimeError):
+    """Raised when test code reaches the real SMTP transport.
+
+    Deliberately NOT an smtplib.SMTPException: send_email catches those and
+    retries over STARTTLS, so an SMTPException here would be converted into a
+    second connection attempt instead of a stop.
+    """
+
+
+_OUTBOUND_ATTEMPTS: list = []
+
+
+def _sealed_transport(kind: str):
+    def _refuse(*args, **kwargs):
+        host = args[0] if args else kwargs.get("host", "?")
+        port = args[1] if len(args) > 1 else kwargs.get("port", "?")
+        _OUTBOUND_ATTEMPTS.append(f"{kind} -> {host}:{port}")
+        raise OutboundDuringTest(
+            f"a test tried to open {kind} to {host}:{port}. The suite must not "
+            f"transmit mail. If this is a test that MEANS to exercise sending, "
+            f"install a fake provider (monkeypatch app.agents.email.smtp_imap."
+            f"send_email); if it is not, something drained real work -- find "
+            f"what queued it.")
+    return _refuse
+
+
+def seal_outbound():
+    """Replace the SMTP transport with one that refuses. Returns a restore fn."""
+    import smtplib
+    original = (smtplib.SMTP, smtplib.SMTP_SSL)
+    smtplib.SMTP = _sealed_transport("smtplib.SMTP")            # type: ignore
+    smtplib.SMTP_SSL = _sealed_transport("smtplib.SMTP_SSL")    # type: ignore
+
+    def restore():
+        smtplib.SMTP, smtplib.SMTP_SSL = original               # type: ignore
+    return restore
+
+
+def outbound_report() -> Optional[str]:
+    """Non-None if anything reached the transport during the session."""
+    if not _OUTBOUND_ATTEMPTS:
+        return None
+    lines = ["=" * 70,
+             "OUTBOUND MAIL ATTEMPTED — this run tried to transmit",
+             ""]
+    for a in _OUTBOUND_ATTEMPTS[:10]:
+        lines.append(f"    {a}")
+    if len(_OUTBOUND_ATTEMPTS) > 10:
+        lines.append(f"    ... and {len(_OUTBOUND_ATTEMPTS) - 10} more")
+    lines += ["",
+              "  The seal refused them, so nothing left the building. It is",
+              "  still a defect: a test run reached the transport at all.",
+              "  Tests that mean to send install a fake provider and never",
+              "  get here.",
+              "=" * 70]
+    return chr(10).join(lines)
+
+
+
 if __name__ == "__main__":                                  # pragma: no cover
     import sys
 
