@@ -247,10 +247,12 @@ FORBIDDEN_PROCEDURES = {
     "sp_cases": ("Case mutations must go through app/core/cases.py, which "
                  "enforces the lifecycle state machine, owner validation and "
                  "field history. sp_cases() bypasses all three."),
-    "sp_ai_assist": ("Lead scoring and case summaries must go through the "
-                     "governed agent paths. sp_ai_assist() writes leads.score, "
-                     "leads.rating and cases.summary directly, with no field "
-                     "history."),
+    "sp_ai_assist": ("A lead score has one definition -- fn_score_lead. "
+                     "sp_ai_assist() set leads.score from a caller-supplied "
+                     "payload and derived leads.rating from its own inline "
+                     "Hot/Warm/Cold thresholds, and wrote cases.summary "
+                     "outside app/core/cases.py. That is a second, "
+                     "disagreeing answer, not a second writer."),
 }
 
 _FORBIDDEN_RE = re.compile(

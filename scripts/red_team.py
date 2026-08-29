@@ -312,9 +312,32 @@ def attack_degraded_lookup_lies(cur) -> None:
 
     The control is that a failed lookup must be DISTINGUISHABLE from a genuine
     miss. Same failure, same customer, different sentence."""
+    import logging
+
     from app.core import promotions
     real = promotions.get_connection
+
+    # THE LOGGER IS MUTED FOR THE INJECTED WINDOW ONLY, and that is a report
+    # fix rather than a behaviour change. _lookup_failed logs at WARNING, which
+    # is right — a caller is about to return something that looks like a normal
+    # negative result. But this scenario CAUSES that failure on purpose, so the
+    # two WARNING lines landed in the post-deploy report directly beneath the
+    # word FAIL, reading as though production were missing the coupons table.
+    #
+    # They cost a real misdiagnosis on 2026-08-28: the lines were reported as
+    # "the red team's harness is misreporting a table that exists". Nothing was
+    # misreporting anything. The attack was working, and its evidence looked
+    # like a finding.
+    #
+    # Scoped to the try block, so a genuine failure outside this window still
+    # logs normally.
+    # The module's own logger object, not logging.getLogger(__name__): promotions
+    # names its logger "promotions" while the module is app.core.promotions, so
+    # deriving the name from the module muted nothing.
+    _plog = promotions.logger
+    _prev = _plog.level
     try:
+        _plog.setLevel(logging.CRITICAL)
         promotions.get_connection = lambda *a, **k: (_ for _ in ()).throw(
             Exception('relation "coupons" does not exist'))
         broke = promotions.validate_coupon("SAVE10", subtotal=500.0)
@@ -324,6 +347,7 @@ def attack_degraded_lookup_lies(cur) -> None:
         outage_block = promotions.summarize_for_agent(None)
     finally:
         promotions.get_connection = real
+        _plog.setLevel(_prev)
     miss = promotions.validate_coupon("NO-SUCH-CODE-XYZ", subtotal=500.0)
 
     # Two ways to lie: to the caller, and to the model composing the reply.
