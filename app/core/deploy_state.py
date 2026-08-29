@@ -494,6 +494,12 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "telephony.sql": _CORRECTION,
     "tenants.sql": _SCHEMA_OOB,
     "tier1_audit_instrumentation.sql": _SCHEMA_OOB,
+    # Classified PENDING DEPLOYMENT until Railway has it. Redefines
+    # trgfn_order_create_invoice so the opportunity it creates inherits the
+    # ACCOUNT owner when the order has none -- the rule sp_opportunities
+    # already applies. One expression changed; the other 418 lines are
+    # reproduced from the live definition.
+    "fix_order_opportunity_owner_inheritance.sql": _PENDING_DEPLOYMENT,
     "unified_comms_conversations.sql": _SCHEMA_OOB,
     "unified_comms_identity.sql": _SCHEMA_OOB,
     "update_product_images.sql": _CORRECTION,
