@@ -498,12 +498,19 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "telephony.sql": _CORRECTION,
     "tenants.sql": _SCHEMA_OOB,
     "tier1_audit_instrumentation.sql": _SCHEMA_OOB,
-    # Classified PENDING DEPLOYMENT. A data repair, kept SEPARATE from the
-    # write-path fix so either can be audited or reverted alone. Restores the
-    # documented opportunity invariant on OPEN rows only; 166 closed unowned
-    # opportunities are a deliberate exclusion, because assigning owners to
-    # finished business rewrites attribution.
-    "backfill_open_opportunity_owner.sql": _PENDING_DEPLOYMENT,
+    # A DATA BACKFILL, so it stays out-of-band permanently rather than being
+    # promoted into REQUIRED_MIGRATIONS. I had planned to promote it; the
+    # repository's own vocabulary says otherwise, and it is right: a clean
+    # database built from the baseline has no unowned opportunities to repair,
+    # so replaying this there would be a no-op pretending to be a migration.
+    # 17 other files already carry exactly this disposition.
+    #
+    # Applied to both databases 2026-08-28. Kept SEPARATE from the write-path
+    # fix so either can be audited or reverted alone. Restores the documented
+    # opportunity invariant on OPEN rows only: 147 closed unowned
+    # opportunities are a deliberate exclusion, because assigning an owner to
+    # finished business rewrites who is recorded as having won or lost it.
+    "backfill_open_opportunity_owner.sql": _BACKFILL,
     "unified_comms_conversations.sql": _SCHEMA_OOB,
     "unified_comms_identity.sql": _SCHEMA_OOB,
     "update_product_images.sql": _CORRECTION,
