@@ -103,10 +103,13 @@ DECLARED_STALE: Dict[str, str] = {
     # customer_management was REMOVED 2026-08-28 with the local-only
     # fossil batch. The stale-declaration check reported it the same
     # run the drop landed, which is what that check is for.
-    "sp_cases":
-        "SUPERSEDED. No SP or application caller; the case agent's own "
-        "sql_builder states 'There are no case stored procedures'. Writes "
-        "case_comments.id and case_metrics, neither of which exists.",
+    # sp_cases was DROPPED 2026-08-28 by sql/drop_sp_cases.sql, so its
+    # declaration is gone from here. It was never really a stale-reference
+    # exception: nine of its fourteen modes had rotted against case_metrics
+    # and case_comments.id, but five still RAN, and two of those wrote the
+    # exact fields (status, owner_id) that app/core/cases.py exists to audit.
+    # Listing it as a broken-reference fossil described the nine and missed
+    # the five. See tests/test_case_second_boundary.py.
     "sp_ai_assist":
         "DEAD. No caller anywhere. Writes case_sentiment, a table that does "
         "not exist -- part of the same retired case-management generation as "

@@ -505,6 +505,21 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "drop_local_only_dead_functions.sql":
         "One-time data correction -- targets rows that exist only in this "
         "database's history.",
+    # OUT-OF-BAND for the same structural reason as the drop above, but it is
+    # NOT the same kind of change and the classification should not be read as
+    # saying so. A clean database built from the regenerated baseline never
+    # creates sp_cases, so there is nothing for a required migration to drop
+    # -- that is why it stays out of REQUIRED_MIGRATIONS.
+    #
+    # The difference: Railway DOES have it, and until the drop is applied
+    # there, production keeps a live ungoverned mutation path (five of the
+    # fourteen modes still execute; `assign` and `close` write cases.owner_id
+    # and cases.status with no record_field_history). A matching PENDING
+    # DEPLOYMENT entry sits in postdeploy_verify.DECLARED_DRIFT and must be
+    # deleted in the same change that records the Railway application.
+    "drop_sp_cases.sql":
+        "One-time data correction -- targets rows that exist only in this "
+        "database's history.",
     # A DATA BACKFILL, so it stays out-of-band permanently rather than being
     # promoted into REQUIRED_MIGRATIONS. I had planned to promote it; the
     # repository's own vocabulary says otherwise, and it is right: a clean

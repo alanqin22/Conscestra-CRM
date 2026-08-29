@@ -326,6 +326,25 @@ DECLARED_DRIFT: dict = {
     # is exactly what the stale check exists to surface.
     ("orphan_functions", "increment_workflow_version"):
         "TARGET-ONLY orphan: defined, bound to no trigger. Inert residue.",
+
+    # -- PENDING DEPLOYMENT, and this entry must not outlive that state ------
+    # The md5 half of this key is the body hash Railway still reports. It was
+    # derived from the definition captured BEFORE the local drop, using the
+    # same normalisation the query applies (strip CR, collapse repeated LF),
+    # and the derivation was validated against three functions the database
+    # could still hash itself.
+    ("functions", "sp_cases:dec380d8704c14dd8ef42e91f143400a"):
+        "PENDING DEPLOYMENT. Dropped from LOCAL 2026-08-28 by "
+        "sql/drop_sp_cases.sql; Railway still has it, so it reads as "
+        "TARGET-ONLY drift. This is the ONE window where that is expected. "
+        "sp_cases is not inert residue -- five of its fourteen modes still "
+        "execute, and `assign` and `close` write cases.owner_id and "
+        "cases.status with no record_field_history, so production keeps a "
+        "live ungoverned mutation path until the drop is applied there. "
+        "DELETE THIS ENTRY in the same change that records the Railway "
+        "application. If the stale-declaration check names it, the drop "
+        "landed and this exception is the only thing still pretending "
+        "otherwise.",
 }
 
 

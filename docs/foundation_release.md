@@ -106,12 +106,19 @@ broad search.
 with no history awareness — is refused for **every** caller including admin and
 the system context (`test_case_second_boundary`).
 
-**Documented limitation:** the database half of that defence is inert. The
-application connects as a PostgreSQL superuser that owns the object, and
-superusers bypass privilege checks — a `REVOKE` empties the ACL and changes
-nothing (verified empirically in `test_20`). The application guard is currently
-the only effective control. Tracked as a **platform-security** item, outside
-Axis 5.
+**Limitation CLOSED, 2026-08-28.** This previously read: *"the database half of
+that defence is inert … the application guard is currently the only effective
+control."* That is no longer true, and not because the ACL changed —
+`sql/drop_sp_cases.sql` removed the object. There is no privilege left to
+argue about.
+
+The measurement that prompted it is worth recording: of the fourteen modes,
+**five still executed**, and `assign` and `close` were verified writing
+`cases.owner_id` and `cases.status` in a rolled-back transaction. "Legacy"
+had been doing a lot of work in that sentence.
+
+The application guard stays, and `test_20` now fails on *any*
+`sp\_case%` procedure rather than the one known name.
 
 ### 2.5 ✅ FIXED — unauthenticated calendar feed
 
