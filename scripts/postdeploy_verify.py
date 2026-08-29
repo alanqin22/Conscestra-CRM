@@ -280,6 +280,14 @@ def _schema_inventory(dsn: str) -> dict:
 #     behaviour is what needs fixing.
 #
 # key: (object class, exact inventory string) -> why the difference is correct
+_BATCH_A_PENDING = (
+    "TARGET-ONLY, PENDING DEPLOYMENT (sql/drop_dead_seed_fossils.sql). Dropped "
+    "from LOCAL 2026-08-28, so production is the side still holding it -- and "
+    "the fix is to apply the drop there, NOT to restore it here. Cannot "
+    "execute a single statement: called against a real database, each raises "
+    "on its first write to a column or table that no longer exists. Delete "
+    "this entry when the drop reaches Railway.")
+
 DECLARED_DRIFT: dict = {
     # -- dead local cruft: an abandoned vector-column experiment ------------
     ("columns", "content_embeddings.embedding_v:USER-DEFINED"):
@@ -326,6 +334,45 @@ DECLARED_DRIFT: dict = {
     # is exactly what the stale check exists to surface.
     ("orphan_functions", "increment_workflow_version"):
         "TARGET-ONLY orphan: defined, bound to no trigger. Inert residue.",
+
+    # -- BATCH A, PENDING DEPLOYMENT ----------------------------------------
+    # Dropped from LOCAL 2026-08-28; Railway still has all eight, so they read
+    # as TARGET-ONLY drift until the two migrations are applied there. The
+    # md5s were read from RAILWAY'S OWN CATALOG rather than derived, so a key
+    # that stops matching means the object changed there, not that the
+    # arithmetic was wrong.
+    #
+    # DELETE ALL NINE ENTRIES in the same change that records the Railway
+    # application. The stale check names them the moment the drops land.
+    ("functions", "sp_opportunities_seed_owner_performance:6ed3cab6a1a97a00f646ed1a8c4096df"):
+        _BATCH_A_PENDING,
+    ("functions", "sp_sale_forecast_seed_product_pricing:ab093c84482eeeb6462127d8c02c1a1d"):
+        _BATCH_A_PENDING,
+    ("functions", "sp_seed_accounts:9a6a34c2afdfb52db3ddad6c4f42c15b"):
+        _BATCH_A_PENDING,
+    ("functions", "sp_seed_contacts:a07e448b249e8de16a76cac0da46f0b2"):
+        _BATCH_A_PENDING,
+    ("functions", "sp_seed_products:21a509fd0c0ced23fd74a91c6acd1b7c"):
+        _BATCH_A_PENDING,
+    ("functions", "sp_snapshot_forecast_accuracy:46ce4f6cf17b900c610a84fe69061f21"):
+        _BATCH_A_PENDING,
+    ("functions", "trgfn_unified_events:95f4b976a761ea7d2de5b7f6c988b28f"):
+        _BATCH_A_PENDING,
+    ("orphan_functions", "trgfn_unified_events"):
+        _BATCH_A_PENDING + " Also appears as an orphan: it returns trigger and "
+        "is bound to zero triggers, which is why it is unreachable.",
+
+    # sp_ai_assist is listed apart from the seven above ON PURPOSE. They cannot
+    # execute a single statement. It can: update_lead_score and
+    # update_case_summary were measured mutating leads.score, leads.rating and
+    # cases.summary, with no field history. Until its migration reaches
+    # Railway, production keeps an ungoverned write path into two business
+    # tables -- not merely an unused object.
+    ("functions", "sp_ai_assist:b0742ba8cc19c8ab0182c7054bd90d7f"):
+        "TARGET-ONLY, PENDING DEPLOYMENT (sql/drop_sp_ai_assist.sql). NOT "
+        "inert: two of its eight modes still write leads.score/rating and "
+        "cases.summary ungoverned, so the side still holding it is the side "
+        "that matters. Delete this entry when the drop reaches Railway.",
 
     # -- PENDING DEPLOYMENT, and this entry must not outlive that state ------
     # sp_cases: DEPLOYED TO RAILWAY 2026-08-28 and the declaration is

@@ -520,6 +520,22 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "drop_sp_cases.sql":
         "One-time data correction -- targets rows that exist only in this "
         "database's history.",
+    # BATCH A, same out-of-band reasoning: the regenerated baseline no longer
+    # creates any of them, so a clean database has nothing to drop. Both DO
+    # need a Railway apply, and each carries PENDING DEPLOYMENT entries in
+    # postdeploy_verify.DECLARED_DRIFT until it lands there.
+    #
+    # TWO FILES, NOT ONE, and the split is the point. The seven in the first
+    # cannot execute a statement. sp_ai_assist can -- update_lead_score and
+    # update_case_summary were measured mutating leads.score, leads.rating and
+    # cases.summary. Merging them would put a live write-path removal behind a
+    # title that says cleanup, and reverting one would revert the other.
+    "drop_dead_seed_fossils.sql":
+        "One-time data correction -- targets rows that exist only in this "
+        "database's history.",
+    "drop_sp_ai_assist.sql":
+        "One-time data correction -- targets rows that exist only in this "
+        "database's history.",
     # A DATA BACKFILL, so it stays out-of-band permanently rather than being
     # promoted into REQUIRED_MIGRATIONS. I had planned to promote it; the
     # repository's own vocabulary says otherwise, and it is right: a clean

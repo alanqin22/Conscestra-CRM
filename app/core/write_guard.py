@@ -231,10 +231,26 @@ _MODE_RE = re.compile(r"p_(?:mode|action)\s*:?=\s*'([a-z_]+)'", re.IGNORECASE)
 #
 # What has not changed: do not weaken this guard on the assumption that the
 # database is backstopping it. This is the control that holds in either case.
+#
+# sp_ai_assist(): added 2026-08-28, and it is here because the sp_cases work
+# nearly missed it. It was filed as an inert fossil -- "no caller anywhere,
+# writes case_sentiment, a table that does not exist". Every clause true, the
+# conclusion wrong: case_sentiment is reached by ONE of its eight modes. Two
+# others were measured MUTATING rows -- update_lead_score sets leads.score and
+# leads.rating, update_case_summary sets cases.summary -- with no field
+# history and no state machine.
+#
+# Note also that the pattern check added with sp_cases matches `sp\_case%`.
+# This name does not match it. A guard shaped around the last incident does
+# not automatically cover the next one.
 FORBIDDEN_PROCEDURES = {
     "sp_cases": ("Case mutations must go through app/core/cases.py, which "
                  "enforces the lifecycle state machine, owner validation and "
                  "field history. sp_cases() bypasses all three."),
+    "sp_ai_assist": ("Lead scoring and case summaries must go through the "
+                     "governed agent paths. sp_ai_assist() writes leads.score, "
+                     "leads.rating and cases.summary directly, with no field "
+                     "history."),
 }
 
 _FORBIDDEN_RE = re.compile(
