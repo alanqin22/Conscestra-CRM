@@ -1416,9 +1416,22 @@ async def lifespan(app: FastAPI):
             leader.on_promotion(_start_scheduler_now)
         else:
             _start_scheduler_now()
+            # A CURATED summary of 9 of the 36 jobs, not a manifest — it exists
+            # so the nightly chain can be read in order at a glance. Every time
+            # printed here is checked against the real trigger by
+            # tests/test_scheduler_banner.py, because a summary that drifts
+            # from the schedule is worse than no summary: it is read as fact.
+            #
+            # The lead rescore was missing from this line for its first deploy.
+            # That mattered more than it looks: the banner already named
+            # "hot-lead emit 22:30", and the rescore exists precisely to run
+            # before it, so the one job that explained the 22:30 entry was the
+            # one not shown. The (Mon) qualifier is load-bearing too — every
+            # other entry here is daily.
             logger.info(
                 "[Scheduler] Started (America/New_York) — "
-            "opps advance 22:00 ET | orders advance 22:05 ET | "
+            "opps advance 22:00 ET | lead rescore 22:00 ET (Mon) | "
+            "orders advance 22:05 ET | "
             "activity sweep 22:10 ET | orders seed 22:15 ET | "
             "pipeline seed 22:20 ET | overdue-invoice emit 22:25 ET | "
             "hot-lead emit 22:30 ET | supervisor tick 9/12/15/18 ET (Mon-Fri)"
