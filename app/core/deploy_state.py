@@ -152,6 +152,10 @@ REQUIRED_MIGRATIONS: List[str] = [
     # function that could not execute -- zero callers across twelve surfaces,
     # four columns that no longer exist.
     "drop_convert_lead.sql",
+    # PROMOTED 2026-08-28 after Railway verification: the fallback is present,
+    # confined to the opportunities insert (not invoices or activities), the
+    # trigger binding survived CREATE OR REPLACE and all three grants remain.
+    "fix_order_opportunity_owner_inheritance.sql",
 ]
 
 
@@ -494,12 +498,12 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "telephony.sql": _CORRECTION,
     "tenants.sql": _SCHEMA_OOB,
     "tier1_audit_instrumentation.sql": _SCHEMA_OOB,
-    # Classified PENDING DEPLOYMENT until Railway has it. Redefines
-    # trgfn_order_create_invoice so the opportunity it creates inherits the
-    # ACCOUNT owner when the order has none -- the rule sp_opportunities
-    # already applies. One expression changed; the other 418 lines are
-    # reproduced from the live definition.
-    "fix_order_opportunity_owner_inheritance.sql": _PENDING_DEPLOYMENT,
+    # Classified PENDING DEPLOYMENT. A data repair, kept SEPARATE from the
+    # write-path fix so either can be audited or reverted alone. Restores the
+    # documented opportunity invariant on OPEN rows only; 166 closed unowned
+    # opportunities are a deliberate exclusion, because assigning owners to
+    # finished business rewrites attribution.
+    "backfill_open_opportunity_owner.sql": _PENDING_DEPLOYMENT,
     "unified_comms_conversations.sql": _SCHEMA_OOB,
     "unified_comms_identity.sql": _SCHEMA_OOB,
     "update_product_images.sql": _CORRECTION,
