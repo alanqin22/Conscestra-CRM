@@ -96,14 +96,10 @@ _GUARDED_ERRORS = ("undefined_table", "undefined_column", "undefined_object",
 #
 # function -> why its stale reference is not a defect to fix
 DECLARED_STALE: Dict[str, str] = {
-    "convert_lead":
-        "DEAD. Zero callers across app code, SPs, triggers, views, rules, "
-        "defaults, policies, constraints, pg_depend and dynamic SQL. Written "
-        "against the pre-rename schema (accounts.name, opportunities.source/"
-        "campaign_id, activities.activity_type). sp_leads is the working "
-        "conversion path -- 13 opportunities carry its naming. Slated for a "
-        "governed DROP; declared meanwhile so the detector is not permanently "
-        "red about a function everyone has agreed to remove.",
+    # convert_lead's entry was REMOVED 2026-08-28, by the stale-declaration
+    # check rather than by anyone remembering: drop_convert_lead.sql took the
+    # function out and the declaration stopped matching anything the same run.
+    # An excuse that outlives its defect is itself a defect.
     "customer_management":
         "DEAD, and so is its only caller. Reached solely from cm_test, itself "
         "dispositioned local-only cruft in the drift audit. Writes to "
