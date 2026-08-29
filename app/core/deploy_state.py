@@ -498,6 +498,13 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "telephony.sql": _CORRECTION,
     "tenants.sql": _SCHEMA_OOB,
     "tier1_audit_instrumentation.sql": _SCHEMA_OOB,
+    # LOCAL-ONLY cleanup, so it never needs a Railway deployment: all five
+    # functions are verified absent from production already. Dropping them
+    # reduces drift rather than creating it. Not governed -- a clean database
+    # built from the regenerated baseline never has them to drop.
+    "drop_local_only_dead_functions.sql":
+        "One-time data correction -- targets rows that exist only in this "
+        "database's history.",
     # A DATA BACKFILL, so it stays out-of-band permanently rather than being
     # promoted into REQUIRED_MIGRATIONS. I had planned to promote it; the
     # repository's own vocabulary says otherwise, and it is right: a clean

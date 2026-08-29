@@ -311,22 +311,11 @@ DECLARED_DRIFT: dict = {
     # Each appears only in governance/sp/crm_db.sql and crm_db_tables.sql,
     # historical whole-database dumps rather than live code. No migration,
     # trigger, stored procedure or Python module calls them.
-    ("functions", "cm_test:0a5ed9a2890c39cb7b9b32b2b9459e96"):
-        "LOCAL-ONLY. Dead: referenced only by the historical whole-database "
-        "dumps in sp/. Never deployed, and should not be.",
-    ("functions", "customer_management:27a1785dfed2284687ed4f78db7f4719"):
-        "LOCAL-ONLY. Dead: a demo CRUD wrapper from the pre-agent schema, referenced on"
-        "ly by the historical dumps in sp/. No caller anywhere.",
-    ("functions", "get_user_name:978177d7cad82a3b85949b428f7acde7"):
-        "LOCAL-ONLY. Dead: superseded by the employees/owners identity model; reference"
-        "d only by the historical dumps in sp/.",
-    ("functions", "is_user_active:2df68b72c1713f62d6ff9fb00333eb58"):
-        "LOCAL-ONLY. Dead: superseded by the auth_credentials/session model; referenced"
-        " only by the historical dumps in sp/.",
-    ("functions", "product_management:cf38f310d15576f91e6f8ed8ed3bf2cf"):
-        "LOCAL-ONLY. Dead: a demo CRUD wrapper for products, superseded by the Products"
-        " agent and its stored procedures. Only in the sp/ dumps.",
 
+    # THE FIVE DEAD LOCAL FUNCTIONS THAT WERE HERE ARE GONE, dropped
+    # 2026-08-28 by drop_local_only_dead_functions.sql. The stale-
+    # declaration check named all five the same run, which is why this
+    # list did not quietly outlive them.
     # -- production orphans left by the trigger consolidation ---------------
     # REMOVED 2026-08-28, by the stale-declaration check rather than by
     # anyone remembering: set_lead_updated_at, update_updated_at_column,
