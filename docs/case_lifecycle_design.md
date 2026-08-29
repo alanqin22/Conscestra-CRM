@@ -70,7 +70,7 @@ This makes the C1 risk **stronger** than first reported, not weaker. The gap
 itself stands unchanged: there is still no governed Cases agent, no UI and no
 integrated lifecycle around the existing records.
 
-**Disposition (Step 5b):**
+**Disposition (Step 5b, superseded — see 2026-08-28 below):**
 
 - **Application layer — effective.** `write_guard.FORBIDDEN_PROCEDURES` rejects
   any `sp_cases(` query unconditionally, before every role early-return, for
@@ -81,14 +81,46 @@ integrated lifecycle around the existing records.
   bypass privilege checks. A `REVOKE` empties the ACL and changes nothing
   (verified: `has_function_privilege` still returns true afterwards). Applying
   it would look like a control while being none, so it is documented here
-  instead. It becomes worthwhile the moment the app runs as a non-superuser role
-  — `tests/test_case_second_boundary.py::test_20` fails at exactly that point.
-- **Not dropped.** Signature and recovery path recorded below; removal waits.
+  instead.
+- **Not dropped.** Signature and recovery path recorded; removal waits.
+
+### Resolution (2026-08-28) — `sp_cases()` is DROPPED
+
+`sql/drop_sp_cases.sql` removed it. The deferral above was reasonable when it
+was written and wrong to keep, for a reason the original disposition could not
+have known: **it described the procedure as legacy without ever measuring how
+much of it still ran.**
+
+Before dropping, every mode was executed against a real database inside a
+rolled-back transaction and the rows re-read:
+
+| outcome | modes |
+|---|---|
+| **still executed** | `assign` (set `cases.owner_id`), `close` (set `cases.status`), `update`, `list`, `queue`, `summary`, `timeline` |
+| already broken | `get`, `create`, `resolve`, `sla_report` (`case_metrics` gone), `escalate`, `add_comment`, `reopen` (`case_comments.id` gone) |
+
+So this was never fourteen dead modes. It was a **half-working bypass**, and the
+half that worked wrote precisely the two fields `app/core/cases.py` exists to
+audit. That is worse than a wholly broken one: the working half is the half that
+gets found.
+
+**Why DROP and not the deferred REVOKE.** `PUBLIC` held `EXECUTE`, so revoking
+from `crm_app` alone would have changed nothing; making it real meant `REVOKE …
+FROM PUBLIC`, a broader production change that costs the same as a drop while
+leaving a re-grantable object behind a permission wall. Privilege separation
+shipping to production (2026-08-03) made the ACL half *meaningful* there, which
+is exactly what made deferring it pointless rather than what made it viable.
+
+**The application guard stays.** A dropped function can be recreated by anyone
+restoring an old dump. `FORBIDDEN_PROCEDURES` keeps its `sp_cases` entry, and
+`test_20` now matches `sp\_case%` by pattern — so re-creating `sp_cases`, or
+authoring `sp_case_mgmt` next quarter, both turn the suite red. Verified by
+planting a stub and watching it fail.
 
 ```
-public.sp_cases(text,uuid,uuid,uuid,text,text,text,text,text,uuid,text,boolean,
-                uuid,text,jsonb,uuid,uuid,integer,integer,text,date,date,boolean)
-owner: postgres   ·   recovery: sp/crm_db.sql (CREATE FUNCTION public.sp_cases)
+DROPPED 2026-08-28 · sql/drop_sp_cases.sql
+recovery: sp/crm_db.sql (CREATE FUNCTION public.sp_cases) — restoring it
+          restores a procedure guard_query still refuses, which is correct
 ```
 
 ## Design decisions

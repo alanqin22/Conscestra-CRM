@@ -326,6 +326,20 @@ DECLARED_DRIFT: dict = {
     # is exactly what the stale check exists to surface.
     ("orphan_functions", "increment_workflow_version"):
         "TARGET-ONLY orphan: defined, bound to no trigger. Inert residue.",
+
+    # BATCH A: DEPLOYED TO RAILWAY 2026-08-28, and its nine declarations lived
+    # here for the length of one deploy. All nine were named by the stale
+    # check on the first run afterwards, and a direct read of Railway's
+    # pg_proc confirms all eight functions are gone -- including sp_ai_assist,
+    # whose two live modes had been writing leads.score, leads.rating and
+    # cases.summary in production with no field history.
+
+    # -- PENDING DEPLOYMENT, and this entry must not outlive that state ------
+    # sp_cases: DEPLOYED TO RAILWAY 2026-08-28 and the declaration is
+    # gone with it. It was never removed because anyone remembered -- the
+    # stale check named it on the first run after the deploy, and that
+    # naming is the INDEPENDENT evidence the drop landed. deploy_sp.ps1
+    # printing SUCCESS is the system reporting on itself.
 }
 
 
@@ -534,6 +548,26 @@ def main(argv: Optional[list] = None) -> int:
     # Not passing --app-url is a choice and stays a skip. Passing one that does
     # not answer is a broken invocation, and the checks downstream of it are
     # then measuring something other than what the operator asked for.
+    # AND SAY SO WHEN THE QUESTION WAS NOT ASKED.
+    #
+    # Omitting --app-url stays a choice, not an error — but the consequence is
+    # not obvious from the output, and it misled a reader on 2026-08-28. With
+    # no app role to reason about, the trigger-disable scenario judges THIS
+    # admin connection, always breaches, and the run ends "FAILED: red team /
+    # Do not roll forward" on a deployment that is correctly configured. That
+    # was read as a pre-existing defect rather than as an under-specified
+    # invocation. Adding --app-url turned the same run green.
+    #
+    # A line, not a failure: the fix is one flag, and the reader should be
+    # holding it before the red team's verdict rather than after.
+    if args.target and not app_url:
+        print("  NOTE  no --app-url, so the application's database role is "
+              "unknown to this run.\n        The trigger-disable scenario will "
+              "judge THIS admin connection, which\n        can always disable a "
+              "trigger, and will report a breach that says\n        nothing "
+              "about the application. Pass --app-url to ask the question\n"
+              "        that was meant.\n")
+
     early_fail: List[str] = []
     if app_url and not app_role:
         print("  FAIL  app identity — --app-url was given and did not yield the "

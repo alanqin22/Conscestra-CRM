@@ -96,46 +96,27 @@ _GUARDED_ERRORS = ("undefined_table", "undefined_column", "undefined_object",
 #
 # function -> why its stale reference is not a defect to fix
 DECLARED_STALE: Dict[str, str] = {
-    # convert_lead's entry was REMOVED 2026-08-28, by the stale-declaration
-    # check rather than by anyone remembering: drop_convert_lead.sql took the
-    # function out and the declaration stopped matching anything the same run.
-    # An excuse that outlives its defect is itself a defect.
-    # customer_management was REMOVED 2026-08-28 with the local-only
-    # fossil batch. The stale-declaration check reported it the same
-    # run the drop landed, which is what that check is for.
-    "sp_cases":
-        "SUPERSEDED. No SP or application caller; the case agent's own "
-        "sql_builder states 'There are no case stored procedures'. Writes "
-        "case_comments.id and case_metrics, neither of which exists.",
-    "sp_ai_assist":
-        "DEAD. No caller anywhere. Writes case_sentiment, a table that does "
-        "not exist -- part of the same retired case-management generation as "
-        "sp_cases.",
-    "sp_snapshot_forecast_accuracy":
-        "DEAD. No caller. Writes forecast_accuracy_snapshots, which does not "
-        "exist; forecast accuracy is captured by the scheduled "
-        "_run_capture_forecast_snapshot path instead.",
-    "trgfn_unified_events":
-        "DEAD. Bound to no trigger and called by nothing, despite the name. "
-        "Writes invoice_events, which does not exist. The live event path is "
-        "trgfn_payment_update_invoice, which references the same table behind "
-        "an EXCEPTION guard.",
-    "sp_seed_accounts":
-        "SEED FOSSIL. No caller; writes accounts.name, renamed to "
-        "account_name. Seeding is done by app/core/demo.py now.",
-    "sp_seed_contacts":
-        "SEED FOSSIL. No caller; writes contacts.billing_address / "
-        "shipping_address, both moved to the addresses table.",
-    "sp_seed_products":
-        "SEED FOSSIL. No caller; writes products.name, renamed to "
-        "product_name.",
-    "sp_opportunities_seed_owner_performance":
-        "SEED FOSSIL. No caller; writes opportunity_products columns "
-        "(opportunity_product_id, unit_price) that no longer exist.",
-    "sp_sale_forecast_seed_product_pricing":
-        "SEED FOSSIL. No caller; writes product_pricing columns (cost, "
-        "promo_price, retail_price, wholesale_price) replaced by the "
-        "price_type / price_value model.",
+    # EMPTY, and that is the intended end state rather than an accident.
+    #
+    # Every entry that was ever here has been DROPPED instead of declared:
+    # convert_lead, customer_management and the local-only batch, then
+    # sp_cases, then the seven inert Batch A fossils and sp_ai_assist -- all
+    # on 2026-08-28. None was removed because someone remembered; in every
+    # case the stale-declaration check named it on the first run after the
+    # drop landed. That is what this mechanism is for.
+    #
+    # TWO OF THEM WERE NOT WHAT THEIR DECLARATIONS SAID, which is the lesson
+    # worth keeping. sp_cases was described as a rotted 14-mode fossil and had
+    # five modes that still ran, two writing cases.status and cases.owner_id.
+    # sp_ai_assist was described as "writes case_sentiment, a table that does
+    # not exist" -- true of one mode out of eight, while update_lead_score and
+    # update_case_summary were measured mutating leads.score and
+    # cases.summary. A broken reference proves one path fails. It never proves
+    # an object is inert.
+    #
+    # So if an entry returns here: say what was MEASURED -- every mode called
+    # in a rolled-back transaction, rows re-read -- not what the broken
+    # reference implies.
 }
 
 
