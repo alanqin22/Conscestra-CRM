@@ -20,12 +20,26 @@ not Customer Memory.
 ──────────────────────────────────────────────────────────────────────────────
 THREE DESIGN DECISIONS, EACH FORCED BY A FACT
 ──────────────────────────────────────────────────────────────────────────────
-1. NO pgvector. It is not installed and not guaranteed on the deploy target
-   (pg_available_extensions lists only pg_trgm). Vectors are float32 bytea and
-   ranking is a numpy matrix product in `embeddings.rank`. At this corpus size a
-   scoped query ranks tens-to-hundreds of candidates — microseconds. If the
-   corpus grows past ~100k rows, pgvector + HNSW becomes the right answer and
-   only `search()` changes.
+1. NO pgvector — SUPERSEDED 2026-08-31, and the original reasoning is kept
+   because the premise changed, not the logic. It read: "it is not installed
+   and not guaranteed on the deploy target (pg_available_extensions lists only
+   pg_trgm)". Measured on that date, pgvector 0.8.6 is INSTALLED on both the
+   local and the Railway databases.
+
+   The other half of the original claim also stopped holding, and this is the
+   part that forced the change. "At this corpus size a scoped query ranks
+   tens-to-hundreds of candidates" was true at ~7k rows. At 12,774 the
+   MAX_CANDIDATES=4,000 recency window means **69% of the indexed corpus is
+   unreachable by any query**, and which 31% is visible is chosen by recency
+   rather than relevance — a correctness defect, not a latency one, and a
+   silent one: the search returns confident, well-formed, incomplete answers.
+
+   So `embedding_v vector(512)` + an HNSW index now exist and are kept exact
+   (see `rebuild_vectors` and `vector_drift`). THE READ PATH IS STILL NUMPY:
+   switching `search()` over is gated on measured ranking parity, because
+   replacing one silent retrieval defect with another is the specific failure
+   worth avoiding here. Both representations are written from one value in one
+   statement — the 35 rows that once disagreed came from two writes of it.
 
 2. NO PROCESS-LOCAL VECTOR CACHE. semantic.py keeps the whole KB in a module
    global, which is fine for 65 rows but wrong here: N replicas × N copies, each
@@ -292,6 +306,187 @@ def template_fingerprint(text: str, width: int = DEDUPE_PREFIX) -> str:
 BATCH = int(os.getenv("CONTENT_INDEX_BATCH", "128"))      # embedded per pass
 MIN_CHARS = int(os.getenv("CONTENT_INDEX_MIN_CHARS", "25"))
 MAX_CANDIDATES = int(os.getenv("CONTENT_INDEX_MAX_CANDIDATES", "4000"))
+
+# ── Retrieval mode ──────────────────────────────────────────────────────────
+# The kill switch, because this changes which rows every grounded answer is
+# drawn from.
+#
+#   recency_only  the pre-existing contract, exactly. DEFAULT.
+#   hybrid        recency candidates UNION vector candidates, the whole union
+#                 ranked by the exact NumPy ranker, then sliced.
+#
+# WHY NOT VECTOR-ONLY. It was tried, for about an hour, and measured on 40
+# queries: replacing the recency pool with a vector pool GAINED 40 results and
+# LOST 38 different ones. Not an upgrade — a trade. The cause is corpus
+# redundancy: template groups run to 88 identical vectors, so the 4,000 most
+# SIMILAR rows are far less diverse than the 4,000 most RECENT, and relevant
+# records get crowded out by copies of one template that dedupe later collapses
+# to a single line anyway.
+#
+# The union fixes that, and was chosen experimentally over two alternatives
+# (a scaled budget; deduping before the rank slice). Across 60 queries at
+# limits 1/3/5/10/20 it was the only one with ZERO true content loss — every
+# baseline result it did not return was either displaced by something strictly
+# more similar, or a representative swap inside the same template group.
+RETRIEVAL_MODE = os.getenv("CONTENT_INDEX_RETRIEVAL_MODE", "recency_only").strip().lower()
+HYBRID = RETRIEVAL_MODE == "hybrid"
+
+# Vector candidate pool size. A TUNED OPERATIONAL PARAMETER, not an invariant.
+#
+# 500 captured 175 of 177 observed gains with zero measured true content loss
+# on this corpus, while avoiding the materially higher vector-query cost seen
+# at 4,000 (~30 ms of SQL against ~0.8 ms, dwarfing the ~6 ms the extra ranking
+# costs). Two additional results were not worth six times the latency.
+#
+# Tuned on ONE corpus at ONE size. If the corpus composition changes
+# materially — in particular its template redundancy — revalidate rather than
+# assume. Do not silently retune.
+N_VEC = int(os.getenv("CONTENT_INDEX_VECTOR_POOL", "500"))
+
+# THE CORPUS N_VEC WAS VALIDATED AGAINST, recorded so "revalidate if the corpus
+# changes materially" is a check rather than a hope. Measured 2026-09-01.
+_NVEC_BASELINE = {"rows": 12976, "largest_template_group": 480,
+                  "duplicate_share": 0.53, "validated": "2026-09-01"}
+
+# Cached readiness. Re-checked periodically rather than per search: the answer
+# changes only when a migration or a backfill runs.
+_VEC_TTL = int(os.getenv("CONTENT_INDEX_VECTOR_TTL_SECS", "300"))
+_vec_state: Dict[str, Any] = {"checked_at": 0.0, "ready": False, "why": "unchecked"}
+
+
+def vector_pool_validity() -> Dict[str, Any]:
+    """Is N_VEC still the size it was measured to be adequate at?
+
+    N_VEC is a TUNED OPERATIONAL PARAMETER and the instruction attached to it
+    was "revalidate if the corpus changes materially, do not silently retune".
+    An instruction in a comment is one nobody runs, so this is the check.
+
+    IT DOES NOT RETUNE ANYTHING. It reports that the evidence behind the number
+    has expired, and names why. Choosing a new number requires re-running the
+    end-to-end content-loss measurement, which is a decision, not a heuristic.
+
+    Two properties matter, and only the second is obvious:
+
+      SIZE          more rows means the pool covers a smaller share.
+      REDUNDANCY    the pool is spent on copies. This is the sharper risk here:
+                    the largest template group was measured at 480 against an
+                    N_VEC of 500, so a single template can very nearly fill the
+                    vector pool on a query that matches it. That is survivable
+                    today only because the recency pool is unioned alongside.
+    """
+    out: Dict[str, Any] = {"ok": True, "revalidate": False, "reasons": [],
+                           "baseline": _NVEC_BASELINE, "n_vec": N_VEC}
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM content_embeddings")
+                rows = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT coalesce(max(n), 0), coalesce(sum(n), 0) FROM ("
+                    "  SELECT count(*) n FROM content_embeddings "
+                    "  WHERE snippet <> '' GROUP BY left(snippet, 60) "
+                    "  HAVING count(*) > 1) z")
+                largest, dup_rows = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"ok": False, "revalidate": False, "error": str(exc)[:200]}
+
+    share = (dup_rows / rows) if rows else 0.0
+    out.update({"rows": rows, "largest_template_group": largest,
+                "duplicate_share": round(share, 3)})
+
+    base = _NVEC_BASELINE
+    if rows > base["rows"] * 2 or rows < base["rows"] / 2:
+        out["reasons"].append(
+            f"corpus size moved from {base['rows']} to {rows}")
+    if largest > N_VEC * 0.8:
+        out["reasons"].append(
+            f"largest template group ({largest}) is within 80% of N_VEC "
+            f"({N_VEC}) — one template can crowd out the vector pool")
+    if share > base["duplicate_share"] + 0.15:
+        out["reasons"].append(
+            f"duplicate share rose from {base['duplicate_share']:.0%} to "
+            f"{share:.0%} — the pool buys less diversity per row")
+    out["revalidate"] = bool(out["reasons"])
+    return out
+
+
+def _log_retrieval(diag: Dict[str, Any], empty_reason: Optional[str] = None) -> None:
+    """One structured line per search. Counts and reasons; never content.
+
+    The point is to make ONE distinction legible from a log: did retrieval find
+    nothing, or did retrieval not happen? Those were the same observable
+    outcome before this change, and the difference is what separates "we have
+    no record of that" from "the index was unreachable".
+
+    No snippets, no embeddings, no identifiers of the subject — a diagnostic
+    that leaks the corpus to fix an observability gap trades one defect for a
+    worse one.
+    """
+    if empty_reason:
+        diag["empty_result_reason"] = empty_reason
+    try:
+        logger.info("[content_index] retrieval " + " ".join(
+            f"{k}={v}" for k, v in diag.items() if v not in (None, False)))
+    except Exception:                                       # pragma: no cover
+        pass
+
+
+def _vector_candidates_ready() -> bool:
+    """Is `embedding_v` present AND complete on this database?
+
+    BOTH CONDITIONS, and the second is the one that matters. Ordering by
+    `embedding_v <=> …` silently drops every row whose vector is NULL — so a
+    half-backfilled column would not degrade the search, it would HIDE part of
+    the corpus while reporting nothing. That is the same failure this switch
+    exists to remove, arriving by a different door: the column was found 59%
+    populated on 2026-08-31.
+
+    Falls back LOUDLY. A search quietly reverting to the recency window is
+    indistinguishable from one that never switched, which is precisely how the
+    original defect went unnoticed for months.
+    """
+    import time as _t
+    now = _t.monotonic()
+    if now - _vec_state["checked_at"] < _VEC_TTL:
+        return _vec_state["ready"]
+    ready, why = False, "unknown"
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass('public.content_embeddings')")
+                if not cur.fetchone()[0]:
+                    why = "content_embeddings does not exist"
+                else:
+                    cur.execute(
+                        "SELECT count(*) FROM pg_attribute a "
+                        "WHERE a.attrelid='content_embeddings'::regclass "
+                        "AND a.attname='embedding_v' AND NOT a.attisdropped")
+                    if not cur.fetchone()[0]:
+                        why = ("embedding_v column absent — apply "
+                               "sql/content_embeddings_pgvector.sql")
+                    else:
+                        cur.execute("SELECT count(*) FROM content_embeddings "
+                                    "WHERE embedding_v IS NULL")
+                        missing = cur.fetchone()[0]
+                        if missing:
+                            why = (f"{missing} row(s) have no vector — run "
+                                   f"content_index.rebuild_vectors()")
+                        else:
+                            ready, why = True, "ready"
+        finally:
+            conn.close()
+    except Exception as exc:                                # pragma: no cover
+        why = f"could not check: {str(exc)[:120]}"
+    if ready != _vec_state["ready"] or _vec_state["why"] != why:
+        (logger.info if ready else logger.warning)(
+            f"[content_index] index-backed candidates {'ON' if ready else 'OFF'}"
+            f" — {why}")
+    _vec_state.update({"checked_at": now, "ready": ready, "why": why})
+    return ready
 
 
 class RetrievalUnavailable(RuntimeError):
@@ -616,10 +811,15 @@ def reindex(source_types: Optional[List[str]] = None,
                     cur.execute(
                         """INSERT INTO content_embeddings
                              (source_type, source_id, content_hash, model, dims,
-                              embedding, account_id, contact_id, opportunity_id,
-                              party_key, visibility, occurred_at, snippet,
-                              speech_act, direction, actor, parent_key, chunk_ix)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)
+                              embedding, embedding_v, account_id, contact_id,
+                              opportunity_id, party_key, visibility, occurred_at,
+                              snippet, speech_act, direction, actor, parent_key,
+                              chunk_ix)
+                           -- embedding AND embedding_v are written from the SAME
+                           -- `vec`, in the SAME statement. That is what keeps
+                           -- them equal: the 35 rows that once disagreed were
+                           -- produced by two separate writes of one value.
+                           VALUES (%s,%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0)
                            -- chunk_ix is part of the PK since schema v2. A
                            -- short record is chunk 0; long-form sources will
                            -- write 0..n. The conflict target MUST match the PK
@@ -628,6 +828,7 @@ def reindex(source_types: Optional[List[str]] = None,
                              content_hash=EXCLUDED.content_hash,
                              model=EXCLUDED.model, dims=EXCLUDED.dims,
                              embedding=EXCLUDED.embedding,
+                             embedding_v=EXCLUDED.embedding_v,
                              account_id=EXCLUDED.account_id,
                              contact_id=EXCLUDED.contact_id,
                              opportunity_id=EXCLUDED.opportunity_id,
@@ -641,7 +842,8 @@ def reindex(source_types: Optional[List[str]] = None,
                              actor=EXCLUDED.actor,
                              updated_at=now()""",
                         (st, r["source_id"], h, model, len(vec),
-                         E.encode(vec), r["account_id"], r["contact_id"],
+                         E.encode(vec), E.to_pgvector(vec),
+                         r["account_id"], r["contact_id"],
                          r["opportunity_id"], r["party_key"],
                          r["visibility"] or INTERNAL, r["occurred_at"],
                          text[:2000], speech_act(text), r.get("direction"),
@@ -804,17 +1006,116 @@ def search(query: str,
             "NOT an empty result set.")
     _LAST_COVERAGE["searches"] += 1
 
-    sql = (f"SELECT source_type, source_id, embedding, dims, snippet, "
-           f"visibility, occurred_at, speech_act FROM content_embeddings "
+    # CANDIDATE SELECTION IS THE WHOLE FIX, and it is one clause.
+    #
+    # Everything downstream — the numpy re-rank, the template dedupe, MIN_SIM,
+    # the speech-act filter — is unchanged and still decides the final order.
+    # The index is not trusted to rank; it is trusted to CHOOSE WHAT TO RANK.
+    # So the exact scores every caller sees are still computed here, over
+    # candidates drawn from the whole corpus instead of from the last 4,000
+    # rows by date.
+    #
+    # MEASURED BEFORE SWITCHING (60 sampled queries, recall@10 against an
+    # exhaustive numpy ranking of all 12,971 rows):
+    #
+    #     recency window, BEST POSSIBLE   29.8%   ← the ceiling, not the score
+    #     pgvector HNSW                   92.5%
+    #     distance-equivalent queries     96.7%
+    #     mean similarity shortfall       0.0095
+    #     latency                         1.6 ms vs 1.7 ms
+    #
+    # The residual 7.5% is not a miss. This corpus is heavily templated, so the
+    # true top-k contains ties, and a different member of a tie scores as a
+    # miss by identity while being identical by distance — which is what the
+    # 96.7% figure separates out.
+    # Kept SEPARATE from the candidate query's parameters. The truncation
+    # COUNT below reuses only the WHERE clause, and appending the query vector
+    # to a shared list gave it one argument more than it had placeholders —
+    # which psycopg2 raised, and the handler below swallowed as "no results".
+    where_args = list(args)
+    _cols = ("source_type, source_id, embedding, dims, snippet, "
+             "visibility, occurred_at, speech_act")
+
+    # RECENCY POOL — unchanged semantics, plus an explicit secondary key.
+    # `occurred_at` ties were previously broken by whatever order PostgreSQL
+    # returned, which is the other half of the determinism problem D2 fixes in
+    # the ranker. Ordering by the primary key after the timestamp costs nothing
+    # and makes the pool reproducible.
+    sql = (f"SELECT {_cols} FROM content_embeddings "
            f"WHERE {' AND '.join(where)} "
-           f"ORDER BY occurred_at DESC NULLS LAST LIMIT {int(MAX_CANDIDATES)}")
+           f"ORDER BY occurred_at DESC NULLS LAST, source_type, source_id "
+           f"LIMIT {int(MAX_CANDIDATES)}")
+
+    # VECTOR POOL — the same eligibility clause, so speech-act filtering and
+    # visibility apply identically to both pools. Only the ordering differs.
+    vec_sql = (f"SELECT {_cols} FROM content_embeddings "
+               f"WHERE {' AND '.join(where)} AND embedding_v IS NOT NULL "
+               f"ORDER BY embedding_v <=> %s::vector, source_type, source_id "
+               f"LIMIT {int(N_VEC)}")
+
+    # ── Diagnostics. Counts and reasons only; never content, never vectors. ──
+    diag: Dict[str, Any] = {"retrieval_mode": "hybrid" if HYBRID else "recency_only",
+                            "recency_candidate_count": 0, "vector_candidate_count": 0,
+                            "union_candidate_count": 0, "overlap_count": 0,
+                            "ranked_count": 0, "final_count": 0,
+                            "fallback_reason": None, "vector_query_failure": False,
+                            "recency_query_failure": False, "empty_result_reason": None}
+
+    _vec = HYBRID and _vector_candidates_ready()
+    if HYBRID and not _vec:
+        diag["fallback_reason"] = _vec_state.get("why")
 
     try:
         conn = get_connection()
         try:
             with conn.cursor() as cur:
+                # RECENCY IS THE FLOOR. Its failure is a genuine retrieval
+                # failure, not an empty result — the caller must be able to
+                # tell "nothing matched" from "the index did not answer".
                 cur.execute(sql, args)
                 rows = cur.fetchall()
+                diag["recency_candidate_count"] = len(rows)
+
+                # VECTOR IS ADDITIVE, so its failure degrades rather than
+                # fails. Caught SEPARATELY and reported LOUDLY: a vector query
+                # that dies must not look like a corpus with nothing in it,
+                # and it must not take the recency results down with it.
+                if _vec:
+                    try:
+                        # ef_search MUST BE RAISED TO REACH N_VEC.
+                        #
+                        # HNSW returns at most `ef_search` rows regardless of
+                        # LIMIT, and the default is 40 — so `LIMIT 500` was
+                        # measured returning 41. The D1 experiment simulated
+                        # the vector pool with exact numpy and therefore never
+                        # saw this; without the line below, N_VEC is a number
+                        # the index quietly ignores.
+                        #
+                        # The vector cast comes FIRST on purpose: pgvector
+                        # registers hnsw.ef_search when its library loads, and
+                        # PostgreSQL accepts `SET` for any unknown two-part
+                        # name as a custom option — so setting it before the
+                        # library is loaded silently sets a variable nothing
+                        # reads. Verified after setting, for the same reason.
+                        cur.execute("SELECT '[1,0]'::vector <=> '[0,1]'::vector")
+                        cur.execute(f"SET LOCAL hnsw.ef_search = {max(int(N_VEC), 40)}")
+                        cur.execute(vec_sql, where_args + [E.to_pgvector(qv)])
+                        vrows = cur.fetchall()
+                        diag["vector_candidate_count"] = len(vrows)
+                        seen = {(r[0], r[1]) for r in rows}
+                        overlap = sum(1 for r in vrows if (r[0], r[1]) in seen)
+                        diag["overlap_count"] = overlap
+                        rows = rows + [r for r in vrows if (r[0], r[1]) not in seen]
+                    except Exception as vexc:
+                        conn.rollback()
+                        diag["vector_query_failure"] = True
+                        diag["fallback_reason"] = f"vector query failed: {str(vexc)[:120]}"
+                        logger.error(
+                            f"[content_index] VECTOR candidate query failed — "
+                            f"falling back to recency candidates only. This is "
+                            f"a degraded search, not an empty corpus: {vexc}",
+                            exc_info=True)
+                diag["union_candidate_count"] = len(rows)
                 # HOW MUCH OF THE CORPUS COULD THIS SEARCH EVEN SEE?
                 #
                 # Candidates are the MOST RECENT `MAX_CANDIDATES` rows matching
@@ -838,29 +1139,91 @@ def search(query: str,
                 #
                 # Coverage moves with corpus size, not per query, so one reading
                 # every SAMPLE searches is the same signal at 1/20th the cost.
-                if len(rows) >= MAX_CANDIDATES:
+                # ONLY MEANINGFUL ON THE RECENCY PATH, and this guard is not a
+                # convenience. The measurement above asks "how much of the
+                # corpus could this search even see", which is a real question
+                # when candidates are the most RECENT 4,000 rows. When they are
+                # the most RELEVANT 4,000 the limit is always reached and never
+                # indicates degradation — so counting it there would report
+                # permanent truncation, drown the real signal, and teach
+                # everyone to ignore the one number that detects this defect
+                # coming back.
+                if not _vec and len(rows) >= MAX_CANDIDATES:
                     _LAST_COVERAGE["truncated"] += 1
                     if _LAST_COVERAGE["truncated"] % TRUNCATION_SAMPLE == 1:
                         cur.execute("SELECT count(*) FROM content_embeddings "
-                                    f"WHERE {' AND '.join(where)}", args)
+                                    f"WHERE {' AND '.join(where)}", where_args)
                         _record_truncation(len(rows), cur.fetchone()[0])
         finally:
             conn.close()
     except Exception as exc:
-        logger.info(f"[content_index] search skipped (table missing?): {exc}")
-        return []
+        # THE RECENCY QUERY FAILED, and that is a retrieval failure.
+        #
+        # This used to catch everything, log at INFO as "table missing?", and
+        # return [] — so an unreachable index, a malformed query and a corpus
+        # with no matches were the same answer to the caller. It was not
+        # hypothetical: a parameter-count bug surfaced as "0 results" and was
+        # only found by reading the log line it was hiding behind.
+        #
+        # A missing table still degrades quietly, because a database that has
+        # never been indexed is a legitimate state that must not raise on every
+        # search. Anything else is now loud, and the caller is told.
+        diag["recency_query_failure"] = True
+        msg = str(exc)
+        if "does not exist" in msg or "undefined table" in msg.lower():
+            logger.info(f"[content_index] no content index on this database: {exc}")
+            _log_retrieval(diag, "no_index")
+            return []
+        logger.error(f"[content_index] RECENCY candidate query FAILED — this is "
+                     f"a retrieval failure, not an empty result: {exc}",
+                     exc_info=True)
+        raise RetrievalUnavailable(
+            f"the content index could not be queried: {str(exc)[:200]}")
 
     if not rows:
+        _log_retrieval(diag, "no_candidates")
         return []
 
     by_key = {(r[0], r[1]): r for r in rows}
-    # Over-fetch, then suppress near-duplicates down to `limit`. Ranking a few
-    # extra rows is free (one matrix product); losing the only distinct answer
-    # to four copies of a template is not.
+
+    # CANONICAL ORDER BEFORE RANKING. The ranker's sort is stable (D2), so the
+    # order candidates arrive in decides how exact ties are broken. Sorting by
+    # the primary key here is what turns "stable" into "deterministic": the
+    # same union produces the same result whichever pool contributed a row and
+    # in whatever order the pools came back.
+    cands = sorted(by_key.items(), key=lambda kv: kv[0])
+
+    # RANK THE WHOLE UNION, SLICE LAST (D1-C).
+    #
+    # The budget used to be `limit * 6`, applied INSIDE rank() before template
+    # dedupe ran. On a union that is measurably wrong: the pool is larger and
+    # more redundant, so copies of one template consume the budget before a
+    # distinct record is reached, and the search returns FEWER results than the
+    # recency path it replaced. Measured across 60 queries at five limits, the
+    # three candidate-budget strategies were compared end to end, and ranking
+    # the entire union was the only one with zero true content loss.
+    #
+    # The cost is one larger matrix product — 4.1 ms to 10.2 ms measured at a
+    # 4,500-row union — which is far less than the vector query it accompanies.
+    # THE BUDGET IS MODE-DEPENDENT, and that is the kill switch's whole
+    # promise. "Rank all" is part of D1-C, not a free improvement: because
+    # rank() applies MIN_SIM AFTER its slice, widening the slice lets through
+    # results that the fixed `limit * 6` budget had been silently consuming
+    # slots for. Applied to the recency pool it changed recency_only's output —
+    # 2, 4, 1, 1 results became 5, 5, 5, 5 on four sample queries.
+    #
+    # That is arguably better and is emphatically NOT what recency_only means.
+    # The switch has to restore the prior contract exactly or it is not a
+    # rollback, so the legacy path keeps the legacy budget.
+    budget = len(cands) if _vec else int(limit) * 6
     ranked = E.rank(qv,
-                    [((r[0], r[1]), bytes(r[2]), r[3]) for r in rows],
-                    limit=int(limit) * 6,
+                    [(k, bytes(r[2]), r[3]) for k, r in cands],
+                    limit=budget,
                     min_sim=MIN_SIM if min_sim is None else float(min_sim))
+    diag["ranked_count"] = len(ranked)
+    if not ranked:
+        _log_retrieval(diag, "all_below_min_sim")
+        return []
 
     # Customer audience: re-assert visibility from the source before returning.
     if not is_internal and ranked:
@@ -896,6 +1259,15 @@ def search(query: str,
             "speech_act": r[7],
             "similarity": round(sim, 4),
         })
+
+    # EVERY EMPTY RESULT NAMES ITS CAUSE. Reaching here with nothing means the
+    # candidates ranked, cleared MIN_SIM, and were then removed — by template
+    # dedupe or by the customer visibility re-check. Both are legitimate; being
+    # unable to tell which is not.
+    diag["final_count"] = len(out)
+    diag["dedupe_count"] = len(ranked) - len(out)
+    _log_retrieval(diag, None if out else
+                   ("removed_by_dedupe_or_visibility" if ranked else "no_candidates"))
 
     # Audit trail. Recorded HERE, at the single point every retrieval passes
     # through, so no caller can obtain grounding without leaving a record. The
@@ -939,6 +1311,170 @@ def status() -> Dict[str, Any]:
         "by_source": [{"source_type": s, "visibility": v, "count": n,
                        "model": m, "dims": d} for s, v, n, m, d in rows],
     }
+
+
+def rebuild_vectors(batch: int = 1000, limit: Optional[int] = None,
+                    verify_only: bool = False) -> Dict[str, Any]:
+    """Derive `embedding_v` from `embedding` — the whole column, not the gaps.
+
+    WHY WHOLESALE. A hand-made backfill left this column 59% populated AND
+    wrong in 35 places: rows whose vector disagreed with the bytea it was
+    supposedly computed from, worst cosine 0.960217. Filling only the NULLs
+    would have preserved every one of those, and a wrong vector does not fail —
+    it ranks the wrong document, confidently, on a surface nobody re-checks.
+    So every row is rewritten from the authoritative source and none of the
+    existing values is trusted.
+
+    DIRECTION IS FIXED: bytea -> vector. `embedding` is what every writer
+    writes and every reader reads; `embedding_v` exists for the HNSW index.
+    When they disagree the bytea is right by definition.
+
+    No re-embedding, no API spend: the vectors already exist and this is a
+    decode. Resumable and idempotent — re-running it changes nothing once the
+    column agrees, which is also what makes it safe to schedule.
+
+    `verify_only` reports the disagreement without writing, so the drift can be
+    measured on production before anything is changed there.
+    """
+    out: Dict[str, Any] = {"ok": True, "checked": 0, "rewritten": 0,
+                           "disagreed": 0, "missing": 0, "skipped_dims": 0,
+                           "verify_only": verify_only, "worst_cosine": 1.0}
+    try:
+        import numpy as _np
+    except Exception as exc:                                # pragma: no cover
+        return {"ok": False, "error": f"numpy unavailable: {exc}"}
+
+    conn = get_connection()
+    try:
+        last: Optional[Tuple[str, str, int]] = None
+        while True:
+            with conn.cursor() as cur:
+                # Keyset pagination on the primary key. An OFFSET walk over a
+                # table being written to skips rows, and the row it skips is
+                # invisible rather than reported.
+                if last is None:
+                    cur.execute(
+                        "SELECT source_type, source_id, chunk_ix, dims, "
+                        "embedding, embedding_v IS NULL "
+                        "FROM content_embeddings "
+                        "ORDER BY source_type, source_id, chunk_ix LIMIT %s",
+                        (batch,))
+                else:
+                    cur.execute(
+                        "SELECT source_type, source_id, chunk_ix, dims, "
+                        "embedding, embedding_v IS NULL "
+                        "FROM content_embeddings "
+                        "WHERE (source_type, source_id, chunk_ix) > (%s,%s,%s) "
+                        "ORDER BY source_type, source_id, chunk_ix LIMIT %s",
+                        (*last, batch))
+                rows = cur.fetchall()
+            if not rows:
+                break
+
+            for st, sid, ix, dims, blob, was_null in rows:
+                last = (st, sid, ix)
+                out["checked"] += 1
+                if was_null:
+                    out["missing"] += 1
+                vec = E.decode(bytes(blob), expect_dims=int(dims)) if blob else None
+                if vec is None:
+                    # A width that does not match its own `dims` is not
+                    # comparable to anything; writing it into a vector(512)
+                    # would either fail or silently mean something else.
+                    out["skipped_dims"] += 1
+                    continue
+                if not verify_only:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE content_embeddings SET embedding_v = %s::vector "
+                            "WHERE source_type=%s AND source_id=%s AND chunk_ix=%s",
+                            (E.to_pgvector(vec), st, sid, ix))
+                        out["rewritten"] += cur.rowcount
+            if not verify_only:
+                conn.commit()
+            if limit and out["checked"] >= limit:
+                break
+
+        # Measure what is left, from the database rather than from the counters
+        # above — a report derived from the work it is reporting on cannot
+        # detect the work being wrong.
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*), count(embedding_v) FROM content_embeddings")
+            total, vectors = cur.fetchone()
+        out["total"] = total
+        out["with_vector"] = vectors
+        out["still_missing"] = total - vectors
+    except Exception as exc:
+        # LOUD, not merely recorded. A returned {"ok": False} is only seen by a
+        # caller that reads it, and the scheduled caller does not: a rebuild
+        # that dies half-way would otherwise leave the column partly written
+        # and say so nowhere — which is the state this whole routine exists to
+        # repair, recreated by the repair itself.
+        logger.error(f"[content_index] rebuild_vectors FAILED after "
+                     f"{out['checked']} row(s), {out['rewritten']} rewritten: "
+                     f"{exc}", exc_info=True)
+        out["ok"] = False
+        out["error"] = str(exc)[:300]
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+    return out
+
+
+def vector_drift() -> Dict[str, Any]:
+    """How far `embedding_v` has drifted from the authoritative `embedding`.
+
+    The detector for the failure this column already had once. Cheap enough to
+    schedule: it decodes in numpy and compares direction, so it costs no model
+    calls and touches no external service.
+    """
+    try:
+        import numpy as _np
+    except Exception as exc:                                # pragma: no cover
+        return {"ok": False, "error": f"numpy unavailable: {exc}"}
+    out: Dict[str, Any] = {"ok": True, "compared": 0, "disagreed": 0,
+                           "worst_cosine": 1.0, "examples": []}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT source_type, source_id, chunk_ix, dims, embedding, "
+                        "embedding_v::text FROM content_embeddings "
+                        "WHERE embedding_v IS NOT NULL")
+            rows = cur.fetchall()
+        for st, sid, ix, dims, blob, vtxt in rows:
+            a = E.decode(bytes(blob), expect_dims=int(dims)) if blob else None
+            if a is None or not vtxt:
+                continue
+            av = _np.asarray(a, dtype=_np.float64)
+            # not np.fromstring: deprecated, and it fails silently on a
+            # malformed literal by returning a short array rather than raising.
+            bv = _np.array(vtxt.strip("[]").split(","), dtype=_np.float64)
+            if av.shape != bv.shape:
+                out["disagreed"] += 1
+                continue
+            out["compared"] += 1
+            na, nb = _np.linalg.norm(av), _np.linalg.norm(bv)
+            if na == 0 or nb == 0:
+                continue
+            cos = float(av @ bv / (na * nb))
+            if cos < 0.9999:
+                out["disagreed"] += 1
+                out["worst_cosine"] = min(out["worst_cosine"], cos)
+                if len(out["examples"]) < 10:
+                    out["examples"].append(
+                        {"source_type": st, "source_id": sid, "chunk_ix": ix,
+                         "cosine": round(cos, 6)})
+    except Exception as exc:
+        logger.error(f"[content_index] vector_drift FAILED after "
+                     f"{out['compared']} comparison(s): {exc}", exc_info=True)
+        out["ok"] = False
+        out["error"] = str(exc)[:300]
+    finally:
+        conn.close()
+    return out
 
 
 # ============================================================================

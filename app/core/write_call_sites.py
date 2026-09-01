@@ -136,6 +136,11 @@ ADMIN_GATED: Set[str] = {
     "app/core/agent_console.py", "app/core/agent_versions.py",
     "app/core/blackboard.py", "app/core/ceo_briefing.py",
     "app/core/content_index.py", "app/core/conversations.py",
+    # Writes corpus_provenance only. Every route on its router carries
+    # require_admin (verified: an unauthenticated GET returns 403), and
+    # the table's own CHECK constraints and settled-state trigger mean a
+    # wrong classification cannot be written even by an authorised caller.
+    "app/core/corpus_provenance.py",
     "app/core/custom_agents.py", "app/core/custom_fields.py",
     "app/core/customer_memory.py", "app/core/data_quality.py",
     "app/core/demo.py", "app/core/deploy_state.py", "app/core/embed.py",

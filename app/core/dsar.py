@@ -80,18 +80,22 @@ DIRECT: Dict[str, Tuple[str, ...]] = {
     # The subject's own records
     "contacts":                   ("contact_id", "email", "phone"),
     "leads":                      ("lead_id", "email", "phone"),
-    "customers":                  ("customer_id", "account_id"),
     "accounts":                   ("account_id",),
     "channel_identities":         ("account_id",),
     # Their activity
     "activities":                 ("contact_id", "lead_id", "account_id"),
     "activity_participants":      ("contact_id",),
-    "appointments":               ("customer_id",),
     "cases":                      ("contact_id", "account_id"),
     "conversations":              ("account_id",),
-    "call_logs":                  ("customer_id",),
-    "call_state":                 ("customer_id",),
-    "invalid_phones_log":         ("customer_id",),
+    # RETIRED 2026-09-01: appointments, call_logs, call_state,
+    # invalid_phones_log and customers were all keyed by `customer_id` — the
+    # remains of a booking application that predates this CRM. Nothing wrote
+    # any of them (the three call/appointment tables held zero rows;
+    # invalid_phones_log's eight were all logged on 2025-10-22), and live
+    # booking writes `activities`. They left the manifest together because
+    # `customers` was the RESOLVER for the others' subject key: retiring it
+    # alone would have left four sections in the manifest that no export could
+    # ever reach — a coverage claim with nothing behind it.
     # Commercial record
     "opportunities":              ("contact_id", "account_id"),
     "orders":                     ("contact_id", "account_id"),
@@ -192,6 +196,22 @@ CHILD: Dict[str, Tuple[str, str, str]] = {
 # EXCLUDED: table -> why. A reason is mandatory. "We didn't think of it" is not
 # one of these, which is the point of making the list explicit.
 EXCLUDED: Dict[str, str] = {
+    # customers_retired_20260901 and invalid_phones_log_retired_20260901 were
+    # briefly listed here as a HOLDING STATE while their disposition was owed.
+    #
+    # DISPOSITION E8, SETTLED 2026-09-01: ERASE. 38 rows and 8 rows were
+    # permanently removed (sql/erasure_e8_retired_tables.sql) and both tables
+    # were dropped, so there is nothing left to exclude. The erasure itself is
+    # recorded in `retired_table_dispositions`, which is now the ledger for the
+    # standing invariant:
+    #
+    #     No retired table may retain personal data without an explicit
+    #     disposition. Erasure is the default unless the table is restored
+    #     to the manifest.
+    #
+    # The shells were dropped rather than emptied because both carried
+    # `customer_id` and `account_id`: leaving them out of this dict while they
+    # still existed would have made coverage() refuse to certify an export.
     "employees":    "Staff record, not customer data. KNOWN LIMITATION: the "
                     "staff-subject path this implies does NOT exist -- "
                     "_resolve() accepts only contact/lead/account/email. See "
@@ -776,18 +796,21 @@ def _resolve(cur, subject_type: str, subject_id: str) -> Dict[str, Any]:
                     "AND (contact_id IS DISTINCT FROM %s)",
                     (ids["account_id"], ids["contact_id"]))
         others = cur.fetchone()[0]
-        # customer_id is derived FROM THE ACCOUNT, so on a shared account it
-        # may belong to a colleague. Resolving it unconditionally laundered an
-        # account-scoped identifier into a subject-scoped one and slipped past
-        # the Art. 15(4) withholding — a shared-account export carried another
-        # contact's email address in the `customers` section. Withholding the
-        # account is not enough if an id taken from it is still trusted.
-        if others == 0:
-            cur.execute("SELECT customer_id FROM customers WHERE account_id = %s "
-                        "LIMIT 1", (ids["account_id"],))
-            c = cur.fetchone()
-            if c:
-                ids["customer_id"] = c[0]
+        # RETIRED 2026-09-01 with the `customers` table, and the defect it
+        # guarded is kept written down because the SHAPE recurs even though
+        # this instance is gone:
+        #
+        #   customer_id was derived FROM THE ACCOUNT, so on a shared account it
+        #   could belong to a colleague. Resolving it unconditionally laundered
+        #   an account-scoped identifier into a subject-scoped one and slipped
+        #   past the Art. 15(4) withholding — a shared-account export carried
+        #   another contact's email address in the `customers` section.
+        #   Withholding the account is not enough if an id taken from it is
+        #   still trusted.
+        #
+        # `others` is still computed below and still gates `_account_scope_
+        # released`. Any FUTURE account-derived identifier must re-earn the
+        # `others == 0` guard that used to stand here.
     ids["_account_shared_with"] = others
     ids["_account_scope_released"] = (others == 0)
     return ids

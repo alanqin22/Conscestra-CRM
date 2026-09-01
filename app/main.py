@@ -1741,7 +1741,12 @@ app.include_router(identity_resolution_router, dependencies=_ADMIN)
 # -- Reversible identity links + resolved "golden record" view (P1). Links only —
 # records are never rewritten, so every decision is reversible.
 from app.core.identity_links import router as identity_links_router
+# Corpus provenance: which subjects are demonstration data and which are real.
+# Admin-gated — it reports on the whole corpus, and the tripwire it exposes is
+# the signal an operator uses to decide the public-read posture.
+from app.core.corpus_provenance import router as corpus_provenance_router
 app.include_router(identity_links_router, dependencies=_ADMIN)
+app.include_router(corpus_provenance_router, dependencies=_ADMIN)
 
 # -- Data lifecycle / erasure (#8) — explicit delete/anonymize/retain policy across
 # the distributed copies (custom fields, memories, transcripts, identity links);

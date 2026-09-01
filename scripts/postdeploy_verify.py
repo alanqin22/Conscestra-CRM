@@ -611,6 +611,59 @@ def main(argv: Optional[list] = None) -> int:
         if not verdict and not skipped:
             failures.append("schema drift")
 
+    # A DIFFERENT QUESTION FROM THE CHECK ABOVE, and they are easy to confuse.
+    #
+    #   _schema_drift        SPATIAL — objects here that are missing there.
+    #                        Catches "applied locally, never to Railway", which
+    #                        cost a fifteen-day coupon outage.
+    #   undeclared change    TEMPORAL — this database moved since the last time
+    #                        a TOOL recorded it. Catches "applied by hand,
+    #                        through neither door", which is invisible to every
+    #                        declaration-path control because it never entered
+    #                        a declaration.
+    #
+    # ADVISORY, deliberately, and this is the first run of a new detector: it
+    # will surface historical drift that predates its own existence. That list
+    # is worth reading before it can stop a deploy — the same advisory-first
+    # path write_call_sites took, for the same reason. Promote it to blocking
+    # once the reported set has been reviewed and attested once.
+    # A subprocess, not an in-process call: deploy_state resolves its DSN from
+    # the environment AT IMPORT, so asking this process (already bound to the
+    # local database) about the target would silently report on the wrong one.
+    try:
+        import json as _json
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "from app.core.deploy_state import schema_drift;"
+             "import json;print(json.dumps(schema_drift(),default=str))"],
+            cwd=str(ROOT), capture_output=True, text=True,
+            env={**os.environ, "DB_DSN": dsn, "DATABASE_URL": dsn})
+        rep = _json.loads((proc.stdout or "{}").strip().splitlines()[-1])
+    except Exception as exc:
+        rep = {"state": "unknown", "error": str(exc)[:160]}
+
+    state = rep.get("state", "unknown")
+    if state == "clean":
+        print("  PASS  undeclared schema change")
+        print(f"        fingerprint {rep.get('live_fingerprint')} matches the "
+              f"last attestation ({rep.get('last_attested', {}).get('source')})\n")
+    elif state == "never_attested":
+        print("  SKIP  undeclared schema change")
+        print("        never attested — a database that has never been "
+              "recorded has not been shown to be undrifted. Run "
+              "deploy_state.record_schema_attestation('baseline') once this "
+              "schema is believed correct.\n")
+    elif state == "drifted":
+        print("  WARN  undeclared schema change (advisory)")
+        print(f"        {rep.get('detail', '')}")
+        for k in ("added", "removed", "altered"):
+            for name in (rep.get(k) or [])[:8]:
+                print(f"          {k[:5]:5}  {name}")
+        print()
+    else:
+        print("  SKIP  undeclared schema change")
+        print(f"        could not evaluate: {rep.get('error', 'unknown')}\n")
+
     _report_connected_roles(dsn)
 
     if failures:

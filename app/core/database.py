@@ -210,6 +210,51 @@ def close_all_pools() -> None:
         _POOLS.clear()
 
 
+def _stamp_correlation(conn):
+    """Carry the current play's correlation id INTO the database session.
+
+    WHY IT HAS TO CROSS THIS BOUNDARY. Eight of the nine event triggers
+    `INSERT INTO events` directly from PL/pgSQL — an account created, a deal
+    moved, an invoice raised, a payment received. Those are the rows that
+    answer "what changed in the business", they are written by the database
+    inside the same transaction as the change (which is what makes them
+    trustworthy), and no Python context reaches them. A ContextVar closes none
+    of that gap; a session variable closes all of it, because the BEFORE INSERT
+    trigger on `events` reads it no matter which path did the insert.
+
+    Joins app.repair_key / app.actor / app.erasure / app.suppress_events — the
+    same mechanism, already established in this schema.
+
+    SESSION-SCOPED, NOT `SET LOCAL`, because a borrower runs many transactions
+    and the id must outlive each of them. Safe to do so: `_Pooled.close()`
+    calls `conn.reset()` (RESET ALL) before the connection returns to the pool,
+    so a value cannot leak into the next borrower's work.
+
+    Costs one round trip, and ONLY when there is an id to carry — an unattended
+    scheduler tick has no play and pays nothing. Best-effort throughout: a
+    connection that cannot be annotated is still a working connection, and
+    failing here would take down the request to protect its audit trail.
+    """
+    try:
+        from app.core import grounding
+        cid = grounding.correlation_id()
+    except Exception:
+        return
+    if not cid:
+        return
+    try:
+        prev = conn.autocommit
+        conn.autocommit = True           # no transaction is open at borrow time
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT set_config('app.correlation_id', %s, false)",
+                            (str(cid)[:64],))
+        finally:
+            conn.autocommit = prev
+    except Exception as exc:                                # pragma: no cover
+        logger.debug(f"could not stamp correlation id: {exc}")
+
+
 def get_connection():
     """Return a raw psycopg2 connection for the current tenant.
 
@@ -294,7 +339,9 @@ def get_connection():
                         "every pooled connection failed validation — the "
                         "database is unreachable or was restarted and the pool "
                         "could not be refreshed")
-                return _Pooled(raw, pool, slots)
+                pooled = _Pooled(raw, pool, slots)
+                _stamp_correlation(pooled)
+                return pooled
             except Exception:
                 slots.release()
                 raise
@@ -317,6 +364,7 @@ def get_connection():
     else:
         conn = psycopg2.connect(dsn, application_name=app_name)
     conn.set_client_encoding('UTF8')
+    _stamp_correlation(conn)
     return conn
 
 

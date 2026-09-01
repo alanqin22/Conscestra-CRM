@@ -72,6 +72,25 @@ def encode(vec: Sequence[float]) -> bytes:
     return struct.pack(f"<{len(vec)}f", *vec)
 
 
+def to_pgvector(vec: Sequence[float]) -> str:
+    """Render a vector as a pgvector literal, for the indexed `embedding_v`.
+
+    Lives beside `encode` on purpose. content_embeddings stores the SAME
+    numbers twice — as bytea for the application to rank in numpy, and as
+    vector(512) for the HNSW index — and the only way two representations of
+    one value stay equal is if both are produced from that value at the same
+    moment, by code sitting in the same place. They were not, once: a hand-made
+    backfill left 35 rows whose vector disagreed with their bytea (worst cosine
+    0.960), which is invisible until a search quietly ranks the wrong thing.
+
+    Deliberately NOT the inverse of `decode`. There is no bytea -> vector path
+    here that a caller could reach for instead of writing both columns from the
+    source vector; the repair direction lives in content_index.rebuild_vectors,
+    where it is a one-time correction rather than a routine.
+    """
+    return "[" + ",".join(repr(float(x)) for x in vec) + "]"
+
+
 def decode(blob: bytes, expect_dims: Optional[int] = None) -> Optional[List[float]]:
     """Unpack a float32 blob. Returns None when the width does not match what
     the caller expects — a vector of a different geometry is not comparable, and
@@ -218,7 +237,23 @@ def rank(query_vec: Sequence[float],
         qn = float(np.linalg.norm(q)) or 1.0
         norms = np.where(norms == 0, 1.0, norms)
         sims = (M @ q) / (norms * qn)
-        order = np.argsort(-sims)[:max(int(limit), 1)]
+        # STABLE, AS OF 2026-09-01 (D2). numpy's default is quicksort, which is
+        # not stable, so the order of EQUAL similarities was decided by
+        # whatever order the caller happened to pass — and ties are not rare
+        # here: measured 395 of 4,000 candidates tied on one query, with a
+        # largest tie group of 88, because the corpus is heavily templated.
+        #
+        # That made determinism incidental. It held only because the candidate
+        # SQL returned rows in a fixed order; 2 of 25 queries returned a
+        # different result once the candidate pool arrived in a different
+        # order. A stable sort plus a caller that passes candidates in a
+        # canonical order makes tie-breaking defined instead of accidental.
+        #
+        # THIS IS A BEHAVIOUR CHANGE AND IS NOT DESCRIBED AS ANYTHING ELSE:
+        # some existing results will reorder among equal scores. The
+        # similarity VALUES are untouched — same dot product, same norms, same
+        # float32 — so only the arrangement of exact ties differs.
+        order = np.argsort(-sims, kind="stable")[:max(int(limit), 1)]
         return [(keys[i], float(sims[i])) for i in order
                 if float(sims[i]) >= min_sim]
     except ImportError:

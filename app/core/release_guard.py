@@ -105,15 +105,21 @@ def _check_api_auth() -> Dict[str, Any]:
     all passed its own security check. A guard that reports the wrong posture
     is worse than no guard, because it manufactures confidence.
 
-    Deliberately softer than the calendar check: API_SECURITY_MODE governs a
-    staged rollout across many endpoints, and hard-stopping a deploy over a
-    posture decision could take down a working system. The calendar feed is one
-    endpoint serving customer data with nothing else in front of it.
+    Softer than the calendar check for the postures somebody CHOSE — `locked`
+    and `public-read` are staged-rollout decisions across many endpoints, and
+    hard-stopping a deploy over one could take down a working system.
+
+    NOT softer for `open`, as of 2026-08-31. That posture is reached by
+    misspelling the mode or by configuring nothing, both of which are the
+    absence of a decision rather than a decision, and it removes anonymous-write
+    protection at all three layers at once. It blocks in a deployed environment
+    unless API_ALLOW_OPEN=1 says otherwise. See the reasoning at the branch.
     """
     try:
         from app.core import auth_dep
         posture = auth_dep.SECURITY_POSTURE
         conflict = getattr(auth_dep, "POSTURE_CONFLICT", "")
+        unrecognised = getattr(auth_dep, "SECURITY_MODE_UNRECOGNISED", "")
     except Exception as exc:
         return {"control": "api_auth", "ok": False, "severity": "advisory",
                 "message": f"could not resolve the security posture: {exc}"}
@@ -123,10 +129,17 @@ def _check_api_auth() -> Dict[str, Any]:
     # answer silently, and would otherwise read this report as agreement.
     note = (f" ({conflict} is set but IGNORED — API_SECURITY_MODE wins.)"
             if conflict else "")
+    # Reported wherever it appears, even when the resulting posture is safe: a
+    # mode string nobody recognises is a misconfiguration whether or not it
+    # happened to land somewhere harmless, and the operator should learn that
+    # the word they wrote does nothing.
+    if unrecognised:
+        note += (f" (API_SECURITY_MODE={unrecognised!r} is not a recognised "
+                 f"value and was IGNORED.)")
 
     if posture == "locked":
         return {"control": "api_auth", "ok": True,
-                "severity": "advisory" if conflict else "ok",
+                "severity": "advisory" if (conflict or unrecognised) else "ok",
                 "message": "posture=locked — every data call requires a login."
                            + note}
     if posture == "public-read":
@@ -135,10 +148,142 @@ def _check_api_auth() -> Dict[str, Any]:
                            "writes require an Admin/writer login. Deliberate "
                            "for a demo; use API_SECURITY_MODE=locked otherwise."
                            + note}
-    return {"control": "api_auth", "ok": False, "severity": "advisory",
-            "message": "posture=open — CRM data endpoints enforce NOTHING. "
-                       "Set API_SECURITY_MODE=locked (or public-read) before "
-                       "exposing this deployment." + note}
+
+    # ── posture == open ─────────────────────────────────────────────────────
+    # BLOCKING in a deployed environment, and this is a deliberate change from
+    # the softer treatment this check used to give it.
+    #
+    # WHY THE OLD REASONING NO LONGER APPLIES. It said hard-stopping a deploy
+    # "over a posture decision" could take down a working system. True of a
+    # posture somebody CHOSE. `open` is almost never chosen: it is reached by
+    # misspelling the mode (`blocked` reads like lockdown, matches nothing,
+    # falls through to flags that are unset in any deployment using the single
+    # switch) or by not configuring one at all. Both are the absence of a
+    # decision, not the presence of one.
+    #
+    # WHY IT IS WORTH A FAILED DEPLOY. Measured, not assumed: under `open`,
+    # require_data_access returns before it stamps the caller's role, and all
+    # THREE write controls key off that role. So they fail together —
+    #     HTTP gate           anonymous structured write ALLOWED
+    #     write_guard._role   None, read as "system/background — never gated"
+    #     readonly_context()  None, so no read-only transaction is opened
+    #     guard_query()       write stored procedure ALLOWED
+    # — leaving anonymous create/update/delete on every CRM record. That is a
+    # different class of exposure from the deliberate public-read posture,
+    # which protects writes at all three of those layers.
+    #
+    # THE ESCAPE HATCH IS THE POINT, exactly as CALENDAR_FEED_PUBLIC is for the
+    # feed: an operator who genuinely wants an unauthenticated deployment sets
+    # API_ALLOW_OPEN=1 and gets it. That turns an accident into a decision, and
+    # keeps a real deployment from being locked out by a control it disagrees
+    # with.
+    if _flag("API_ALLOW_OPEN"):
+        return {"control": "api_auth", "ok": True, "severity": "advisory",
+                "message": "posture=open — CRM data endpoints enforce NOTHING, "
+                           "reads AND writes, by explicit choice "
+                           "(API_ALLOW_OPEN=1)." + note}
+
+    cause = (f"API_SECURITY_MODE={unrecognised!r} is not a recognised value, so "
+             f"it was ignored"
+             if unrecognised else
+             "no API_SECURITY_MODE is set and neither legacy flag is enabled")
+    return {"control": "api_auth", "ok": False, "severity": "blocking",
+            "message": (
+                f"posture=open — CRM data endpoints enforce NOTHING: anonymous "
+                f"callers may create, update and delete records, because all "
+                f"three write controls key off a role this posture never "
+                f"stamps. Cause: {cause}. Set API_SECURITY_MODE=locked (or "
+                f"public-read for a demo); accepted values are "
+                f"open|off · public-read|publicread|read · "
+                f"locked|lockdown|full|strict. To run without authentication "
+                f"deliberately, set API_ALLOW_OPEN=1." + note)}
+
+
+def _check_public_read_corpus() -> Dict[str, Any]:
+    """public-read is safe only while the corpus is demonstration data.
+
+    The posture is a deliberate product decision — a prospective client must see
+    the CRM working without a login — and it rests entirely on an assumption
+    about WHAT IS IN THE DATABASE. Nothing checked that assumption, and nothing
+    would have noticed the day it stopped holding. The marketing motion this
+    posture exists to serve is the very thing that ends it: demos become
+    clients, and clients bring real records.
+
+    TWO SIGNALS, TWO SEVERITIES, and the split is the design.
+
+      BLOCKING   a customer subject CLASSIFIED `real`. That classification can
+                 only come from an external trace or a named person (the schema
+                 forbids every heuristic), so it is definitive, and serving
+                 definitively-real customer records anonymously is not a
+                 posture anyone should reach by inaction.
+
+      ADVISORY   an address outside the domains this deployment generates into.
+                 Deliberately over-sensitive, therefore deliberately NOT
+                 blocking: you do not hard-stop a deployment on a smoke
+                 detector calibrated to catch toast. Measured when written, it
+                 fires on eight rows in the legacy `customers` table that no
+                 anonymous read path can reach.
+
+    Quiet unless the posture is public-read: under `locked` there is nothing to
+    protect against here, and under `open` the api_auth check has already said
+    something louder.
+    """
+    try:
+        from app.core import auth_dep
+        if auth_dep.SECURITY_POSTURE != "public-read":
+            return {"control": "public_read_corpus", "ok": True, "severity": "ok",
+                    "message": f"posture={auth_dep.SECURITY_POSTURE} — the "
+                               f"corpus assumption is not load-bearing here."}
+        from app.core import corpus_provenance as cp
+        trip = cp.tripwire()
+        classified_real = [r for r in trip["reasons"] if "classified real" in r]
+    except Exception as exc:
+        # Cannot verify != verified safe. Advisory rather than blocking: an
+        # unreadable corpus is usually a database that is not up yet, and
+        # refusing to start on that would make this control the reason the
+        # application cannot reach its own database.
+        return {"control": "public_read_corpus", "ok": False,
+                "severity": "advisory",
+                "message": f"could not verify the corpus is demonstration "
+                           f"data: {str(exc)[:160]}"}
+
+    if classified_real and _flag("PUBLIC_READ_ACCEPT_REAL_DATA"):
+        # Same shape as CALENDAR_FEED_PUBLIC: an operator who genuinely intends
+        # to serve real customer records to anonymous callers can, and says so
+        # in a variable whose name is hard to set by accident. Never silent —
+        # an accepted risk that stops being reported stops being managed.
+        return {"control": "public_read_corpus", "ok": True,
+                "severity": "advisory",
+                "message": ("posture=public-read is serving records CLASSIFIED "
+                            "as real by explicit choice "
+                            "(PUBLIC_READ_ACCEPT_REAL_DATA=1): " +
+                            "; ".join(classified_real))}
+
+    if classified_real:
+        return {"control": "public_read_corpus", "ok": False,
+                "severity": "blocking",
+                "message": (
+                    "posture=public-read while the corpus holds records "
+                    "CLASSIFIED as real: " + "; ".join(classified_real) +
+                    ". Anonymous callers can read them. Set "
+                    "API_SECURITY_MODE=locked, or set "
+                    "PUBLIC_READ_ACCEPT_REAL_DATA=1 to serve real customer "
+                    "data publicly as a deliberate decision.")}
+
+    if trip["tripped"]:
+        return {"control": "public_read_corpus", "ok": True,
+                "severity": "advisory",
+                "message": ("posture=public-read and the corpus is not "
+                            "uniformly demonstration data: " +
+                            "; ".join(trip["reasons"]) +
+                            ". Not blocking — the domain signal is an alarm, "
+                            "not evidence. Classify them "
+                            "(corpus_provenance.classify) so the question is "
+                            "settled rather than re-guessed.")}
+
+    return {"control": "public_read_corpus", "ok": True, "severity": "ok",
+            "message": "posture=public-read and every customer subject is "
+                       "demonstration data or unclassified-with-no-signal."}
 
 
 def _check_admin_token() -> Dict[str, Any]:
@@ -576,7 +721,8 @@ def _check_db_privileges() -> Dict[str, Any]:
                        f"database-privilege layer is live"}
 
 
-CHECKS = (_check_calendar_feed, _check_api_auth, _check_admin_token,
+CHECKS = (_check_calendar_feed, _check_api_auth,
+          _check_public_read_corpus, _check_admin_token,
           _check_training_ack, _check_secret_strength,
           _check_configuration_integrity, _check_public_url,
           _check_email_call_sites, _check_capability_registry,
