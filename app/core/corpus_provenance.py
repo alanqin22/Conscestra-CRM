@@ -143,6 +143,24 @@ def classify(apply: bool = False) -> Dict[str, Any]:
     try:
         for table in ALL_SUBJECTS:
             meta = _SUBJECT_META[table]
+
+            # A RETIRED TABLE IS NOT AN OPEN QUESTION, and reporting it as one
+            # is a wrong reason stated confidently. `customers` was dropped
+            # from Railway by the E8 erasure; without this branch classify()
+            # described it as a live table lacking a signal column, whose rows
+            # "stay ambiguous" — implying records still awaiting a decision.
+            # There are no records. The distinction matters because ambiguous
+            # is a real state this system acts on: it is what blocks a merge
+            # and what the tripwire counts.
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass(%s) IS NOT NULL",
+                            (f"public.{table}",))
+                if not cur.fetchone()[0]:
+                    out["skipped"].append(
+                        f"{table}: table does not exist here — retired, not "
+                        f"unclassified; no rows remain to decide about")
+                    continue
+
             if not meta["synth"]:
                 out["skipped"].append(
                     f"{table}: no is_synthetic column — nothing to establish, "
@@ -185,6 +203,50 @@ def classify(apply: bool = False) -> Dict[str, Any]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Is a subject table absent because it was RETIRED, or absent because someone
+# dropped it?
+#
+# These must not be the same answer. Skipping every missing table would make
+# `DROP TABLE contacts` the quietest way to silence the tripwire — the control
+# would report clear precisely when the corpus had been destroyed. So absence
+# only excuses a table when the retirement is LEDGERED in
+# retired_table_dispositions, which is written by the E8 erasure migration and
+# is the same record the disposition invariant reads.
+#
+# Anything absent and undeclared is treated as a failure to read the corpus,
+# which trips the wire — the fail-closed behaviour this module already promises.
+# ---------------------------------------------------------------------------
+
+LIVE, RETIRED, UNDECLARED = "live", "retired", "undeclared"
+
+
+def _table_status(cur, table: str) -> str:
+    cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"public.{table}",))
+    if cur.fetchone()[0]:
+        return LIVE
+    cur.execute("SELECT to_regclass('public.retired_table_dispositions') "
+                "IS NOT NULL")
+    if not cur.fetchone()[0]:
+        return UNDECLARED          # no ledger exists — nothing is declared
+    # THE LEDGER RECORDS THE RENAMED TABLE, not the original. E8 renames
+    # `customers` to `customers_retired_20260901` before dropping it, so the
+    # row reads `customers_retired_<date>` and an equality match on the
+    # original name finds nothing — which is how this first ran, reporting a
+    # correctly-retired table as an undeclared drop.
+    #
+    # The pattern is anchored (`table || '_retired_%'`) rather than a bare
+    # LIKE so `contacts` can never be satisfied by a row about some other
+    # table that merely contains the word. `disposition <> 'pending'` still
+    # applies: a retirement that has not been decided is not a declaration.
+    cur.execute(
+        "SELECT count(*) FROM retired_table_dispositions "
+        "WHERE (table_name = %s OR table_name LIKE %s) "
+        "  AND disposition <> 'pending'",
+        (table, table + r"\_retired\_%"))
+    return RETIRED if cur.fetchone()[0] else UNDECLARED
+
+
 def summary() -> Dict[str, Any]:
     """Counts per subject table: classified, and how much is ambiguous.
 
@@ -199,7 +261,22 @@ def summary() -> Dict[str, Any]:
         for et, st, n in _rows("SELECT entity_type, state, count(*) "
                                "FROM corpus_provenance GROUP BY 1,2"):
             recorded[(et, st)] = n
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                status = {t: _table_status(cur, t) for t in ALL_SUBJECTS}
+        finally:
+            conn.close()
+        undeclared = sorted(t for t, v in status.items() if v == UNDECLARED)
+        if undeclared:
+            raise RuntimeError(
+                f"subject tables absent with no recorded retirement: "
+                f"{undeclared}. A dropped table is not the same as a retired "
+                f"one; declare it in retired_table_dispositions.")
+        out["retired"] = sorted(t for t, v in status.items() if v == RETIRED)
         for table in ALL_SUBJECTS:
+            if status[table] != LIVE:
+                continue
             meta = _SUBJECT_META[table]
             total = _rows(f"SELECT count(*) FROM {table}")[0][0]
             syn = recorded.get((table, SYNTHETIC), 0)
@@ -243,8 +320,27 @@ def tripwire() -> Dict[str, Any]:
                            "checked_domains": sorted(synthetic_domains())}
     domains = synthetic_domains()
     try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                status = {t: _table_status(cur, t) for t in CUSTOMER_SUBJECTS}
+        finally:
+            conn.close()
+        undeclared = sorted(t for t, v in status.items() if v == UNDECLARED)
+        if undeclared:
+            # Absent AND undeclared. Not an excuse to skip — the corpus could
+            # not be read, which is the fail-closed case.
+            raise RuntimeError(
+                f"customer subject table(s) absent with no recorded "
+                f"retirement: {undeclared}")
+        out["retired"] = sorted(t for t, v in status.items() if v == RETIRED)
+
         for table in CUSTOMER_SUBJECTS:
             meta = _SUBJECT_META[table]
+
+            # Signal 1 runs even for a RETIRED table: the classification rows
+            # outlive the table they describe, and a lingering `real` is worth
+            # surfacing rather than dropping on the floor with the DDL.
             n_real = _rows(
                 "SELECT count(*) FROM corpus_provenance "
                 "WHERE entity_type=%s AND state=%s", (table, REAL))[0][0]
@@ -252,6 +348,12 @@ def tripwire() -> Dict[str, Any]:
                 out["tripped"] = True
                 out["reasons"].append(
                     f"{table}: {n_real} record(s) classified real")
+
+            # Signal 2 reads the table itself, so it cannot run once the table
+            # is gone. A ledgered retirement is the only reason that is
+            # acceptable, and it was established above.
+            if status[table] != LIVE:
+                continue
 
             col = meta["email"]
             not_ours = _rows(
