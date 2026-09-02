@@ -1518,7 +1518,40 @@ router = APIRouter(tags=["semantic-content"])
 
 @router.get("/content-index/status")
 def content_index_status():
-    return status()
+    """Index health, PLUS which retrieval mode is actually running.
+
+    WHY THE MODE IS REPORTED HERE. RETRIEVAL_MODE is read from the environment
+    at import, and nothing else in the application observes it — so after
+    setting CONTENT_INDEX_RETRIEVAL_MODE on a deployment there was no way to
+    confirm it had taken, short of inferring it from result counts. That
+    inference is weak: two deployments hold different corpora, so "more results
+    than the other one" is not proof of anything.
+
+    This is the same reason /health reports `commit` and `process`: a
+    configuration that changes behaviour must be READABLE FROM THE RUNNING
+    PROCESS, not deduced from how it behaves.
+
+    `vector_pool` carries both signals deliberately — `revalidate` is the
+    standing disclosure that one template can nearly fill the vector pool
+    (permanently true here, and covered by the recency union), while
+    `changed_since_validation` is the one that means something has actually
+    moved. Reporting only the first would look like a permanent alarm;
+    reporting only the second would hide the thin margin.
+    """
+    out = status()
+    ready = _vector_candidates_ready()
+    out["retrieval"] = {
+        "mode": RETRIEVAL_MODE,
+        "hybrid": HYBRID,
+        # HYBRID is what was ASKED FOR; effective is what search will actually
+        # do. They differ when the vector column is absent or incomplete, and
+        # that gap is exactly where a silently-degraded deployment hides.
+        "effective": "hybrid" if (HYBRID and ready) else "recency_only",
+        "vectors_ready": ready,
+        "n_vec": N_VEC,
+        "vector_pool": vector_pool_validity(),
+    }
+    return out
 
 
 @router.post("/content-index/reindex")
