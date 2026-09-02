@@ -1741,7 +1741,12 @@ app.include_router(identity_resolution_router, dependencies=_ADMIN)
 # -- Reversible identity links + resolved "golden record" view (P1). Links only —
 # records are never rewritten, so every decision is reversible.
 from app.core.identity_links import router as identity_links_router
+# Corpus provenance: which subjects are demonstration data and which are real.
+# Admin-gated — it reports on the whole corpus, and the tripwire it exposes is
+# the signal an operator uses to decide the public-read posture.
+from app.core.corpus_provenance import router as corpus_provenance_router
 app.include_router(identity_links_router, dependencies=_ADMIN)
+app.include_router(corpus_provenance_router, dependencies=_ADMIN)
 
 # -- Data lifecycle / erasure (#8) — explicit delete/anonymize/retain policy across
 # the distributed copies (custom fields, memories, transcripts, identity links);
@@ -2428,6 +2433,31 @@ async def health():
         "commit": (os.getenv("RAILWAY_GIT_COMMIT_SHA")
                    or os.getenv("GIT_COMMIT_SHA") or "unknown")[:12],
         "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID", "") or None,
+
+        # WHY THE PROCESS MODEL IS REPORTED, for the same reason `commit` is.
+        #
+        # main.py calls uvicorn.run(reload=settings.debug), and `debug`
+        # DEFAULTS TO TRUE. uvicorn ignores `workers` whenever reload is on --
+        # it logs one warning and carries on single-process. So setting
+        # WEB_CONCURRENCY=2 on a deployment that never set DEBUG=false buys
+        # nothing, silently, and the only evidence is a line in the startup log
+        # nobody re-reads.
+        #
+        # `debug` gates nothing else in this application, so there was no way to
+        # observe it from outside. Now there is: `workers_effective` is what
+        # uvicorn will actually run, not what was requested.
+        "process": {
+            "pid": os.getpid(),
+            "debug": settings.debug,
+            "reload": settings.debug,
+            "web_concurrency": os.getenv("WEB_CONCURRENCY"),
+            "workers_effective": (
+                1 if settings.debug
+                else max(1, int(os.getenv("WEB_CONCURRENCY") or 1))),
+            "note": ("reload is on, so uvicorn ignores WEB_CONCURRENCY -- set "
+                     "DEBUG=false to run more than one worker"
+                     if settings.debug else None),
+        },
         "database": _db,
         "scheduler": _sched,
         "connections": _pool,

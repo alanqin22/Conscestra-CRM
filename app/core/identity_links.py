@@ -297,8 +297,23 @@ def confirm(link_id: str, decided_by: str = "admin") -> Dict[str, Any]:
         raise LinkError(f"refused: that record is already linked into "
                         f"{other[0][0]}. Unlink that first.")
 
+    # `confirm_method`, not `match_method`, and the two are deliberately
+    # different facts (E6, sql/identity_confirm_evidence.sql).
+    #
+    #   match_method    how the pair was DISCOVERED — normalized_name, email,
+    #                   phone. Legitimate for discovery, and preserved.
+    #   confirm_method  what JUSTIFIES the merge. Only a deterministic foreign
+    #                   key, or a named human who looked.
+    #
+    # This path IS the named human: somebody called /confirm and supplied
+    # decided_by. Recording it as `human_confirmed` rather than copying
+    # match_method is what stops a 92%-false-positive name match from becoming
+    # the stated basis for an irreversible merge. The CHECK refuses anything
+    # else, so a caller that omits the basis fails loudly here rather than
+    # merging quietly.
     _execute("UPDATE identity_links SET status='confirmed', decided_at=now(), "
-             "decided_by=%s WHERE link_id=%s::uuid", (decided_by, link_id))
+             "decided_by=%s, confirm_method=%s WHERE link_id=%s::uuid",
+             (decided_by, "human_confirmed", link_id))
     if ent == "leads":
         _mirror_lead_scaffold(pid, dup, lk.get("confidence"), linked=True)
     return {"ok": True, "link_id": link_id, "status": "confirmed",

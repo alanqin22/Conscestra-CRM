@@ -57,7 +57,7 @@ def _tracked_anywhere(paths) -> list:
 
     Asking the parent repository alone is wrong now and answers "none". These
     artefacts live in the `governance` submodule, and a parent tracks a
-    submodule as a GITLINK, not as files -- `git ls-files governance/tests/x.py`
+    none of them as files -- `git ls-files governance/tests/x.py` in the parent
     is empty even though a clean clone with --recurse-submodules gets the file.
 
     Reported as untracked, that emptiness said "the control count describes
@@ -65,14 +65,22 @@ def _tracked_anywhere(paths) -> list:
     fully version-controlled. A governance tool that cries wolf gets muted, so
     the question is asked of the repository that actually owns each path:
 
-      * a path inside a submodule counts as tracked when the PARENT records
-        the gitlink (so a clone knows to fetch it) AND the SUBMODULE's index
-        carries the file. Either half alone is not enough -- a gitlink to a
-        repo missing the file still yields nothing on disk.
+      * a governance path counts as tracked when the parent PINS a commit in
+        .governance-pin (so a checkout knows exactly what to fetch) AND that
+        repository's index carries the file. Either half alone is not enough
+        -- a pin to a commit missing the file still yields nothing on disk.
       * anything else is asked of the parent, as before.
     """
-    from app.core.artifact_paths import REPO_ROOT
+    from app.core.artifact_paths import REPO_ROOT, GOVERNANCE, governance_pin
     import collections
+
+    # WAS: the submodule gitlink (mode 160000). The submodule was removed
+    # because it appeared in the PUBLIC file listing; without this change
+    # every governance path fell through to the parent, which tracks none of
+    # them, turning the entire control inventory untracked in one step with
+    # no error anywhere. Same fact, different mechanism.
+    gov_dir = GOVERNANCE.name
+    pinned = governance_pin() is not None
 
     def _git(cwd, args):
         return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
@@ -82,8 +90,7 @@ def _tracked_anywhere(paths) -> list:
     by_repo = collections.defaultdict(list)
     for p in paths:
         head = p.split("/", 1)[0]
-        link = _git(REPO_ROOT, ["ls-files", "-s", head])
-        if link.startswith("160000") and "/" in p:
+        if head == gov_dir and pinned and "/" in p:
             by_repo[head].append(p.split("/", 1)[1])
         else:
             by_repo[""].append(p)

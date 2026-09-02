@@ -116,7 +116,7 @@ class Stage:
 # and an absence that is not is an accident wearing a green tick.
 # DELIBERATELY NOT DECLARED: "00_base_schema.sql is not present in this
 # checkout". That skip guards the baseline controls, and its cause would be a
-# `governance` submodule that failed to check out -- exactly the condition this
+# `governance` checkout that failed to fetch -- exactly the condition this
 # whole gate exists to catch. Declaring it would let a missing baseline turn
 # the strongest controls into quiet skips and still report PASS. Leaving it
 # undeclared means that day is a FAILURE, which is the point.

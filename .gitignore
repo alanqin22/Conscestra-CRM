@@ -186,3 +186,6 @@ rls_state_railway_*.json
 
 # Database dumps — full copies of production customer data. Never committed.
 backups/
+
+# Private governance repo (schema/sql/sp/tests) — see .governance-pin
+/governance/

@@ -81,8 +81,26 @@ _cache: Dict[str, Tuple[float, Optional[Dict[str, str]]]] = {}
 
 
 def _default_dsn() -> str:
+    """The DSN every connection resolves through, or a refusal.
+
+    EMPTY IS NOT A FALLBACK. psycopg2.connect("") is perfectly valid: libpq
+    fills the gaps from PGHOST / PGUSER / PGDATABASE or a unix socket, and
+    connects to *something*. That is the worst available outcome — an
+    unconfigured process quietly reading and writing whichever database
+    happened to be reachable, with no error to notice.
+
+    So the absence of configuration fails here, at the single point all data
+    access funnels through, with a message naming both variables that could
+    have supplied it."""
     from app.core.config import get_settings
-    return get_settings().db_dsn
+    dsn = (get_settings().db_dsn or "").strip()
+    if not dsn:
+        raise TenantError(
+            "No database is configured: both DB_DSN and DATABASE_URL are "
+            "unset. Set DB_DSN in .env for local work; deployments inject "
+            "DATABASE_URL. (Refusing to connect rather than letting libpq "
+            "guess a host from the environment.)")
+    return dsn
 
 
 def _lookup(tenant_id: str) -> Optional[Dict[str, str]]:

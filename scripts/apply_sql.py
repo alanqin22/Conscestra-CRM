@@ -154,6 +154,24 @@ def main() -> int:
         print("ROLLED BACK — nothing changed.")
     else:
         print(f"APPLIED to {label}.")
+        # Record what the schema looks like now, because a TOOL just
+        # changed it. Anything that shifts the fingerprint WITHOUT
+        # leaving one of these used neither door — which is the only
+        # question this detector tries to answer.
+        try:
+            from app.core.deploy_state import record_schema_attestation
+            att = record_schema_attestation("apply_sql", path.name, dsn=dsn)
+            print(f"  schema attested on {att.get('database')!r}: "
+                  f"{att.get('fingerprint')} "
+                  f"({att.get('objects')} objects)"
+                  if att.get("ok") else
+                  f"  NOTE schema NOT attested on "
+                  f"{att.get('database')!r}: {att.get('error')}")
+        except Exception as exc:
+            # Never fail an apply that succeeded. The cost is one
+            # unexplained-looking drift next check — a false positive in
+            # the safe direction.
+            print(f"  NOTE could not attest the schema: {exc}")
     print(f"NOT recorded in schema_migrations — {path.name} is classified "
           f"'{disposition_of(path.name)}'. That classification is the "
           f"provenance record; the ledger deliberately has no row.")

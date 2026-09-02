@@ -1,0 +1,18 @@
+# WHICH GOVERNANCE COMMIT THIS COMMIT WAS VERIFIED AGAINST.
+#
+# governance/ (schema, sql, sp, tests) lives in a separate PRIVATE repository
+# and is no longer a submodule -- it used to appear as a gitlink entry in this
+# repository's file listing, which read as though the private material were
+# published here. It never was: a gitlink is a commit id, and every clone of
+# that path 404s without access.
+#
+# But the gitlink was doing one real job besides fetching, and this file keeps
+# it: it recorded WHICH governance commit a given public commit was verified
+# against. Without a pin, CI would verify each commit against whatever
+# governance/main happened to be at the time, and a green tick would no longer
+# identify what was actually checked. That is the same class of defect as a
+# test that passes for the wrong reason.
+#
+# Update this whenever governance changes, in the same commit that depends on
+# the change -- exactly as the gitlink had to be updated.
+9ebc8530da672f016fb443cee6376ebfafe5df02

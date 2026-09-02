@@ -241,6 +241,27 @@ def main() -> int:
                 print(f"   (file's own BEGIN/COMMIT stripped -- this runner "
                       f"owns the transaction)")
         print(f"done -- {len(applied)} applied, {len(have)} already present")
+        # Attest the schema whenever this run CHANGED it. A no-op run is
+        # deliberately silent: re-attesting an unchanged schema would let a
+        # drift that arrived between runs be signed off by a command that did
+        # nothing, which is the detector endorsing what it exists to catch.
+        if applied:
+            try:
+                from app.core.deploy_state import record_schema_attestation
+                att = record_schema_attestation(
+                    "migrate", f"{len(applied)} migration(s): "
+                               f"{', '.join(n for n, _, _ in applied)}",
+                    dsn=dsn)
+                print(f"schema attested on {att.get('database')!r}: "
+                      f"{att.get('fingerprint')} "
+                      f"({att.get('objects')} objects)"
+                      if att.get("ok") else
+                      f"NOTE schema NOT attested on "
+                      f"{att.get('database')!r}: {att.get('error')}")
+            except Exception as exc:
+                # Never fail a migration that succeeded. The cost is one
+                # unexplained-looking drift on the next check.
+                print(f"NOTE could not attest the schema: {exc}", file=sys.stderr)
         return 1 if missing_files else 0
     finally:
         conn.close()

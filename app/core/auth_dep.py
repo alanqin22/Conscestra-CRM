@@ -49,15 +49,49 @@ WRITE_ROLES = {"admin", "member"}
 #        locked      → every data call requires a login (full lockdown)
 #   2) Otherwise fall back to the individual flags API_AUTH_ENABLED / API_PUBLIC_READ.
 _MODE = os.getenv("API_SECURITY_MODE", "").strip().lower().replace("_", "-")
-if _MODE in ("open", "off"):
+
+# Every value each posture answers to. Named rather than inlined because the
+# release guard has to distinguish "not configured" from "configured wrong",
+# and those are the same `else` branch below.
+_MODE_OPEN = ("open", "off")
+_MODE_PUBLIC = ("public-read", "publicread", "read")
+_MODE_LOCKED = ("locked", "lockdown", "full", "strict")
+_MODE_KNOWN = _MODE_OPEN + _MODE_PUBLIC + _MODE_LOCKED
+
+# A MODE NOBODY RECOGNISES MEANS 'open', AND THAT IS THE TRAP.
+#
+# The fallback below is correct for an UNSET mode — it is the documented legacy
+# path. It is catastrophic for a MISSPELLED one. `API_SECURITY_MODE=blocked`
+# reads like lockdown, matches nothing, falls through to API_AUTH_ENABLED /
+# API_PUBLIC_READ — neither of which is set in a deployment that chose the
+# single-switch form — and both default to 0. Posture: `open`. No auth at all,
+# writes included, silently, from a string an operator wrote to TIGHTEN
+# security.
+#
+# The value cannot simply be rejected here: raising at import would take down a
+# running deployment over a typo, and this module is imported by everything.
+# So the mistake is RECORDED and release_guard refuses to start on it — the
+# same division of labour the calendar-feed control already uses. Accepted
+# spellings: open|off · public-read|publicread|read · locked|lockdown|full|strict
+SECURITY_MODE_RAW = _MODE
+SECURITY_MODE_UNRECOGNISED = _MODE if (_MODE and _MODE not in _MODE_KNOWN) else ""
+
+if _MODE in _MODE_OPEN:
     API_AUTH_ENABLED, API_PUBLIC_READ = False, False
-elif _MODE in ("public-read", "publicread", "read"):
+elif _MODE in _MODE_PUBLIC:
     API_AUTH_ENABLED, API_PUBLIC_READ = True, True
-elif _MODE in ("locked", "lockdown", "full", "strict"):
+elif _MODE in _MODE_LOCKED:
     API_AUTH_ENABLED, API_PUBLIC_READ = True, False
 else:
     API_AUTH_ENABLED = _flag("API_AUTH_ENABLED")
     API_PUBLIC_READ = _flag("API_PUBLIC_READ")
+
+if SECURITY_MODE_UNRECOGNISED:
+    logger.error(
+        f"[security] API_SECURITY_MODE={SECURITY_MODE_UNRECOGNISED!r} is NOT a "
+        f"recognised value and was IGNORED. The posture fell back to "
+        f"API_AUTH_ENABLED/API_PUBLIC_READ. Accepted: "
+        f"{', '.join(_MODE_KNOWN)}.")
 
 _POSTURE = ("open" if not API_AUTH_ENABLED else
             "public-read" if API_PUBLIC_READ else "locked")
@@ -273,6 +307,43 @@ async def caller_can_write(request: Request) -> bool:
     return (sess or {}).get("role", "anonymous") in WRITE_ROLES
 
 
+def _enforce_public_read_limit(request: Request) -> None:
+    """Throttle anonymous CRM reads; raise 429 past the ceiling.
+
+    Best-effort by construction: a failure inside the limiter must never take
+    down the read surface it is protecting, because the surface working is the
+    product decision and the limit is a guard on it. A limiter that cannot
+    count degrades to the previous behaviour — unlimited — and says so, rather
+    than refusing traffic it failed to measure.
+    """
+    try:
+        from app.core import rate_limit
+        if not rate_limit.PUBLIC_READ_LIMIT_ENABLED:
+            return
+        ip = rate_limit.client_ip(request)
+        count = rate_limit.public_read_ip.record(ip)
+        if count <= rate_limit.PUBLIC_READ_MAX_PER_IP:
+            return
+    except HTTPException:
+        raise
+    except Exception as exc:                                # pragma: no cover
+        logger.warning(f"[security] public-read limiter unavailable: {exc}")
+        return
+
+    # Logged at WARNING with the address: the first evidence that somebody is
+    # walking the corpus rather than reading it is this line.
+    logger.warning(
+        f"[security] public-read limit hit: ip={ip} "
+        f"{count}/{rate_limit.PUBLIC_READ_MAX_PER_IP} in "
+        f"{rate_limit.PUBLIC_READ_WINDOW_SECONDS}s")
+    raise HTTPException(
+        status_code=429,
+        detail="Too many requests. This demonstration environment limits "
+               "anonymous browsing — please sign in for full access.",
+        headers={"Retry-After": str(rate_limit.PUBLIC_READ_WINDOW_SECONDS)},
+    )
+
+
 async def require_data_access(request: Request) -> Optional[Dict[str, Any]]:
     """Unified data-endpoint gate (the demo-friendly model).
 
@@ -326,6 +397,14 @@ async def require_data_access(request: Request) -> Optional[Dict[str, Any]]:
     # Public reads: allow anonymous when nothing needs a session (role already
     # stamped above for the deep write guard).
     if API_PUBLIC_READ and not is_write:
+        # …but not without limit. The only control standing between the demo
+        # posture and a full enumeration of the CRM is this ceiling, so it is
+        # enforced HERE — the single gate every data endpoint already passes
+        # through — rather than per router, where a new endpoint would be
+        # unprotected by default. Signed-in callers are exempt: `sess` means
+        # the caller is identified, which is what the limit is a substitute for.
+        if not sess:
+            _enforce_public_read_limit(request)
         return None
 
     # From here a session is required (a structured write, or full-lockdown read).

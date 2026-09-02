@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
 
+import psycopg2
+
 from app.core.database import get_connection
 
 logger = logging.getLogger("deploy_state")
@@ -156,6 +158,21 @@ REQUIRED_MIGRATIONS: List[str] = [
     # confined to the opportunities insert (not invoices or activities), the
     # trigger binding survived CREATE OR REPLACE and all three grants remain.
     "fix_order_opportunity_owner_inheritance.sql",
+    # PROMOTED 2026-09-01, and only after Railway had both. They sat in
+    # OUT_OF_BAND_SQL marked PENDING DEPLOYMENT while they were applied locally
+    # but not to production, because this list is a claim about what production
+    # has RUN. Verified on Railway before promotion: customers,
+    # invalid_phones_log, appointments, call_logs and call_state all absent,
+    # zero orphan functions remaining, and the disposition ledger holding
+    # exactly two rows with rows_erased 38 and 8.
+    #
+    # ORDER IS LOAD-BEARING, not alphabetical. The erasure targets the RETIRED
+    # names, so the rename must precede it; applied the other way round it
+    # erases nothing while appearing to succeed. The file now REFUSES that
+    # ordering rather than relying on this comment — a migration safety gate
+    # found the silent no-op against Railway before it ran.
+    "retire_customers_fossil_cluster.sql",
+    "erasure_e8_retired_tables.sql",
 ]
 
 
@@ -211,6 +228,90 @@ _PENDING_DEPLOYMENT = (
     "application, and not before. Binds the canonical trg_<table>_touch "
     "trigger on accounts, contacts, leads, customers, employees and "
     "product_pricing, retiring four legacy-named triggers.")
+
+# Second use of the marker above, which is what it was kept for. Same three
+# states, same rule: this is NOT a claim that production has run it.
+_PENDING_CORRELATION = (
+    "PENDING DEPLOYMENT -- authored 2026-08-31 and applied to LOCAL only. A "
+    "governed schema change that belongs in REQUIRED_MIGRATIONS, and is not "
+    "there yet because Railway does not have it; declaring it earlier would "
+    "make migrate --check assert a chain production has not run. Move it in "
+    "the SAME change that records its Railway application, and not before. "
+    "Adds a BEFORE INSERT trigger on events that fills correlation_id from "
+    "the app.correlation_id session GUC, and stops emit_event() inventing a "
+    "random correlation id for events that have no play behind them -- 2.8% "
+    "of 226k events carried a usable correlation, because eight of nine "
+    "trigger functions INSERT INTO events directly and never reach "
+    "emit_event().")
+
+# Third use of the PENDING DEPLOYMENT marker. Same rule: not a claim that
+# production has run it.
+_PENDING_PGVECTOR = (
+    "PENDING DEPLOYMENT -- authored 2026-08-31 and applied to LOCAL only. A "
+    "governed schema change that belongs in REQUIRED_MIGRATIONS once Railway "
+    "has it, and not before. It ADOPTS objects that were applied to local by "
+    "hand and entered neither the manifest nor the ledger: a vector(512) "
+    "column embedding_v and an HNSW index idx_ce_hnsw, 59% populated and 35 "
+    "rows disagreeing with their authoritative bytea. Railway has neither. "
+    "Idempotent by construction so it is correct on both. Creating the "
+    "structure only -- coverage is filled by content_index.rebuild_vectors(), "
+    "not claimed here.")
+
+_PENDING_CORPUS_PROVENANCE = (
+    "PENDING DEPLOYMENT -- authored 2026-08-31 and applied to LOCAL only. "
+    "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
+    "records its Railway application. Creates corpus_provenance: which "
+    "subjects are demonstration data and which are real. It exists because "
+    "the question could not be answered -- seed_email_migration.sql rewrote "
+    "EVERY address with no synthetic filter and kept no backup, so email "
+    "domain proves nothing, and is_synthetic coverage runs 0%-54% by table. "
+    "The rule CHECK is the control: the prohibited inferences (email domain, "
+    "name similarity, is_email_verified, created_at clustering, model "
+    "judgement) cannot be recorded at all.")
+
+_PENDING_RETIRE_CUSTOMERS = (
+    "PENDING DEPLOYMENT -- authored 2026-09-01 and applied to LOCAL only. "
+    "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
+    "records its Railway application. Retires the legacy `customers` cluster "
+    "-- remnants of a booking application that predates this CRM. Probed "
+    "first, sp_cases-style: zero writers, zero FK dependents, zero views, and "
+    "booking.py calls none of it. DROPS three zero-row tables and three orphan "
+    "functions; RENAMES the two that hold data, because a rename is reversible "
+    "in one statement and `customers` is not covered by governed_deletions. "
+    "The disposition of the personal data it holds is deliberately NOT decided "
+    "here -- see dsar.EXCLUDED, which records it as a holding state.")
+
+_PENDING_SCHEMA_ATTEST = (
+    "PENDING DEPLOYMENT -- authored 2026-09-01 and applied to LOCAL only. "
+    "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
+    "records its Railway application. Creates schema_attestations, which "
+    "closes the one gap every other integrity control here shares: they all "
+    "live in the DECLARATION path and cannot see a change that never used the "
+    "tooling. Proved 2026-08-31 by a hand-made vector column and HNSW index "
+    "that passed every check. Deliberately a MIGRATION rather than a runtime "
+    "ensure_table: a detector for undeclared schema changes must not make one.")
+
+_PENDING_ERASURE_E8 = (
+    "PENDING DEPLOYMENT -- authored 2026-09-01 and applied to LOCAL only. "
+    "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
+    "records its Railway application. Executes disposition E8 (SETTLED: "
+    "ERASE): permanently removes the personal data held in the two retired "
+    "fossil tables, records the erasure in a new retired_table_dispositions "
+    "ledger, and drops the emptied shells -- because both carry customer_id "
+    "and account_id, so leaving them out of dsar.EXCLUDED while they exist "
+    "would break export certification. IRREVERSIBLE by design: no restorable "
+    "image, which is what distinguishes an erasure from a deletion.")
+
+_PENDING_IDENTITY_CONFIRM = (
+    "PENDING DEPLOYMENT -- authored 2026-09-01 and applied to LOCAL only. "
+    "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
+    "records its Railway application. E6: separates match_method (how a pair "
+    "was DISCOVERED -- name, email, phone are fine there) from confirm_method "
+    "(what JUSTIFIES a merge -- only a deterministic FK or a named human). "
+    "Found live: 20 candidates already recorded on normalized_name and email "
+    "at confidence 0.85-0.99, with identity.materialize registered as an A2A "
+    "capability. Nothing had merged; nothing prevented it. Also makes "
+    "materialized_at unreachable without status='confirmed'.")
 
 _SCHEMA_OOB = (
     "Historical schema operation applied out-of-band; it never entered the "
@@ -376,7 +477,12 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "embed_keys.sql": _SCHEMA_OOB,
     "employee_emails_to_emp_subdomain.sql": _CORRECTION,
     "employee_service_seed.sql": _SCHEMA_OOB,
+    "content_embeddings_pgvector.sql": _PENDING_PGVECTOR,
+    "corpus_provenance.sql": _PENDING_CORPUS_PROVENANCE,
+    "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
+    "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
     "escalations.sql": _SCHEMA_OOB,
+    "event_correlation_propagation.sql": _PENDING_CORRELATION,
     "event_types_voice_learning.sql": _CORRECTION,
     "executive_intelligence.sql": _SCHEMA_OOB,
     "expire_moot_courtesy_tasks.sql": _CORRECTION,
@@ -1008,6 +1114,232 @@ def check_migrations() -> Dict[str, Any]:
             "out_of_order": out_of_order,
             "note": ("apply the missing files in the order listed"
                      if missing else "schema is current")}
+
+
+# ============================================================================
+# SCHEMA ATTESTATION — did the schema move without a tool recording that it did?
+# ============================================================================
+#
+# Every other integrity control in this module lives in the DECLARATION path.
+# This one does not, because the gap it closes is precisely a change that never
+# entered a declaration: on 2026-08-31 a vector column and an HNSW index were
+# found on the local database, created by hand, in no migration and no ledger,
+# absent from Railway, and every control passed.
+#
+# The question deliberately is NOT "is the schema correct" — that would require
+# simulating 265 migration files and would report standing historical drift
+# until somebody switched it off. It is "did the schema move, and does anything
+# explain the movement".
+
+def _schema_objects(cur) -> Dict[str, str]:
+    """One hash per schema object. Named keys so a drift report can say WHAT.
+
+    Function BODIES are included, not just signatures. The incident this
+    detector exists for was three successive CREATE OR REPLACEs of one trigger
+    function — same name, same arguments, different behaviour — which a
+    signature-only fingerprint cannot see.
+
+    Line endings are normalised because Railway stores prosrc with CRLF and
+    local with LF. Within a single database that never changes, so this is
+    defensive rather than necessary; it costs nothing and removes a whole class
+    of spurious diff if a database is ever restored across platforms.
+    """
+    import hashlib as _h
+    objs: Dict[str, str] = {}
+
+    def _put(key: str, payload: str) -> None:
+        objs[key] = _h.sha256(payload.replace("\r\n", "\n").encode("utf-8")
+                              ).hexdigest()[:12]
+
+    cur.execute("""
+        SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_attribute a ON a.attrelid = c.oid
+         WHERE n.nspname='public' AND c.relkind IN ('r','p')
+           AND a.attnum > 0 AND NOT a.attisdropped
+         ORDER BY c.relname, a.attname""")
+    cols: Dict[str, List[str]] = {}
+    for rel, col, typ, notnull in cur.fetchall():
+        cols.setdefault(rel, []).append(f"{col} {typ}{' NN' if notnull else ''}")
+    for rel, spec in cols.items():
+        _put(f"table:{rel}", "|".join(spec))
+
+    cur.execute("""
+        SELECT p.oid::regprocedure::text, pg_get_functiondef(p.oid)
+          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname='public' AND p.prokind IN ('f','p')""")
+    for sig, body in cur.fetchall():
+        _put(f"function:{sig}", body or "")
+
+    cur.execute("""
+        SELECT c.relname, t.tgname, pg_get_triggerdef(t.oid)
+          FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname='public' AND NOT t.tgisinternal""")
+    for rel, tg, dfn in cur.fetchall():
+        _put(f"trigger:{rel}.{tg}", dfn or "")
+
+    cur.execute("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname='public'")
+    for name, dfn in cur.fetchall():
+        _put(f"index:{name}", dfn or "")
+
+    cur.execute("""
+        SELECT c.conname, pg_get_constraintdef(c.oid)
+          FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace
+         WHERE n.nspname='public'""")
+    for name, dfn in cur.fetchall():
+        _put(f"constraint:{name}", dfn or "")
+
+    return objs
+
+
+def _attestation_conn(dsn: Optional[str] = None):
+    """Connect to the database being ATTESTED, not to whichever one this
+    process happens to be configured for.
+
+    THE DEFECT THIS CLOSES, in full because it was subtle and shipped:
+    `apply_sql --target railway` applied a migration to production and then
+    reported "schema attested" — having fingerprinted the LOCAL database,
+    because this module resolved its own connection from DB_DSN. The apply was
+    correct and the record was about the wrong database. Worse, Railway got no
+    attestation at all, so the drift detector was blind on the one database it
+    most needed to watch.
+
+    A caller with a target DSN must pass it. Callers with none keep the old
+    behaviour, which is right for the application itself.
+    """
+    if not dsn:
+        return get_connection()
+    conn = psycopg2.connect(dsn)
+    conn.set_client_encoding("UTF8")
+    return conn
+
+
+def schema_fingerprint(dsn: Optional[str] = None) -> Dict[str, Any]:
+    """Composite hash of every object in the public schema, plus the parts."""
+    import hashlib as _h
+    conn = _attestation_conn(dsn)
+    try:
+        with conn.cursor() as cur:
+            objs = _schema_objects(cur)
+            cur.execute("SELECT current_database()")
+            db = cur.fetchone()[0]
+    finally:
+        conn.close()
+    blob = "\n".join(f"{k}={v}" for k, v in sorted(objs.items()))
+    return {"fingerprint": _h.sha256(blob.encode("utf-8")).hexdigest()[:16],
+            "objects": objs, "object_count": len(objs), "database": db}
+
+
+def record_schema_attestation(source: str, detail: str = "",
+                              dsn: Optional[str] = None) -> Dict[str, Any]:
+    """Record what the schema looks like now, because a TOOL just changed it.
+
+    Called by migrate.py and apply_sql.py after a successful apply. Everything
+    that shifts the fingerprint without leaving one of these is, by
+    construction, a change that used neither door.
+
+    Best-effort: a failure to attest must never fail the migration that
+    succeeded. The consequence is one unexplained-looking drift on the next
+    check, which is a false positive in the safe direction.
+    """
+    fp = schema_fingerprint(dsn)
+    try:
+        conn = _attestation_conn(dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO schema_attestations (source, fingerprint, "
+                    "objects, detail, database) VALUES (%s,%s,%s,%s,%s)",
+                    (source[:80], fp["fingerprint"], json.dumps(fp["objects"]),
+                     detail[:500] or None, fp["database"]))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"ok": True, "fingerprint": fp["fingerprint"],
+                "objects": fp["object_count"], "database": fp["database"]}
+    except Exception as exc:
+        # NAMES THE DATABASE IT FAILED ON. The mis-targeting this parameter
+        # fixes was invisible partly because the message said only "could not
+        # record" — an operator reading it had no way to notice it was talking
+        # about the wrong database.
+        logger.warning(f"could not record schema attestation for "
+                       f"{fp.get('database')!r}: {exc}")
+        return {"ok": False, "error": str(exc)[:200],
+                "fingerprint": fp["fingerprint"], "database": fp.get("database")}
+
+
+def schema_drift(dsn: Optional[str] = None) -> Dict[str, Any]:
+    """Has the schema moved since the last time a tool recorded it?
+
+    Returns the object names that were added, removed or altered — naming them
+    is the difference between a detector somebody acts on and one they mute.
+
+    NO ATTESTATION AT ALL is reported as `unknown`, never as clean. A database
+    that has never been attested has not been shown to be undrifted; saying
+    otherwise would be the absence of evidence dressed as evidence of absence,
+    which is the failure this codebase's outcome model exists to forbid.
+    """
+    out: Dict[str, Any] = {"ok": True, "unexplained": False, "state": "unknown"}
+    try:
+        live = schema_fingerprint(dsn)
+        conn = _attestation_conn(dsn)
+        try:
+            with conn.cursor() as cur:
+                # FILTERED ON `database`, so a fingerprint taken against the
+                # wrong database can never be read as drift in this one. The
+                # targeting bug that motivated this is fixed above; the filter
+                # stays because a detector whose correctness depends on every
+                # caller passing the right DSN is one careless call site away
+                # from silence. Rows written before the column existed carry
+                # NULL and are accepted for this database — they were, by
+                # construction, written by the only writer there was.
+                cur.execute(
+                    "SELECT source, fingerprint, objects, recorded_at "
+                    "FROM schema_attestations "
+                    "WHERE database = %s OR database IS NULL "
+                    "ORDER BY recorded_at DESC, id DESC LIMIT 1",
+                    (live["database"],))
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"ok": False, "state": "unknown", "unexplained": False,
+                "error": str(exc)[:200]}
+
+    out["live_fingerprint"] = live["fingerprint"]
+    out["object_count"] = live["object_count"]
+    out["database"] = live["database"]
+    if not row:
+        out["state"] = "never_attested"
+        out["detail"] = ("no attestation recorded — run "
+                         "deploy_state.record_schema_attestation('baseline') "
+                         "once this schema is believed correct")
+        return out
+
+    source, fp, objs, at = row
+    out["last_attested"] = {"source": source, "fingerprint": fp,
+                            "at": at.isoformat() if at else None}
+    if fp == live["fingerprint"]:
+        out["state"] = "clean"
+        return out
+
+    prev = objs if isinstance(objs, dict) else json.loads(objs or "{}")
+    now = live["objects"]
+    out["state"] = "drifted"
+    out["unexplained"] = True
+    out["added"] = sorted(set(now) - set(prev))[:50]
+    out["removed"] = sorted(set(prev) - set(now))[:50]
+    out["altered"] = sorted(k for k in set(prev) & set(now)
+                            if prev[k] != now[k])[:50]
+    out["detail"] = (
+        f"{len(out['added'])} added, {len(out['removed'])} removed, "
+        f"{len(out['altered'])} altered since {source} attested at "
+        f"{out['last_attested']['at']}. If these were applied by hand, apply "
+        f"them through migrate.py or apply_sql.py instead; if they are correct "
+        f"and reviewed, record a new attestation naming who reviewed them.")
+    return out
 
 
 def safety_fingerprint() -> Dict[str, Any]:

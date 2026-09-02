@@ -41,7 +41,28 @@ class Settings(BaseSettings):
     ollama_model: str = "gpt-oss:20b"
 
     # ── Database ──────────────────────────────────────────────────────────────
-    db_dsn: str = "postgresql://postgres:aria@localhost:5434/crmdb"
+    # NO DEFAULT, AND THE ABSENCE IS THE POINT.
+    #
+    # This field used to carry a complete working DSN — host, port, database
+    # AND the developer's real local password — as its default. Two problems,
+    # and the second is the one that matters:
+    #
+    #   1. It was a credential published in a PUBLIC repository. Localhost-only
+    #      and a synthetic database, so not remotely exploitable, but it was a
+    #      real password reused on a real machine, and "nobody can reach it"
+    #      is a property of the network, not of the repository.
+    #   2. It made a MISSING configuration look like a working one. Neither
+    #      Railway nor CI ever reaches this line — both set DATABASE_URL, which
+    #      the validator below copies over db_dsn — so the default was only
+    #      ever used when nothing was configured at all. In exactly that case
+    #      it silently connected to whatever happened to be listening on
+    #      localhost:5434, which is the shape of failure this codebase spends
+    #      most of its controls refusing: a wrong answer that looks right.
+    #
+    # Empty is not a fallback either — see tenancy._default_dsn(), which
+    # refuses to connect rather than letting libpq guess from PGHOST/PGUSER.
+    # Set DB_DSN in .env for local work; deployments inject DATABASE_URL.
+    db_dsn: str = ""
     database_url: Optional[str] = None  # Railway injects this automatically
 
     # ── Application ───────────────────────────────────────────────────────────

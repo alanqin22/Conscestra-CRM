@@ -117,6 +117,35 @@ reset_requests = SlidingWindowLimiter(5, 3600)  # password-reset: 5/identifier/h
 # so throttle per-IP to bound queue-flooding + LLM cost even for authorized callers.
 plan_exec_ip = SlidingWindowLimiter(_int_env("PLAN_EXEC_MAX_PER_HOUR", 20), 3600)
 
+# ANONYMOUS CRM READS under the public-read posture.
+#
+# public-read is a deliberate product decision (2026-08-31): a prospective
+# client must see the CRM working without a login. It is not a defect and is
+# not to be "fixed". But it left the entire read surface with NO control at
+# all, so the corpus was enumerable at whatever rate the host would serve —
+# 118 accounts, 129 contacts, 2,193 orders and the AR position, page by page,
+# to anyone who knew the hostname.
+#
+# Rate limiting is the control that fits the decision instead of reversing it.
+# A demonstration is a human reading pages; enumeration is a script walking
+# them. Only the second notices a ceiling.
+#
+# SIZED FOR THE DEMO, NOT FOR THE ATTACKER. A management page can fan out to
+# several agent calls per interaction, and a prospect clicking around briskly
+# is still nowhere near 240 requests in five minutes. That ceiling caps a
+# scraper at ~48/min — slow enough that a full walk of every module takes long
+# enough to notice, generous enough that no real visitor will ever see it.
+#
+# NOT APPLIED TO SIGNED-IN CALLERS: a session identifies who is asking, and
+# staff legitimately drive far more traffic than a visitor. This limiter exists
+# because the caller is anonymous, so it ends where anonymity does.
+PUBLIC_READ_LIMIT_ENABLED = os.getenv(
+    "PUBLIC_READ_RATE_LIMIT", "1").strip().lower() not in ("0", "false", "no", "off")
+PUBLIC_READ_MAX_PER_IP = _int_env("PUBLIC_READ_MAX_PER_IP", 240)
+PUBLIC_READ_WINDOW_SECONDS = _int_env("PUBLIC_READ_WINDOW_SECONDS", 300)
+public_read_ip = SlidingWindowLimiter(PUBLIC_READ_MAX_PER_IP,
+                                      PUBLIC_READ_WINDOW_SECONDS)
+
 
 def client_ip(request: Request) -> str:
     """Best-effort client address; honours the proxy's X-Forwarded-For (Railway
