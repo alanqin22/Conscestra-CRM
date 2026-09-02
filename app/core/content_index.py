@@ -375,6 +375,8 @@ def vector_pool_validity() -> Dict[str, Any]:
                     today only because the recency pool is unioned alongside.
     """
     out: Dict[str, Any] = {"ok": True, "revalidate": False, "reasons": [],
+                           "changed_since_validation": False,
+                           "changed_reasons": [],
                            "baseline": _NVEC_BASELINE, "n_vec": N_VEC}
     try:
         conn = get_connection()
@@ -399,17 +401,47 @@ def vector_pool_validity() -> Dict[str, Any]:
 
     base = _NVEC_BASELINE
     if rows > base["rows"] * 2 or rows < base["rows"] / 2:
-        out["reasons"].append(
+        out["changed_reasons"].append(
             f"corpus size moved from {base['rows']} to {rows}")
+    # TWO DIFFERENT QUESTIONS, previously answered by one flag — which is why
+    # an attempt to "fix" this got it backwards on 2026-09-02.
+    #
+    #   1. IS THE MARGIN THIN?  Yes, permanently, and deliberately reported.
+    #      The baseline records largest_template_group=480 against N_VEC=500,
+    #      so one template can very nearly fill the vector pool. That was TRUE
+    #      WHEN THE ZERO-CONTENT-LOSS MEASUREMENT WAS TAKEN, and 500 was
+    #      validated anyway, because the recency pool is unioned alongside and
+    #      covers what a single template crowds out. It is recorded rather than
+    #      tuned away: the thing carrying this configuration is the union, and
+    #      anyone changing the union needs to see that.
+    #
+    #   2. HAS ANYTHING CHANGED SINCE?  Separate field, and False today.
+    #
+    # Collapsing these made `revalidate` look like a false alarm — it fires in
+    # the state its own evidence came from — and the tempting fix was to
+    # silence it. That would have deleted the disclosure while leaving the
+    # thin margin in place. So both are reported, and neither is inferred from
+    # the other.
+    base_ratio = base["largest_template_group"] / 500.0
+    ratio = largest / float(N_VEC or 1)
+    out["crowding_ratio"] = round(ratio, 3)
+    out["baseline_crowding_ratio"] = round(base_ratio, 3)
     if largest > N_VEC * 0.8:
         out["reasons"].append(
             f"largest template group ({largest}) is within 80% of N_VEC "
             f"({N_VEC}) — one template can crowd out the vector pool")
+    if ratio > base_ratio * 1.1:
+        out["changed_reasons"].append(
+            f"template crowding worsened: largest group {largest} against "
+            f"N_VEC {N_VEC} is a ratio of {ratio:.2f}, versus {base_ratio:.2f} "
+            f"when the pool size was validated "
+            f"({base['largest_template_group']} against 500)")
     if share > base["duplicate_share"] + 0.15:
-        out["reasons"].append(
+        out["changed_reasons"].append(
             f"duplicate share rose from {base['duplicate_share']:.0%} to "
             f"{share:.0%} — the pool buys less diversity per row")
     out["revalidate"] = bool(out["reasons"])
+    out["changed_since_validation"] = bool(out["changed_reasons"])
     return out
 
 
