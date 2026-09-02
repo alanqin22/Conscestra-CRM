@@ -42,6 +42,7 @@ from typing import Iterable
 __all__ = [
     "REPO_ROOT", "GOVERNANCE", "SQL_DIR", "SP_DIR", "SCHEMA_DIR", "TESTS_DIR",
     "BASELINE", "SUBMODULE_NAME", "available", "require", "rel",
+    "PIN_FILE", "governance_pin",
 ]
 
 SUBMODULE_NAME = "governance"
@@ -74,12 +75,55 @@ BASELINE: Path = SCHEMA_DIR / "00_base_schema.sql"
 
 
 def available() -> bool:
-    """Is the submodule checked out, as opposed to merely declared?
+    """Is the governance checkout present, as opposed to merely expected?
 
-    `git submodule add` leaves an empty directory in a fresh clone until
-    `--init` runs, so directory EXISTENCE proves nothing. The contents do.
+    Directory EXISTENCE proves nothing — a failed fetch leaves an empty
+    directory behind, which is why this asks about contents. That was true of
+    `git submodule add` and is equally true of a clone that failed partway.
     """
     return SQL_DIR.is_dir() and SCHEMA_DIR.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# The pin replaced the submodule gitlink.
+#
+# governance/ WAS a submodule. It showed as a gitlink entry in the PUBLIC
+# repository's file listing, which read as though the private schema and tests
+# were published there — they never were, a gitlink is a commit id — but the
+# appearance was the objection, and it is now cloned explicitly instead.
+#
+# The gitlink was doing one job besides fetching, and .governance-pin keeps it:
+# recording WHICH governance commit a given public commit was verified against.
+# Several tools decided "is this path version-controlled?" by looking for mode
+# 160000 in the parent's index. With the gitlink gone that test answers "no"
+# for every governance path, and each of those tools would report a fully
+# version-controlled artefact as untracked — a false alarm, which by its own
+# reasoning is how a governance tool gets muted. They ask here instead.
+# ---------------------------------------------------------------------------
+
+PIN_FILE: Path = REPO_ROOT / ".governance-pin"
+
+
+def governance_pin() -> str | None:
+    """The pinned governance commit sha, or None if nothing is pinned.
+
+    Returns None rather than raising: callers use this to decide which
+    repository owns a path, and a missing pin means "ask the parent", which is
+    the correct answer for every non-governance path anyway.
+    """
+    try:
+        if not PIN_FILE.is_file():
+            return None
+        for line in reversed(PIN_FILE.read_text(encoding="utf-8").splitlines()):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if len(line) == 40 and all(c in "0123456789abcdef" for c in line):
+                return line
+            return None
+    except OSError:
+        return None
+    return None
 
 
 def require(*paths: Path) -> None:
@@ -101,8 +145,8 @@ def require(*paths: Path) -> None:
     for p in paths:
         if not p.exists():
             raise FileNotFoundError(
-                f"{p} is missing from the {SUBMODULE_NAME} submodule. The "
-                f"submodule is checked out, so this is drift rather than a "
+                f"{p} is missing from {SUBMODULE_NAME}/. The checkout is "
+                f"present, so this is drift rather than a "
                 f"setup problem: run "
                 f"`python -m scripts.verify_artifact_sync --repo {GOVERNANCE} "
                 f"--remote <owner>/<repo>` to see what else differs.")

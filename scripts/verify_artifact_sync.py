@@ -4,7 +4,7 @@
         --remote alanqin22/Conscestra-CRM-governance --ref main
 
 WHY THIS EXISTS. Governance artefacts now live in a second repository that CI
-clones as a submodule. If that mirror is missing a file, the gate does not fail
+clones from the pin. If that mirror is missing a file, the gate does not fail
 loudly -- it collects fewer controls and still reports success, which is the
 Stage 3 defect wearing a new hat. So the two file sets have to be compared, and
 the comparison itself has to be trustworthy.
@@ -86,7 +86,8 @@ def remote_files(remote: str, ref: str, gh: str) -> Tuple[Set[str], str]:
     """The blob paths in a GitHub tree, plus the commit SHA they came from.
 
     Blobs only: `tree` entries are directories and `commit` entries are
-    submodule gitlinks, neither of which is a file either side can hold.
+    gitlinks, neither of which is a file either side can hold. (This repo no
+    longer uses submodules, but the GitHub tree API can still return them.)
     """
     sha = _gh(gh, ["api", f"repos/{remote}/commits/{ref}", "--jq", ".sha"]).strip()
     tree = json.loads(_gh(gh, ["api", f"repos/{remote}/git/trees/{sha}?recursive=1"]))

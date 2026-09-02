@@ -66,13 +66,50 @@ jobs:
       # exactly like "no base schema" and skip the gate -- the original defect.
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
-          token: ${{ secrets.GOVERNANCE_TOKEN }}
-          # By default checkout leaves the token in .git/config as an auth
-          # header for the rest of the job, where every later step -- and
-          # anything a dependency pulls in -- can read it. The submodule fetch
-          # happens inside the action, so dropping it afterwards costs nothing.
+          # Nothing private is fetched by this step any more, so it needs no
+          # elevated token. persist-credentials stays off regardless: a token
+          # left in .git/config is readable by every later step and by anything
+          # a dependency pulls in.
           persist-credentials: false
+      - name: Fetch governance at the pinned commit
+        env:
+          GOV_TOKEN: ${{ secrets.GOVERNANCE_TOKEN }}
+          GOV_REPO: ${{ vars.GOVERNANCE_REPO || 'alanqin22/Conscestra-CRM-governance' }}
+        run: |
+          # governance/ WAS a submodule. It appeared as a gitlink in the public
+          # repository's file listing, which read as though private material
+          # were published there; it was not, but the appearance was the
+          # objection. Cloning it explicitly removes the entry entirely.
+          #
+          # THE PIN IS NOT OPTIONAL. A submodule recorded which governance
+          # commit each public commit was verified against. Cloning `main`
+          # instead would verify every commit against whatever main happens to
+          # be, so a green tick would stop identifying what was checked. The
+          # SHA in .governance-pin restores that, and a checkout that cannot
+          # reach it FAILS here rather than proceeding with an empty directory
+          # that would look exactly like "no base schema" -- the original
+          # defect this workflow exists to prevent.
+          set -euo pipefail
+          if [ -z "${GOV_TOKEN:-}" ]; then
+            echo "::error::GOVERNANCE_TOKEN is not set. The verification gate"
+            echo "::error::cannot run without read access to the private"
+            echo "::error::governance repository."
+            exit 1
+          fi
+          PIN=$(grep -vE '^\s*(#|$)' .governance-pin | tail -1 | tr -d '[:space:]')
+          if [ -z "$PIN" ]; then
+            echo "::error::.governance-pin names no commit."
+            exit 1
+          fi
+          echo "governance pin: $PIN"
+          git clone --quiet --no-checkout             "https://x-access-token:${GOV_TOKEN}@github.com/${GOV_REPO}.git"             governance
+          git -C governance checkout --quiet "$PIN" || {
+            echo "::error::governance commit $PIN is not reachable in ${GOV_REPO}."
+            echo "::error::Push the governance commit before the change that pins it."
+            exit 1
+          }
+          # Drop the credential-bearing remote so no later step can read it.
+          git -C governance remote remove origin
       - uses: actions/setup-python@v5
         # 3.12 OR NEWER IS REQUIRED — do not lower this.
         #
@@ -97,7 +134,7 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "::error::governance/ is empty or missing. The verification"
             echo "::error::gate cannot run. Set the GOVERNANCE_TOKEN secret to"
-            echo "::error::a token with read access to Conscestra-CRM-governance."
+            echo "::error::a token with read access to the governance repo."
             exit 1
           fi
 
@@ -208,13 +245,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
-          token: ${{ secrets.GOVERNANCE_TOKEN }}
-          # By default checkout leaves the token in .git/config as an auth
-          # header for the rest of the job, where every later step -- and
-          # anything a dependency pulls in -- can read it. The submodule fetch
-          # happens inside the action, so dropping it afterwards costs nothing.
+          # Nothing private is fetched by this step any more, so it needs no
+          # elevated token. persist-credentials stays off regardless: a token
+          # left in .git/config is readable by every later step and by anything
+          # a dependency pulls in.
           persist-credentials: false
+      - name: Fetch governance at the pinned commit
+        env:
+          GOV_TOKEN: ${{ secrets.GOVERNANCE_TOKEN }}
+          GOV_REPO: ${{ vars.GOVERNANCE_REPO || 'alanqin22/Conscestra-CRM-governance' }}
+        run: |
+          # governance/ WAS a submodule. It appeared as a gitlink in the public
+          # repository's file listing, which read as though private material
+          # were published there; it was not, but the appearance was the
+          # objection. Cloning it explicitly removes the entry entirely.
+          #
+          # THE PIN IS NOT OPTIONAL. A submodule recorded which governance
+          # commit each public commit was verified against. Cloning `main`
+          # instead would verify every commit against whatever main happens to
+          # be, so a green tick would stop identifying what was checked. The
+          # SHA in .governance-pin restores that, and a checkout that cannot
+          # reach it FAILS here rather than proceeding with an empty directory
+          # that would look exactly like "no base schema" -- the original
+          # defect this workflow exists to prevent.
+          set -euo pipefail
+          if [ -z "${GOV_TOKEN:-}" ]; then
+            echo "::error::GOVERNANCE_TOKEN is not set. The verification gate"
+            echo "::error::cannot run without read access to the private"
+            echo "::error::governance repository."
+            exit 1
+          fi
+          PIN=$(grep -vE '^\s*(#|$)' .governance-pin | tail -1 | tr -d '[:space:]')
+          if [ -z "$PIN" ]; then
+            echo "::error::.governance-pin names no commit."
+            exit 1
+          fi
+          echo "governance pin: $PIN"
+          git clone --quiet --no-checkout             "https://x-access-token:${GOV_TOKEN}@github.com/${GOV_REPO}.git"             governance
+          git -C governance checkout --quiet "$PIN" || {
+            echo "::error::governance commit $PIN is not reachable in ${GOV_REPO}."
+            echo "::error::Push the governance commit before the change that pins it."
+            exit 1
+          }
+          # Drop the credential-bearing remote so no later step can read it.
+          git -C governance remote remove origin
       - uses: actions/setup-python@v5
         # 3.12+ required — see the import-check job above.
         with: { python-version: '3.12', cache: pip }
