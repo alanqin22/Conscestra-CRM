@@ -733,7 +733,15 @@ def _run_staff_email_digest() -> None:
         from app.core import staff_email
         res = staff_email.run_digest()
         if res.get("skipped"):
-            logger.debug(f"[StaffEmailDigest] {res['skipped']}")
+            # A skip is normally uninteresting, hence DEBUG. A skip that
+            # CONTRADICTS the configuration is not: somebody turned sending on
+            # and the module never ran. run_digest already logs that at
+            # WARNING; this keeps the two lines consistent rather than having
+            # the scheduler quietly downgrade it.
+            if res.get("config_conflict"):
+                logger.warning(f"[StaffEmailDigest] {res['config_conflict']}")
+            else:
+                logger.debug(f"[StaffEmailDigest] {res['skipped']}")
         else:
             logger.info(f"[StaffEmailDigest] sent {res.get('sent')} of "
                         f"{res.get('recipients')} (apply={res.get('applying')})")

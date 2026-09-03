@@ -156,6 +156,18 @@ ADMIN_GATED: Set[str] = {
     "app/core/retention.py", "app/core/scoring.py", "app/core/semantic.py",
     "app/core/sequences.py", "app/core/shadow_eval.py",
     "app/core/staff_email.py", "app/core/tuning.py",
+    # work_ownership.py is READ-ONLY except for one path: grant_employee_owner()
+    # mints an owner row and classifies it in corpus_provenance. That is the
+    # explicit governed authorization act — admin-invoked, DRY RUN BY DEFAULT,
+    # and refusing five named ways (service identity, F1 collision, unrecorded
+    # provenance, already linked, not an employee).
+    #
+    # The narrowed no-repair invariant in the tests states the boundary the
+    # declaration relies on: this module may create an owner ROW, and may never
+    # write an owner onto WORK or derive one from a contact, account or
+    # creator. `test_K_N` asserts exactly that, including that the single
+    # INSERT lives in the grant path and mints a fresh uuid.
+    "app/core/work_ownership.py",
 }
 
 # ============================================================================

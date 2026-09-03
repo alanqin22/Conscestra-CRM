@@ -48,7 +48,7 @@ FRESH_DAYS = int(os.getenv("DQ_FRESH_DAYS", "30"))   # open deals stale beyond t
 _EMAIL_RE = r"^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$"
 
 DIMENSIONS = ["completeness", "validity", "consistency", "uniqueness",
-              "integrity", "freshness", "provenance"]
+              "integrity", "freshness", "provenance", "eligibility"]
 
 
 # ── Soft-delete guards per entity (differ across tables) ─────────────────────
@@ -61,9 +61,20 @@ _ALIVE = {
 }
 
 
-def _check(entity, key, dim, label, sql, caveat=None) -> Dict[str, Any]:
+def _check(entity, key, dim, label, sql, caveat=None, fn=None) -> Dict[str, Any]:
+    """`sql` returns (good, total). `fn` is the escape hatch for a check whose
+    rule cannot honestly be written in SQL.
+
+    There is exactly one such check today and the reason is specific:
+    owner ELIGIBILITY depends on declared personhood, which lives in
+    `dsar.SERVICE_IDENTITY_ROLES` plus an individually named exception list.
+    Re-expressing that in SQL would be a SECOND implementation of "is this a
+    person" — and two answers to that question is how they drift apart, in the
+    direction of certifying a service account as an accountable human.
+
+    So the check calls the one implementation instead of copying it."""
     return {"entity": entity, "key": key, "dimension": dim, "label": label,
-            "sql": sql, "caveat": caveat}
+            "sql": sql, "caveat": caveat, "fn": fn}
 
 
 # ============================================================================
@@ -200,6 +211,31 @@ CHECKS: List[Dict[str, Any]] = [
            "{bad} case(s) are in progress with no owner (nobody is "
            "accountable for them)"),
 
+    # ── OWNERSHIP ELIGIBILITY — may the owner HOLD work? ──────────────────
+    # THE THIRD QUESTION, and the one nothing asked. Completeness asks "is it
+    # set". Integrity asks "does it resolve". A task owned by a customer
+    # contact passes BOTH: the column is populated and the foreign key lands on
+    # a real row in `owners`.
+    #
+    # It is still not ownership. 9,974 activities are owned by customer
+    # identities and every one of them scored clean on the two dimensions
+    # above, which is precisely how the defect stayed unmeasured while a
+    # dimension literally named "Rep accountability" reported a healthy number.
+    #
+    # Scoped to OPEN activities: closed history is preserved, not rewritten,
+    # so scoring it would report a debt no action can clear. UNOWNED rows are
+    # excluded from the ratio rather than counted as failures — an unassigned
+    # row is the CORRECT outcome of the ratified P3 transition, and a readiness
+    # score that fell as enforcement did its job would train its reader to
+    # ignore it. They are surfaced separately, because they still need a human.
+    _check("activities", "act_owner_eligible", "eligibility",
+           "Open work is owned by someone eligible to hold it",
+           None,
+           "{bad} open activity(ies) have an owner who may not hold work "
+           "(customer identity, service actor, unresolved, or colliding)",
+           fn=lambda: __import__("app.core.work_ownership",
+                                 fromlist=["x"]).owner_eligibility_check()),
+
     # ── OWNERSHIP INTEGRITY — does the owner actually EXIST? ───────────────
     # COMPLETENESS ASKS "IS IT SET"; INTEGRITY ASKS "DOES IT RESOLVE", and
     # reading one as the other is how an audit reported "activities 100%
@@ -306,8 +342,13 @@ DECISIONS: List[Dict[str, Any]] = [
     # on the two entities whose ownership is healthy while the largest
     # transactional table had no reps on it at all. A decision-reliability map
     # that omits the weakest input reports confidence it has not earned.
+    # act_owner_eligible joins for the same reason ord_owner did: this decision
+    # was scoring on whether an owner was SET while the largest live-work table
+    # was 2% owned by anyone allowed to hold work. A map that omits its weakest
+    # input reports confidence it has not earned.
     {"name": "Rep accountability",
-     "checks": ["opp_owner", "acc_owner", "ord_owner", "case_owner_active"]},
+     "checks": ["opp_owner", "acc_owner", "ord_owner", "case_owner_active",
+                "act_owner_eligible"]},
     {"name": "Customer segmentation", "checks": ["acc_name_unique", "acc_industry", "con_account"]},
     {"name": "Email outreach", "checks": ["con_reachable", "con_email_valid", "lead_email_valid"]},
     {"name": "Contactability (calls/SMS)", "checks": ["con_reachable", "con_phone_valid", "lead_reachable"]},
@@ -339,7 +380,7 @@ def _good_total(sql: str) -> Tuple[Optional[int], Optional[int]]:
 def _run_checks() -> List[Dict[str, Any]]:
     out = []
     for c in CHECKS:
-        good, total = _good_total(c["sql"])
+        good, total = (c["fn"]() if c.get("fn") else _good_total(c["sql"]))
         if total is None:
             status, rate = "no_data", None
         elif total == 0:

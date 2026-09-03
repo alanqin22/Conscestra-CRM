@@ -1149,6 +1149,21 @@ can be trended with confidence. And before any result counts, the test harness
 proves that the change it made is the change actually running — an instrument
 is only useful once you know it is measuring what you think it is.
 
+**A refusal only counts as evidence when you know which rule refused.** Checking
+that the database rejected something proves less than it appears to: a table
+carries many rules, and any of them turning it away produces the same visible
+outcome. A safeguard was found that had passed its own test for the wrong
+reason — the test supplied a case that a *different* branch happened to catch,
+while the branch under examination stayed open for exactly the input it was
+written to stop. An audit of the suite found **eighteen such checks, seventeen
+of which asserted only that something had gone wrong**, not what.
+
+Every one of them now names the rule it expects to fire, and each conversion was
+verified by naming the *wrong* rule and confirming the test then fails. A new
+check that does not name its reason is refused by the build. The handful that
+predate the rule are listed individually rather than waived as a group, so the
+backlog is visible and can only shrink.
+
 ## Verification Runs Where the System Actually Lives
 
 Continuous integration establishes what a build server is well suited to
@@ -1195,6 +1210,32 @@ that collapses them into *Failed to load* has told you nothing. Each one
 says which it is.
 
 **A platform that can act on its own must be able to tell you when it can't.**
+
+## A Setting You Cannot Read Is a Setting You Cannot Trust
+
+Changing a setting and confirming a setting are not the same act, and the gap
+between them is where a system quietly does something other than what it was
+told.
+
+Two live examples, both found and both closed. Asking the platform to run more
+than one worker process had **no effect at all** while a development flag was
+left on — the web server silently ignores the request in that mode, logs one
+line about it at startup, and carries on single-process. Nothing else in the
+application read that flag, so there was no way to tell from outside. And after
+switching retrieval to its hybrid mode, the only available check was comparing
+result counts against a different environment holding a different corpus — which
+is suggestive, and is not proof.
+
+The platform now **reports its own running configuration**: which build is
+actually serving, how many workers are genuinely running as opposed to
+requested, which retrieval mode is in effect as opposed to configured, and
+whether the process is the one carrying the scheduled work. Each is read from
+the live process rather than inferred from its behaviour.
+
+The distinction between *requested* and *effective* is deliberate and appears
+wherever the two can diverge. A deployment that asked for a capability it did
+not get should look different from one that got it — otherwise a silently
+degraded system reports success, which is the most expensive kind of green.
 
 ## Progress That Survives Anything
 
@@ -1262,6 +1303,44 @@ indexing was evaluated against the workload rather than adopted because it is
 fashionable, and the honest conclusion — at the current data volume the exact
 search is already faster than the index would be, and the threshold where that
 reverses is written down — is recorded with the numbers behind it.
+
+## Retrieval No Longer Guesses From the Recent Past
+
+Asking the memory a question used to mean searching the most recent slice of it.
+That is a reasonable default and a quiet ceiling: on a corpus of roughly
+thirteen thousand records **the search ranked 4,000 of them — under a third** —
+and said so in its own logs,
+because a system that can only see the recent past should admit it rather than
+present a partial answer as a complete one.
+
+Retrieval now draws from **two pools at once**: the recency pool as before, and
+a semantic pool selected by vector similarity, unioned and then re-ranked
+exactly. A question phrased in the customer's words finds the record written in
+yours, whether it was filed yesterday or last quarter.
+
+**The gain was measured, not assumed.** Across a fixed set of questions the
+same searches returned **44 results before and 104 after — 81 genuinely new** —
+with **zero true content loss**. That last number is the one that mattered
+enough to define precisely: a result that drops out of the top ten because
+better matches arrived is *displaced*, and still reachable; a result the system
+can no longer return at any depth is *lost*. Seventeen were displaced. None
+were lost.
+
+**It is a setting, not a rewrite.** Hybrid retrieval is opt-in, reversible by
+changing one value, and degrades honestly — if the semantic index is missing or
+incomplete the search falls back to recency rather than returning half an
+answer. The platform reports which of the two is *actually* running, not merely
+which was requested, because those are different questions and only one of them
+is the truth.
+
+**The tuning carries its own expiry.** The size of the semantic pool was tuned
+against one corpus at one moment, and that fact is recorded alongside the
+number. The platform separately reports whether the corpus has since moved away
+from the state the tuning was validated against — and it reports the standing
+limitation too, rather than quietly rounding it off: one heavily-repeated
+template can very nearly fill the semantic pool on its own, and what covers that
+is the recency pool beside it. A caveat that is only true in a comment is a
+caveat nobody reads.
 
 ## Governance Before Autonomy
 
@@ -1364,6 +1443,38 @@ gates, so private data neither leaks into prompts nor out of them.
 
 Security is not a feature layered onto the platform. **Security is the
 architecture.**
+
+## A Public Demonstration, With a Ceiling and a Floor
+
+The live demonstration is deliberately open: anyone may read, without signing
+up, because a CRM you cannot look at explains nothing. That posture is a
+decision, and decisions need edges.
+
+**The absent case is no longer the dangerous one.** An unset configuration used
+to select the posture that enforces *nothing* — where anonymous callers may
+create, update and delete, because all three write controls key off a role that
+posture never assigns. A typo in the variable name chose it silently. That
+posture now **blocks release** unless someone explicitly and separately affirms
+it, so the failure mode of forgetting is closed rather than wide open.
+
+**Open to read is not open to take.** Anonymous reading is now rate-limited per
+caller, enforced at the single gate every data endpoint already passes through —
+rather than endpoint by endpoint, where a newly added route would be unprotected
+by default. A demonstration is a demonstration; it is not a bulk export channel.
+Signed-in callers are exempt, because being identified is what the limit stands
+in for.
+
+**Writes were, and remain, closed.** Reading is anonymous; creating, updating and
+deleting require a signed-in account with a role that permits it, refused at the
+gate before anything executes. Administrative surfaces are refused outright.
+
+**And a credential stopped shipping in the source.** A configuration default
+carried a working database password. It was reachable only from the same
+machine, but "nobody can reach it" is a property of a network, not of a
+published repository. Worse, it made a *missing* configuration look like a
+working one — the one case it applied in was the case where nothing had been
+configured at all. It is now empty, and an unconfigured system refuses to
+connect rather than guessing.
 
 ## The Application Cannot Switch Off Its Own Controls
 
@@ -1682,8 +1793,8 @@ informal way changed production and passed every check in silence — the
 migration checker iterates the manifest, the health report divides by the
 manifest, and the schema comparison looked only at tables.
 
-Every one of the **253 SQL files now carries exactly one disposition**: 36
-governed migrations and 217 explicitly-classified operations, each with a
+Every one of the **268 SQL files now carries exactly one disposition**: 41
+governed migrations and 227 explicitly-classified operations, each with a
 written reason. A file in neither list is an **error**, not a default, and the
 migration runner refuses to touch a database while one exists. The two tools
 also refuse each other's work: a governed migration handed to the one-off path
@@ -1703,6 +1814,114 @@ an independently reviewed artifact*, because no second copy exists to disagree w
 That limit is stated plainly rather than glossed over — and it is why the disposition
 manifest above, which *is* in source control, carries the written reason for every
 file it declares. The reasoning is published even where the SQL is not.
+
+## Which Records Describe Real People Is Recorded, Not Inferred
+
+A demonstration system that anyone can browse and a system holding real customer
+data are the same software with entirely different obligations. Telling them
+apart afterwards turned out to be impossible: an earlier migration rewrote every
+address in the corpus, destroying the one signal that would have answered it.
+
+So the answer is **recorded rather than reconstructed**. Each record carries a
+provenance state — synthetic, real, or ambiguous — with the rule that
+established it. What makes this a control rather than a spreadsheet is what the
+database *refuses*: the tempting inferences are rejected as **check
+constraints**, not discouraged in a document. An email domain, a name match, the
+window a record was created in, and a language model's opinion can none of them
+be written down as grounds for calling a person real. The wrong answer is not
+merely discouraged; it cannot be stored.
+
+**Absence means ambiguous, never unclassified.** The classifier writes only what
+evidence supports — it will mark a record synthetic where the record itself says
+so, and it will never promote a record to *real* on its own. A real person is
+recorded by a named human, or not at all. Deriving *real* from a heuristic would
+be the same error pointed the other way.
+
+**The alarm is calibrated to be wrong in the safe direction.** A separate
+tripwire watches for anything that merely *looks* like a real customer — an
+address outside the domains this deployment generates into — and it is
+deliberately over-sensitive. That signal is an alarm and can never become
+evidence; the schema makes writing it into the provenance record impossible.
+A false alarm costs somebody a glance at the configuration. A miss costs real
+customer records served to anyone with the hostname. The public demonstration
+posture blocks its own release if a record *classified* real is reachable
+anonymously.
+
+## Discovery Is Not Evidence
+
+Two records can look like the same person and not be. On this corpus, matching
+contacts to leads by name finds **121 pairs, of which 9 are real** — a 92% false
+positive rate. Merging identities is irreversible: it rewrites references across
+every related table and retires the duplicate.
+
+Nothing had merged. Nothing prevented it either — and the queue already held
+name and email matches sitting at confidence scores high enough to act on, with
+the merge itself available as a callable capability.
+
+The fix is a distinction the schema now enforces:
+
+- **How a pair was found.** A heuristic. Name, email and phone belong here — that
+  is how you *notice* two records might be one person, and blocking discovery
+  would make duplicates invisible rather than unmergeable.
+- **What justifies acting on it.** Only a deterministic foreign key, or a named
+  human who looked. Nothing else, and a confirmation that names nobody is not a
+  human confirmation — it is the word for one.
+
+A merge cannot be executed without having been confirmed, and that is a property
+of the table rather than of one call site. The twenty existing candidate pairs
+were **left exactly where they are**: rejecting them in bulk would hide genuine
+duplicates from future review, and they can no longer be acted on by their own
+evidence. Doing nothing was the correct action, so nothing is what was done.
+
+## A Retired Table Still Owes an Answer
+
+Data outlives the feature that created it. Two tables retired long ago were
+still holding personal information — not referenced by anything, not visible in
+any screen, and not erased either, because nobody had ever been required to say
+what should happen to them.
+
+Retirement now carries an **explicit disposition**. Personal data is erased
+*before* the table is dropped, the erasure is recorded with its row count in a
+permanent ledger, and erasure is the default that applies unless someone
+declares otherwise. Forty-six rows of personal detail were removed under that
+rule, on every database, with the record of it kept.
+
+**Absence must be declared, not merely observed.** The subtle failure here was
+the obvious fix: if a missing table simply excused itself, then dropping a table
+would become the quietest way to silence the alarm watching it — the control
+would report all-clear at precisely the moment the data was destroyed. A table
+is therefore excused only when its retirement is *recorded*; a disposition still
+marked pending is not a decision, and an undeclared disappearance is treated as
+a failure to read the corpus, which fails closed.
+
+## Every Event Names the Request That Caused It
+
+An event that cannot be traced to the request that produced it is an
+observation without a cause. Business events now carry the correlation
+identifier of the interaction that triggered them, propagated at the database
+session rather than threaded by hand through every call site — so a
+notification, a queued action and the conversation that set them in motion can
+be reassembled after the fact rather than inferred from timestamps.
+
+## A Schema Change Can Now Be Caught Even If It Used No Path At All
+
+Declaring which path a change took closes the gap between two *known* ways of
+applying SQL. It does not close the third: someone connecting to the database
+and altering it directly. That change belongs to no manifest, so no manifest
+notices it.
+
+The platform now records a **fingerprint of the schema itself** — every object,
+per database — at the moment each declared change is applied. A later comparison
+answers a question the manifest structurally cannot: *has this database changed
+in a way nothing declared?* Production currently reports **2,293 objects and
+clean**, meaning the live schema is exactly what the declared history says it
+should be.
+
+The per-database part is not incidental. The first implementation recorded a
+fingerprint of the *local* database while applying a change to the remote one —
+a check that was confidently reporting on the wrong subject. It now names which
+database each attestation describes, because an answer about the wrong system is
+worse than no answer.
 
 ## A Migration and Its Record Commit Together
 
