@@ -124,6 +124,38 @@ def applying() -> bool:
     return _flag("STAFF_EMAIL_APPLY", "0")
 
 
+def config_conflict() -> Optional[str]:
+    """The one flag combination that is silently inert, named out loud.
+
+    Two flags give three meaningful states:
+
+        ENABLED=0            module off — decides nothing, records nothing
+        ENABLED=1 APPLY=0    decides and records, sends nothing (the shadow
+                             window this whole investigation ran in)
+        ENABLED=1 APPLY=1    sends
+
+    The fourth, ENABLED=0 with APPLY=1, means somebody switched sending on and
+    nothing happened. It is not an error the module can resolve — but it is a
+    STATEMENT OF INTENT that the configuration contradicts, and until now it
+    produced no signal whatsoever.
+
+    WORSE THAN QUIET: the digest's skip is logged at DEBUG by the scheduler, so
+    an operator who set APPLY=1 and expected mail saw nothing at all — not even
+    a skip line. A misconfiguration that looks identical to a quiet morning is
+    the exact failure this module was rewritten to eliminate, reappearing one
+    layer down in its own configuration.
+
+    Returns a sentence for a human, or None when the config is coherent.
+    """
+    if applying() and not enabled():
+        return ("STAFF_EMAIL_APPLY=1 but STAFF_EMAIL_ENABLED=0 — nothing will "
+                "send. APPLY is the send switch; ENABLED is what lets the "
+                "module decide at all, and with it off the digest pass returns "
+                "before any decision is made. Set STAFF_EMAIL_ENABLED=1 as "
+                "well.")
+    return None
+
+
 def role_mailbox() -> str:
     return (os.getenv("STAFF_EMAIL_ROLE_MAILBOX")
             or os.getenv("ESCALATION_EMAIL_TO")
@@ -137,6 +169,35 @@ TIER_WORKLIST = "actionable"       # Tier 2 — digest only
 TIER_AMBIENT = "informational"     # Tier 3 — never
 
 EMAIL_KINDS = ("approval", "escalation", "escalation_remind", "digest")
+
+# WHY A ZERO-SEND HAPPENED. Six distinct facts that a single "0 sent" collapses
+# into one, and the collapse is what let a structural dead end read as a quiet
+# week for ten days. Enumerated rather than left implicit so a test can assert
+# the set, and so no future refusal quietly reuses a slug that means something
+# else.
+#
+#   nothing_actionable        no work exists for this recipient. Correct, quiet.
+#   worklist_unreachable      work exists; NO authorized recipient can receive
+#                             any of it. Pass-level, not per-person.
+#   recipient_not_authorized  this holder is identifiable but holds no grant.
+#   identity_unresolved       this holder's uuid does not name exactly one
+#                             person — a collision, or no known space at all.
+#                             Never guess which; never email either candidate.
+#   send_disabled             a decision was reached and deliberately not acted
+#                             on (STAFF_EMAIL_APPLY=0). NOT a failure.
+#   delivery_failure          the provider refused or errored. The only one of
+#                             the six that means the transport is at fault.
+#
+# The distinction that matters most: `send_disabled` and `delivery_failure` are
+# about the SEND, the other four are about whether a send was ever possible.
+ZERO_SEND_REASONS = (
+    "nothing_actionable",
+    "worklist_unreachable",
+    "recipient_not_authorized",
+    "identity_unresolved",
+    "send_disabled",
+    "delivery_failure",
+)
 
 # How long one worker owns a send before it is presumed dead and reclaimable.
 # Matches order_notifications.ATTEMPT_LEASE deliberately: one lease policy for
@@ -627,9 +688,61 @@ def decide(*, kind: str, tier: str, ref: str,
     # is worth a ledger row whichever way it goes.
     out["ledgerable"] = True
 
+    # THE COLLISION QUARANTINE, APPLIED TO THE OTHER DOOR — AND BEFORE
+    # RESOLUTION, BECAUSE THE IDENTIFIER IS THE HAZARD.
+    #
+    # `resolve_recipient` already refuses a colliding uuid arriving as
+    # free-text `assignee`. It does NOT check the `owner_id` branch, which
+    # reads `assignable_identity` and trusts what it finds — so the guard
+    # covered the path where the identifier is untrusted and left open the one
+    # where it had been written down. On this corpus that asymmetry is a single
+    # grant wide: `a1451ad6…` is jmartin in `employees` and John Smith in
+    # `owners`.
+    #
+    # Checked on the INPUT rather than on the resolved recipient, and ahead of
+    # every other gate, so the refusal does not depend on whether that uuid
+    # happens to be granted today. A guard that only fires once the dangerous
+    # thing has already been authorized is not a guard.
+    #
+    # Applies to EVERY kind. A service identity has no inbox worth writing to
+    # and a colliding uuid names two people; neither becomes less true because
+    # the mail is an approval.
+    if owner_id:
+        try:
+            from app.core import work_ownership
+            if work_ownership.is_service_identity(owner_id):
+                return _no(f"{owner_id[:8]}… is a declared service identity, "
+                           "not a person", "identity_unresolved")
+        except Exception as exc:                               # pragma: no cover
+            # `is_service_identity` fails closed; a bare exception must not be
+            # quieter than the answer it failed to produce.
+            return _no(f"personhood could not be established: {exc}",
+                       "identity_unresolved")
+        if _is_collision(owner_id):
+            return _no(f"{owner_id[:8]}… names more than one person across "
+                       "identity spaces; refused", "identity_unresolved")
+
     recipient = resolve_recipient(assignee=assignee, executive_id=executive_id,
                                   owner_id=owner_id)
     out["recipient"] = recipient
+
+    # A DIGEST IS PERSONAL AND HAS NO SECOND-BEST DESTINATION.
+    #
+    # `resolve_recipient` degrades an unresolvable identity to the role mailbox
+    # on purpose, and for an escalation that is right: unowned work must still
+    # reach somebody. A worklist is the opposite kind of object. It is one
+    # person's queue, it means nothing to anyone else, and `preference_for`
+    # gives the role mailbox `auto_email_enabled: True` — so without this gate
+    # a grant revoked between the directory read and the send would deliver
+    # that person's queue to support@.
+    #
+    # Cannot fire from `run_digest()`, which iterates the directory and so
+    # resolves by construction. It fires for every OTHER caller of
+    # `send_digest()`, and "only reachable through one caller today" is not a
+    # safety property — it is a coincidence of the current call graph.
+    if kind == "digest" and recipient.get("kind") == "role_mailbox":
+        return _no("a worklist has no role-mailbox fallback — "
+                   f"{recipient.get('why')}", "recipient_not_authorized")
 
     allowed, why, cls = preference_allows(preference_for(recipient), tier)
     if not allowed:
@@ -1224,18 +1337,37 @@ def digest_items(owner_id: str) -> List[Dict[str, Any]]:
     written before an email decision existed, and pretending otherwise would
     manufacture a worklist nobody agreed to.
     """
+    # THE LOOKUP CROSSES IDENTITY SPACES, so it is resolved rather than
+    # assumed. This function receives an OWNER id; `notifications.employee_uuid`
+    # holds EMPLOYEE ids (and agent ids, and — for the four executives — owner
+    # ids, because their subscriptions were created that way).
+    #
+    # Matching owner_id against that column directly worked only because those
+    # four coincided. A grant that mints a fresh owner uuid, which a correct
+    # grant must, matches nothing — the grant succeeds and the digest is
+    # silently empty.
+    #
+    # `recipient_identities()` returns the identities that RECORD-BEARINGLY
+    # represent this owner. An empty result means no resolvable recipient,
+    # which is a different state from "no work" and is reported as such by the
+    # caller rather than collapsed into it.
+    from app.core import work_ownership
+    keys = work_ownership.recipient_keys(owner_id)
+    if not keys:
+        return []
+
     items = _rows(
         """SELECT n.notification_uuid::text AS id, m.title, m.body,
                   m.tier, n.created_at
            FROM notifications n
            JOIN notification_messages m ON m.notification_uuid = n.message_uuid
-           WHERE n.employee_uuid = %s::uuid
+           WHERE n.employee_uuid = ANY(%s::uuid[])
              AND n.channel = 'in_app'
              AND n.status <> 'read'
              AND m.tier = %s
            ORDER BY n.created_at DESC
            LIMIT 50""",
-        (owner_id, TIER_WORKLIST))
+        (keys, TIER_WORKLIST))
 
     # Live escalations this person owns, whose reason is NOT one the exception
     # mail already covers. Resolved through assignable.resolve(), so a
@@ -1257,6 +1389,180 @@ def digest_items(owner_id: str) -> List[Dict[str, Any]]:
                       "body": esc.get("summary") or "",
                       "created_at": esc.get("sla_due_at")})
     return items
+
+
+def worklist_reachability() -> Dict[str, Any]:
+    """Can the digest have content at all — or is its silence structural?
+
+    THE FAILURE THIS EXISTS TO NAME. `nothing_actionable` is the correct and
+    honest refusal for a recipient whose queue is empty this morning. It was
+    also, for ten consecutive days, the refusal recorded for recipients whose
+    queue CANNOT be non-empty — and nothing in the record tells the two apart.
+    The pass logged `sent 0 of 4` either way, which is precisely what a quiet
+    week is supposed to look like.
+
+    They are not the same fact:
+
+        empty today   ->  the wiring is right; the morning is quiet. Wait.
+        unreachable   ->  Tier 2 work exists and NOBODY who may be emailed
+                          owns any of it. Waiting changes nothing.
+
+    Measured on Railway 2026-09-01: 76 unread Tier 2 items, held by three
+    `employees` identities. The four authorized recipients are the executives,
+    and their intersection with that set is EMPTY — not small, empty, and it
+    has never been anything else. §K.4 read the first day's zeros as
+    pre-Stage-2 NULL tiers that would age out; 302 stamped `actionable` rows
+    later they have not, because the stamp was never the cause. The cause is
+    that the recipient set and the work set are two different identity spaces.
+
+    THIS PROPOSES NO REPAIR, DELIBERATELY. Granting `@emp.agentorc.ca`
+    assignability is a separate authorization the design explicitly withholds
+    (§K, "Never in this sequence"), and it is the change that takes the
+    recipient universe from 4 to 12. The job here is to stop the gap from
+    reading as a quiet day.
+
+    NAMED LIMIT: this probes the notifications half of `digest_items()` only.
+    The escalations half resolves free text in Python and cannot be asked in
+    SQL; on Railway that table is empty today, so it contributes nothing to
+    either count — but if it fills, `unreachable` becomes a FLOOR rather than a
+    total. Better to say so than to imply a completeness this query lacks.
+    """
+    rows = _rows(
+        """WITH scoped AS (
+               SELECT n.employee_uuid AS holder
+                 FROM notifications n
+                 JOIN notification_messages m
+                   ON m.notification_uuid = n.message_uuid
+                WHERE n.channel = 'in_app'
+                  AND n.status <> 'read'
+                  AND m.tier = %s),
+           held AS (
+               SELECT holder, count(*) AS items
+                 FROM scoped WHERE holder IS NOT NULL GROUP BY 1)
+           SELECT h.holder::text AS owner_id, h.items,
+                  EXISTS (SELECT 1 FROM assignable_identity a
+                           WHERE a.owner_id = h.holder AND a.is_active)
+                    AS authorized,
+                  EXISTS (SELECT 1 FROM employees e
+                           WHERE e.employee_uuid = h.holder) AS in_employees,
+                  EXISTS (SELECT 1 FROM owners o
+                           WHERE o.owner_id = h.holder) AS in_owners
+             FROM held h ORDER BY h.items DESC""",
+        (TIER_WORKLIST,))
+
+    unassigned_row = _one(
+        """SELECT count(*) FROM notifications n
+             JOIN notification_messages m ON m.notification_uuid = n.message_uuid
+            WHERE n.channel = 'in_app' AND n.status <> 'read'
+              AND m.tier = %s AND n.employee_uuid IS NULL""", (TIER_WORKLIST,))
+    unassigned = int(unassigned_row[0]) if unassigned_row else 0
+
+    def _space(h: Dict[str, Any]) -> str:
+        # F1 restated as data rather than as a warning in a docstring. A uuid
+        # present in BOTH spaces is one identifier naming two different people
+        # — on this corpus, `a1451ad6…` is jmartin in `employees` and John
+        # Smith in `owners`. Which one holds the work is not decidable from the
+        # column, so neither may be emailed.
+        if h["authorized"]:
+            return "assignable"
+        if h["in_employees"] and h["in_owners"]:
+            return "collision"
+        if h["in_employees"]:
+            return "employee"
+        if h["in_owners"]:
+            return "owner"
+        return "unknown"
+
+    def _why(space: str) -> str:
+        # An unresolved identity and an unauthorized one are different
+        # problems with different remedies: the first needs an identity
+        # decision, the second needs a grant. Collapsing them would make the
+        # grant look like the fix for both.
+        if space in ("collision", "unknown"):
+            return "identity_unresolved"
+        return "recipient_not_authorized"
+
+    holders, by_reason = [], {}
+    total = reachable = identifiable = authorized_holders = 0
+    for h in rows:
+        space, items = _space(h), int(h["items"])
+        total += items
+        if h["authorized"]:
+            reachable += items
+            authorized_holders += 1
+        else:
+            by_reason[_why(space)] = by_reason.get(_why(space), 0) + items
+        if space != "collision" and space != "unknown":
+            identifiable += 1
+        holders.append({"owner_id": h["owner_id"], "items": items,
+                        "reachable": bool(h["authorized"]), "space": space})
+
+    # Work nobody holds cannot be delivered either, and it is a THIRD problem —
+    # an assignment gap, not an identity or authorization gap. Counted under
+    # its own reason so a fix aimed at the other two does not appear to have
+    # moved it.
+    if unassigned:
+        by_reason["identity_unresolved"] = (
+            by_reason.get("identity_unresolved", 0) + unassigned)
+
+    grand_total = total + unassigned
+    recipients = len(_rows("SELECT 1 FROM assignable_identity WHERE is_active"))
+
+    return {
+        # -- the eight questions, answerable without joining anything by hand --
+        "tier2_total": grand_total,
+        "assigned": total,
+        "unassigned": unassigned,
+        "holders_total": len(rows),
+        "holders_identifiable": identifiable,
+        "holders_authorized": authorized_holders,
+        "reachable": reachable,
+        "unreachable": grand_total - reachable,
+        "unreachable_by_reason": by_reason,
+        "recipients": recipients,
+        "sending": {"enabled": enabled(), "applying": applying()},
+        # The whole point of the function, as one boolean an alert can read.
+        "structural_silence": bool(grand_total > 0 and reachable == 0),
+        # uuids, counts and reason codes only. No names, no addresses: this
+        # endpoint answers "can this be delivered", which never requires
+        # knowing who the person is.
+        "holders": holders[:10],
+        "covers": ("notifications only — the escalations half of digest_items() "
+                   "is not probed, so `unreachable` is a floor, not a total"),
+        # Kept for callers written against the first version of this probe.
+        "tier2_unread": grand_total,
+    }
+
+
+def _note_observation(*, kind: str, tier: str, decision: str,
+                      reason_class: str, recipient_kind: str = "none") -> None:
+    """Record an observation that is ABOUT THE PASS rather than about one
+    person's decision.
+
+    Kept separate from `observe()` on purpose: that function's contract is
+    "call decide(), then record what it answered", and a pass-level fact has no
+    decide() call behind it. Folding this in would mean an observation row that
+    claims a decision nobody made.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO staff_email_observations
+                     (day, email_kind, tier, decision, reason_class,
+                      recipient_kind, origin, n)
+                   VALUES (current_date, %s, %s, %s, %s, %s, %s, 1)
+                   ON CONFLICT (day, email_kind, tier, decision, reason_class,
+                                recipient_kind, origin)
+                   DO UPDATE SET n = staff_email_observations.n + 1,
+                                 last_seen_at = now()""",
+                (kind, tier, decision, reason_class, recipient_kind, _origin()))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        logger.debug(f"[staff_email] pass observation not recorded: {exc}")
+    finally:
+        conn.close()
 
 
 def _app_url() -> Optional[str]:
@@ -1397,6 +1703,10 @@ def send_digest(owner_id: str, *, email: Optional[str] = None,
         # failure, and must not burn the idempotency key.
         release(claim_info["email_id"], "STAFF_EMAIL_APPLY=0 — composed, not sent")
         out["reason"] = "STAFF_EMAIL_APPLY=0 — composed, not sent"
+        # A deliberate non-send is not the same fact as an empty worklist and
+        # must not be counted as one. It is the ONLY zero here that a single
+        # env var reverses.
+        out["reason_class"] = "send_disabled"
         out["subject"] = subject
         return out
 
@@ -1405,6 +1715,11 @@ def send_digest(owner_id: str, *, email: Optional[str] = None,
     out["sent"] = outcome == "accepted"
     out["outcome"] = outcome
     out["reason"] = f"provider outcome: {outcome}"
+    # The one zero in this module that actually means the transport failed.
+    # Kept distinct from every upstream refusal so that "email is broken" and
+    # "email was correctly not attempted" can never be read as the same event.
+    if not out["sent"]:
+        out["reason_class"] = "delivery_failure"
     out["subject"] = subject
     return out
 
@@ -1414,7 +1729,15 @@ def run_digest() -> Dict[str, Any]:
     people. NEVER raises — one recipient's failure must not cost the others
     theirs."""
     if not enabled():
-        return {"ok": True, "skipped": "STAFF_EMAIL_ENABLED=0"}
+        # WARNING, not debug, and raised HERE rather than left to the caller:
+        # the scheduler logs a skipped pass at DEBUG, so a contradiction
+        # reported through the return value alone would stay invisible in
+        # exactly the deployment where somebody is waiting for mail.
+        conflict = config_conflict()
+        if conflict:
+            logger.warning(f"[staff_email] MISCONFIGURED — {conflict}")
+        return {"ok": True, "skipped": "STAFF_EMAIL_ENABLED=0",
+                "config_conflict": conflict}
     try:
         from app.core import assignable
         people = assignable.directory()
@@ -1436,8 +1759,31 @@ def run_digest() -> Dict[str, Any]:
     sent = sum(1 for r in results if r.get("sent"))
     logger.info(f"[staff_email] digest pass: {sent} sent of {len(results)} "
                 f"recipients (apply={applying()})")
+
+    # A pass that sent nothing is normally the correct outcome and is logged at
+    # INFO for exactly that reason. But `sent 0 of 4` has two causes and only
+    # one of them is a quiet morning — so before accepting the quiet reading,
+    # ask whether ANY Tier 2 work was addressable at all. When the answer is
+    # none, this is not a quiet day, it is a pass that could not have succeeded,
+    # and it says so at WARNING and leaves a counted row behind.
+    reach: Dict[str, Any] = {}
+    if sent == 0:
+        reach = worklist_reachability()
+        if reach.get("structural_silence"):
+            logger.warning(
+                f"[staff_email] digest reached nobody: "
+                f"{reach['unreachable']} Tier 2 item(s) are held by identities "
+                f"that may not receive work, and 0 are addressable by the "
+                f"{reach['recipients']} authorized recipient(s). This is NOT a "
+                f"quiet day — the recipient set and the work set are disjoint. "
+                f"See worklist_reachability() and GET /staff-email/status.")
+            _note_observation(kind="digest", tier=TIER_WORKLIST,
+                              decision="refuse",
+                              reason_class="worklist_unreachable")
+
     return {"ok": True, "recipients": len(results), "sent": sent,
-            "applying": applying(), "results": results}
+            "applying": applying(), "results": results,
+            "reachability": reach or None}
 
 
 def _utc_day() -> str:
@@ -1466,10 +1812,17 @@ def status() -> Dict[str, Any]:
         "stage": "4 — digest (dark unless STAFF_EMAIL_APPLY=1); sends only via _deliver",
         "enabled": enabled(),
         "applying": applying(),
+        # None when the two flags agree. A sentence when they contradict, so
+        # the status endpoint answers "why is nothing sending" without anyone having
+        # to reason about which flag does what.
+        "config_conflict": config_conflict(),
         "role_mailbox": role_mailbox(),
         "ledger": {"rows": int(counts[0]), "accepted": int(counts[1]),
                    "skipped": int(counts[2]), "failed_or_rejected": int(counts[3])},
         "budget": budget(),
+        # Answers "why has nobody received a digest?" without anyone having to
+        # correlate two tables by hand, which is what it took to find it.
+        "reachability": worklist_reachability(),
         "tier_rules": {"count": len(rules), "rules": rules},
         "migration": ("applied" if _one("SELECT 1 FROM information_schema.tables "
                                         "WHERE table_name='staff_email_ledger'")
@@ -1505,12 +1858,40 @@ def api_digest_preview(body: Dict[str, Any]):
     if not _UUID_RE.match(owner_id):
         return {"ok": False, "error": "owner_id must be a uuid"}
     items = digest_items(owner_id)
+    reach = worklist_reachability()
     if not items:
-        return {"ok": True, "items": 0,
-                "would_send": False, "reason": "nothing actionable"}
+        # THREE ZEROS THAT ARE NOT THE SAME ZERO. Section K.4 told a reader to
+        # interpret `{"items": 0}` as "nothing to evaluate yet" — a reading
+        # that was correct on the day it was written and wrong every day
+        # since. The preview is where a human goes to look, so it is the last
+        # place that may leave the three indistinguishable.
+        if reach.get("structural_silence"):
+            reason, code = ("nothing actionable — and no Tier 2 work is "
+                            "addressable by any authorized recipient; the "
+                            "empty digest here is structural, not a quiet day",
+                            "worklist_unreachable")
+        elif not applying():
+            # Work exists and is deliverable; the send path is off by choice.
+            reason, code = ("nothing actionable for this recipient; note that "
+                            "sending is disabled (STAFF_EMAIL_APPLY=0)",
+                            "nothing_actionable")
+        else:
+            reason, code = "nothing actionable", "nothing_actionable"
+        return {"ok": True, "items": 0, "would_send": False,
+                "reason": reason, "reason_class": code,
+                "sending": reach.get("sending"),
+                "reachability": reach}
+
     subject, _html, text = _compose_digest(
         str((body or {}).get("display_name") or "there"), items)
-    return {"ok": True, "items": len(items), "would_send": True,
+    return {"ok": True, "items": len(items),
+            # "would_send" answers the preview's own question — would THIS
+            # compose and dispatch — and is deliberately not conflated with
+            # whether the send path is switched on. A reader who needs the
+            # second reads `sending`.
+            "would_send": True,
+            "reason_class": "send_disabled" if not applying() else "eligible",
+            "sending": reach.get("sending"),
             "subject": subject, "text": text}
 
 

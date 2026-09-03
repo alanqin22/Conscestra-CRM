@@ -578,7 +578,10 @@ def _record_action_sync(ctx: Dict[str, Any], draft: str, tier: str,
                     {
                         "subj": f"Payment reminder ({tier}) {verb} – {ctx['invoice_number']}",
                         "desc": draft,
-                        "owner": ctx.get("owner_id"),
+                        # E1 — see the note in the lead handler.
+                        "owner": _owner_for_write(ctx.get("owner_id"),
+                                                  "invoice.overdue",
+                                                  "invoice", ctx["invoice_id"]),
                         "inv": ctx["invoice_id"],
                         "acct": ctx.get("account_id"),
                         "ct": ctx.get("contact_id"),
@@ -729,6 +732,22 @@ HANDLERS["invoice.overdue"] = handle_invoice_overdue
 # triggers the Activity agent to auto-schedule outreach and the Notifications
 # agent to raise an alert — entirely internal CRM records, safe by default.
 
+def _owner_for_write(candidate, handler, entity_type=None, entity_id=None):
+    """E1 hook. Returns the owner this handler should write.
+
+    Deliberately swallows everything and falls back to the raw candidate: an
+    activity that failed to be created because its ELIGIBILITY CHECK failed
+    would be a worse defect than the one being fixed — it would drop real work
+    to protect a bookkeeping property."""
+    try:
+        from app.core import work_ownership
+        return work_ownership.owner_for_write(candidate, handler=handler,
+                                              entity_type=entity_type,
+                                              entity_id=entity_id)
+    except Exception:                                          # pragma: no cover
+        return candidate
+
+
 HOT_SCORE = 70
 
 
@@ -793,7 +812,15 @@ def _record_lead_outreach_sync(ctx: Dict[str, Any], correlation_id) -> None:
                     "desc": (f"{name} at {company} scored {score} (Hot, >= {HOT_SCORE}). "
                              f"Call within 4 hours while intent is high. "
                              f"Auto-scheduled from lead.scored."),
-                    "owner": ctx.get("owner_id"),
+                    # E1. The entity's owner is a CANDIDATE; this decides
+                    # whether it may become the accountable owner. Under the
+                    # ratified P3 transition an ineligible candidate yields
+                    # NULL — the task is still created and still due, the
+                    # system simply stops asserting a name against it.
+                    # Gated by OWNER_ELIGIBILITY_ENFORCE, default off.
+                    "owner": _owner_for_write(ctx.get("owner_id"),
+                                              "lead.scored",
+                                              "lead", ctx["lead_id"]),
                     "lead": ctx["lead_id"],
                 },
             )

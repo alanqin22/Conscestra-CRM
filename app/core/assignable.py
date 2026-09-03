@@ -50,6 +50,14 @@ def _flag(name: str, default: str = "0") -> bool:
 
 STRICT = _flag("ASSIGNABLE_STRICT", "0")
 
+# The eligibility states a GRANT may not be issued against — the four that are
+# decidable without reading a membership row. Declared rather than inlined so
+# the set is reviewable, and so `NOT_GRANTED` is visibly absent: that is the
+# state this primitive exists to change, and refusing it would make grant()
+# unable to grant.
+_GRANT_REFUSES = ("IDENTITY_COLLISION", "IDENTITY_UNRESOLVED",
+                  "INELIGIBLE_NOT_HUMAN", "INELIGIBLE_CUSTOMER_IDENTITY")
+
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
@@ -364,6 +372,42 @@ def grant(email: str, *, owner_id: Optional[str] = None,
                                       "is not an identity"}
     if owner_id and not _UUID_RE.match(owner_id):
         return {"ok": False, "error": "owner_id must be a uuid"}
+
+    # ── E4 — THE PRIMITIVE MAY NOT CONFER MEMBERSHIP ON AN IDENTITY THE
+    #         CONTRACT CAN NEVER CERTIFY ───────────────────────────────────
+    #
+    # This function used to validate two things: that the email contained '@'
+    # and that owner_id parsed as a uuid. That was the whole of its
+    # enforcement, so it would accept a customer contact, a service account and
+    # a colliding identifier alike — and any predicate built on "has an active
+    # membership" would have inherited every one of those gaps.
+    #
+    # NOT CIRCULAR, and the reason is the precedence order. The predicate's
+    # first four states — collision, unresolved, not-human, customer — are
+    # decided WITHOUT reading a membership row. Only the last two
+    # (not-granted, not-active) depend on membership, and those are exactly the
+    # two this function exists to change, so it must not consult them about
+    # itself.
+    #
+    # Refusing here does not make the predicate redundant: eligibility is
+    # time-varying (revocation is immediate) while this check happens once, at
+    # the moment of granting. This closes the door; the predicate still decides
+    # who is inside it.
+    if owner_id:
+        try:
+            from app.core import work_ownership
+            verdict = work_ownership.eligibility(owner_id)
+        except Exception as exc:                               # pragma: no cover
+            # Fail closed. A grant is a deliberate widening of who may receive
+            # work; issuing one while the contract cannot be evaluated is the
+            # decision this refuses to make.
+            return {"ok": False,
+                    "error": f"eligibility could not be evaluated: {exc}"}
+        if verdict["state"] in _GRANT_REFUSES:
+            logger.warning(f"[assignable] refused grant of {email} — "
+                           f"{verdict['state']}: {verdict['reason']}")
+            return {"ok": False, "error": verdict["reason"],
+                    "state": verdict["state"]}
     conn = None
     try:
         conn = get_connection()

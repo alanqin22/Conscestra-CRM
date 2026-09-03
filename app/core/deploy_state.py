@@ -419,6 +419,86 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "ar_collections_settle_88pct.sql": _CORRECTION,
     "assignable_identity.sql": _SCHEMA_OOB,
     "audit_log_immutability.sql": _SCHEMA_OOB,
+    # E4 — the two structural guards on the membership and owner primitives
+    # (one active membership per owner; one owner row per employee).
+    #
+    # PENDING DEPLOYMENT. Applied locally 2026-09-02, NOT yet on Railway. It
+    # sits here rather than in REQUIRED_MIGRATIONS for the reason recorded
+    # above: that list is a claim about what production has RUN, and declaring
+    # it first would make `migrate --check` report a chain production has not
+    # executed. Promote it only once Railway has it -- same path
+    # promotions_coupons.sql and the touch triggers took.
+    #
+    # It is genuinely a governed schema definition: a clean database SHOULD
+    # execute it, both indexes are idempotent, and neither depends on data a
+    # fresh environment lacks. Nothing about it is a one-time repair.
+    # Turns on work email for the seven granted employee identities and gives
+    # them a Tier-2 route. AUTHORISED by the owner 2026-09-02.
+    #
+    # A DATA/CONFIG change, not schema, and RAILWAY-SCOPED: the seven grants
+    # exist only there, so the UPDATE matches nothing on a local database.
+    # Out-of-band is the correct disposition — a clean database must NOT
+    # replay it, because a fresh environment has no such grants and should not
+    # acquire email-enabled recipients by being created.
+    "employee_work_email_activation.sql": (
+        "OUT OF BAND -- authorised activation applied to RAILWAY 2026-09-02. "
+        "A clean database must not replay it: it would confer email on grants "
+        "that environment does not have."),
+    # An owner id may never equal the employee id it links to. Reusing one as
+    # the other is exactly how the F1 collision was created, and it is the
+    # shortest path to a working digest — so it is forbidden structurally
+    # rather than by convention, before the first employee-linked owner exists.
+    # 0 of 44 rows carry a link today, so nothing can violate it.
+    #
+    # PENDING DEPLOYMENT status is recorded at application time.
+    "owners_no_identity_reuse.sql": ("APPLIED TO RAILWAY 2026-09-02. Promotable, not promoted -- see the "
+        "note on activities_owner_no_fabrication.sql."),
+    # P5 — the eight non-service employee identities attested SYNTHETIC by the
+    # owner, 2026-09-02. corpus_provenance held ZERO rows for `employees`, so
+    # they were unclassified; real-vs-synthetic cannot be reconstructed on this
+    # corpus but it can be attested, and the table's CHECK already admits
+    # rule='human_attested' for state='synthetic'.
+    #
+    # It is what keeps a P5 grant distinguishable from production
+    # accountability: without it, eight demo personas would enter the eligible
+    # population indistinguishably from real staff.
+    #
+    # A DECLARATION, not a repair — it changes no employee, owner or activity.
+    # Eight uuids named individually so a future real hire cannot inherit it.
+    "employees_provenance_attestation.sql": ("APPLIED TO RAILWAY 2026-09-02. Stays out-of-band permanently: it "
+        "records attestations about eight SPECIFIC identities, and a clean "
+        "database has no such employees to attest about."),
+    # Removes trg_fill_activity_owner, the BEFORE INSERT OR UPDATE trigger
+    # whose entire body fabricates activity ownership (contact -> account ->
+    # created_by -> sentinel). It made the ratified P3 transition impossible:
+    # a handler writing NULL got a sentinel-owned row back, visible on no
+    # surface at all. Supersedes the intent recorded in
+    # bind_missing_business_rule_triggers.sql, which bound it precisely to
+    # prevent unowned activities -- the opposite of what P3 decided.
+    #
+    # Changes no existing row. The function is kept (unbound), so re-binding is
+    # one statement.
+    #
+    # PENDING DEPLOYMENT. Applied locally 2026-09-02, not yet on Railway.
+    "activities_owner_no_fabrication.sql": ("APPLIED TO RAILWAY 2026-09-02. Promotable to REQUIRED_MIGRATIONS, but "
+        "NOT promoted here: apply_sql records no ledger row, so declaring "
+        "it would make migrate --check report a chain the ledger cannot "
+        "evidence. Answering that by writing a ledger row is exactly what "
+        "the ledger exists to prevent, so promotion waits."),
+    # E7 — the executive role-assignment link, under a truthful name.
+    # Additive: adds owner_id, copies the four values across, constrains it to
+    # owners. Does NOT drop employee_uuid (readers still on it) and does NOT
+    # clear it (is_employee derives from it -- a separate decision).
+    #
+    # PENDING DEPLOYMENT. Applied locally 2026-09-02, not yet on Railway.
+    "executives_owner_id_column.sql": (
+        "PENDING DEPLOYMENT -- governed schema change applied locally "
+        "2026-09-02, awaiting Railway. Promote to REQUIRED_MIGRATIONS after "
+        "production has run it."),
+    "owner_eligibility_guards.sql": (
+        "PENDING DEPLOYMENT -- governed schema change applied locally "
+        "2026-09-02, awaiting Railway. Promote to REQUIRED_MIGRATIONS after "
+        "production has run it."),
     "auth_sessions.sql": _SCHEMA_OOB,
     "autocomplete_communication_activities.sql": _SCHEMA_OOB,
     "backfill_account_addresses.sql": _BACKFILL,

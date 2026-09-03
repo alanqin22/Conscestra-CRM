@@ -1449,6 +1449,51 @@ Their 53 unread notifications are all `unstamped` (pre-Stage-2) or
 `informational`. NULL means never email, and that is the right answer for rows
 written before an email decision existed.
 
+#### CORRECTION, 2026-09-01 — that explanation was wrong
+
+The paragraph above is left standing because being able to see the mistake
+matters more than a tidy document. It was plausible, it matched the
+observation, and it was **not the cause**.
+
+The prediction it implied — that the zeros would resolve as Stage 2 stamped
+more rows — has now been tested by ten days of production data and falsified:
+
+| | 2026-08-22 | 2026-09-01 (Railway) |
+|---|---|---|
+| Stamped `actionable` messages | ~0 | **302** |
+| Unread Tier 2 items | 0 visible | **76** |
+| Reachable by an authorized recipient | — | **0** |
+| Digest sends | 0 | **0** |
+
+The tier stamp works. The digest job runs (07:30 ET, ten recorded runs). What
+does not exist is any **overlap** between the two identity spaces the digest
+straddles:
+
+* recipients come from `assignable_identity.owner_id` — four executives;
+* work comes from `notifications.employee_uuid` — and all 76 unread Tier 2
+  items are held by three `employees` identities (`sysadmin`, `sjohnson`,
+  `mchen`).
+
+The intersection is empty and has never been otherwise, so `nothing_actionable`
+4-of-4 is not a quiet morning that will end. It is the only outcome this wiring
+can produce.
+
+**The instrument was the defect, not the wiring.** `nothing_actionable` is a
+true statement in both cases and the daily log line `sent 0 of 4` is identical
+in both cases, so a structural dead end and a healthy idle system were the same
+observation for ten days. `worklist_reachability()` now separates them, and
+`run_digest()` escalates to WARNING with a counted `worklist_unreachable`
+observation when a pass could not have succeeded. `GET /staff-email/status`
+carries the numbers. `tests/test_staff_email_reachability.py` — 9 cases, 3
+mutations verified — including test_92, which insists a genuinely idle system
+is *not* alarmed on.
+
+**No repair is proposed here.** Closing the gap means granting
+`@emp.agentorc.ca` assignability, which section K names as a separate
+authorization and which takes the recipient universe from 4 to 12. That
+decision is the owner's; this change only stops the gap from being invisible
+while it waits.
+
 ### Reading `notifications.employee_uuid` — the safe direction
 
 F1 says that column is an ambiguous identity space. `digest_items()` reads it
@@ -1497,10 +1542,15 @@ confirm it is useful"*, and both halves are still unmet:
 
 1. **The Stage 2 evidence window has not run.** It needs seven days on
    **Railway** (F8), and the migrations are not applied there yet.
-2. **Nobody has read a digest.** Use `POST /staff-email/digest-preview` with an
-   `owner_id` — it renders without sending. Today it returns
-   `{"items": 0, "would_send": false}` for all four, which is itself the answer
-   that there is nothing to evaluate yet.
+2. **Nobody has read a digest, and as wired nobody can.** Use
+   `POST /staff-email/digest-preview` with an `owner_id` — it renders without
+   sending. It returns `{"items": 0, "would_send": false}` for all four.
+   ~~which is itself the answer that there is nothing to evaluate yet~~ —
+   **corrected 2026-09-01:** that reading was wrong. The preview now also
+   returns `reachability`, which reports `structural_silence: true`: there is
+   nothing to evaluate *at all* until the recipient set and the work set
+   overlap, and that is the separate authorization above, not a matter of
+   waiting longer.
 
 When both are satisfied, `STAFF_EMAIL_APPLY=1` on **Railway only** — local stays
 0, matching the briefing topology, or every executive gets two copies.
