@@ -5,26 +5,64 @@
 > No signup required. Drop into any module and talk to the AI agents
 > directly, or use the inline forms — same experience either way.
 
-Where traditional CRMs function as digital filing cabinets, storing historical
-transactions and customer records, Conscestra acts as a conductor — an
-AI-native CRM that coordinates intelligence, decisions, communications, and
-actions across the entire business in real time.
+Conscestra is a **governed orchestration system for customer intelligence and
+business execution**. Specialized AI agents work from one shared business
+context, act only through explicitly authorized capabilities, and are
+coordinated toward outcomes the organization has defined.
 
-The name itself expresses the philosophy behind the platform: **Conscestra**
-combines *conscious* and *orchestra* to describe a system that does not
-merely collect information, but understands relationships, context, timing,
-and intent across the organization.
+*Conscious* describes **contextual awareness, not sentience**. Conscestra does
+not simply execute an instruction. It interprets that instruction within the
+state of the business — the relationships, history, current conditions,
+objectives, constraints, and authorization that surround it — and coordinates
+the appropriate intelligence and actions within defined boundaries.
 
-At its core, Conscestra transforms isolated business events into coordinated
-intelligence.
+*Orchestration* is **the architecture, not the branding**. An orchestra produces
+one coordinated performance from many specialized performers because they share
+a score, keep precise timing, and are coordinated toward a single outcome.
+Conscestra applies the same structural principle to enterprise AI:
 
-**[Explore the Live Demo →](https://agentorc.ca/)** &nbsp;·&nbsp; See How the Agents Cooperate
+| In an orchestra | In Conscestra |
+| --- | --- |
+| The objective the performance serves | **Executive leadership** establishes the business objective |
+| The conductor | **The Orchestrator** coordinates agents, sequencing, dependencies and events |
+| The musicians | **AI agents** perform specialized roles within a defined business domain |
+| The score, and its boundaries | **Governance and policy** define what may be done, and under what conditions |
+| What each performer needs to know | **Business data and context** — records, communications, workflows, history |
+| Rhythm and timing | **Events, deadlines, sequencing and workflow state** |
+| The recording | **Audit and monitoring** — what occurred, who acted, what resulted |
+
+Authority is distributed across those layers rather than concentrated in one.
+An agent cannot invent a capability it was not granted, widen its own
+authorization, or act outside the scope its role defines. Consequential actions
+become proposals subject to independent evaluation and human approval.
+
+**[Explore the Live Demo →](https://agentorc.ca/)**
 
 _Safe by default · Opt-in outreach · Fully audited · No sign-up to explore_
 
 ---
 
-## An Orchestra of Specialized AI Agents
+## The Site
+
+[agentorc.ca](https://agentorc.ca/) is six pages, ordered as one architectural
+argument — **understand → contextualize → coordinate → execute → govern →
+verify → improve**:
+
+| Page | What it covers |
+| --- | --- |
+| **[Home](https://agentorc.ca/)** | What Conscestra is, how it understands the business, shared context, coordinated intelligence |
+| **[Capabilities](https://agentorc.ca/capabilities.html)** | Business execution — multilingual voice, order self-service, customer portal, AI SDR, obligations, cases, routing, analytics |
+| **[Governance & Trust](https://agentorc.ca/governance.html)** | What AI is permitted to do — four layers of control, independent critic review, capability grants, consent, audit trail |
+| **[Assurance](https://agentorc.ca/assurance.html)** | How those controls are proven — negative testing, runtime verification, database integrity, tested recovery |
+| **[Integration & Adoption](https://agentorc.ca/integration.html)** | Measured improvement, MCP tools under the same authorization model, provider failover, guided onboarding |
+| **[Company](https://agentorc.ca/company.html)** | Agentorc.ca, services, the 14 connected business modules, contact |
+
+The sections below follow the same order and carry the same headings as the
+site, so a section here and its page there are the same argument.
+
+---
+
+## Specialized AI Agents Working Together
 
 Conscestra operates as a symphony of specialized AI Agents, each responsible
 for its own domain while remaining continuously aware of the larger business
@@ -67,7 +105,7 @@ transparent, replayable, traceable, and fully auditable.
 
 **Powerful AI collaboration should never become an invisible black box.**
 
-## Natural Language Becomes the User Interface
+## Ask Your CRM Questions in Plain Language
 
 Conscestra replaces complex navigation and dashboard hunting with
 conversation.
@@ -94,7 +132,7 @@ honesty rather than artificial confidence.
 Every response includes a transparent audit trail explaining how conclusions
 were reached and which systems contributed to the answer.
 
-## Intelligence Beyond the CRM
+## Business Intelligence Beyond the CRM
 
 Modern businesses operate far beyond a single database. Conscestra therefore
 extends beyond CRM records into the broader information ecosystem. Every AI
@@ -117,7 +155,7 @@ directly to Conscestra's agents, organizational memory, and capability
 registry; and Conscestra's own agents can call tools hosted on external MCP
 servers, under the same grants and guardrails as every native action.
 
-## AI That Understands Business Context
+## AI That Understands Customers and Business Context
 
 Conscestra introduces what it calls **AI 360 Summaries**. With a single
 click, executives can generate decision-grade briefings for accounts,
@@ -143,7 +181,7 @@ last conversation. A customer who writes in is never greeted like a
 stranger, and no agent ever asks a question the CRM already knows the
 answer to.
 
-## Every Customer Has a Living Profile
+## Every Customer Has a Continuously Updated Profile
 
 Beyond the on-demand 360, Conscestra maintains a **persistent customer
 intelligence profile**, recomputed every night for every customer — no LLM
@@ -159,7 +197,7 @@ cost, fully explainable:
   sentiment** distilled from their inbound emails.
 - **Expected next purchase date** projected from their historical cadence.
 
-## Every Lead Arrives Ready for Action
+## Every New Lead Is Ready for the Next Step
 
 Conscestra doesn't simply capture leads — it prepares them for your sales
 team.
@@ -186,7 +224,7 @@ aligned to the customer's preferred hour, protects it on the calendar, and
 sends a signed calendar invite — a hot reply becomes a confirmed meeting
 with zero human latency, and a person confirms what the agent committed to.
 
-## AI Agents Execute Complete Business Workflows
+## AI Agents Can Execute Business Processes End to End
 
 Traditional automation reacts once.
 
@@ -224,7 +262,7 @@ on the CRM timeline regardless of medium.
 
 Your business keeps moving — even while your team sleeps.
 
-## Every Resolved Case Teaches the Next One
+## Every Resolved Case Makes the Next Answer Better
 
 Most support knowledge evaporates the moment a ticket closes. Conscestra
 keeps it — and grows it from **five inflows, all through one governed
@@ -264,7 +302,7 @@ set.
 
 Every resolved case makes the next answer better. **The help desk compounds.**
 
-## A Promise Made Is a Promise Owed
+## When AI Creates a Commitment, It Creates an Obligation
 
 The worst failure of a customer-facing AI is not a wrong answer. It is a
 **dropped one** — the conversation where the customer asked for a manager,
@@ -291,7 +329,7 @@ the obligation.
 
 **The conversation can end. The obligation cannot, until someone closes it.**
 
-## The Work Outlives the Conversation
+## Work Continues Until It Is Complete
 
 An escalation is an **event** — the moment something went wrong. The work that
 event creates is a different thing entirely, and it is the thing that survives.
@@ -333,7 +371,7 @@ The case layer ships behind flags (`CASES_ENABLED` on, `CASES_AUTO_OPEN` and
 `CASES_KB_FEEDBACK` off) so an organization decides when escalations start
 creating cases on their own.
 
-## Work Finds the Person Who Can Actually Do It
+## The Right Work Reaches the Right Person
 
 A case with an owner is only as good as the owner being right. Assignment by
 round-robin gives a French complaint to someone who doesn't speak French and a
@@ -358,7 +396,7 @@ same as a contact who happens to be in the CRM — and the system reports
 identity collisions rather than resolving them first-match-wins. Answering
 confidently with the wrong person's record is worse than declining to answer.
 
-## Give It a Goal, Get a Governed Plan
+## Give AI a Goal. Get a Governed Plan.
 
 For everything the playbooks don't already cover, executives can hand the
 Orchestrator a **novel goal in plain language** — *"reduce overdue
@@ -374,7 +412,7 @@ three autonomous layers checking each other before a human ever looks.
 
 The AI supplies judgment. Deterministic rails supply safety.
 
-## Ask *What If* Before You Act
+## Evaluate Business Scenarios Before Taking Action
 
 Executives can also rehearse a decision before committing to it. Ask the
 Orchestrator *"what if we cut overdue invoices by 30%?"* and the simulator
@@ -388,7 +426,7 @@ arithmetic over real data, and the whole exercise is **read-only by
 construction** — nothing is changed, proposed, or sent. Rehearse the move,
 then hand the winning scenario to the planner as a goal.
 
-## An SDR That Never Sleeps
+## AI Sales Development Representative Working 24/7
 
 The support line (*The Phone Line Is a Digital Employee*, below) answers
 people who are already customers. The front door is staffed too — for **the
@@ -412,7 +450,7 @@ as wide as you choose.
 Chat to qualified lead to booked meeting — **before a human ever says
 hello.**
 
-## The Storefront Has a Salesperson
+## AI Sales and Service Agent for Your Online Store
 
 The same chat bubble on the store is now a **Sales & Service agent** that
 actually knows the shop. Ask it what a shopper asks — what a product does, how
@@ -436,7 +474,7 @@ session or the code, never by a name typed into a box.
 **Every shopper question — product, price, policy, or their own order —
 answered by one agent, grounded in real data.**
 
-## The Customer Can See Their Own Record
+## Give Customers Secure Access to Their Information
 
 For a long time the phone line did more for a verified caller than the website
 did for a signed-in one. A customer could log in and reach exactly two things:
@@ -466,7 +504,7 @@ list reads as *"you have no orders"* when the truth is *"you are not linked
 yet,"* and that distinction is the whole difference between a working product
 and a broken one. They get an explicit onboarding state instead.
 
-## The Whole CRM, From a Text Message
+## Manage Approved CRM Tasks From a Simple Text Message
 
 The number a prospect calls is also a command line for the people who run the
 business. Text it a question — *"the latest order for David Chen?"*, *"find
@@ -490,7 +528,7 @@ it. Questions by text; changes stay in the app.
 
 **The CRM in your pocket, with the write path closed.**
 
-## The Phone Line Is a Digital Employee
+## Customers Can Call in Their Preferred Language
 
 Customers can now **call** the company and reach a support agent that knows
 exactly how much to trust each caller. Anyone gets answers from the approved
@@ -617,7 +655,7 @@ worse than one that never offered.
 **Every call is a conversation with the whole CRM, in the caller's own
 language, on exactly the terms each caller has earned.**
 
-## The Voice Vendor Is a Setting, Not a Dependency
+## Flexible Voice Infrastructure Without Application Rebuilds
 
 Speech is the expensive part of a phone call. Not the AI — measured on real
 traffic, the language model is about **one percent** of what a call costs,
@@ -644,7 +682,7 @@ mangled.
 seam — the tier ladder, the verification, the knowledge base, the governed
 writes, the audit trail — knows or cares which company heard the words.
 
-## The Agent Cancels the Order — the Database Decides Whether It May
+## Cancel an Order by Phone With Confidence
 
 A customer calls to cancel an order, and it is cancelled **while they are still
 on the line**. Not a ticket, not a callback, not *someone will be in touch*: the
@@ -720,7 +758,7 @@ The whole conversation runs in the caller's own language, end to end.
 
 **The model chooses the words. The database chooses the outcome.**
 
-## A Link in the Email Can Look. It Cannot Act.
+## View Your Order Instantly. Change It Only When Verified
 
 The order confirmation now carries an **Order Status** button, and it opens the
 same order the email describes — number, items, total, shipping address, where
@@ -780,7 +818,7 @@ one somebody made over the phone.
 
 **Two front doors. One lock, and the database still holds the key.**
 
-## One Customer Memory, Every Channel
+## One Customer Context Across Every Conversation
 
 A customer who explains a problem on the phone should not start over in the
 next email. When any conversation ends — a support call, an SDR chat, an
@@ -799,7 +837,7 @@ else's history.
 
 **Start the conversation anywhere. Continue it everywhere.**
 
-## Every Channel. One Conversation. One Intelligence.
+## Every Customer Conversation Stays Connected
 
 The channel is temporary; the relationship is permanent. Conscestra treats
 Voice, SMS, Email, WhatsApp, Slack, and Teams not as separate integrations but
@@ -837,7 +875,7 @@ identified one**, history intact, so the relationship record begins at
 **Start on WhatsApp at 9am, continue by phone at 10, receive a proposal by email
 that afternoon — one person, one conversation, one memory.**
 
-## Your Team Chat Is a Command Surface
+## Ask Your CRM From Slack or Teams
 
 The unified layer runs *inbound* too, and the internal side turns Slack and
 Teams into a seat at the CRM. An employee messages the bot — a direct question
@@ -933,7 +971,7 @@ examples named.
 The first real scan found two live code bugs and several hundred stranded
 tasks. The detector paid for itself on day one.
 
-## Agents That Pursue Business Goals, Not Just Events
+## AI Agents Can Pursue Business Objectives
 
 Beyond reacting to events, Conscestra's supervisor is **goal-oriented**.
 Leadership declares business objectives — *cut overdue invoices in half in 90
@@ -949,7 +987,7 @@ through governance.
 
 Thresholds watch symptoms. **Objectives pursue outcomes.**
 
-## Autonomous, Yet Always Governed
+## Autonomous AI With Governed Controls
 
 AI should never act without accountability.
 
@@ -981,7 +1019,7 @@ automation remains transparent and reliable.
 
 Even the supervisors are supervised.
 
-## Four Walls Around Every Action
+## Four Layers of Control Around Every AI Action
 
 Autonomy is only as trustworthy as its boundaries, so Conscestra builds
 **four distinct guardrail layers** around every agent action:
@@ -1010,7 +1048,7 @@ The input side was already walled: natural-language write attempts are
 caught at the database choke point, personal data is masked before any
 model prompt, and unverified callers can never reach account-scoped answers.
 
-## A Control Room, Not a Black Box
+## Make AI Activity Visible and Governable
 
 All of this is **visible and adjustable without touching code**. The
 governance console shows every guardrail policy with its live value against
@@ -1027,7 +1065,7 @@ lands in the same trace as the proposal that spawned it.
 
 Leadership scales autonomy with a slider, not a leap of faith.
 
-## AI That Learns From Results
+## AI That Improves Through Measured Results
 
 Conscestra continuously measures its own performance.
 
@@ -1059,7 +1097,7 @@ deterministic fallbacks rather than ever breaking a flow, and a cheaper
 model tier for high-volume wording. The morning briefing reports what the
 automation earned *and* what it burned.
 
-## The Agents You Author Can Also Act
+## Create AI Agents That Execute Business Work
 
 An agent that can only explain things is a search box with better manners.
 Conscestra's no-code Studio lets a business user describe an agent in plain
@@ -1084,7 +1122,7 @@ action, with the same critic, the same audit trail, the same human.
 
 **The agent proposes in the customer's words. The platform decides in yours.**
 
-## Publishing an Agent Is a Release, Not a Save
+## Publishing an AI Agent Is a Controlled Release
 
 The moment a business user can create a customer-facing agent without an
 engineer, editing that agent becomes a **deployment** — and deployments need
@@ -1113,7 +1151,7 @@ Publishing without a record is not.
 
 **Anyone can build an agent. No one can quietly ship a broken one.**
 
-## A Platform That Audits Itself
+## Continuous Assurance for AI and Business Data
 
 Two standing agents keep the platform honest about its own weaknesses.
 
@@ -1130,7 +1168,7 @@ ownerless accounts. The safe fixes arrive as governed, fully **reversible**
 proposals — every change records its before-state — while anything that
 moves money or history stays a human decision. Garbage in, governed out.
 
-## Every Control Is Proven by Breaking It
+## Prove That Every Control Works
 
 A control that has never been tested against the thing it is meant to stop is a
 belief, not a control. Conscestra proves its safeguards the way it proves its
@@ -1164,7 +1202,7 @@ check that does not name its reason is refused by the build. The handful that
 predate the rule are listed individually rather than waived as a group, so the
 backlog is visible and can only shrink.
 
-## Verification Runs Where the System Actually Lives
+## Verify Controls in the Production Environment
 
 Continuous integration establishes what a build server is well suited to
 establish: that every module imports cleanly, and that the memory derivation
@@ -1183,7 +1221,7 @@ It reports what the system actually did. An attack that could not be exercised
 is reported as such rather than counted as blocked, so a passing result means
 every control was genuinely engaged and genuinely held.
 
-## Is the Platform Itself Healthy Right Now?
+## Know the Current State of the Platform
 
 Every module in Conscestra reports on the *business*. None of them answered
 a different question: **is the machinery under all of it actually working?**
@@ -1211,7 +1249,7 @@ says which it is.
 
 **A platform that can act on its own must be able to tell you when it can't.**
 
-## A Setting You Cannot Read Is a Setting You Cannot Trust
+## Verify Runtime State, Not Just Configuration
 
 Changing a setting and confirming a setting are not the same act, and the gap
 between them is where a system quietly does something other than what it was
@@ -1237,7 +1275,7 @@ wherever the two can diverge. A deployment that asked for a capability it did
 not get should look different from one that got it — otherwise a silently
 degraded system reports success, which is the most expensive kind of green.
 
-## Progress That Survives Anything
+## Durable Processing State Across Restarts
 
 A queue is disposable work — process it, discard it. Progress is durable
 memory — it has to outlive the work it describes. Conscestra keeps the two
@@ -1256,7 +1294,7 @@ knows precisely where it was.
 
 **Restart-safe by construction, not by good timing.**
 
-## Every Preview Follows the Whole Chain
+## Understand the Full Impact Before Execution
 
 Before anything irreversible runs, you see what it will do — including the
 records that follow the ones you named.
@@ -1275,7 +1313,7 @@ them.
 
 **Know the full blast radius before you approve it, not after.**
 
-## Fast Because It Was Measured, Not Because It Feels Fast
+## Performance Proven Under Real Operating Conditions
 
 Performance work here starts with a number and ends with a number. Semantic
 search — the path behind agent recall, the knowledge base and the store
@@ -1304,7 +1342,7 @@ fashionable, and the honest conclusion — at the current data volume the exact
 search is already faster than the index would be, and the threshold where that
 reverses is written down — is recorded with the numbers behind it.
 
-## Retrieval No Longer Guesses From the Recent Past
+## Semantic Search Across the Full Business Memory
 
 Asking the memory a question used to mean searching the most recent slice of it.
 That is a reasonable default and a quiet ceiling: on a corpus of roughly
@@ -1342,7 +1380,7 @@ template can very nearly fill the semantic pool on its own, and what covers that
 is the recency pool beside it. A caveat that is only true in a comment is a
 caveat nobody reads.
 
-## Governance Before Autonomy
+## Governed AI With Clear Business Rules
 
 Powerful AI demands responsible governance.
 
@@ -1356,7 +1394,7 @@ AI Agents prepare. People remain in control.
 
 Because autonomous systems create value only when they earn trust.
 
-## Security as a Foundational Principle
+## Security Is Built Into the Architecture
 
 Data security represents the highest priority within Conscestra's
 architecture. Every layer of the platform — identity, authorization,
@@ -1444,7 +1482,7 @@ gates, so private data neither leaks into prompts nor out of them.
 Security is not a feature layered onto the platform. **Security is the
 architecture.**
 
-## A Public Demonstration, With a Ceiling and a Floor
+## Explore a Public Demo With Clear Security Boundaries
 
 The live demonstration is deliberately open: anyone may read, without signing
 up, because a CRM you cannot look at explains nothing. That posture is a
@@ -1476,7 +1514,7 @@ working one — the one case it applied in was the case where nothing had been
 configured at all. It is now empty, and an unconfigured system refuses to
 connect rather than guessing.
 
-## The Application Cannot Switch Off Its Own Controls
+## The Database Enforces Critical Security Controls
 
 Every database-layer guarantee in Conscestra — the assertion gate that stops an
 unverified claim reaching a customer, the append-only verification trail, the
@@ -1497,7 +1535,7 @@ disable them**. The application's own health endpoint reports which role it
 connected as, so the separation is something you can verify rather than
 something you were told.
 
-## "Stop" Means Stop, on Whichever Channel You Said It
+## Opt-Outs Follow the Person Across Every Channel
 
 Consent is usually built for whichever channel a product launched with, and
 then quietly fails to follow it anywhere else. Ours began as an email
@@ -1536,7 +1574,7 @@ delete, which is what turns "they opted out" from an assertion into evidence,
 and a consent record about a person is part of that person's data: it is
 returned in their access request like anything else.
 
-## Erasure Is Permitted, and Never Silent
+## The Data Can Be Erased. The Accountability Remains.
 
 A customer asks to be forgotten. The law requires the data to go, and the same
 law requires you to be able to demonstrate that you handled the request
@@ -1555,7 +1593,7 @@ automatic monthly pass strips the personal link and keeps everything else.
 Nothing is ever removed from the register, and it stops being a list of people.
 Accountability and data minimisation, both honoured, on the same record.
 
-## Everything We Hold About You, Returnable On Request
+## Request a Complete Copy of Your Personal Data
 
 A person is entitled to a copy of their data — GDPR Article 15, Article 20 for
 portability, and the equivalent right under Canada's PIPEDA. Conscestra answers
@@ -1583,7 +1621,7 @@ signed-in session and never from the request, so nobody can open a request
 against someone else. Every export that is actually released is written to an
 append-only register the application cannot edit.
 
-## A Backup That Proves Itself Every Night
+## Backups Are Tested Through Actual Recovery
 
 Most backup systems tell you a file was written. That is a hypothesis, not a
 recovery plan — the only proof a dump restores is restoring it.
@@ -1608,7 +1646,7 @@ database costs roughly twice what restoring into an empty one does, and the
 privilege grants must be re-applied afterwards — both facts were established by
 running it, and both are written down as steps rather than warnings.
 
-## Ready for the Day Something Goes Wrong
+## Be Prepared Before an Incident Occurs
 
 Incident response is written for the jurisdiction the business is actually in.
 PIPEDA applies to every breach and requires a record of **all** of them — kept
@@ -1629,7 +1667,7 @@ many reachable directly, what categories of data, what changed during the window
 the same day. The exercise record expires after twelve months, so readiness that
 has gone stale reports itself.
 
-## One Model Provider Should Not Be a Single Point of Failure
+## Resilient AI With Controlled Provider Failover
 
 A CRM whose phone line, storefront, and help desk all think through one
 vendor's API has quietly made that vendor's worst day its own. Conscestra
@@ -1660,7 +1698,7 @@ same as that model responding, and we learned that the direct way.
 
 **Resilience is knowing which failures deserve a second chance.**
 
-## Tools From Anywhere, Governed the Same Way
+## External Tools Operate Under the Same Governance Model
 
 Conscestra already **serves** the Model Context Protocol, so assistants like
 Claude can work with the CRM directly. It now **consumes** MCP as well: the
@@ -1690,7 +1728,7 @@ something off means it is off.
 **New capabilities arrive as fast as the ecosystem builds them, under rules
 that never move.**
 
-## One Version of the Truth, and It Can Explain Itself
+## One Trusted View of the Business
 
 An AI-native CRM has a harder problem than a traditional one. When many agents
 each query the database independently, they can all be correct and still
@@ -1776,7 +1814,7 @@ now runs inside an explicit tenant and system-actor context, so proactive
 intelligence can never quietly serve only the first organization — and every
 automated action remains attributable to the job that took it.
 
-## Every Schema Change Declares Which Path It Took
+## Every Database Change Has a Defined Disposition
 
 A database can be correct and its history still be unreadable. The schema
 answers *what is true now*; nothing answered *why*, or *whether anyone meant
@@ -1815,7 +1853,7 @@ That limit is stated plainly rather than glossed over — and it is why the disp
 manifest above, which *is* in source control, carries the written reason for every
 file it declares. The reasoning is published even where the SQL is not.
 
-## Which Records Describe Real People Is Recorded, Not Inferred
+## Data Classification Is Based on Evidence
 
 A demonstration system that anyone can browse and a system holding real customer
 data are the same software with entirely different obligations. Telling them
@@ -1847,7 +1885,7 @@ customer records served to anyone with the hostname. The public demonstration
 posture blocks its own release if a record *classified* real is reachable
 anonymously.
 
-## Discovery Is Not Evidence
+## Only Verified Matches Are Merged
 
 Two records can look like the same person and not be. On this corpus, matching
 contacts to leads by name finds **121 pairs, of which 9 are real** — a 92% false
@@ -1873,7 +1911,7 @@ were **left exactly where they are**: rejecting them in bulk would hide genuine
 duplicates from future review, and they can no longer be acted on by their own
 evidence. Doing nothing was the correct action, so nothing is what was done.
 
-## A Retired Table Still Owes an Answer
+## Retired Data Has an Explicit Disposition
 
 Data outlives the feature that created it. Two tables retired long ago were
 still holding personal information — not referenced by anything, not visible in
@@ -1903,7 +1941,7 @@ session rather than threaded by hand through every call site — so a
 notification, a queued action and the conversation that set them in motion can
 be reassembled after the fact rather than inferred from timestamps.
 
-## A Schema Change Can Now Be Caught Even If It Used No Path At All
+## Detect Unauthorized Database Changes
 
 Declaring which path a change took closes the gap between two *known* ways of
 applying SQL. It does not close the third: someone connecting to the database
@@ -1923,7 +1961,7 @@ a check that was confidently reporting on the wrong subject. It now names which
 database each attestation describes, because an answer about the wrong system is
 worse than no answer.
 
-## A Migration and Its Record Commit Together
+## Keep Database Changes and Records Transactionally Consistent
 
 A migration that is applied but unrecorded is indistinguishable from one that
 never ran. That window was real: the schema change and its ledger entry
@@ -1948,7 +1986,7 @@ row, which reads as diligence and is in fact a fabricated claim about the past.
 Every writer that can create a ledger entry — including one that lives in SQL
 rather than code — now either records a real hash or records nothing.
 
-## The Audit Trail Names Who Acted
+## The Audit Trail Clearly Identifies the Actor
 
 "Who did this?" is only answerable if the answer is allowed to be *not a
 person*. Approvals arrive from people, from named policies, from a scheduled
@@ -1969,7 +2007,7 @@ the registry arms itself at startup so a fresh deployment is never accidentally
 permissive, and an operator's decision to disable something survives every
 subsequent deploy.
 
-## Drift Is Visible Beyond Tables
+## Verify Database Behavior, Not Just Structure
 
 Comparing two databases by their tables answers a narrower question than it
 appears to. A stored function whose logic silently diverged has the same name on
@@ -1990,7 +2028,7 @@ including them produced nine hundred phantom differences per run — a version
 difference dressed up as drift. Nullability is compared where it is portable
 instead. A check that cries wolf nine hundred times is one nobody reads.
 
-## Executive Awareness in Real Time
+## Continuous Executive Business Intelligence
 
 Every morning, leadership receives a personalized executive briefing.
 
@@ -2023,7 +2061,7 @@ no sign-in. Same underlying intelligence, a different perspective for each leade
 
 Business awareness becomes continuous rather than periodic.
 
-## A Practical Vision of Conscious AI
+## A Practical Vision for Context-Aware AI
 
 As researchers such as Geoffrey Hinton continue expanding our understanding
 of intelligence and machine reasoning, Conscestra embraces a practical
@@ -2034,7 +2072,7 @@ conditions. It should not merely execute isolated commands.
 **Intelligence without awareness becomes automation. Awareness without
 accountability becomes risk.** Conscestra seeks to unite both.
 
-## More Than a System of Record
+## A System of Business Understanding
 
 Conscestra CRM is not merely a repository of transactions. It is not simply
 another dashboard. It is not another database with an AI chatbot attached.
