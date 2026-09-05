@@ -149,19 +149,31 @@ def _recipient_is_deliverable(to: str) -> Dict[str, Any]:
     return {"ok": True, "first_name": (first_name or "").strip() or None}
 
 
-# @seed.agentorc.ca is DELIVERABLE ON PURPOSE and is not filtered here.
+# @seed.agentorc.ca IS NOW FILTERED. This block used to say the opposite, and
+# the reasoning it gave is worth keeping because it is instructive about how it
+# failed.
 #
-# It is a catch-all this project owns, created so the synthetic corpus would
-# stop pointing at RFC 2606 addresses that belong to nobody. Verification, not
-# the domain, is the gate: a seed contact carries is_email_verified=false and is
-# refused above like any other, and one that has been deliberately verified is
-# how an end-to-end send is exercised into a mailbox we control.
+# It argued: the seed catch-all is deliverable on purpose, and "verification,
+# not the domain, is the gate: a seed contact carries is_email_verified=false
+# and is refused above like any other." The second clause was measured on
+# 2026-09-04 and is false — 112 of 129 seed contacts carry
+# is_email_verified = TRUE. So the gate this comment named as sufficient was
+# passing them, and the domain check it dismissed as unnecessary was the only
+# remaining wall, with the seed domain absent from it.
 #
-# An earlier version of the message above claimed this function rejected
-# "placeholder/seed" domains. It never did — `seed.agentorc.ca` is not in
-# _PLACEHOLDER_EMAIL_DOMAINS and matches none of the reserved suffixes. Wording
-# that overstates a control is the same defect class this module exists because
-# of, so it is corrected rather than left as a comforting sentence.
+# What that cost: 26 dunning notices PER DAY, every one to seed.agentorc.ca,
+# alongside ~122/day of order mail on the same gate — about 92% of all outbound
+# volume, delivered to a catch-all no person reads, and enough to exhaust a
+# 100/day provider quota. It was found by the quota alarm. Nothing else in the
+# system reported it, because from in here every one of those sends succeeded.
+#
+# `seed.agentorc.ca` is now in _PLACEHOLDER_EMAIL_DOMAINS (app/core/agent_bus.py),
+# which _is_real_email consults above. To exercise an end-to-end send, use a real
+# mailbox — not a verified seed row.
+#
+# The note this replaces already warned that "wording that overstates a control
+# is the same defect class this module exists because of". That was right. The
+# wording simply overstated a DIFFERENT control than the one it was watching.
 
 
 def _compose(params: Dict[str, Any]) -> Dict[str, str]:

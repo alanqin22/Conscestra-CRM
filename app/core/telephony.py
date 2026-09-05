@@ -275,7 +275,67 @@ def _from_number(dest: Optional[str] = None,
     return default
 
 
-AUTOSEND = _flag("SMS_AUTOSEND", "0")
+def autosend_allowed() -> bool:
+    """May THIS deployment send agent-initiated SMS and place outbound calls?
+
+    SMS_AUTOSEND says the operator wants it; `unattended_allowed` says this
+    process is the deployment that was meant to do it. Both are required.
+
+    WHY. The email side of this was found on 2026-09-04: the local development
+    instance ran the same nightly scheduler as Railway against its own database
+    and sent live customer mail, 25 order emails in one night that Railway's
+    ledger knew nothing about. SMS_AUTOSEND sat behind the identical shape — a
+    flag in a laptop's .env, with nothing asking whether the laptop was
+    supposed to be sending — and the blast radius is worse, not better: an SMS
+    costs money per message and arrives on a real handset, where a duplicate
+    from a developer machine is not a line in an archive but a phone buzzing.
+
+    WHAT IS NOT GATED, and must not be. `transactional=True` sends bypass
+    AUTOSEND already and continue to: the voice-support OTP and the
+    order-cancellation code are requested by a caller who is on the line
+    waiting, and local voice testing legitimately runs through ngrok against a
+    real phone. So does `mandatory` on the inbound auto-reply path — a STOP
+    confirmation is a compliance obligation, and inbound webhooks reach exactly
+    one host anyway, so they were never the double-send risk. The risk is the
+    robot deciding on its own to text somebody.
+
+    SMS_AUTOSEND_LOCAL=1 is the deliberate override. It is NOT shared with
+    AGENT_BUS_AUTOSEND_LOCAL: turning on local email testing must not quietly
+    start billing for text messages.
+    """
+    if not _flag("SMS_AUTOSEND", "0"):
+        return False
+    try:
+        from app.core.release_guard import unattended_allowed
+    except Exception as exc:                                   # pragma: no cover
+        # Fails OPEN and loudly, for the same reason the email gate does:
+        # release_guard is imported at startup, so a process that cannot import
+        # it is already visibly broken, whereas failing closed would silence
+        # real outbound messaging in production for an unrelated import error.
+        logger.error("[telephony] cannot import release_guard (%s) — allowing "
+                     "autosend on prior behaviour; this process cannot tell "
+                     "whether it is deployed", exc)
+        return True
+    return unattended_allowed("sms", "SMS_AUTOSEND_LOCAL")
+
+
+# Import-time snapshot, matching how this module has always exposed the flag
+# and how `critic.py` reads it (`telephony.AUTOSEND`). Call `autosend_allowed()`
+# where the value must be re-read after startup.
+AUTOSEND = autosend_allowed()
+
+
+def _autosend_off_reason() -> str:
+    """Why this send was drafted rather than transmitted.
+
+    There are now TWO ways to be off and they call for different fixes, so
+    the draft note must not keep saying "SMS_AUTOSEND=0" when the flag is in
+    fact 1. A note that names the wrong cause sends the reader to change a
+    setting that was already correct."""
+    if not _flag("SMS_AUTOSEND", "0"):
+        return "SMS_AUTOSEND=0"
+    return ("SMS_AUTOSEND=1 but this process is not the designated sender "
+            "(not deployed; set SMS_AUTOSEND_LOCAL=1 to send from here)")
 AUTOREPLY = _flag("SMS_AUTOREPLY", "1")
 
 _API = "https://api.twilio.com/2010-04-01/Accounts"
@@ -398,12 +458,13 @@ def send_sms(to: str, body: str, *, lead_id=None, account_id=None,
                                       "(TWILIO_ACCOUNT_SID/AUTH_TOKEN/FROM_NUMBER)"}
 
     if not AUTOSEND and not transactional:
+        why = _autosend_off_reason()
         _log_activity("task", f"Send SMS to {to_n} (draft)",
-                      f"SMS drafted by {sent_by} (SMS_AUTOSEND=0 — not sent):\n"
+                      f"SMS drafted by {sent_by} ({why} — not sent):\n"
                       f"{body}", direction="outbound", lead_id=lead_id,
                       account_id=account_id, owner_id=owner_id, status="open")
         return {"ok": True, "sent": False, "drafted": True, "to": to_n,
-                "note": "SMS_AUTOSEND=0 — drafted as an owner task"}
+                "note": f"{why} — drafted as an owner task"}
 
     import requests
     prov = _provider()
@@ -543,7 +604,8 @@ def place_call(to: str, say_text: str, *, lead_id=None, account_id=None,
         return {"ok": False, "error": f"{_provider()} not configured"}
     if not AUTOSEND:
         _log_activity("task", f"Place call to {to_n} (draft)",
-                      f"Voice message drafted by {called_by} (SMS_AUTOSEND=0):\n"
+                      f"Voice message drafted by {called_by} "
+                      f"({_autosend_off_reason()}):\n"
                       f"{say_text}", direction="outbound", lead_id=lead_id,
                       account_id=account_id, owner_id=owner_id, status="open")
         return {"ok": True, "called": False, "drafted": True, "to": to_n}

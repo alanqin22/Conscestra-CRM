@@ -466,9 +466,11 @@ BLIND: List[Dict[str, Any]] = [
                     "actually drafted vs sent rather than confirming a send.",
         "evidence": "app/main.py _run_emit_overdue_invoice_events at 22:25 ET, "
                     "self-gated ('No-op unless AGENT_BUS_ENABLED=1'); "
-                    "app/core/agent_bus.py AUTOSEND = _flag('AGENT_BUS_AUTOSEND') "
-                    "default 0, 'Real SMTP only when AGENT_BUS_AUTOSEND=1' and the "
-                    "recipient must pass _is_real_email()",
+                    "app/core/agent_bus.py autosend_allowed() requires "
+                    "AGENT_BUS_AUTOSEND=1 (default 0) AND "
+                    "release_guard.unattended_allowed(), so a non-deployed "
+                    "process drafts rather than sends; the recipient must also "
+                    "pass _is_real_email()",
     },
     {
         "question": "Now that the weekly retraining swapped in the new lead scoring "

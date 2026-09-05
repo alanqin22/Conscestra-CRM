@@ -65,7 +65,62 @@ ENABLED      = _flag("AGENT_BUS_ENABLED")
 POLL_SECS    = int(os.getenv("AGENT_BUS_POLL_SECS", "30"))
 BATCH        = int(os.getenv("AGENT_BUS_BATCH", "10"))
 MAX_ATTEMPTS = int(os.getenv("AGENT_BUS_MAX_ATTEMPTS", "5"))
-AUTOSEND     = _flag("AGENT_BUS_AUTOSEND")
+def autosend_allowed() -> bool:
+    """May THIS deployment send unattended outbound mail?
+
+    Two conditions, not one. The flag says the operator wants robots to send;
+    `is_deployed()` says this process is the thing that was meant to do it.
+
+    WHY THE SECOND CONDITION EXISTS. On 2026-09-04 the info@ archive showed 47
+    order confirmations and 42 shipped notices for a night in which Railway's
+    `order_notifications` had accepted 22 and 17. There was no duplicate sender
+    and no second code path — the local development instance was running the
+    same nightly scheduler against its own database and sending live mail over
+    SMTP. Railway 22 + local 25 = 47, Railway 17 + local 25 = 42, and
+    order.delivered reconciled exactly at 23 + 0 = 23, because local had no
+    orders at that stage. Two instances, two databases, both live senders.
+
+    A laptop that can reach the mail server is a production email sender, and
+    nothing in the system said so: local mail carried the same BCC, so it
+    landed in the same archive and was indistinguishable there from Railway's.
+
+    AGENT_BUS_AUTOSEND alone could not prevent this. It was 1 in the local
+    .env, which is the ordinary state of a developer machine that has ever
+    needed to test a send — and, as release_guard puts it, "a control that only
+    engages when an environment variable is set is not a control". The default
+    now has to be earned by evidence of deployment rather than assumed.
+
+    AGENT_BUS_AUTOSEND_LOCAL=1 is the deliberate override for testing a real
+    send from a laptop. It is a separate variable on purpose: turning it on is
+    a decision someone has to make in as many words, and it greps.
+
+    The deployment half lives in `release_guard.unattended_allowed`, shared
+    with SMS and outbound voice, which carry the same exposure behind
+    SMS_AUTOSEND. Keeping one copy is the point: a second copy is the one that
+    does not get updated.
+    """
+    if not _flag("AGENT_BUS_AUTOSEND"):
+        return False
+    try:
+        from app.core.release_guard import unattended_allowed
+    except Exception as exc:                                   # pragma: no cover
+        # Fails OPEN, and loudly. release_guard is imported during startup, so
+        # a process that cannot import it is already broken in a way that will
+        # be noticed; failing closed here would instead silence real customer
+        # order mail in production for an unrelated import error — the worse
+        # of the two outcomes, and the harder one to diagnose.
+        logger.error("[autosend] cannot import release_guard (%s) — allowing "
+                     "autosend on prior behaviour; this process cannot tell "
+                     "whether it is deployed", exc)
+        return True
+    return unattended_allowed("email", "AGENT_BUS_AUTOSEND_LOCAL")
+
+
+# Import-time snapshot, kept because seven modules read `agent_bus.AUTOSEND` as
+# an attribute (booking, critic, marketing, quotes, voice_support, and twice
+# here). Gating it here gates all of them at once. Call `autosend_allowed()`
+# directly where the value must be re-read after startup.
+AUTOSEND     = autosend_allowed()
 BACKFILL_MIN = int(os.getenv("AGENT_BUS_BACKFILL_MINUTES", "0"))
 # Blast-radius cap on the resume window (see _resume_cutoff). Bounds how far a
 # restart may reach back, so a long-dead consumer can never mass-replay history.
@@ -1163,9 +1218,11 @@ HANDLERS["invoice_paid"] = handle_milestone_settled
 
 # ── Order → Email: buyer order-lifecycle emails (confirmation + shipped) ──────
 # Customers who SIGN UP with a real address (OTP-verified → contacts.is_email_verified)
-# get genuine order emails; the synthetic seed contacts (example.com, demo domains,
-# is_email_verified=false) never do — they stay draft+log. Real send only when
-# AGENT_BUS_AUTOSEND=1 AND the recipient passes _is_real_email().
+# get genuine order emails; synthetic seed contacts never do — they stay draft+log.
+# Real send only when AGENT_BUS_AUTOSEND=1 AND the recipient passes _is_real_email().
+#
+# This block used to say seed contacts are "is_email_verified=false". They are not,
+# and saying so here is what kept the leak below invisible for 1,306 sends.
 
 # Obvious placeholder / non-deliverable domains used by the seed data and RFC docs.
 #
@@ -1180,16 +1237,53 @@ HANDLERS["invoice_paid"] = handle_milestone_settled
 # legitimate customer mail is affected. If a real customer ever does arrive on
 # company.com, that is the day to replace this blunt entry with a per-record
 # decision — not to quietly delete the line.
+#
+# seed.agentorc.ca is the catch-all this system assigns to its OWN synthetic
+# contacts (seed_email_migration.sql rewrote every seeded address to
+# <slug>-<4hex>@seed.agentorc.ca). It is here because the verification gate
+# above does not hold on those rows and cannot be made to:
+#
+#   112 of 129 seed.agentorc.ca contacts carry is_email_verified = TRUE.
+#
+# So every one of them passed `is_verified`, reached the provider, and was
+# accepted — 1,306 order emails, 100% of all order mail ever sent, delivered to
+# a mailbox no person reads. At ~62/day plus a BCC apiece that is the whole of
+# a 100/day provider quota, which is how this was found: the quota alarm, not a
+# customer complaint.
+#
+# WHAT THIS ENTRY IS, AND IS NOT. It is a DELIVERY decision — do not spend
+# provider quota on a catch-all — exactly like the entries above it. It is NOT
+# a provenance claim: corpus_provenance forbids inferring "this record is
+# synthetic" from an email domain, and nothing here records that inference.
+# A row on this domain may well describe a real person; we simply decline to
+# post mail to an address the system invented for itself.
+#
+# Checked before adding: `agentorc.ca` itself is NOT matched (the test is exact
+# equality, not a suffix), so info@agentorc.ca and every real customer address
+# are unaffected. If real people are ever hosted on the seed subdomain, that is
+# the day to give them real addresses — not to quietly delete this line.
 _PLACEHOLDER_EMAIL_DOMAINS = {
     "example.com", "examples.com", "example.org", "example.net",
     "test.com", "test", "localhost", "invalid", "none.com",
     "company.com", "system.internal",
+    "seed.agentorc.ca",
 }
 
 def _is_real_email(addr: Optional[str], is_verified: bool) -> bool:
     """A deliverable, opted-in recipient: verified through the OTP flow AND not an
-    obvious placeholder/seed domain. Seed contacts are is_email_verified=false, so
-    only addresses a human actually confirmed (like a real home-store signup) pass."""
+    obvious placeholder/seed domain.
+
+    BOTH halves are load-bearing, and the second is not a belt-and-braces
+    afterthought. This docstring used to claim "seed contacts are
+    is_email_verified=false", and read that way the domain check looks
+    redundant. The claim was false in production — 112 of 129 seed contacts are
+    flagged verified — so the domain set was in fact the only thing standing
+    between synthetic rows and the provider, and it did not name the domain
+    they actually use.
+
+    is_email_verified is a MUTABLE attribute that seeding, imports and backfills
+    all write. Do not treat it as proof of provenance; it is evidence about one
+    address at one moment."""
     if not addr or not is_verified:
         return False
     addr = addr.strip().lower()

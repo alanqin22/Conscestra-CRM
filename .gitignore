@@ -175,6 +175,9 @@ docs/*.png
 .htaccess
 robots.txt
 sitemap.xml
+# Shared stylesheet for the six marketing pages — deploys to agentorc.ca
+# alongside the *.html above, so it is local-only for the same reason.
+conscestra.css
 deploy_html.ps1
 deploy_sp.ps1
 submit_indexnow.py

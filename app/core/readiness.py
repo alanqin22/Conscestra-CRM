@@ -208,8 +208,19 @@ _FEATURE_FLAGS = {
 
 def _features() -> Dict[str, bool]:
     # explore defaults on; the rest default off.
-    return {name: _flag(env, "1" if name == "explore" else "0")
-            for name, env in _FEATURE_FLAGS.items()}
+    out = {name: _flag(env, "1" if name == "explore" else "0")
+           for name, env in _FEATURE_FLAGS.items()}
+    # `autosend` is the one flag whose env var is not the answer. Unattended
+    # sending also requires this process to look deployed, so reporting
+    # AGENT_BUS_AUTOSEND here would tell an operator on a laptop that mail is
+    # going out when none is — a posture panel that disagrees with behaviour is
+    # worse than no panel. Report what the senders actually ask.
+    try:
+        from app.core.agent_bus import autosend_allowed
+        out["autosend"] = autosend_allowed()
+    except Exception:
+        pass
+    return out
 
 
 # ============================================================================
