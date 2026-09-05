@@ -61,6 +61,55 @@ def is_deployed() -> bool:
     return False
 
 
+_unattended_refusals_logged: set = set()
+
+
+def unattended_allowed(channel: str, override_env: str) -> bool:
+    """May this process act UNATTENDED on `channel` — send with nobody waiting?
+
+    This is the deployment half of every autosend gate. The channel keeps its
+    own operator flag (AGENT_BUS_AUTOSEND, SMS_AUTOSEND); this answers the
+    second question those flags cannot: is this process the deployment that
+    was supposed to do the sending?
+
+    WHY IT IS SHARED. On 2026-09-04 the local development instance was found
+    sending live order email over SMTP on the same nightly schedule as Railway,
+    against its own database — Railway 22 + local 25 = the 47 confirmations the
+    info@ archive recorded. Email was fixed first. SMS and outbound voice sat
+    behind an identical flag with identical exposure and would have had to be
+    fixed the same way, separately, from memory. Two copies of a control drift;
+    the second copy is the one that gets forgotten. So the predicate lives once,
+    here, beside `is_deployed()` which it is built on.
+
+    ATTENDED SENDS ARE NOT GATED BY THIS and must not be. A voice OTP the caller
+    is waiting for, a human rep's reply from the console, and a mandatory STOP
+    confirmation all reach the carrier through `transactional=True` or
+    `mandatory`, which never consult this function. Local voice testing runs
+    through ngrok against a real phone, and a laptop that answers a live call
+    still owes that caller their code. What is refused here is the robot acting
+    on its own.
+
+    THE OVERRIDE IS PER CHANNEL, deliberately. Email and SMS do not share one
+    switch: enabling local email testing must not silently enable local SMS,
+    because SMS costs money per message and reaches a real handset.
+
+    Returns True when the override is set, or when this looks deployed.
+    """
+    if _flag(override_env):
+        return True
+    if is_deployed():
+        return True
+    if channel not in _unattended_refusals_logged:
+        _unattended_refusals_logged.add(channel)
+        logger.warning(
+            "[unattended] %s autosend is ON but this process does not look "
+            "deployed — unattended %s is REFUSED. This is what stops a laptop "
+            "becoming a second live sender alongside production. Set %s=1 to "
+            "act unattended from here deliberately.", channel, channel,
+            override_env)
+    return False
+
+
 # ── the checks ──────────────────────────────────────────────────────────────
 # Each returns (ok, severity, message). BLOCKING failures stop startup in a
 # deployed environment; ADVISORY ones are logged loudly and reported.

@@ -93,9 +93,16 @@ class RetryableNotificationError(RuntimeError):
 
 def _autosend() -> bool:
     """Read at call time, not import time — the flag is environment state, and
-    a test that sets it must not depend on import order."""
-    return os.getenv("AGENT_BUS_AUTOSEND", "0").strip().lower() in (
-        "1", "true", "yes", "on")
+    a test that sets it must not depend on import order.
+
+    Delegates to `agent_bus.autosend_allowed()`, which asks the flag AND
+    whether this process is the deployment that was meant to send. This module
+    used to read the environment variable itself, and that second reader is how
+    a laptop sent 50 order emails in a night that Railway's ledger knew nothing
+    about: same code, same BCC, different database. Imported lazily, matching
+    how this module already reaches `_is_real_email`."""
+    from app.core.agent_bus import autosend_allowed
+    return autosend_allowed()
 
 
 # ============================================================================
