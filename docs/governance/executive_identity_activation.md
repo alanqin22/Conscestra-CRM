@@ -39,7 +39,11 @@ customer contact, not a service identity, not an identity collision, membership 
 | CTO | ✓ Bill Wang | ✓ `585f003c…` | ✓ | ✓ `viewer` | ✓ 09:09 | ✓ | ✓ **attested by the CEO** |
 | COO | ✓ Alex Zhou | ✓ `e4d99e38…` | ✓ | ✓ `viewer` | ✓ 09:39 | ✓ | ✓ **attested by the CEO** |
 
-**MILESTONE — 2026-09-06 09:40. All five authorities are operational.** Each executive
+**MILESTONE — 2026-09-06. All five authorities are operational on BOTH databases.**
+Production activation, including the Railway differences that local could not have
+predicted, is recorded in `five_authority_readiness.md` §14.
+
+Locally, 09:40: Each executive
 holds an individual credential, has set their own password through the self-service reset
 flow, and can sign in and decide. `GET /governance/authorities` reports an empty `missing`,
 an empty `without_credential` **and** an empty `identity_mismatch` for the first time.
