@@ -476,10 +476,30 @@ Application commit `bfbfac7a37b9`. All five SQL files applied to Railway, in ord
 
 ### The gap this release opened, and closed
 
-The application shipped before its schema. For roughly two hours Railway ran governance
-code against a database with none of its tables, and the failure was measured rather than
-assumed: `column e.owner_id does not exist` and `relation "governance_action_policies" does
-not exist`.
+The application shipped before its schema. The failure was measured rather than assumed:
+`column e.owner_id does not exist` and `relation "governance_action_policies" does not
+exist`.
+
+**CORRECTION — the window was 7 minutes 45 seconds, not "roughly two hours".** That earlier
+figure was an estimate written from the shape of the conversation rather than from a clock,
+and the system had recorded the answer all along. `schema_attestations` on Railway:
+
+```
+deploy #65 container start              18:26:02 UTC
+governance_activation.sql      applied  18:33:47 UTC
+governance_five_authorities    applied  18:33:54 UTC
+governance_reescalation        applied  18:34:03 UTC
+governance_kb_publish_policy   applied  18:34:11 UTC
+```
+
+Overstating an outage by a factor of fifteen is not a harmless rounding: it is the same
+class of error as understating a settled classification as an absence, and in an incident
+record it would misdirect whoever reads it next. The correction is kept here rather than
+applied silently, and the source is named so the next person measures instead of estimating.
+
+Everything the original entry says about the CONSEQUENCES stands — the split between failing
+safe and failing hard is unchanged, and so is the lesson about naming every migration in the
+handover.
 
 The consequences split cleanly, and the split is worth keeping.
 
@@ -737,3 +757,48 @@ existed to damage.
 The pattern is the same one the reset tests hit earlier in the day: **a suite that operates
 on production-shaped records will eventually damage one.** Three fixtures have now been given
 their own throwaway subjects for exactly this reason.
+
+## 16. Production verification baseline — Day 0
+
+**Anchor: 2026-09-06 18:34:11 UTC**, the moment code and schema were both in place
+(`schema_attestations`, last activation file applied). Deploy #65 started the container at
+18:26:02; the seven-minute gap between them is §13.
+
+A second, later anchor is worth recording because it is when the loop became *usable* rather
+than merely present: **19:30:07 UTC**, when the last of the five executives set their own
+password. Nothing could have been decided in the console before it.
+
+| Milestone | UTC |
+|---|---|
+| Day 0 (schema complete) | 2026-09-06 18:34 |
+| Console usable | 2026-09-06 19:30 |
+| Day 7 | 2026-09-13 18:34 |
+| **Day 14 target** | **2026-09-20 18:34** |
+
+The conservative anchor is the earlier one, and it is the one to hold to: the fourteen days
+run from when the governed system was live, not from when somebody first used it.
+
+### Day 0 measurements, from the running system
+
+| Criterion | Day 0 |
+|---|---|
+| Pending proposals | 0 |
+| …missing owner / authority / due date | 0 |
+| Rows expired since deploy | 0 |
+| Breached approvals | 0 |
+| Escalated approvals | 0 |
+| Stranded executions (lease held) | 0 |
+| Governance alerts | 1 open, high, owned |
+| Alerts without an owner | 0 |
+| Orphaned events | 39, none older than 24h |
+| Classes still `decision_required` | 0 |
+| `AUTO_EXECUTE` classes | 1 (`order.cancel`), and it names a policy owner |
+| Executives holding admin | 0 |
+| Decisions bound to an executive session | **0** |
+
+The last row is the one that matters, and it is not a defect: **no decision of any kind has
+been taken on Railway since the deploy**, and there are no pending proposals waiting on
+anyone. Every one of the 66 decided rows predates the activation — 60 expired by `system`
+(last at 01:45, before the deploy), 3 by `email-link`, 3 by `policy:voice_order_cancel`. All
+carry `decided_actor = NULL` because the column did not exist when they were decided and
+none was a session decision.
