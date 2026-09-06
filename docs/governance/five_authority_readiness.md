@@ -667,8 +667,43 @@ which it has had all along. Measuring attestation instead means the answer track
 been vouched for*, so the two databases differ precisely because their populations differ —
 and production, which has more unattested identities, is the one that keeps warning.
 
-It also names the remaining work rather than hiding it: seven identities on production are
-authorised to receive work with nobody having stated they are real people.
+It also names the state rather than hiding it: seven identities on production are authorised
+to receive work and are **not** attested real.
+
+**A correction, recorded rather than quietly fixed.** The sentence above originally read
+"…with nobody having stated they are real people", which was true and misleading. Nobody had
+stated they are real *because somebody had already stated the opposite.* All seven were
+attested **synthetic** on 2026-09-03 — `state='synthetic'`, `rule='human_attested'`,
+`decided_by='grant-gate:owner:…'` — and none of them lacks a provenance row.
+
+The difference matters. "Nobody has decided" is an open item; "somebody decided these are
+demo personas" is a closed one, and it is the stronger record of the two. Reporting a
+settled classification as an absence understates the system and invites work that has
+already been done. The check that would have caught it is the one this whole exercise keeps
+returning to: read the record before describing it.
+
+### Railway is ahead of local here, not behind
+
+| | Owners attested real | Owners attested synthetic | Employees attested synthetic |
+|---|---|---|---|
+| local | 5 | — | 8 |
+| railway | 5 | **7** | 8 |
+
+Local has no synthetic owner rows because those seven owners were never created there — not
+because it is cleaner. They exist on production, hold **25 activities and 2 opportunities**,
+receive the staff worklist digest, and are correctly labelled demo personas.
+
+**Making Railway match local would be a downgrade**, and it is worth writing down so nobody
+attempts it as tidying. Revoking the seven memberships would leave 27 records owned by
+ineligible identities and the staff digest reaching nobody — a failure this system has
+already produced once and warned about in its own logs. The honest direction, if parity is
+ever wanted, is local → Railway: provision those owners locally and attest them synthetic,
+so both databases model the same organisation.
+
+**Decision, 2026-09-06 (owner): leave both as they are.** Each database is describing itself
+accurately, and `environment()` reporting "synthetic" on production is the classification
+working rather than a gap in it — the organisation genuinely is part real and part demo, and
+the flag says so instead of rounding to whichever answer is tidier.
 
 ### A latent defect found while promoting
 
