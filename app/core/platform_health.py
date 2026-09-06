@@ -228,6 +228,37 @@ def platform_metrics() -> List[Dict[str, Any]]:
             out.append(_metric("queue_orphaned", "Orphaned events", None, UNKNOWN,
                                f"agent_bus unreadable: {str(exc)[:60]}"))
 
+        # DURABLE orphans + delayed rows — the queue's states, not just its
+        # depth (activation §14). healthy = pending and young; delayed =
+        # pending past the poll cadence; orphaned = marked by the consumer as
+        # unreachable; failed = retries exhausted. A system is not healthy
+        # because recent events flow while older ones are stranded.
+        try:
+            from app.core import agent_bus as _bus
+            stale = max(_bus.POLL_SECS * 10, 600)
+        except Exception:                                          # noqa: BLE001
+            stale = 600
+        st = _q("""SELECT count(*) FILTER (WHERE status='orphaned'),
+                          count(*) FILTER (WHERE status='pending' AND last_attempt_at IS NULL
+                                           AND created_at < now() - make_interval(secs => %s)),
+                          min(orphaned_at) FILTER (WHERE status='orphaned'),
+                          (SELECT count(*) FROM governance_alerts
+                            WHERE alert_class='event_orphaned' AND status='escalated')
+                   FROM event_queue""", (stale,))
+        if st is not None:
+            n_od, n_delay, o_since, n_esc = int(st[0] or 0), int(st[1] or 0), st[2], int(st[3] or 0)
+            out.append(_metric(
+                "queue_orphaned_durable", "Orphaned (durable state)", n_od,
+                CRIT if n_esc else (WARN if n_od else OK),
+                (f"since {str(o_since)[:16]} — owned by an alert; POST /agent-bus/drain replays"
+                 + (f" · {n_esc} alert(s) ESCALATED to CEO" if n_esc else "")) if n_od
+                else "no durably orphaned events", "events"))
+            out.append(_metric(
+                "queue_delayed", "Delayed (unclaimed past poll cadence)", n_delay,
+                WARN if n_delay else OK,
+                f"pending > {stale // 60} min without an attempt" if n_delay else "none",
+                "events"))
+
         # Reported separately and never alerted on: visible, but it cannot make
         # a healthy platform look broken.
         if handled:
@@ -450,6 +481,67 @@ def governance_metrics() -> List[Dict[str, Any]]:
             WARN if expired7 else OK,
             "proposals nobody decided before they lapsed" if expired7
             else "nothing lapsed undecided", "expired"))
+
+    # -- ACTIVATION (§20): the 48h clock, escalations, ownership, stranded
+    #    executions, decision latency, alert lifecycle. Read from the two
+    #    modules that own the numbers so this page and the briefing agree.
+    try:
+        from app.core import governance as _gov, governance_alerts as _galerts
+        gm = _gov.metrics()
+        if gm.get("available"):
+            br = int(gm.get("breached_open") or 0) + int(gm.get("escalated_open") or 0)
+            out.append(_metric("approvals_breached", "Approvals past 48h SLA", br,
+                               CRIT if br else OK,
+                               f"{gm.get('escalated_open', 0)} escalated to CEO · "
+                               f"{gm.get('breached_7d', 0)} breached this week "
+                               f"(rate {gm.get('breach_rate_7d_pct', 0)}%)" if br
+                               else f"{gm.get('breached_7d', 0)} breached in the last 7 days",
+                               "approvals"))
+            out.append(_metric("approvals_due_soon", "Approvals due within 12h",
+                               int(gm.get("due_soon") or 0),
+                               WARN if gm.get("due_soon") else OK,
+                               "decide before the clock runs out" if gm.get("due_soon") else "none",
+                               "approvals"))
+            out.append(_metric("approvals_stranded", "Stranded executions",
+                               int(gm.get("stranded") or 0),
+                               CRIT if gm.get("stranded") else OK,
+                               "approved but never finished — side effects unknown"
+                               if gm.get("stranded") else "none in flight past the lease",
+                               "approvals"))
+            oe = int(gm.get("pending_ownership_exceptions") or 0)
+            out.append(_metric("ownership_exceptions", "Pending owned by CEO as exception", oe,
+                               WARN if oe else OK,
+                               "the responsible role has no eligible executive" if oe
+                               else "every pending approval has its own authority",
+                               "approvals"))
+            out.append(_metric("decision_latency", "Median decision time (30d)",
+                               gm.get("median_decision_hours"),
+                               OK if (gm.get("median_decision_hours") or 0) <= 48 else WARN,
+                               f"p95 {gm.get('p95_decision_hours')}h · SLA 48h", "hours"))
+            vf = int(gm.get("verification_failed_7d") or 0)
+            out.append(_metric("verification_failed", "Executed but unverifiable (7d)", vf,
+                               WARN if vf else OK,
+                               "the function returned but the effect could not be seen"
+                               if vf else "every executed action verified", "actions"))
+        else:
+            out.append(_metric("approvals_breached", "Approvals past 48h SLA", None, UNKNOWN,
+                               "activation migration not applied "
+                               "(governance/sql/governance_activation.sql)"))
+        am = _galerts.metrics()
+        if am.get("available"):
+            out.append(_metric("alerts_live", "Governed alerts open", int(am.get("live") or 0),
+                               CRIT if am.get("escalated") or am.get("critical")
+                               else (WARN if am.get("past_due") else OK),
+                               f"{am.get('escalated', 0)} escalated · {am.get('critical', 0)} critical · "
+                               f"{am.get('past_due', 0)} past due · "
+                               f"{am.get('ownership_exceptions', 0)} owned by CEO as exception",
+                               "alerts"))
+        else:
+            out.append(_metric("alerts_live", "Governed alerts open", None, UNKNOWN,
+                               "governance_alerts not readable"))
+    except Exception as exc:                                       # noqa: BLE001
+        out.append(_metric("approvals_breached", "Approvals past 48h SLA", None, UNKNOWN,
+                           f"governance metrics unavailable: {str(exc)[:80]}"))
     return out
 
 

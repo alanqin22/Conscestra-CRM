@@ -103,6 +103,17 @@ AUTHORIZED_SENDERS: Dict[Tuple[str, str], str] = {
         "sign-in one-time code — an authentication step, not a work notice",
     ("app/agents/admin_users/router.py", "send_reset"):
         "password reset link — same",
+    ("app/agents/auth/router.py", "_send_reset_email"):
+        "self-service password reset code. REACHES STAFF, including all five "
+        "governance authorities, and is deliberately NOT routed through "
+        "staff_email. That path applies tier, preference and an attention "
+        "budget, all of which are correct for work notices and wrong here: a "
+        "person who muted digests, or whose budget is spent, must still be able "
+        "to recover their own account. It is also not attention-competing mail "
+        "— the recipient asked for it seconds earlier. The abuse concern is the "
+        "opposite one, an unauthenticated caller mailbombing an executive, and "
+        "that is answered by the 5-per-identifier-per-hour throttle on the "
+        "endpoint rather than by the budget",
 
     # ── Module-level bindings. Not calls — but importable by anything, which
     #    makes the module itself an email capability. Declared so the chain
@@ -135,6 +146,17 @@ AUTHORIZED_SENDERS: Dict[Tuple[str, str], str] = {
         "daily executive briefing. Predates this design and has its own "
         "recipient model (executives.briefing_hour); a candidate to fold into "
         "staff_email once the digest has proven itself",
+    ("app/core/governance_policy.py", "email_authority"):
+        "SLA breach and escalation mail to an approval authority (activation "
+        "plan §26.6: email now, a paging channel later). It is ledger-WRAPPED "
+        "the same way route_approval is -- begin_send claims an idempotency key "
+        "per (kind, ref) and finish_send records the provider outcome, so the "
+        "attention budget and the breaker both apply -- but it calls the sender "
+        "directly rather than through staff_email._deliver, for the reason "
+        "recorded there: an executive must not miss an escalation because the "
+        "ledger table was missing, so the bookkeeping fails OPEN and the send "
+        "does not depend on it. Recipient is always an `executives` row with "
+        "auto_email_enabled, never a free-text address",
 }
 
 _SENDERS = {"send_email", "_send_via_resend"}

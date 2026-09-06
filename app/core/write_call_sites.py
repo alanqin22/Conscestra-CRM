@@ -145,6 +145,13 @@ ADMIN_GATED: Set[str] = {
     "app/core/customer_memory.py", "app/core/data_quality.py",
     "app/core/demo.py", "app/core/deploy_state.py", "app/core/embed.py",
     "app/core/escalation.py", "app/core/evals.py",
+    # Governance activation (docs/governance/activation_plan.md). Both routers
+    # are included under _ADMIN. governance_alerts writes governance_alerts /
+    # notifications (owner eligibility and the lifecycle are enforced by
+    # trigger, so even an authorised caller cannot write an unowned or
+    # out-of-order row); governance_policy writes governance_action_policies
+    # (versioned + historied by trigger; every change needs a reason).
+    "app/core/governance_alerts.py", "app/core/governance_policy.py",
     "app/core/executive_intelligence.py", "app/core/identity.py",
     "app/core/identity_links.py", "app/core/industry_packs.py",
     "app/core/intelligence.py", "app/core/kb_ingest.py",

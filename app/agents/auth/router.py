@@ -47,6 +47,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import psycopg2
+
+from app.core import release_guard
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
@@ -736,6 +738,78 @@ async def change_password(req: ChangePasswordRequest):
     return AuthResponse(success=True, message="Password changed successfully")
 
 
+def _send_reset_email(to_email: str, token: str, ttl_seconds: int) -> None:
+    """Deliver a reset code to the account holder. The ONLY channel in production.
+
+    Until 2026-09-06 this endpoint sent nothing at all. Its own docstring said
+    "Production note: email the returned token to the user", and that was never
+    implemented — the flow appeared to work only because the token came back in
+    the HTTP response, which is what made it an unauthenticated account
+    takeover. Closing that hole without building this would have left the
+    deployed system with no password reset whatsoever.
+
+    Never logs the token. A secret in a log is a secret in whatever ships logs.
+    """
+    minutes = max(1, int(ttl_seconds) // 60)
+    window = (f"{minutes // 60} hour" + ("s" if minutes // 60 > 1 else "")
+              if minutes >= 60 else f"{minutes} minutes")
+
+    # The origin a PERSON should see, which is not the API origin. No *.html is
+    # in git, so the backend cannot serve auth.html in production and a link
+    # built from APP_URL would land on a 500. order_status._public_site is the
+    # single place that rule is written down; re-deriving it here is how the
+    # two would drift, and the failure mode is a broken button in every email.
+    from app.core.order_status import _public_site
+    # ?tab=reset opens the Reset panel with the code box already showing. The
+    # bare page opens on Sign In, and on 2026-09-06 a recipient did the natural
+    # thing with a long random string on a sign-in form: pasted it into
+    # Password. It is a one-time token, not a password, and the form had no way
+    # to say so. NO TOKEN IN THE URL — a query string lands in browser history,
+    # in the referrer of every asset the page loads, and in any proxy log on the
+    # way. The code is pasted by hand, from the mail, once.
+    link = f"{_public_site()}/auth.html?tab=reset"
+
+    send_email(
+        to=to_email,
+        subject="Conscestra CRM — Password reset code",
+        body_html=(
+            "<div style=\"font-family:sans-serif;max-width:480px;margin:0 auto;"
+            "padding:32px 24px\">"
+            "<h2 style=\"color:#0d9488;margin-bottom:8px\">Conscestra CRM</h2>"
+            "<p>You asked to reset your password.</p>"
+            f"<p><b>1.</b> Open <a href=\"{link}\">{link}</a> — it opens on the "
+            "<b>Reset</b> tab.<br>"
+            "<b>2.</b> Paste the code below into <b>Reset token</b>.<br>"
+            "<b>3.</b> Type the new password you want, then press "
+            "<b>Set New Password</b>.</p>"
+            "<div style=\"font-size:1.1rem;font-weight:700;background:#f0fdfa;"
+            "border-radius:8px;padding:14px;text-align:center;"
+            f"letter-spacing:.04em;margin:24px 0\">{token}</div>"
+            "<p style=\"color:#6b7280;font-size:.875rem\">"
+            "This code is <b>not your password</b> — it is a one-time code that "
+            "lets you choose one. Do not type it into the Sign In form.<br>"
+            f"It expires in {window}. If you did not request it, you can ignore "
+            "this email — your password has not changed.</p></div>"
+        ),
+        body_text=(
+            "You asked to reset your Conscestra CRM password.\n\n"
+            f"Reset code: {token}\n\n"
+            f"1. Open {link} — it opens on the Reset tab.\n"
+            "2. Paste the code above into 'Reset token'.\n"
+            "3. Type the new password you want, then press 'Set New Password'.\n\n"
+            "This code is NOT your password. It is a one-time code that lets you "
+            "choose one, so do not type it into the Sign In form.\n"
+            f"It expires in {window}.\n\n"
+            "If you did not request this, ignore this email — your password has "
+            "not changed.\n\n— Conscestra CRM"
+        ),
+        # Transactional. commercial=True would check the marketing opt-out list,
+        # and an unsubscribe from a newsletter must never be able to lock
+        # somebody out of their own account.
+        commercial=False,
+    )
+
+
 @router.post("/auth/password-reset/request", response_model=AuthResponse)
 async def password_reset_request(req: PasswordResetRequestModel, request: Request):
     """Generate a single-use password reset token.
@@ -777,10 +851,64 @@ async def password_reset_request(req: PasswordResetRequestModel, request: Reques
 
     reset_token = str(row[0])
     logger.info(f"Reset token created for identifier={req.identifier!r} (never log the token itself)")
+
+    # ── THE TOKEN IS NOT HANDED TO THE CALLER UNLESS SOMEBODY SAID SO ────────
+    # This used to return `reset_token` unconditionally, with a comment reading
+    # "DEMO ONLY — remove in production". Nothing enforced the comment. The
+    # endpoint takes no authentication, so on 2026-09-05 an ANONYMOUS caller
+    # could post any real identifier and receive a working password-reset token
+    # for it — verified locally against `cto@agentorc.ca`, and the commit
+    # Railway reported as deployed (cfaef1776d54) carries the same line.
+    #
+    # It stayed survivable only while one shared administrator credential
+    # existed and the console decided nothing. Individual executive credentials
+    # changed that: every governed decision is now bound to an authenticated
+    # executive session, so this endpoint had become the cheapest way to forge
+    # one — no impersonation needed, just the CFO's email address.
+    #
+    # FAILS CLOSED, and deliberately not on `is_deployed()` alone: that helper
+    # documents itself as treating absence of evidence as "not deployed" so a
+    # developer is never blocked, which is the correct bias for a warning and
+    # the wrong one for a secret. A host that sets neither APP_ENV nor the
+    # RAILWAY_* markers would hand out tokens. So disclosure requires a POSITIVE
+    # opt-in that someone has to type, AND the absence of deployment evidence.
+    # Unset anywhere, including a misconfigured production box: no token.
+    disclose = (
+        os.getenv("AUTH_RESET_TOKEN_IN_RESPONSE", "").strip().lower()
+        in ("1", "true", "yes")
+        and not release_guard.is_deployed()
+    )
+    if disclose:
+        return AuthResponse(
+            success=True,
+            message="Reset token generated. In production this is emailed — never logged.",
+            reset_token=reset_token,   # local only; see the gate above
+        )
+
+    # DELIVERY, and deliberately in the branch where the token was NOT handed
+    # back. Exactly one channel carries it, never two: on a laptop the response
+    # already contains it and no mail leaves the machine, and on a deployed host
+    # the response contains nothing and the inbox is the only way to get it.
+    #
+    # Failures are logged and swallowed on purpose. This reply must be identical
+    # whether or not the account exists, so nothing about delivery may change it
+    # — an error here would re-open the account-existence oracle that the shared
+    # message below closes.
+    try:
+        _send_reset_email(identifier, reset_token, req.ttl_seconds)
+    except Exception as exc:                       # never the token in a log
+        logger.warning(f"[security] reset email failed for {identifier!r}: "
+                       f"{str(exc)[:160]}")
+
+    # THE DEFAULT PATH, and the SAME sentence the unknown-identifier branch
+    # returns. A different reply here would leave the endpoint an
+    # account-existence oracle: post an address, and the answer tells you
+    # whether it is a real credential. Closing the takeover while still
+    # confirming the account would trade a break-in for an enumeration of every
+    # executive who has a sign-in.
     return AuthResponse(
         success=True,
-        message="Reset token generated. In production this is emailed — never logged.",
-        reset_token=reset_token,   # DEMO ONLY — remove in production
+        message="If that account exists, a reset link has been sent",
     )
 
 

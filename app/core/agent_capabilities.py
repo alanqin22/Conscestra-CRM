@@ -287,6 +287,19 @@ def invoke(slug: str, capability: str, params: Dict[str, Any],
             return {"ok": True, "outcome": PROPOSED, "approval_id": str(aid),
                     "message": ("Submitted for approval — a person needs to "
                                 "confirm this before it takes effect.")}
+        except governance.ProposalCapReached as capped:
+            # NOT an ERROR. The class has used its daily share of the
+            # approver's attention, which is a policy answer, and the person
+            # talking to the agent deserves to be told that rather than shown a
+            # failure. Recorded as REFUSED so "what did the agent try to do"
+            # stays answerable — the audit distinction this module exists for.
+            _audit(slug, capability, kind, REFUSED, str(capped)[:200], params,
+                   conversation_id, int((time.time() - t0) * 1000))
+            logger.info(f"[agent_caps] '{slug}' refused {capability} — {capped}")
+            return {"ok": False, "outcome": REFUSED, "reason": str(capped)[:160],
+                    "message": ("That needs a person's approval, and today's "
+                                "limit for this kind of request has been "
+                                "reached. It can be raised again tomorrow.")}
         except Exception as exc:
             _audit(slug, capability, kind, ERROR, str(exc)[:200], params,
                    conversation_id, int((time.time() - t0) * 1000))

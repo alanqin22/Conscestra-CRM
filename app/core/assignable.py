@@ -543,18 +543,59 @@ def environment() -> Dict[str, Any]:
     Reported so the product cannot appear staffed when it is not. The judgement
     is DERIVED FROM COUNTS, never from an email domain — 40 of 44 owners are
     customer contacts and the employee cohort is seed data, so the only honest
-    measure is how many people a human has actually authorised."""
-    granted = len(directory())
-    linked = len([d for d in directory() if d.get("owner_id")])
+    measure is how many people a human has actually vouched for.
+
+    MEASURED, NOT COMPARED TO A CONSTANT. This read `linked <= 4` until
+    2026-09-05. That was never a judgement about realness: it was the size of
+    the directory on the day it was written, frozen as a magic number. When the
+    CEO authorised a fifth identity (the CTO), five stopped being <= four and
+    the system began reporting a real staffed organisation — on the strength of
+    ONE MORE ROW. The case-management banner is rendered `if (env.synthetic)`,
+    so the "Synthetic organisation" warning silently disappeared from the UI.
+    A flag that exists to stop the product looking staffed turned itself off by
+    being staffed one person further, which is the exact failure it names.
+
+    The honest measure now exists in this system, and it is the one the CEO
+    used for Bill Wang: an owner counts as a real party only when a human has
+    ATTESTED them in `corpus_provenance`. So the organisation stays synthetic
+    while ANY authorised identity is unattested, and stops being synthetic only
+    once every one of them has been vouched for by name. That transition has to
+    be earned, and — unlike a threshold — it can never be reached by adding
+    more people. Adding an unattested identity now moves the flag towards
+    synthetic, not away from it."""
+    from app.core import work_ownership as wo
+
+    d = directory()
+    linked_ids = [x["owner_id"] for x in d if x.get("owner_id")]
+    prov = wo.owner_provenance(linked_ids)
+    attested = [i for i in linked_ids if prov.get(i) == wo.PROV_REAL]
     emp = _rows("SELECT count(*) AS n FROM employees")
+
+    # An empty directory is synthetic, not "fully attested". `all()` over an
+    # empty sequence is True, and that vacuous truth would report a staffed
+    # organisation for an organisation with nobody in it.
+    synthetic = (not linked_ids) or len(attested) < len(linked_ids)
+
+    if synthetic:
+        message = (
+            "Synthetic organisation — employee records are simulated and "
+            f"{len(attested)} of {len(linked_ids)} authorised identities are "
+            "attested as real people. Work eligibility is granted explicitly, "
+            "so directory records are not automatically able to receive work.")
+    else:
+        message = (
+            f"Staffed organisation — all {len(linked_ids)} authorised "
+            "identities are attested as real people. Work eligibility is still "
+            "granted explicitly, so directory records are not automatically "
+            "able to receive work.")
+
     return {
-        "assignable": granted,
-        "assignable_and_linked": linked,
+        "assignable": len(d),
+        "assignable_and_linked": len(linked_ids),
+        "attested_real": len(attested),
         "directory_records": int(emp[0]["n"]) if emp else 0,
-        "synthetic": linked <= 4,
-        "message": ("Synthetic organisation — employee records are simulated. "
-                    "Work eligibility is granted explicitly, so directory "
-                    "records are not automatically able to receive work."),
+        "synthetic": synthetic,
+        "message": message,
     }
 
 

@@ -579,14 +579,20 @@ async def _slack_apply_decision(action: str, approval_uuid: str, token: str,
         return
     try:
         if action == "approve":
-            res = await governance.approve(approval_uuid, decided_by=decided_by)
+            res = await governance.approve(approval_uuid, decided_by=decided_by, via="chat")
             ok = res.get("ok")
-            msg = (f"✅ *Approved* by <@{decided_by}> — "
-                   + ("executed." if ok else f"execution FAILED: "
-                      f"{(res.get('result') or {}).get('error') or 'unknown error'}"))
+            if res.get("refused") == "authority":
+                msg = f"⛔ <@{decided_by}> is not an approval authority for this item: {res.get('error')}"
+            else:
+                msg = (f"✅ *Approved* by <@{decided_by}> — "
+                       + ("executed." if ok else f"execution FAILED: "
+                          f"{(res.get('result') or {}).get('error') or 'unknown error'}"))
         else:
-            await asyncio.to_thread(governance.reject, approval_uuid, decided_by)
-            msg = f"🚫 *Rejected* by <@{decided_by}> — no action was taken."
+            res = await asyncio.to_thread(governance.reject, approval_uuid, decided_by, None, "chat")
+            if res.get("refused") == "authority":
+                msg = f"⛔ <@{decided_by}> is not an approval authority for this item: {res.get('error')}"
+            else:
+                msg = f"🚫 *Rejected* by <@{decided_by}> — no action was taken."
     except Exception as exc:
         logger.warning(f"[transports] Slack decision apply failed: {exc}")
         msg = "⚠️ Something went wrong applying that decision."

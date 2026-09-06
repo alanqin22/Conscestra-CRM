@@ -16,7 +16,7 @@ Design notes:
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter
 
@@ -339,16 +339,42 @@ def gather() -> Dict[str, Any]:
                      "       COALESCE(amount,0), created_at::date "):
             try:
                 with conn.cursor() as cur2:
+                    # No expires_at filter: a breached proposal is the most
+                    # important line in this section, not the one hidden from it.
                     approvals = _rows(cur2,
                         "SELECT action_type, proposed_by, COALESCE(assigned_to,'unassigned'), "
                         + cols +
                         "FROM action_approvals "
-                        "WHERE status='pending' AND (expires_at IS NULL OR expires_at>now()) "
+                        "WHERE status='pending' "
                         "ORDER BY COALESCE(amount,0) DESC, created_at LIMIT 5")
                 break
             except Exception as exc:
                 logger.warning(f"[ceo_briefing] approvals query fallback: {exc}")
                 conn.rollback()
+        # Governance today (activation §21) — the numbers leadership must see or
+        # decide on. Own connections; best-effort.
+        governance_today = None
+        try:
+            from app.core import governance as _gov, governance_alerts as _galerts
+            governance_today = {"approvals": _gov.metrics(), "alerts": _galerts.metrics(),
+                                "escalated": [], "breached": [], "due_soon": []}
+            for p in _gov.pending():
+                item = {"action_type": p.get("action_type"), "authority": p.get("authority_role"),
+                        "owner": p.get("accountable_owner"), "due_at": p.get("due_at"),
+                        "hours_left": p.get("hours_left"), "id": p.get("approval_uuid")}
+                if p.get("escalation_status") == "escalated":
+                    governance_today["escalated"].append(item)
+                elif p.get("escalation_status") == "breached":
+                    governance_today["breached"].append(item)
+                elif (p.get("hours_left") is not None and 0 <= p["hours_left"] <= 12):
+                    governance_today["due_soon"].append(item)
+            governance_today["critical_alerts"] = [
+                {"headline": a.get("headline"), "owner": a.get("accountable_owner"),
+                 "status": a.get("status"), "hours_left": a.get("hours_left")}
+                for a in _galerts.list_alerts()
+                if a.get("severity") == "critical" or a.get("status") == "escalated"][:8]
+        except Exception as exc:
+            logger.warning(f"[ceo_briefing] governance section skipped: {exc}")
         # Agent performance report card (learning loop) — best-effort.
         try:
             from app.core.learning import agent_performance
@@ -398,6 +424,7 @@ def gather() -> Dict[str, Any]:
             "low_stock": low_stock,
             "closing": closing, "biggest": biggest, "atrisk": atrisk, "big_inv": big_inv,
             "approvals": approvals, "perf": perf, "objectives": objectives,
+            "governance": governance_today,
             "discount_pressure": discount_pressure,
             "anomalies": anomalies,
         }
@@ -605,6 +632,54 @@ def _anomaly_lines(anoms: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+def _governance_lines(g: Optional[Dict[str, Any]]) -> List[str]:
+    """The fourteen questions of activation §21, as briefing lines. Only lines
+    with something to say are emitted; a fully quiet day says so in one line."""
+    if not g:
+        return []
+    a = g.get("approvals") or {}
+    al = g.get("alerts") or {}
+    out: List[str] = []
+    if not a.get("available"):
+        return ["governance metrics unavailable (activation migration not applied?)"]
+    if a.get("pending"):
+        by = ", ".join(f"{k} {v}" for k, v in (a.get("pending_by_authority") or {}).items())
+        out.append(f"Approvals requiring attention: {a['pending']}" + (f" ({by})" if by else ""))
+    if g.get("due_soon"):
+        out.append("Approaching 48h: " + "; ".join(
+            f"{i['action_type']} → {i['authority']} ({i['hours_left']}h left)" for i in g["due_soon"][:6]))
+    if a.get("breached_open") or a.get("escalated_open"):
+        out.append(f"SLA BREACHES: {a.get('breached_open', 0) + a.get('escalated_open', 0)} "
+                   f"pending past 48h ({a.get('breached_7d', 0)} breached this week, "
+                   f"breach rate {a.get('breach_rate_7d_pct', 0)}%)")
+    if g.get("escalated"):
+        out.append("CEO ESCALATIONS awaiting decision: " + "; ".join(
+            f"{i['action_type']} (was {i['authority']}, {i['id'][:8]})" for i in g["escalated"][:8]))
+    if a.get("pending_ownership_exceptions") or al.get("ownership_exceptions"):
+        out.append(f"Unowned consequential work (CEO holding as exception): "
+                   f"{a.get('pending_ownership_exceptions', 0)} approvals, "
+                   f"{al.get('ownership_exceptions', 0)} alerts")
+    if a.get("stranded"):
+        out.append(f"STRANDED executions needing a human look: {a['stranded']}")
+    if al.get("available"):
+        if al.get("critical") or al.get("escalated"):
+            out.append(f"Critical/escalated alerts open: {al.get('critical', 0)} critical, "
+                       f"{al.get('escalated', 0)} escalated")
+        for c in (g.get("critical_alerts") or [])[:5]:
+            out.append(f"   · {c['headline']} — owner {c.get('owner') or '?'} · {c.get('status')}")
+    out.append(f"AI actions last 24h: {a.get('approved_24h', 0)} human-approved, "
+               f"{a.get('auto_executed_24h', 0)} under standing policy, "
+               f"{a.get('rejected_24h', 0)} rejected, {a.get('failed_24h', 0)} failed, "
+               f"{a.get('pending', 0)} awaiting approval")
+    if a.get("verification_failed_7d"):
+        out.append(f"Governance exceptions: {a['verification_failed_7d']} executed action(s) "
+                   f"this week whose effect could not be verified")
+    if a.get("median_decision_hours") is not None:
+        out.append(f"Decision time (30d): median {a['median_decision_hours']}h · "
+                   f"p95 {a.get('p95_decision_hours')}h")
+    return out
+
+
 def _perf_lines(perf: Dict[str, Any]) -> List[str]:
     """Agent report card → compact human lines (shared by text + HTML)."""
     if not perf:
@@ -704,6 +779,12 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
             ct = _critic_text(r)
             if ct:
                 t.append(f"       {ct}")
+        t.append("")
+    gov_lines = _governance_lines(d.get("governance"))
+    if gov_lines:
+        t.append("GOVERNANCE TODAY — what leadership must know or decide")
+        for ln in gov_lines:
+            t.append(f"   - {ln}")
         t.append("")
     obj_lines = _objective_lines(d.get("objectives"))
     if obj_lines:
@@ -842,6 +923,10 @@ def render(d: Dict[str, Any], deltas: Dict[str, Any] = None) -> Dict[str, str]:
                 + f' <span style="color:{MUTE}">proposed by {r[1]} · assigned to {r[2]} ({r[4]})</span>'
                 + _critic_html(r)))))
 
+    if gov_lines:
+        h.append(section('Governance Today — What Leadership Must Know or Decide',
+                         lis(gov_lines, lambda ln: ln)))
+
     if obj_lines:
         h.append(section('Business Objectives — What the Agent Fleet Is Pursuing',
                          lis(obj_lines, lambda ln: ln)))
@@ -957,6 +1042,11 @@ def render_role(d: Dict[str, Any], deltas: Dict[str, Any], role: str) -> Dict[st
     for s in sections:
         title, inner = sec_html[s]
         h.append(section(title, inner))
+    # Governance today — the CEO sees the whole picture (escalations land on
+    # that desk, D4); every other authority sees it only when it has lines.
+    _gl = _governance_lines(d.get("governance"))
+    if _gl and (role == "CEO" or any("BREACH" in ln or "STRANDED" in ln for ln in _gl)):
+        h.append(section('Governance Today', lis(_gl, lambda ln: ln)))
     # Approvals routed to THIS executive (assigned_to is "ROLE Full Name")
     mine = [r for r in d.get("approvals", []) if str(r[2]).startswith(role)]
     if mine:

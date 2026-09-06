@@ -27,9 +27,10 @@ import json
 import logging
 import os
 import time
+import uuid as _uuid_mod
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -167,28 +168,113 @@ def decide(confidence: float) -> str:
 # Queue
 # ============================================================================
 
+class ProposalCapReached(RuntimeError):
+    """This action class has used its daily share of an executive's attention.
+
+    Raised by `propose()` when `governance_action_policies.daily_proposal_cap`
+    is met. It is an exception rather than a silent return because the caller
+    has produced a real candidate: something must decide whether to defer it,
+    record it, or drop it, and that decision belongs to the producer, not to a
+    `None` nobody checks."""
+
+    def __init__(self, action_type: str, cap: int, approver: Optional[str] = None):
+        self.action_type, self.cap, self.approver = action_type, cap, approver
+        super().__init__(f"{action_type} has reached its daily cap of {cap} "
+                         f"proposal(s) for the {approver or 'approver'}")
+
+
 def propose(action_type: str, proposed_by: str, params: Dict[str, Any],
             entity_type: Optional[str] = None, entity_id: Optional[str] = None,
             confidence: float = 0.0, severity: Optional[str] = None,
             ttl_hours: Optional[int] = 72) -> str:
-    """Enqueue a pending action for human approval. Returns approval_uuid."""
+    """Enqueue a pending action for human approval. Returns approval_uuid.
+
+    ACTIVATION (docs/governance/activation_plan.md §6–§8). A proposal is born
+    with its governance facts, not annotated with them later:
+
+        authority_role        which of the five authorities decides (policy)
+        accountable_owner_id  the ELIGIBLE human who owns the outcome — the
+                              authority's executive, or the CEO flagged as an
+                              ownership exception. The trigger refuses a
+                              pending row without one.
+        due_at / sla_hours    the 48-hour decision clock (D3), durable
+        decision_mode / policy_version   what policy put it here
+
+    `expires_at` is written NULL. Expiry is no longer a state a proposal can
+    reach on its own: at due_at it is BREACHED and escalated (D4), and it stays
+    decidable. `ttl_hours` is kept in the signature so every caller still
+    compiles; it is deliberately ignored.
+
+    Raises `ProposalCapReached` when the class has used its `daily_proposal_cap`
+    — a governance statement about how much of one executive's day this class
+    may consume, versioned in the same row that names them. The refusal is
+    counted and alerted, never silent.
+    """
+    from app.core import governance_policy as gp
+    pol = gp.policy_for(action_type)
+    owner = gp.resolve_accountable_owner(pol.get("approver_role"))   # raises when nobody eligible
+    sla_hours = int(pol.get("sla_hours") or gp.DEFAULT_SLA_HOURS)
+    cap = pol.get("daily_proposal_cap")
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            # THE CAP, CHECKED IN THE SAME STATEMENT THAT INSERTS. A separate
+            # count-then-insert would let two producers each see room; this
+            # cannot exceed the cap by more than the number of TRULY concurrent
+            # inserts, which for the nightly miner on the leader is one. Stated
+            # rather than claimed exact: READ COMMITTED does not serialise the
+            # subselect, and pretending otherwise would be the kind of comment
+            # this codebase keeps finding to be wrong.
+            if cap:
+                cur.execute(
+                    """SELECT count(*) >= %(cap)s FROM action_approvals
+                        WHERE action_type=%(at)s
+                          AND created_at >= date_trunc('day', now())""",
+                    {"cap": int(cap), "at": action_type})
+                if cur.fetchone()[0]:
+                    conn.rollback()
+                    _record_cap_refusal(action_type, int(cap), pol, owner)
+                    raise ProposalCapReached(action_type, int(cap),
+                                             pol.get("approver_role"))
             cur.execute(
                 """INSERT INTO action_approvals
                      (action_type, proposed_by, entity_type, entity_id, params,
-                      confidence, severity, expires_at)
+                      confidence, severity, expires_at,
+                      authority_role, accountable_owner_id, accountable_owner,
+                      ownership_exception, decision_mode, policy_version,
+                      sla_hours, due_at)
                    VALUES (%(at)s,%(by)s,%(et)s,%(eid)s,%(p)s::jsonb,%(cf)s,%(sev)s,
-                           CASE WHEN %(ttl)s IS NULL THEN NULL
-                                ELSE now() + (%(ttl)s||' hours')::interval END)
+                           NULL,
+                           %(role)s, %(oid)s::uuid, %(olabel)s, %(oexc)s,
+                           %(mode)s, %(pver)s, %(sla)s,
+                           now() + make_interval(hours => %(sla)s))
                    RETURNING approval_uuid""",
                 {"at": action_type, "by": proposed_by, "et": entity_type,
                  "eid": str(entity_id) if entity_id else None,
                  "p": json.dumps(params or {}), "cf": confidence, "sev": severity,
-                 "ttl": ttl_hours})
+                 "role": owner["role"], "oid": owner["owner_id"],
+                 "olabel": owner.get("label"), "oexc": bool(owner.get("exception")),
+                 "mode": pol.get("decision_mode"), "pver": pol.get("policy_version"),
+                 "sla": sla_hours})
             aid = str(cur.fetchone()[0])
         conn.commit()
+        if owner.get("exception"):
+            # Owned by the CEO because the responsible role has no eligible
+            # executive. That is a governance gap, and it gets its own work item
+            # so it is counted and closed rather than absorbed silently.
+            try:
+                from app.core import governance_alerts
+                governance_alerts.open_alert(
+                    "ownership_exception",
+                    f"{action_type} routed to the CEO: no eligible "
+                    f"{owner.get('requested_role')} executive",
+                    rule="ownership_exception", severity="medium", source="governance",
+                    affected_type="approval", affected_id=aid,
+                    detail={"requested_role": owner.get("requested_role"),
+                            "action_type": action_type},
+                    dedupe_key=f"ownership_exception:{owner.get('requested_role')}")
+            except Exception as exc:                          # noqa: BLE001
+                logger.warning(f"[governance] ownership-exception alert skipped: {exc}")
         logger.info(f"[governance] proposed {action_type} by {proposed_by} "
                     f"(conf={confidence}) → {aid[:8]}")
         # Independent critique FIRST (best-effort) so the routed notification
@@ -249,6 +335,23 @@ def record_preauthorized(action_type: str, performed_by: str, policy: str,
     never roll back the customer-visible action it describes.
     """
     try:
+        # The standing policy's declared owner is the accountable human for an
+        # automatic action (activation §10/§16): technical decider = the policy,
+        # accountable owner = the executive who owns that policy. Best-effort —
+        # a ledger write must never fail because the policy row is missing.
+        _owner_id = _owner_label = None
+        _mode = _pver = None
+        try:
+            from app.core import governance_policy as gp
+            _pol = gp.policy_for(action_type)
+            _mode, _pver = _pol.get("decision_mode"), _pol.get("policy_version")
+            _o = gp.resolve_accountable_owner(_pol.get("policy_owner")
+                                              if (_pol.get("policy_owner") or "").upper()
+                                              in gp.AUTHORITY_ROLES
+                                              else _pol.get("approver_role"))
+            _owner_id, _owner_label = _o["owner_id"], _o.get("label")
+        except Exception as exc:                              # noqa: BLE001
+            logger.debug(f"[governance] preauthorized owner not resolved: {exc}")
         conn = get_connection()
         try:
             with conn.cursor() as cur:
@@ -256,11 +359,14 @@ def record_preauthorized(action_type: str, performed_by: str, policy: str,
                     """INSERT INTO action_approvals
                          (action_type, proposed_by, entity_type, entity_id,
                           params, confidence, status, decided_by, decided_at,
-                          decision_reason, result, executed_at, expires_at)
+                          decision_reason, result, executed_at, expires_at,
+                          accountable_owner_id, accountable_owner, decision_mode,
+                          policy_version, decided_via)
                        VALUES (%(at)s,%(by)s,%(et)s,%(eid)s,%(p)s::jsonb,1.0,
                                'executed', %(db)s, COALESCE(%(ts)s, now()),
                                %(why)s, %(r)s::jsonb, COALESCE(%(ts)s, now()),
-                               NULL)
+                               NULL, %(oid)s::uuid, %(olabel)s, %(mode)s, %(pver)s,
+                               'policy')
                        RETURNING approval_uuid""",
                     {"at": action_type, "by": performed_by,
                      "et": entity_type,
@@ -270,7 +376,9 @@ def record_preauthorized(action_type: str, performed_by: str, policy: str,
                      "ts": performed_at,
                      "why": f"pre-authorized by standing policy '{policy}' — "
                             f"executed before this record was written",
-                     "r": json.dumps(result or {})})
+                     "r": json.dumps(result or {}),
+                     "oid": _owner_id, "olabel": _owner_label,
+                     "mode": _mode, "pver": _pver})
                 aid = str(cur.fetchone()[0])
             conn.commit()
         finally:
@@ -662,6 +770,34 @@ def _deliver_approval_chat(chosen: Dict[str, Any], channel: str, approval_uuid: 
     return {"delivered": bool(res.get("sent")), "channel": channel, "result": res}
 
 
+def _record_cap_refusal(action_type: str, cap: int, pol: Dict[str, Any],
+                        owner: Dict[str, Any]) -> None:
+    """Make a capped candidate VISIBLE. One work item per class per day, owned
+    by the approver — so "the KB miner has stopped proposing" is never something
+    a person has to infer from an absence."""
+    from datetime import datetime, timezone
+    day = datetime.now(timezone.utc).date().isoformat()
+    logger.info(f"[governance] {action_type} refused: daily cap {cap} reached "
+                f"for {pol.get('approver_role')} on {day}")
+    try:
+        from app.core import governance_alerts
+        governance_alerts.open_alert(
+            "sampled_review",       # a review obligation, not a failure
+            f"{action_type} hit its daily cap of {cap} — further candidates are "
+            f"deferred to tomorrow",
+            rule=None, severity="low", source="governance",
+            affected_type="policy", affected_id=action_type,
+            detail={"action_type": action_type, "daily_cap": cap, "date": day,
+                    "approver_role": pol.get("approver_role"),
+                    "meaning": "the producer had more to propose than this class "
+                               "is allowed to ask of one executive in a day; "
+                               "nothing was lost, and nothing was published"},
+            owner_role=pol.get("approver_role"),
+            dedupe_key=f"proposal_cap:{action_type}:{day}")
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[governance] cap alert not opened for {action_type}: {exc}")
+
+
 def route_approval(approval_uuid: str, action_type: str,
                    params: Dict[str, Any],
                    critique: Optional[Dict[str, Any]] = None
@@ -674,7 +810,16 @@ def route_approval(approval_uuid: str, action_type: str,
     When a critic critique is supplied, it rides along in the notification,
     the audit event, and the one-click decision email."""
     amount = _amount_from(params)
-    role = _affinity_role(action_type)
+    # The approver is POLICY DATA (governance_action_policies.approver_role),
+    # restricted to the five authorities. The keyword affinity table survives
+    # only as the fallback for an action type nobody has declared yet — and
+    # even then it is clamped to an admissible role.
+    from app.core import governance_policy as gp
+    _pol = gp.policy_for(action_type)
+    role = (_pol.get("approver_role") if _pol.get("source") == "db"
+            else _affinity_role(action_type))
+    if role not in gp.AUTHORITY_ROLES:
+        role = gp.ESCALATION_ROLE
     _, summ_text = _action_summary(action_type, params)
 
     conn = get_connection()
@@ -869,7 +1014,6 @@ def renotify_pending(to: Optional[str] = None, limit: int = 20,
                    FROM action_approvals a
                    LEFT JOIN executives e ON e.executive_id = a.assigned_executive_id
                    WHERE a.status='pending'
-                     AND (a.expires_at IS NULL OR a.expires_at > now())
                      AND (%(at)s IS NULL OR a.action_type = %(at)s)
                    ORDER BY a.created_at DESC LIMIT %(lim)s""",
                 {"at": action_type, "lim": int(limit)})
@@ -910,7 +1054,14 @@ def _row(approval_uuid: str) -> Optional[Dict[str, Any]]:
             cur.execute(
                 """SELECT approval_uuid, action_type, proposed_by, entity_type,
                           entity_id, params, confidence, severity, status,
-                          created_at, expires_at, result, executed_at
+                          created_at, expires_at, result, executed_at,
+                          decided_by, decided_at, decision_reason,
+                          authority_role, accountable_owner_id::text AS accountable_owner_id,
+                          accountable_owner, ownership_exception, decision_mode,
+                          policy_version, sla_hours, due_at, breached_at,
+                          escalated_at, escalation_status, executing_at,
+                          execution_token, verification, decided_via, assigned_to,
+                          amount, critique
                    FROM action_approvals WHERE approval_uuid=%s::uuid""",
                 (approval_uuid,))
             r = cur.fetchone()
@@ -920,14 +1071,22 @@ def _row(approval_uuid: str) -> Optional[Dict[str, Any]]:
             d["approval_uuid"] = str(d["approval_uuid"])
             d["entity_id"] = str(d["entity_id"]) if d["entity_id"] else None
             d["confidence"] = float(d["confidence"]) if d["confidence"] is not None else None
-            for k in ("created_at", "expires_at"):
-                d[k] = d[k].isoformat() if d[k] else None
+            d["amount"] = float(d["amount"]) if d.get("amount") is not None else None
+            for k in ("created_at", "expires_at", "decided_at", "due_at", "breached_at",
+                      "escalated_at", "executing_at", "executed_at"):
+                d[k] = d[k].isoformat() if d.get(k) else None
             return d
     finally:
         conn.close()
 
 
-def pending() -> List[Dict[str, Any]]:
+def pending(authority: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Every proposal still awaiting a decision, breached ones FIRST.
+
+    No `expires_at` filter any more: a proposal past its deadline is breached
+    and escalated, and it must be the most visible thing in the queue rather
+    than the one thing hidden from it. `authority` narrows to one role's
+    desk; the CEO additionally sees everything escalated to them."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -935,18 +1094,25 @@ def pending() -> List[Dict[str, Any]]:
                 cur.execute(
                     """SELECT approval_uuid, action_type, proposed_by, entity_type,
                               entity_id, params, confidence, severity, created_at,
-                              expires_at, amount, assigned_to, critique
+                              expires_at, amount, assigned_to, critique,
+                              authority_role, accountable_owner, ownership_exception,
+                              decision_mode, policy_version, sla_hours, due_at,
+                              breached_at, escalated_at, escalation_status,
+                              EXTRACT(EPOCH FROM (due_at - now()))/3600.0 AS hours_left
                        FROM action_approvals
-                       WHERE status='pending' AND (expires_at IS NULL OR expires_at>now())
-                       ORDER BY created_at""")
+                       WHERE status='pending'
+                         AND (%(auth)s IS NULL OR authority_role=%(auth)s
+                              OR (%(auth)s='CEO' AND escalation_status='escalated'))
+                       ORDER BY (escalation_status <> 'none') DESC, due_at NULLS LAST, created_at""",
+                    {"auth": (authority or "").upper() or None})
             except Exception:
-                conn.rollback()   # routing/critic migrations not applied yet
+                conn.rollback()   # activation migration not applied yet
                 cur.execute(
                     """SELECT approval_uuid, action_type, proposed_by, entity_type,
                               entity_id, params, confidence, severity, created_at,
                               expires_at
                        FROM action_approvals
-                       WHERE status='pending' AND (expires_at IS NULL OR expires_at>now())
+                       WHERE status='pending'
                        ORDER BY created_at""")
             cols = [c[0] for c in cur.description]
             out = []
@@ -955,11 +1121,17 @@ def pending() -> List[Dict[str, Any]]:
                 d["approval_uuid"] = str(d["approval_uuid"])
                 d["entity_id"] = str(d["entity_id"]) if d["entity_id"] else None
                 d["confidence"] = float(d["confidence"]) if d["confidence"] is not None else None
-                for k in ("created_at", "expires_at"):
-                    d[k] = d[k].isoformat() if d[k] else None
+                if d.get("amount") is not None:
+                    d["amount"] = float(d["amount"])
+                if d.get("hours_left") is not None:
+                    d["hours_left"] = round(float(d["hours_left"]), 1)
+                for k in ("created_at", "expires_at", "due_at", "breached_at", "escalated_at"):
+                    if k in d:
+                        d[k] = d[k].isoformat() if d[k] else None
                 # 'What you are approving' — same rows the email/notification use.
                 d["summary"] = [{"label": k, "value": v} for k, v in
                                 _summary_rows(d.get("action_type"), d.get("params"))]
+                d["reversible"] = d.get("action_type") in _UNDO
                 out.append(d)
             return out
     finally:
@@ -971,14 +1143,27 @@ def history(limit: int = 30) -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """SELECT approval_uuid, action_type, proposed_by, entity_type,
-                          entity_id, confidence, severity, status, decided_by,
-                          decided_at, decision_reason, result, created_at
-                   FROM action_approvals
-                   WHERE status <> 'pending'
-                   ORDER BY COALESCE(decided_at, created_at) DESC
-                   LIMIT %s""", (int(limit),))
+            try:
+                cur.execute(
+                    """SELECT approval_uuid, action_type, proposed_by, entity_type,
+                              entity_id, confidence, severity, status, decided_by,
+                              decided_at, decision_reason, result, created_at,
+                              assigned_to, authority_role, accountable_owner,
+                              decided_via, verification, breached_at, escalated_at
+                       FROM action_approvals
+                       WHERE status <> 'pending'
+                       ORDER BY COALESCE(decided_at, created_at) DESC
+                       LIMIT %s""", (int(limit),))
+            except Exception:
+                conn.rollback()   # activation migration not applied yet
+                cur.execute(
+                    """SELECT approval_uuid, action_type, proposed_by, entity_type,
+                              entity_id, confidence, severity, status, decided_by,
+                              decided_at, decision_reason, result, created_at
+                       FROM action_approvals
+                       WHERE status <> 'pending'
+                       ORDER BY COALESCE(decided_at, created_at) DESC
+                       LIMIT %s""", (int(limit),))
             cols = [c[0] for c in cur.description]
             out = []
             for r in cur.fetchall():
@@ -986,8 +1171,9 @@ def history(limit: int = 30) -> List[Dict[str, Any]]:
                 d["approval_uuid"] = str(d["approval_uuid"])
                 d["entity_id"] = str(d["entity_id"]) if d["entity_id"] else None
                 d["confidence"] = float(d["confidence"]) if d["confidence"] is not None else None
-                for k in ("created_at", "decided_at"):
-                    d[k] = d[k].isoformat() if d[k] else None
+                for k in ("created_at", "decided_at", "breached_at", "escalated_at"):
+                    if k in d:
+                        d[k] = d[k].isoformat() if d[k] else None
                 out.append(d)
             return out
     finally:
@@ -1110,59 +1296,746 @@ async def _execute(ap: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-async def approve(approval_uuid: str, decided_by: str = "human",
-                  reason: Optional[str] = None) -> Dict[str, Any]:
-    ap = _row(approval_uuid)
-    if not ap:
-        return {"ok": False, "error": "not found"}
-    if ap["status"] != "pending":
-        return {"ok": False, "error": f"not pending (status={ap['status']})"}
-    _set(approval_uuid, "approved", decided_by, reason)
-    res = await _execute(ap)
-    _set(approval_uuid, "executed" if res["ok"] else "failed", result=res)
-    return {"ok": res["ok"], "status": "executed" if res["ok"] else "failed",
-            "approval_uuid": approval_uuid, "result": res}
-
-
-def reject(approval_uuid: str, decided_by: str = "human",
-           reason: Optional[str] = None) -> Dict[str, Any]:
-    ap = _row(approval_uuid)
-    if not ap:
-        return {"ok": False, "error": "not found"}
-    if ap["status"] != "pending":
-        return {"ok": False, "error": f"not pending (status={ap['status']})"}
-    _set(approval_uuid, "rejected", decided_by, reason)
-    return {"ok": True, "status": "rejected", "approval_uuid": approval_uuid}
-
-
 # ============================================================================
-# Stale-approval expiry — pending items don't linger as silent liabilities
+# Decisions — authority-checked, atomic, verified
 # ============================================================================
+#
+# docs/governance/activation_plan.md §7, §15. The previous approve() read the
+# row, checked status in Python, and issued an unconditional UPDATE — twice,
+# across three transactions. Two concurrent approvals of one row both passed the
+# check and both executed; a crash between the second and third transaction
+# left the row 'approved' forever. Now:
+#
+#   1. AUTHORITY.  decided_by must resolve to one of the five authorities
+#      (D2: CEO, CRO, CFO, CTO, COO), and must be the row's authority_role, or
+#      the CEO, or — when the row has been escalated — the escalation
+#      authority. "human", "admin" and a Slack user id that links to no
+#      executive are REFUSED, not recorded. Over HTTP the identity is not even
+#      taken from the request body: `_bound_authority` uses the executive the
+#      SESSION is signed in as (§26.7), so an administrator cannot decide on an
+#      executive's behalf. The one-click email link is the single non-session
+#      path, authorised by possession of the HMAC token mailed to that
+#      executive's own mailbox, and it records decided_actor='email-link' so it
+#      can never be read as a person at a keyboard.
+#   2. ATOMIC CLAIM.  UPDATE ... WHERE status='pending' RETURNING moves the
+#      row to 'executing' with a fresh execution_token. A second approver
+#      finds 0 rows and is told the truth.
+#   3. VERIFY.  After dispatch, _verify_execution asks whether the effect is
+#      observable (dispatch audit row; capability-specific state where known)
+#      and stores the answer. A function returning is not the same as the
+#      business effect existing.
+#   4. FINISH.  UPDATE ... WHERE execution_token=<ours> AND status='executing'.
+#      A row left in 'executing' past EXECUTION_LEASE_MINUTES is STRANDED and
+#      recovered by sla_sweep(): marked failed, alerted, never silently kept.
 
-def expire_stale() -> Dict[str, Any]:
-    """Flip pending approvals past their expires_at to 'expired' (audited).
-    pending() already filters them out of the live queue; this makes the state
-    honest in the table too. Scheduled nightly + POST /governance/expire."""
+EXECUTION_LEASE_MINUTES = int(os.getenv("GOV_EXECUTION_LEASE_MINUTES", "15"))
+DUE_SOON_HOURS = float(os.getenv("GOV_DUE_SOON_HOURS", "12"))
+# How often an escalated, still-undecided approval is re-announced. An
+# escalation stated once is one a busy person can miss; the only thing that
+# stops these is a DECISION (approve / reject / delegate). See §8 of the plan.
+REESCALATE_HOURS = float(os.getenv("GOV_REESCALATE_HOURS", "24"))
+
+
+def _authority_check(ap: Dict[str, Any], decided_by: Optional[str],
+                     via: str) -> Dict[str, Any]:
+    """{ok, role, reason}. Who may decide THIS row."""
+    from app.core import governance_policy as gp
+    row_role = (ap.get("authority_role") or "").upper() or None
+    if via == "email-link":
+        # The token was mailed to the assigned executive; possession decides as
+        # that authority. principal_for_decider records the kind truthfully.
+        return {"ok": True, "role": row_role or gp.ESCALATION_ROLE,
+                "reason": "HMAC decision link mailed to the assigned authority"}
+    role = gp.decider_role(decided_by)
+    if role is None and via == "chat":
+        # Slack / Teams: the user id must link to an executive through the
+        # identity spine. An unlinked id is not an authority.
+        try:
+            from app.core import identity
+            ident = identity.resolve("slack", decided_by or "")
+            email = (getattr(ident, "email", None) or (ident.get("email") if isinstance(ident, dict) else None))
+            role = gp.decider_role(email) if email else None
+        except Exception:                                      # noqa: BLE001
+            role = None
+    if role is None:
+        return {"ok": False, "role": None,
+                "reason": (f"'{decided_by}' is not an approval authority. Decisions are "
+                           f"made by {', '.join(gp.AUTHORITY_ROLES)} — decide as one of "
+                           f"them (executive email or role code).")}
+    if row_role is None or role == row_role or role == gp.ESCALATION_ROLE:
+        return {"ok": True, "role": role, "reason": "authority matches"}
+    if (ap.get("escalation_status") == "escalated"
+            and role == (gp.policy_for(ap["action_type"]).get("escalation_role") or gp.ESCALATION_ROLE)):
+        return {"ok": True, "role": role, "reason": "escalation authority"}
+    return {"ok": False, "role": role,
+            "reason": f"this proposal is assigned to the {row_role}; a {role} may not "
+                      f"decide it (the CEO may, or the {row_role} may delegate)."}
+
+
+def _claim_execution(approval_uuid: str, decided_by: str, reason: Optional[str],
+                     token: str, via: str, role: Optional[str],
+                     actor: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Atomically move pending → executing. None when the row was not pending.
+
+    `decided_by` is the AUTHORITY the decision is recorded against; `actor` is
+    the authenticated identity that performed it. They differ only on the
+    delegated and token paths, and both are kept — the plan's §16 rule that
+    technical attribution and business accountability are separate columns."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """UPDATE action_approvals
-                   SET status='expired', decided_by='system',
-                       decided_at=now(),
-                       decision_reason='expired unactioned (TTL passed)'
-                   WHERE status='pending' AND expires_at IS NOT NULL
-                     AND expires_at < now()
-                   RETURNING approval_uuid::text, action_type""")
-            rows = cur.fetchall()
+                      SET status='executing', decided_by=%(by)s, decided_at=now(),
+                          decision_reason=COALESCE(%(r)s, decision_reason),
+                          executing_at=now(), execution_token=%(tok)s,
+                          decided_via=%(via)s, decided_actor=%(actor)s
+                    WHERE approval_uuid=%(id)s::uuid AND status='pending'
+                RETURNING approval_uuid::text, action_type""",
+                {"by": decided_by, "r": reason, "tok": token, "via": via,
+                 "id": approval_uuid, "actor": actor or decided_by})
+            r = cur.fetchone()
+        conn.commit()
+        return {"approval_uuid": r[0], "action_type": r[1]} if r else None
+    finally:
+        conn.close()
+
+
+def _finish_execution(approval_uuid: str, token: str, status: str,
+                      result: Dict[str, Any], verification: Dict[str, Any]) -> bool:
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE action_approvals
+                      SET status=%(s)s, result=%(res)s::jsonb, executed_at=now(),
+                          verification=%(ver)s::jsonb
+                    WHERE approval_uuid=%(id)s::uuid AND status='executing'
+                      AND execution_token=%(tok)s""",
+                {"s": status, "res": json.dumps(result, default=str),
+                 "ver": json.dumps(verification, default=str),
+                 "id": approval_uuid, "tok": token})
+            n = cur.rowcount
+        conn.commit()
+        return n == 1
+    finally:
+        conn.close()
+
+
+def _verify_execution(ap: Dict[str, Any], res: Dict[str, Any]) -> Dict[str, Any]:
+    """Post-action verification: is the effect OBSERVABLE, not just returned?
+
+    Generic check: the dispatch left an audit row with an accepted outcome.
+    Specific checks: where the capability's effect is a row we can read, read
+    it. Best-effort — a verifier that cannot run says so ('unverified'), which
+    is distinct from 'verified false'."""
+    checks: List[Dict[str, Any]] = []
+    ok_all = True
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """SELECT outcome FROM a2a_dispatches
+                        WHERE intent=%s AND from_agent='governance'
+                          AND at > now() - interval '10 minutes'
+                        ORDER BY at DESC LIMIT 1""", (ap["action_type"],))
+                r = cur.fetchone()
+                dispatched = bool(r and r[0] == "accepted")
+                checks.append({"check": "dispatch_audit_row", "ok": dispatched,
+                               "note": f"outcome={r[0] if r else 'none'}"})
+                ok_all &= dispatched
+            except Exception as exc:                          # noqa: BLE001
+                conn.rollback()
+                checks.append({"check": "dispatch_audit_row", "ok": None,
+                               "note": f"unverified: {str(exc)[:80]}"})
+            data = (res.get("data") or {}) if isinstance(res.get("data"), dict) else {}
+            at = ap["action_type"]
+            try:
+                if at == "order.cancel" and (ap.get("params") or {}).get("order_id"):
+                    cur.execute("SELECT status FROM orders WHERE order_id=%s::uuid",
+                                (ap["params"]["order_id"],))
+                    row = cur.fetchone()
+                    good = bool(row and str(row[0]).lower() == "cancelled")
+                    checks.append({"check": "orders.status=cancelled", "ok": good,
+                                   "note": f"status={row[0] if row else 'missing'}"})
+                    ok_all &= good
+                elif at == "kb.publish" and data.get("article_uuid"):
+                    cur.execute("SELECT status FROM knowledge_articles WHERE article_uuid=%s::uuid",
+                                (data["article_uuid"],))
+                    row = cur.fetchone()
+                    good = bool(row and row[0] == "active")
+                    checks.append({"check": "knowledge_articles.active", "ok": good,
+                                   "note": f"status={row[0] if row else 'missing'}"})
+                    ok_all &= good
+                elif at == "campaign.winback" and data.get("campaign_uuid"):
+                    cur.execute("SELECT 1 FROM marketing_campaigns WHERE campaign_uuid=%s::uuid",
+                                (data["campaign_uuid"],))
+                    good = cur.fetchone() is not None
+                    checks.append({"check": "marketing_campaigns.exists", "ok": good})
+                    ok_all &= good
+            except Exception as exc:                          # noqa: BLE001
+                conn.rollback()
+                checks.append({"check": f"{at}.state", "ok": None,
+                               "note": f"unverified: {str(exc)[:80]}"})
+    finally:
+        conn.close()
+    return {"ok": bool(ok_all), "checks": checks, "verified_at": _now_iso()}
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _decision_event(approval_uuid: str, ap: Dict[str, Any], decision: str,
+                    decided_by: str, role: Optional[str], via: str,
+                    extra: Optional[Dict[str, Any]] = None) -> None:
+    """Audit event for the decision itself (approval.decided). Best-effort."""
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT emit_event('approval.decided','approval',%s::uuid,%s::jsonb,NULL,'governance')",
+                    (approval_uuid, json.dumps({"context": {
+                        "decision": decision, "decided_by": decided_by, "authority": role,
+                        "via": via, "action_type": ap.get("action_type"),
+                        "accountable_owner": ap.get("accountable_owner"),
+                        "escalation_status": ap.get("escalation_status"),
+                        **(extra or {})}}, default=str)))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:                                       # noqa: BLE001
+        logger.debug(f"[governance] decision event skipped: {exc}")
+
+
+async def approve(approval_uuid: str, decided_by: str = "human",
+                  reason: Optional[str] = None, via: str = "api",
+                  actor: Optional[str] = None) -> Dict[str, Any]:
+    ap = _row(approval_uuid)
+    if not ap:
+        return {"ok": False, "error": "not found"}
+    if ap["status"] != "pending":
+        return {"ok": False, "error": f"not pending (status={ap['status']})",
+                "status": ap["status"]}
+    auth = _authority_check(ap, decided_by, via)
+    if not auth["ok"]:
+        logger.warning(f"[governance] approve {approval_uuid[:8]} REFUSED for "
+                       f"'{decided_by}' via {via}: {auth['reason']}")
+        return {"ok": False, "refused": "authority", "error": auth["reason"],
+                "status": ap["status"], "approval_uuid": approval_uuid}
+    token = str(_uuid_mod.uuid4())
+    if not _claim_execution(approval_uuid, decided_by, reason, token, via,
+                            auth["role"], actor):
+        cur_status = (_row(approval_uuid) or {}).get("status")
+        return {"ok": False, "error": f"not pending (status={cur_status}) — already "
+                                      f"decided by someone else", "status": cur_status}
+    try:
+        res = await _execute(ap)
+    except Exception as exc:                                       # noqa: BLE001
+        res = {"ok": False, "error": f"execution raised: {exc}"}
+    verification = _verify_execution(ap, res) if res.get("ok") else \
+        {"ok": False, "checks": [], "note": "not executed"}
+    status = "executed" if res.get("ok") else "failed"
+    finished = _finish_execution(approval_uuid, token, status, res, verification)
+    if not finished:
+        logger.error(f"[governance] {approval_uuid[:8]} finished but the claim was "
+                     f"no longer ours — the lease sweep may have recovered it")
+    if res.get("ok") and not verification.get("ok"):
+        try:
+            from app.core import governance_alerts
+            governance_alerts.open_alert(
+                "verification_failed",
+                f"{ap['action_type']} approved and dispatched, but the effect could "
+                f"not be verified", rule="verification_failed", severity="high",
+                source="governance", affected_type="approval", affected_id=approval_uuid,
+                detail={"verification": verification, "result": res})
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(f"[governance] verification alert skipped: {exc}")
+    _decision_event(approval_uuid, ap, "approve", decided_by, auth["role"], via,
+                    {"status": status, "verified": verification.get("ok"),
+                     "actor": actor or decided_by})
+    return {"ok": bool(res.get("ok")), "status": status, "approval_uuid": approval_uuid,
+            "result": res, "verification": verification, "authority": auth["role"]}
+
+
+def reject(approval_uuid: str, decided_by: str = "human",
+           reason: Optional[str] = None, via: str = "api",
+           actor: Optional[str] = None) -> Dict[str, Any]:
+    ap = _row(approval_uuid)
+    if not ap:
+        return {"ok": False, "error": "not found"}
+    if ap["status"] != "pending":
+        return {"ok": False, "error": f"not pending (status={ap['status']})",
+                "status": ap["status"]}
+    auth = _authority_check(ap, decided_by, via)
+    if not auth["ok"]:
+        logger.warning(f"[governance] reject {approval_uuid[:8]} REFUSED for "
+                       f"'{decided_by}' via {via}: {auth['reason']}")
+        return {"ok": False, "refused": "authority", "error": auth["reason"],
+                "status": ap["status"], "approval_uuid": approval_uuid}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE action_approvals
+                      SET status='rejected', decided_by=%(by)s, decided_at=now(),
+                          decision_reason=COALESCE(%(r)s, decision_reason),
+                          decided_via=%(via)s, decided_actor=%(actor)s
+                    WHERE approval_uuid=%(id)s::uuid AND status='pending'""",
+                {"by": decided_by, "r": reason, "via": via, "id": approval_uuid,
+                 "actor": actor or decided_by})
+            n = cur.rowcount
         conn.commit()
     finally:
         conn.close()
-    if rows:
-        logger.info(f"[governance] expired {len(rows)} stale approval(s): "
-                    f"{[r[1] for r in rows]}")
-    return {"expired": len(rows),
-            "items": [{"approval_uuid": r[0], "action_type": r[1]} for r in rows]}
+    if n != 1:
+        cur_status = (_row(approval_uuid) or {}).get("status")
+        return {"ok": False, "error": f"not pending (status={cur_status})", "status": cur_status}
+    _decision_event(approval_uuid, ap, "reject", decided_by, auth["role"], via,
+                    {"actor": actor or decided_by})
+    return {"ok": True, "status": "rejected", "approval_uuid": approval_uuid,
+            "authority": auth["role"]}
+
+
+def delegate(approval_uuid: str, to_role: str, decided_by: str,
+             reason: str) -> Dict[str, Any]:
+    """Move a pending proposal to another authority's desk. Only when the
+    action's policy allows delegation, and only by the current authority or
+    the CEO. The SLA clock does NOT restart — delegation is not a decision."""
+    from app.core import governance_policy as gp
+    ap = _row(approval_uuid)
+    if not ap:
+        return {"ok": False, "error": "not found"}
+    if ap["status"] != "pending":
+        return {"ok": False, "error": f"not pending (status={ap['status']})"}
+    if not (reason or "").strip():
+        return {"ok": False, "error": "a reason is required to delegate"}
+    to_role = (to_role or "").upper()
+    if to_role not in gp.AUTHORITY_ROLES:
+        return {"ok": False, "error": f"to_role must be one of {gp.AUTHORITY_ROLES}"}
+    pol = gp.policy_for(ap["action_type"])
+    if not pol.get("delegation_allowed"):
+        return {"ok": False, "refused": "policy",
+                "error": f"policy for {ap['action_type']} does not allow delegation"}
+    auth = _authority_check(ap, decided_by, "api")
+    if not auth["ok"]:
+        return {"ok": False, "refused": "authority", "error": auth["reason"]}
+    try:
+        owner = gp.resolve_accountable_owner(to_role)
+    except gp.GovernanceConfigError as exc:
+        return {"ok": False, "error": str(exc)}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE action_approvals
+                      SET authority_role=%(role)s, accountable_owner_id=%(oid)s::uuid,
+                          accountable_owner=%(olabel)s, ownership_exception=%(oexc)s,
+                          assigned_to=%(olabel)s,
+                          decision_reason=COALESCE(decision_reason,'') || %(note)s
+                    WHERE approval_uuid=%(id)s::uuid AND status='pending'""",
+                {"role": owner["role"], "oid": owner["owner_id"], "olabel": owner.get("label"),
+                 "oexc": bool(owner.get("exception")), "id": approval_uuid,
+                 "note": f"\n[delegated {ap.get('authority_role')}→{to_role} by {decided_by}: {reason.strip()}]"})
+            n = cur.rowcount
+            try:
+                cur.execute(
+                    "SELECT emit_event('approval.delegated','approval',%s::uuid,%s::jsonb,NULL,'governance')",
+                    (approval_uuid, json.dumps({"context": {"from": ap.get("authority_role"),
+                                                           "to": to_role, "by": decided_by,
+                                                           "reason": reason.strip()}})))
+            except Exception:                                      # noqa: BLE001
+                pass
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": n == 1, "approval_uuid": approval_uuid, "authority_role": owner["role"],
+            "accountable_owner": owner.get("label")}
+
+
+# ============================================================================
+# The 48-hour clock — breach, escalate, recover. Never expire.
+# ============================================================================
+
+def _notify_owner_breach(cur, owner_id: Optional[str], approval_uuid: str,
+                         ap: Dict[str, Any], event_type: str, title: str, body: str,
+                         kind: str) -> None:
+    if not owner_id:
+        return
+    try:
+        cur.execute(
+            "SELECT emit_event(%s,'approval',%s::uuid,%s::jsonb,NULL,'governance')",
+            (event_type, approval_uuid,
+             json.dumps({"context": {"action_type": ap.get("action_type"),
+                                     "authority": ap.get("authority_role"),
+                                     "due_at": ap.get("due_at"),
+                                     "accountable_owner": ap.get("accountable_owner")}},
+                        default=str)))
+        ev = cur.fetchone()[0]
+        cur.execute(
+            """INSERT INTO notifications
+                 (employee_uuid, event_uuid, channel, status, title, body, metadata)
+               VALUES (%s::uuid, %s, 'in_app', 'pending', %s, %s, %s::jsonb)""",
+            (owner_id, ev, title[:200], body[:2000],
+             json.dumps({"kind": kind, "approval_uuid": approval_uuid,
+                         "action_type": ap.get("action_type")})))
+    except Exception as exc:                                       # noqa: BLE001
+        logger.debug(f"[governance] breach notice skipped: {exc}")
+
+
+def sla_sweep() -> Dict[str, Any]:
+    """Run every 15 minutes. Three passes, each idempotent:
+
+        BREACH    pending & due_at < now & breached_at IS NULL
+                  → breached_at, escalation_status='breached', notify authority
+        ESCALATE  breached & not yet escalated
+                  → escalated_at, escalation_status='escalated', CEO alert +
+                    notice (D4). Same pass as breach: a breach IS the escalation
+                    trigger; splitting them only adds a window in which nobody
+                    has been told.
+        RECOVER   executing/approved rows older than the lease
+                  → status='failed' with a stranded-execution alert. The side
+                    effect may or may not have happened; a human must look.
+        REMIND    escalated & still pending & last notice older than
+                  GOV_REESCALATE_HOURS → say it again, numbered, to the
+                  escalation authority. Acknowledgement IS the decision: there
+                  is no "seen" button, because a governance system whose
+                  reminders can be dismissed without deciding has re-created
+                  the silence it was built to remove.
+
+    Nothing here approves, rejects or expires. Expiry is not a decision."""
+    from app.core import governance_policy as gp
+    out = {"breached": [], "escalated": [], "stranded": []}
+    try:
+        ceo = gp.resolve_accountable_owner(gp.ESCALATION_ROLE)
+    except gp.GovernanceConfigError as exc:
+        logger.error(f"[governance] sla_sweep cannot escalate: {exc}")
+        ceo = None
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT approval_uuid::text FROM action_approvals
+                    WHERE status='pending' AND due_at IS NOT NULL AND due_at < now()
+                      AND escalation_status <> 'escalated'
+                    ORDER BY due_at LIMIT 200""")
+            ids = [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    for aid in ids:
+        ap = _row(aid) or {}
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE action_approvals
+                          SET breached_at=COALESCE(breached_at, now()),
+                              escalated_at=now(), escalation_status='escalated'
+                        WHERE approval_uuid=%s::uuid AND status='pending'
+                    RETURNING breached_at""", (aid,))
+                if cur.rowcount != 1:
+                    conn.rollback(); continue
+                out["breached"].append(aid)
+                # Tell the authority that owned it that the clock ran out.
+                _notify_owner_breach(
+                    cur, ap.get("accountable_owner_id"), aid, ap, "approval.breached",
+                    f"⏰ Decision SLA breached: {ap.get('action_type')}",
+                    f"This proposal passed its {ap.get('sla_hours') or 48}h decision "
+                    f"deadline without a decision. It has been escalated to the "
+                    f"{gp.ESCALATION_ROLE}. It is still yours to decide.",
+                    "approval_breached")
+                if ceo:
+                    _notify_owner_breach(
+                        cur, ceo["owner_id"], aid, ap, "approval.escalated",
+                        f"🚨 Escalated to you: {ap.get('action_type')} "
+                        f"(assigned {ap.get('authority_role')})",
+                        f"The {ap.get('authority_role')} did not decide this within "
+                        f"{ap.get('sla_hours') or 48}h. Per policy it is now yours. "
+                        f"Nothing was executed or rejected automatically.",
+                        "approval_escalated")
+                    out["escalated"].append(aid)
+            conn.commit()
+        except Exception as exc:                                   # noqa: BLE001
+            conn.rollback()
+            logger.warning(f"[governance] breach pass failed for {aid[:8]}: {exc}")
+            continue
+        finally:
+            conn.close()
+        # EMAIL IMMEDIATELY (§26.6, owner decision 2026-09-05). An in-app
+        # notice is only seen by someone already looking at the CRM, and the
+        # failure this whole activation exists to fix is precisely that nobody
+        # was looking. Both the authority whose clock ran out and the CEO it
+        # escalated to are mailed, with the one-click decision links, and the
+        # send is ledgered idempotently per (approval, role).
+        try:
+            _links = decision_links(aid)
+            _text = (
+                f"Approval SLA breached: {ap.get('action_type')} "
+                f"(approval {aid[:8]})\n"
+                f"Assigned authority: {ap.get('authority_role')}\n"
+                f"Accountable owner:  {ap.get('accountable_owner')}\n"
+                f"Due:                {ap.get('due_at')}\n\n"
+                f"Per policy this is now escalated to the {gp.ESCALATION_ROLE}. It has "
+                f"NOT been executed, rejected or expired — the decision is still "
+                f"yours to make.\n\n"
+                f"Decide in the governance console signed in as yourself, or with "
+                f"these one-click links:\n"
+                f"  approve: {_links['approve']}\n"
+                f"  reject:  {_links['reject']}\n")
+            for _role in {ap.get("authority_role"), gp.ESCALATION_ROLE}:
+                _ex = gp.authority_owner(_role) if _role else None
+                if _ex:
+                    gp.email_authority(
+                        _ex,
+                        f"[Action needed] Approval SLA breached: {ap.get('action_type')}",
+                        _text, kind="approval_breach", ref=f"{aid}:{_role}")
+        except Exception as exc:                                   # noqa: BLE001
+            logger.debug(f"[governance] breach email skipped for {aid[:8]}: {exc}")
+
+        # The breach is itself a governed work item owned by the CEO.
+        try:
+            from app.core import governance_alerts
+            al = governance_alerts.open_alert(
+                "approval_breach",
+                f"Approval SLA breached: {ap.get('action_type')} assigned to "
+                f"{ap.get('authority_role')} ({aid[:8]})",
+                rule="approval_breach", severity="high", source="governance",
+                affected_type="approval", affected_id=aid,
+                detail={"action_type": ap.get("action_type"),
+                        "authority_role": ap.get("authority_role"),
+                        "due_at": ap.get("due_at"), "proposed_by": ap.get("proposed_by")},
+                owner_role=gp.ESCALATION_ROLE, dedupe_key=f"approval_breach:{aid}")
+            if al.get("alert_id"):
+                conn = get_connection()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE action_approvals SET alert_id=%s::uuid "
+                                    "WHERE approval_uuid=%s::uuid", (al["alert_id"], aid))
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(f"[governance] breach alert skipped for {aid[:8]}: {exc}")
+
+    # RECOVER stranded executions.
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE action_approvals
+                      SET status='failed', executed_at=now(),
+                          result=COALESCE(result,'{}'::jsonb) || %(res)s::jsonb,
+                          verification=%(ver)s::jsonb
+                    WHERE status IN ('executing','approved')
+                      AND COALESCE(executing_at, decided_at, created_at)
+                          < now() - make_interval(mins => %(lease)s)
+                RETURNING approval_uuid::text, action_type, decided_by""",
+                {"res": json.dumps({"ok": False,
+                                    "error": "stranded: execution never reported back "
+                                             "within the lease; side effects unknown"}),
+                 "ver": json.dumps({"ok": False, "checks": [],
+                                    "note": "stranded execution recovered by sla_sweep"}),
+                 "lease": EXECUTION_LEASE_MINUTES})
+            stranded = cur.fetchall()
+        conn.commit()
+    finally:
+        conn.close()
+    for aid, at, by in stranded:
+        out["stranded"].append(aid)
+        try:
+            from app.core import governance_alerts
+            governance_alerts.open_alert(
+                "stranded_execution",
+                f"{at} was approved by {by} but its execution never completed ({aid[:8]})",
+                rule="stranded_execution", severity="high", source="governance",
+                affected_type="approval", affected_id=aid,
+                detail={"action_type": at, "decided_by": by},
+                dedupe_key=f"stranded:{aid}")
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(f"[governance] stranded alert skipped for {aid[:8]}: {exc}")
+
+    # REMIND — the escalation is a standing obligation, not an announcement.
+    out["reminded"] = []
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT approval_uuid::text, action_type, authority_role,
+                          accountable_owner, due_at, escalation_notices
+                     FROM action_approvals
+                    WHERE status='pending' AND escalation_status='escalated'
+                      AND COALESCE(last_escalation_notice_at, escalated_at)
+                          < now() - make_interval(hours => %(h)s)
+                    ORDER BY escalated_at LIMIT 50""",
+                {"h": int(REESCALATE_HOURS)})
+            due = cur.fetchall()
+    except Exception as exc:
+        conn.rollback()
+        due = []
+        logger.debug(f"[governance] reminder pass unavailable: {str(exc)[:120]}")
+    finally:
+        conn.close()
+
+    for aid, at, auth_role, owner_label, due_at, sent in due:
+        n = int(sent or 0) + 1
+        # Stamp FIRST. If the mail fails, the cadence still advances — a
+        # reminder loop that retries every 15 minutes because a send failed
+        # would turn an escalation into a flood, which is the fastest way to
+        # get the channel filtered into a folder nobody reads.
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE action_approvals
+                          SET escalation_notices=%(n)s, last_escalation_notice_at=now()
+                        WHERE approval_uuid=%(id)s::uuid AND status='pending'""",
+                    {"n": n, "id": aid})
+                if cur.rowcount != 1:
+                    conn.rollback(); continue
+                ap = _row(aid) or {}
+                _notify_owner_breach(
+                    cur, (gp.authority_owner(gp.ESCALATION_ROLE) or {}).get("owner_id"),
+                    aid, ap, "approval.escalated",
+                    f"🔁 Reminder {n}: still undecided — {at}",
+                    f"This proposal was escalated to you and is still pending. "
+                    f"Reminder {n}; it will repeat every "
+                    f"{int(REESCALATE_HOURS)}h until it is approved, rejected or "
+                    f"delegated. Nothing else stops it, and nothing will decide "
+                    f"it on your behalf.",
+                    "approval_escalation_reminder")
+            conn.commit()
+        except Exception as exc:                                   # noqa: BLE001
+            conn.rollback()
+            logger.warning(f"[governance] reminder failed for {aid[:8]}: {exc}")
+            continue
+        finally:
+            conn.close()
+        out["reminded"].append(aid)
+        try:
+            links = decision_links(aid)
+            gp.email_authority(
+                gp.authority_owner(gp.ESCALATION_ROLE),
+                f"[Reminder {n}] Still undecided after escalation: {at}",
+                f"{at} (approval {aid[:8]}) was escalated to you and has still "
+                f"not been decided.\n"
+                f"Originally assigned to: {auth_role} · owner {owner_label}\n"
+                f"Deadline passed: {due_at}\n"
+                f"Reminder number: {n}\n\n"
+                f"This repeats every {int(REESCALATE_HOURS)}h until a decision "
+                f"exists. There is no way to acknowledge it without deciding.\n\n"
+                f"  approve: {links['approve']}\n  reject:  {links['reject']}\n",
+                kind="approval_reescalation", ref=f"{aid}:reminder:{n}")
+        except Exception as exc:                                   # noqa: BLE001
+            logger.debug(f"[governance] reminder email skipped for {aid[:8]}: {exc}")
+
+    if any(out.values()):
+        logger.warning(f"[governance] SLA sweep — breached {len(out['breached'])}, "
+                       f"escalated {len(out['escalated'])}, stranded "
+                       f"{len(out['stranded'])}, reminded {len(out['reminded'])}")
+    return {"ok": True, **{k: len(v) for k, v in out.items()}, "ids": out}
+
+
+def expire_stale() -> Dict[str, Any]:
+    """RETIRED. Expiry was a system decision recorded as `decided_by='system'`;
+    59 of 66 Railway proposals ended that way. Kept as a name so old callers
+    still run — it now runs the SLA sweep, which breaches and escalates instead.
+    No row is ever set to 'expired' again."""
+    res = sla_sweep()
+    return {"expired": 0, "deprecated": True,
+            "note": "expiry is a governance breach, not a decision — see sla_sweep()",
+            "sweep": res}
+
+
+def my_approvals(authority: str) -> Dict[str, Any]:
+    """One authority's desk: pending / due soon / breached / escalated / recent."""
+    from app.core import governance_policy as gp
+    role = (authority or "").upper()
+    if role not in gp.AUTHORITY_ROLES:
+        return {"error": f"authority must be one of {gp.AUTHORITY_ROLES}"}
+    rows = pending(role)
+    due_soon = [r for r in rows if r.get("hours_left") is not None
+                and 0 <= r["hours_left"] <= DUE_SOON_HOURS]
+    breached = [r for r in rows if r.get("escalation_status") in ("breached", "escalated")]
+    escalated_to_me = [r for r in rows if role == gp.ESCALATION_ROLE
+                       and r.get("escalation_status") == "escalated"
+                       and r.get("authority_role") != role]
+    recent = [h for h in history(40) if str(h.get("decided_by") or "").lower()
+              in {a.get("email") for a in gp.authorities() if a["role_code"] == role}
+              or (h.get("assigned_to") or "").startswith(role)][:15]
+    return {"authority": role, "pending": rows, "due_soon": due_soon,
+            "breached": breached, "escalated_to_me": escalated_to_me,
+            "recent": recent, "due_soon_hours": DUE_SOON_HOURS}
+
+
+def metrics() -> Dict[str, Any]:
+    """The governance numbers the briefing and the health page both read."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT
+                     count(*) FILTER (WHERE status='pending')                                    AS pending,
+                     count(*) FILTER (WHERE status='pending' AND due_at IS NOT NULL
+                                        AND due_at BETWEEN now() AND now() + make_interval(hours => %(soon)s)) AS due_soon,
+                     count(*) FILTER (WHERE status='pending' AND escalation_status='breached')  AS breached_open,
+                     count(*) FILTER (WHERE status='pending' AND escalation_status='escalated') AS escalated_open,
+                     count(*) FILTER (WHERE status='pending' AND ownership_exception)           AS pending_ownership_exceptions,
+                     count(*) FILTER (WHERE status IN ('executing','approved'))                 AS in_flight,
+                     count(*) FILTER (WHERE status IN ('executing','approved')
+                                        AND COALESCE(executing_at, decided_at) < now() - make_interval(mins => %(lease)s)) AS stranded,
+                     count(*) FILTER (WHERE created_at > now() - interval '24 hours')           AS created_24h,
+                     count(*) FILTER (WHERE status='executed' AND decided_at > now() - interval '24 hours'
+                                        AND decided_by NOT LIKE 'policy:%%')                    AS approved_24h,
+                     count(*) FILTER (WHERE status='executed' AND decided_at > now() - interval '24 hours'
+                                        AND decided_by LIKE 'policy:%%')                        AS auto_executed_24h,
+                     count(*) FILTER (WHERE status='rejected' AND decided_at > now() - interval '24 hours') AS rejected_24h,
+                     count(*) FILTER (WHERE status='failed' AND executed_at > now() - interval '24 hours')  AS failed_24h,
+                     count(*) FILTER (WHERE breached_at > now() - interval '7 days')            AS breached_7d,
+                     count(*) FILTER (WHERE status='expired' AND decided_at > now() - interval '7 days') AS expired_7d,
+                     count(*) FILTER (WHERE created_at > now() - interval '7 days')             AS created_7d,
+                     count(*) FILTER (WHERE status='executed' AND verification IS NOT NULL
+                                        AND (verification->>'ok')='false'
+                                        AND executed_at > now() - interval '7 days')            AS verification_failed_7d,
+                     percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (decided_at - created_at))/3600.0)
+                        FILTER (WHERE decided_at > now() - interval '30 days' AND decided_by NOT LIKE 'policy:%%'
+                                  AND decided_by <> 'system' AND status IN ('executed','failed','rejected')) AS median_decision_hours,
+                     percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (decided_at - created_at))/3600.0)
+                        FILTER (WHERE decided_at > now() - interval '30 days' AND decided_by NOT LIKE 'policy:%%'
+                                  AND decided_by <> 'system' AND status IN ('executed','failed','rejected')) AS p95_decision_hours
+                   FROM action_approvals""",
+                {"soon": int(DUE_SOON_HOURS), "lease": int(EXECUTION_LEASE_MINUTES)})
+            r = cur.fetchone()
+            cols = [c[0] for c in cur.description]
+            m: Dict[str, Any] = {}
+            for k, v in zip(cols, r):
+                m[k] = (round(float(v), 1) if k.endswith("_hours") and v is not None
+                        else (int(v) if v is not None and not k.endswith("_hours") else v))
+            cur.execute(
+                """SELECT COALESCE(authority_role,'unassigned'), count(*)
+                     FROM action_approvals WHERE status='pending' GROUP BY 1 ORDER BY 1""")
+            m["pending_by_authority"] = {k: int(v) for k, v in cur.fetchall()}
+            cur.execute(
+                """SELECT COALESCE(split_part(decided_by,' ',1),'?') , count(*)
+                     FROM action_approvals
+                    WHERE decided_at > now() - interval '30 days'
+                      AND decided_by NOT LIKE 'policy:%%' AND decided_by <> 'system'
+                    GROUP BY 1 ORDER BY 2 DESC LIMIT 8""")
+            m["decisions_30d_by_decider"] = {k: int(v) for k, v in cur.fetchall()}
+            created7 = m.get("created_7d") or 0
+            m["breach_rate_7d_pct"] = (round(100.0 * (m.get("breached_7d") or 0) / created7, 1)
+                                       if created7 else 0.0)
+            m["available"] = True
+            return m
+    except Exception as exc:
+        conn.rollback()
+        return {"available": False, "error": str(exc).splitlines()[0][:160]}
+    finally:
+        conn.close()
 
 
 # ============================================================================
@@ -1334,9 +2207,61 @@ router = APIRouter(tags=["governance"])
 
 @router.get("/governance/status")
 def governance_status():
+    from app.core import governance_policy as gp
+    pol = gp.list_policies()
     return {"enabled": ENABLED, "act_min": act_min(), "propose_min": propose_min(),
             "defaults": {"act_min": ACT_MIN, "propose_min": PROPOSE_MIN},
-            "pending": len(pending())}
+            "pending": len(pending()),
+            # ACTIVATION: confidence no longer grants authority. These two
+            # numbers are shown for what they still do — propose_min refuses
+            # low-confidence writes; act_min is informational.
+            "confidence_grants_authority": False,
+            "policy_table": pol.get("available"),
+            "decision_required": pol.get("decision_required"),
+            "undeclared_write_capabilities": pol.get("undeclared_write_capabilities"),
+            "sla_hours": gp.DEFAULT_SLA_HOURS, "escalation_role": gp.ESCALATION_ROLE,
+            "authorities": gp.AUTHORITY_ROLES,
+            "metrics": metrics()}
+
+
+@router.get("/governance/my-approvals")
+def governance_my_approvals(authority: str):
+    """One authority's desk: pending, due soon, breached, escalated, recent."""
+    return my_approvals(authority)
+
+
+@router.get("/governance/work")
+def governance_work():
+    """Every open governance work item: pending approvals + live alerts."""
+    from app.core import governance_alerts
+    return {"approvals": pending(), "alerts": governance_alerts.list_alerts(),
+            "metrics": metrics(), "alert_metrics": governance_alerts.metrics()}
+
+
+@router.get("/governance/metrics")
+def governance_metrics_api():
+    from app.core import governance_alerts
+    return {"approvals": metrics(), "alerts": governance_alerts.metrics()}
+
+
+@router.post("/governance/sla-sweep")
+def governance_sla_sweep():
+    """Breach + escalate overdue approvals, recover stranded executions,
+    escalate overdue alerts. Also runs every 15 minutes on the scheduler."""
+    from app.core import governance_alerts
+    return {"approvals": sla_sweep(), "alerts": governance_alerts.sweep_sla()}
+
+
+class _Delegate(BaseModel):
+    to_role: str
+    decided_by: Optional[str] = None     # ignored — the signed-in executive delegates
+    reason: str
+
+
+@router.post("/governance/delegate/{approval_uuid}")
+def governance_delegate(request: Request, approval_uuid: str, body: _Delegate):
+    ex = _bound_authority(request)
+    return delegate(approval_uuid, body.to_role, ex["email"], body.reason)
 
 
 # ── Policy-as-data endpoints (audit #4) ──────────────────────────────────────
@@ -1512,18 +2437,63 @@ def governance_history_delete(body: _DeleteBody):
 
 
 class _Decision(BaseModel):
-    decided_by: str = "human"
+    # `decided_by` is KEPT FOR WIRE COMPATIBILITY AND IGNORED. The authority a
+    # decision is recorded against is the executive the request is SIGNED IN
+    # as (plan §6, §26.7) — a request body cannot choose whose decision this is,
+    # which is the whole point of binding identity.
+    decided_by: Optional[str] = None
     reason: Optional[str] = None
 
 
+def _bound_authority(request: Request) -> Dict[str, Any]:
+    """The executive this request is authenticated as, or a 403 that says how to
+    become one.
+
+    An admin TOKEN carries no session, and an admin session that is not an
+    executive is not an authority. Both may read every desk; neither may decide.
+    Refusing here rather than recording the decision is the difference between
+    "an executive approved this" being a fact and being a UI selection."""
+    from app.core import governance_policy as gp
+    ex = gp.session_authority(request)
+    if not ex:
+        sess = getattr(getattr(request, "state", None), "session", None) or {}
+        who = sess.get("identifier") or "an admin token"
+        raise HTTPException(
+            status_code=403,
+            detail=(f"Decisions are bound to the signed-in executive. This request is "
+                    f"authenticated as {who}, which is not one of the approval "
+                    f"authorities ({', '.join(gp.AUTHORITY_ROLES)}). Sign in with the "
+                    f"executive's own credential — an administrator cannot decide on "
+                    f"an executive's behalf."))
+    if not ex.get("eligible"):
+        raise HTTPException(
+            status_code=403,
+            detail=(f"{ex['role_code']} {ex['full_name']} is signed in but is not an "
+                    f"eligible work owner yet (no active membership). Grant it before "
+                    f"deciding, so the decision has an accountable owner."))
+    return ex
+
+
 @router.post("/governance/approve/{approval_uuid}")
-async def governance_approve(approval_uuid: str, body: _Decision = _Decision()):
-    return await approve(approval_uuid, body.decided_by, body.reason)
+async def governance_approve(request: Request, approval_uuid: str,
+                             body: _Decision = _Decision()):
+    ex = _bound_authority(request)
+    res = await approve(approval_uuid, ex["email"], body.reason,
+                        via="session", actor=ex["email"])
+    if res.get("refused") == "authority":
+        raise HTTPException(status_code=403, detail=res.get("error"))
+    return res
 
 
 @router.post("/governance/reject/{approval_uuid}")
-def governance_reject(approval_uuid: str, body: _Decision = _Decision()):
-    return reject(approval_uuid, body.decided_by, body.reason)
+def governance_reject(request: Request, approval_uuid: str,
+                      body: _Decision = _Decision()):
+    ex = _bound_authority(request)
+    res = reject(approval_uuid, ex["email"], body.reason, via="session",
+                 actor=ex["email"])
+    if res.get("refused") == "authority":
+        raise HTTPException(status_code=403, detail=res.get("error"))
+    return res
 
 
 @router.post("/governance/undo/{approval_uuid}")
@@ -1535,7 +2505,7 @@ async def governance_undo(approval_uuid: str, body: _Decision = _Decision()):
 
 @router.post("/governance/expire")
 def governance_expire():
-    """Flip pending approvals past their TTL to 'expired' (also runs nightly)."""
+    """RETIRED name, kept for callers: runs the SLA sweep. Nothing expires."""
     return expire_stale()
 
 
@@ -1601,7 +2571,8 @@ async def governance_decide_link(g: str = "", a: str = "", t: str = ""):
             body=f"This approval was already <b>{ap['status']}</b>. "
                  f"Nothing further happened."))
     if action == "approve":
-        res = await approve(g, decided_by="email-link")
+        res = await approve(g, decided_by="email-link", via="email-link",
+                            actor="email-link")
         ok = res.get("ok")
         return HTMLResponse(_DECIDE_PAGE.format(
             title="Approved ✓" if ok else "Approved — execution failed",
@@ -1609,7 +2580,7 @@ async def governance_decide_link(g: str = "", a: str = "", t: str = ""):
                   f"{'executed' if ok else 'queued but FAILED to execute'}."
                   + (f"<br><br>{res.get('result', {}).get('error') or ''}"
                      if not ok else ""))))
-    res = reject(g, decided_by="email-link")
+    res = reject(g, decided_by="email-link", via="email-link", actor="email-link")
     return HTMLResponse(_DECIDE_PAGE.format(
         title="Rejected ✓",
         body=f"<b>{ap['action_type']}</b> was rejected. No action was taken."))

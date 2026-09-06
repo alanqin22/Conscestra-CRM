@@ -2007,6 +2007,49 @@ the registry arms itself at startup so a fresh deployment is never accidentally
 permissive, and an operator's decision to disable something survives every
 subsequent deploy.
 
+## Every Approval Names the Executive Who Made It
+
+Five executive authorities govern this platform — **CEO, CRO, CFO, CTO and COO** — and each
+one is a named person with an individual sign-in. Every action class routes to the officer
+accountable for it: revenue actions to the CRO, financial actions to the CFO, technology and
+data to the CTO, operations to the COO, with the CEO holding escalation.
+
+**Authority is bound to the authenticated session.** When an executive approves something,
+the platform records the person who was signed in — their identity comes from the session,
+never from a field in the request. An administrator cannot act on an executive's behalf, and
+no approval is attributable to someone merely because their name was selected in a console.
+
+**Governance access is separate from platform administration.** An executive's application
+role stays ordinary; their authority to decide comes from the executive register alone. This
+keeps the two powers independent: the people who approve business actions do not
+administer the platform, and the people who administer the platform do not approve business
+actions.
+
+Each authority holds a distinct identity across five layers — the authority record, the
+owner identity that work is attributed to, directory membership, the sign-in credential, and
+the policy that names them as approver. The platform verifies all five and reports any that
+is incomplete, so an authority is either fully constituted or visibly pending.
+
+**Identity claims are attested, not inferred.** An owner counts as a real person only when a
+named human has vouched for them on the record, and the platform reports how many of its
+authorized identities carry that attestation. Real accountability is asserted by a person and
+can be traced back to them.
+
+## Executives Recover Their Own Access Securely
+
+Password recovery is self-service and evidence-based. An executive requests a code from the
+sign-in page, receives it in their own mailbox, and chooses a new password themselves. The
+platform never stores, displays, or transmits a password chosen by anyone else — each
+credential begins life with a secret that is generated and discarded unread, so the account
+holder is the first and only person to know their password.
+
+Recovery codes are **single-use and self-retiring**: completing a reset invalidates every
+other outstanding code for that account, so a spare code left in an inbox stops working the
+moment the account is secured. Codes expire on a short timer, requests are rate-limited per
+account, and the request endpoint returns the same response whether or not an account exists,
+so it confirms nothing to an unknown caller. Every issued code is recorded, so recovery
+activity is fully auditable.
+
 ## Verify Database Behavior, Not Just Structure
 
 Comparing two databases by their tables answers a narrower question than it

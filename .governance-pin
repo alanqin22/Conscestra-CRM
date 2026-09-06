@@ -15,10 +15,10 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-2a5f750b0cae5fd42d06146ebec0d3266c6a3a41
+9e363b892e6dab3ecbae7c7054c0ea487905c4c8
 
-# 2a5f750 -- six SQL files and two test files behind the owner-eligibility
-# work. The pin is what couples them to the declarations in
-# deploy_state.OUT_OF_BAND_SQL: CI failed on the previous pin with
-# 'CLASSIFIED BUT ABSENT FROM DISK' for all six, because the public repo
-# declared files the pinned governance commit did not contain.
+# 9e363b8 -- five executive credentials, the password-reset hardening they
+# depend on, and reset_token_single_use.sql. The pin is what couples them to
+# the declarations in deploy_state.OUT_OF_BAND_SQL: this commit declares five
+# out-of-band files, and CI fails with 'CLASSIFIED BUT ABSENT FROM DISK' if
+# the pinned governance commit does not contain every one of them.

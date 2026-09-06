@@ -43,6 +43,7 @@ CONFIG (env)
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -315,7 +316,10 @@ def _resume_cutoff() -> datetime:
 
 
 def orphaned_sync(cutoff: Optional[datetime] = None) -> Dict[str, Any]:
-    """Pending, dispatchable events the running cutoff will NEVER reach.
+    """Pending, dispatchable events the running cutoff will NEVER reach —
+    plus rows already marked 'orphaned' (the durable state the consumer writes
+    at each tick since the activation). The report stays truthful whether or
+    not the consumer has ticked since the rows fell behind.
 
     An orphan is not a backlog that is draining slowly — it is work the bus has
     silently decided not to do. Surfaced in /agent-bus/status and Platform
@@ -337,14 +341,16 @@ def orphaned_sync(cutoff: Optional[datetime] = None) -> Dict[str, Any]:
             cur.execute(
                 """SELECT count(*), min(e.created_at), max(e.created_at)
                    FROM event_queue q JOIN events e USING (event_uuid)
-                   WHERE q.status='pending' AND e.created_at < %(cut)s
+                   WHERE ((q.status='pending' AND e.created_at < %(cut)s)
+                          OR q.status='orphaned')
                      AND (%(catchall)s OR e.event_type = ANY(%(types)s))""",
                 {"cut": cut, "catchall": CATCHALL, "types": types})
             n, oldest, newest = cur.fetchone()
             cur.execute(
                 """SELECT e.event_type, count(*)
                    FROM event_queue q JOIN events e USING (event_uuid)
-                   WHERE q.status='pending' AND e.created_at < %(cut)s
+                   WHERE ((q.status='pending' AND e.created_at < %(cut)s)
+                          OR q.status='orphaned')
                      AND (%(catchall)s OR e.event_type = ANY(%(types)s))
                    GROUP BY 1 ORDER BY 2 DESC""",
                 {"cut": cut, "catchall": CATCHALL, "types": types})
@@ -1674,8 +1680,17 @@ async def run_once() -> Dict[str, Any]:
     # start() but not here, so the defect survived at every entry point except
     # the loop. Using one derivation everywhere is what stops it recurring.
     cutoff = _CUTOFF or _resume_cutoff()
+    # ACTIVATION §13: rows the cutoff will never reach stop being invisible.
+    # They become a DURABLE 'orphaned' state with an owned work item, before
+    # this tick claims anything — so a consumer that is alive but skipping
+    # work can no longer report a clean tick.
+    try:
+        marked = await asyncio.to_thread(_mark_orphans_sync, cutoff)
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[agent_bus] orphan marking failed: {exc}")
+        marked = {}
     events = await asyncio.to_thread(_claim_batch_sync, cutoff)
-    summary = {"claimed": len(events), "results": []}
+    summary = {"claimed": len(events), "results": [], "orphaned_marked": marked}
     for ev in events:
         et = ev["event_type"]
         try:
@@ -1710,6 +1725,159 @@ async def run_once() -> Dict[str, Any]:
         await asyncio.to_thread(_write_watermark_sync)
         logger.info(f"[agent_bus] tick — {summary}")
     return summary
+
+
+def _mark_orphans_sync(cutoff: datetime) -> Dict[str, int]:
+    """Move pending, never-attempted, dispatchable rows created BEFORE the
+    cutoff into status='orphaned' and open ONE owned work item for the batch.
+
+    Invariant (activation §13): every consequential event is either processed
+    or remains VISIBLY owned and actionable. 'orphaned' is that visible state:
+    the health page counts it at any age, the supervisor's stall detector reads
+    it, and `drain_backlog` replays it with an audit row. Returns
+    {event_type: count} for what was marked this tick ({} when nothing)."""
+    types = list(HANDLERS.keys())
+    if not types and not CATCHALL:
+        return {}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """WITH o AS (
+                       UPDATE event_queue q
+                          SET status='orphaned', orphaned_at=now()
+                         FROM events e
+                        WHERE e.event_uuid = q.event_uuid
+                          AND q.status='pending' AND q.last_attempt_at IS NULL
+                          AND q.locked_at IS NULL
+                          AND e.created_at < %(cutoff)s
+                          AND (%(catchall)s OR e.event_type = ANY(%(types)s))
+                    RETURNING e.event_type, e.created_at)
+                   SELECT event_type, count(*), min(created_at) FROM o GROUP BY 1""",
+                {"cutoff": cutoff, "catchall": CATCHALL, "types": types})
+            rows = cur.fetchall()
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        # Pre-activation schema (no orphaned_at column): stay silent here — the
+        # prospective count in orphaned_sync() still reports them.
+        logger.debug(f"[agent_bus] orphan marking unavailable: {str(exc)[:120]}")
+        return {}
+    finally:
+        conn.close()
+    if not rows:
+        return {}
+    marked = {r[0]: int(r[1]) for r in rows}
+    oldest = min(r[2] for r in rows)
+    total = sum(marked.values())
+    logger.warning(f"[agent_bus] {total} event(s) ORPHANED behind cutoff "
+                   f"{cutoff.isoformat()}: {marked}")
+    try:
+        from app.core import governance_alerts
+        al = governance_alerts.open_alert(
+            "event_orphaned",
+            f"{total} consequential event(s) were never processed (oldest "
+            f"{oldest.date().isoformat()}): {', '.join(f'{k} {v}' for k, v in marked.items())}",
+            rule="event_orphaned", severity="high", source="agent-bus",
+            affected_type="event_queue", affected_id=oldest.date().isoformat(),
+            detail={"by_type": marked, "cutoff": cutoff.isoformat(),
+                    "oldest": oldest.isoformat(),
+                    "remedy": "POST /agent-bus/drain replays them (audited)"},
+            dedupe_key="event_orphaned:open")
+        if al.get("alert_id"):
+            conn = get_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE event_queue SET alert_id=%s::uuid "
+                                "WHERE status='orphaned' AND alert_id IS NULL",
+                                (al["alert_id"],))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[agent_bus] orphan alert not opened: {exc}")
+    try:
+        execute_sp_free = get_connection()
+        try:
+            with execute_sp_free.cursor() as cur:
+                cur.execute(
+                    "SELECT emit_event('event.orphaned','event_queue',%s::uuid,%s::jsonb,NULL,'agent-bus')",
+                    ("00000000-0000-0000-0000-000000000000",
+                     json.dumps({"context": {"by_type": marked, "cutoff": cutoff.isoformat()}})))
+            execute_sp_free.commit()
+        finally:
+            execute_sp_free.close()
+    except Exception as exc:                                       # noqa: BLE001
+        logger.debug(f"[agent_bus] event.orphaned not emitted: {exc}")
+    return marked
+
+
+def _replay_orphans_sync(since_days: int, actor: str) -> int:
+    """Put orphaned rows back to 'pending' so a widened drain can claim them.
+    Audited: replayed_at/replayed_by on the row, an event.replayed event, and
+    an audit_log row. Returns the count."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE event_queue
+                      SET status='pending', replayed_at=now(), replayed_by=%(actor)s,
+                          next_attempt_at=NULL, locked_by=NULL, locked_at=NULL
+                    WHERE status='orphaned'
+                      AND created_at > now() - make_interval(days => %(days)s)
+                RETURNING queue_uuid""",
+                {"actor": actor[:120], "days": int(since_days)})
+            n = cur.rowcount
+            if n:
+                try:
+                    cur.execute(
+                        "SELECT emit_event('event.replayed','event_queue',%s::uuid,%s::jsonb,NULL,'agent-bus')",
+                        ("00000000-0000-0000-0000-000000000000",
+                         json.dumps({"context": {"replayed": n, "by": actor,
+                                                 "since_days": since_days}})))
+                except Exception as exc:                           # noqa: BLE001
+                    logger.warning(f"[agent_bus] event.replayed not emitted: {exc}")
+                    raise
+                # The audit row is part of the replay, not decoration: a replay
+                # that cannot be recorded is not performed.
+                cur.execute(
+                    """INSERT INTO audit_log (entity, entity_id, action, payload)
+                       VALUES ('event_queue', %s::uuid, 'replay_orphaned', %s::jsonb)""",
+                    ("00000000-0000-0000-0000-000000000000",
+                     json.dumps({"replayed": n, "by": actor, "since_days": since_days})))
+        conn.commit()
+        return n
+    except Exception as exc:
+        conn.rollback()
+        logger.warning(f"[agent_bus] orphan replay failed (nothing replayed): {str(exc)[:160]}")
+        return 0
+    finally:
+        conn.close()
+
+
+def _orphaned_durable_sync() -> Dict[str, Any]:
+    """Cluster-truthful queue state from the DATABASE, not from this process:
+    durable orphans, oldest pending, and when the consumer (whichever worker
+    holds it) last settled anything."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT count(*) FILTER (WHERE status='orphaned'),
+                          min(created_at) FILTER (WHERE status='pending'),
+                          count(*) FILTER (WHERE status='pending'),
+                          (SELECT last_settled_at FROM agent_bus_watermark WHERE scope='global')
+                     FROM event_queue""")
+            o, oldest, pend, settled = cur.fetchone()
+        return {"orphaned_durable": int(o or 0),
+                "pending": int(pend or 0),
+                "oldest_pending": oldest.isoformat() if oldest else None,
+                "last_settled_at": settled.isoformat() if settled else None}
+    except Exception as exc:
+        conn.rollback()
+        return {"error": str(exc).splitlines()[0][:120]}
+    finally:
+        conn.close()
 
 
 def _rollup_overdue_sync(apply: bool) -> Dict[str, Any]:
@@ -1850,6 +2018,9 @@ async def drain_backlog(max_total: int = 500, since_days: int = 365) -> Dict[str
     saved = _CUTOFF
     _CUTOFF = datetime.now(timezone.utc) - timedelta(days=since_days)
     processed, agg = 0, {}
+    # Durably orphaned rows are put back in reach first — the replay is the
+    # deliberate human act the orphan alert asked for, and it is audited.
+    replayed = await asyncio.to_thread(_replay_orphans_sync, since_days, "agent-bus:drain")
     try:
         while processed < max_total:
             s = await run_once()
@@ -1861,9 +2032,25 @@ async def drain_backlog(max_total: int = 500, since_days: int = 365) -> Dict[str
                 agg[key] = agg.get(key, 0) + 1
     finally:
         _CUTOFF = saved
-    logger.info(f"[agent_bus] drain_backlog processed={processed} breakdown={agg}")
-    return {"processed": processed, "max_total": max_total,
+    # If nothing orphaned remains, the obligation is RESOLVED (not closed —
+    # closure with evidence stays a human act in the Alert Center).
+    remaining = await asyncio.to_thread(_orphaned_durable_sync)
+    resolved = None
+    if replayed and not remaining.get("orphaned_durable"):
+        try:
+            from app.core import governance_alerts
+            resolved = governance_alerts.resolve_by_class(
+                "event_orphaned", "agent-bus:drain",
+                f"replayed {replayed} orphaned row(s); processed {processed}; "
+                f"breakdown {agg}")
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(f"[agent_bus] orphan alert resolution skipped: {exc}")
+    logger.info(f"[agent_bus] drain_backlog replayed={replayed} processed={processed} "
+                f"breakdown={agg}")
+    return {"processed": processed, "max_total": max_total, "replayed_orphans": replayed,
             "since_days": since_days, "breakdown": agg,
+            "orphaned_remaining": remaining.get("orphaned_durable"),
+            "alerts_resolved": (resolved or {}).get("resolved"),
             "note": "re-run to continue; live cutoff restored"}
 
 
@@ -1926,14 +2113,27 @@ router = APIRouter(tags=["agent-bus"])
 
 @router.get("/agent-bus/status")
 def agent_bus_status():
+    # `running` and `cutoff` describe THIS process. On a multi-worker deploy a
+    # follower answers running=false while the leader drains happily — the
+    # assessment read exactly that on Railway (D-11). `cluster` is read from
+    # the database and is true whichever worker answered.
+    try:
+        from app.core import leader as _leader
+        role = _leader.status().get("role")
+    except Exception:                                              # noqa: BLE001
+        role = None
     return {
         "enabled": ENABLED, "autosend": AUTOSEND, "worker": WORKER_ID,
+        "this_process_role": role,
         "poll_secs": POLL_SECS, "batch": BATCH, "handlers": list(HANDLERS),
         "running": bool(_task and not _task.done()),
+        "running_note": ("answered by a follower; the consumer runs on the leader — "
+                         "read `cluster` for the truth" if role == "follower" else None),
         "cutoff": _CUTOFF.isoformat() if _CUTOFF else None,
         "max_catchup_hours": MAX_CATCHUP_HOURS,
         "backfill_minutes": BACKFILL_MIN,
         "orphaned": orphaned_sync(),
+        "cluster": _orphaned_durable_sync(),
     }
 
 

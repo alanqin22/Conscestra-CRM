@@ -311,12 +311,20 @@ def propose_fixes(force: bool = False) -> Dict[str, Any]:
         if pending:
             skipped.append({action: "already awaiting approval"})
             continue
-        aid = governance.propose(
-            action, "data_quality",
-            {"limit": FIX_LIMIT, "why": why,
-             "evidence": {"detector": detector, "count": n,
-                          "samples": s[detector].get("samples") or []}},
-            confidence=0.6, severity="low")
+        try:
+            aid = governance.propose(
+                action, "data_quality",
+                {"limit": FIX_LIMIT, "why": why,
+                 "evidence": {"detector": detector, "count": n,
+                              "samples": s[detector].get("samples") or []}},
+                confidence=0.6, severity="low")
+        except governance.ProposalCapReached as capped:
+            # `skipped` already carries the other reasons a detector produced
+            # no proposal ("nothing to fix", "already awaiting approval"), and
+            # this belongs beside them: a reason, reported, not an aborted pass
+            # that leaves the remaining detectors unrun.
+            skipped.append({action: str(capped)})
+            continue
         proposed.append({"action": action, "count": n, "approval_uuid": aid})
     return {"enabled": ENABLED, "scan": {k: v.get("count", 0) for k, v in s.items()},
             "proposed": proposed, "skipped": skipped}

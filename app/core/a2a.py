@@ -1468,25 +1468,37 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
     # 2026-07-19: this gate now sits BEFORE the structured branch — the six
     # structured writes (sms.send, quote.generate, …) previously slipped past
     # it, relying only on their SPs' internal safeguards.
+    _policy_exec = None          # set when a declared policy authorises execution
     if cap.kind == "write" and not req.govern_bypass:
         from app.core import governance
+        from app.core import governance_policy as gp
         if governance.ENABLED:
-            d = governance.decide(req.confidence)
-            # HITL amount floor (guardrail layer 1): a big-ticket action pauses
-            # for a human even at act-level confidence — confidence measures
-            # how sure the agent is, not how much is at stake.
-            if d == "act":
+            # ACTIVATION (docs/governance/activation_plan.md §9–§10). The
+            # decision is read from the action's POLICY ROW, never from the
+            # confidence score. Confidence can only REFUSE (below propose_min a
+            # write is not even worth an executive's time); it can never grant.
+            pol = gp.policy_for(req.intent)
+            auto, why = gp.may_auto_execute(req.intent, pol)
+            # HITL amount floor (guardrail layer 1) still overrides a standing
+            # policy: how much is at stake is a different question from whether
+            # the class is routinely safe.
+            if auto:
                 hitl = governance.hitl_amount()
                 amt = governance._amount_from(dict(req.params))
                 if hitl > 0 and amt >= hitl:
-                    d = "propose"
-                    logger.info(f"[a2a] {req.intent} ${amt:,.0f} ≥ HITL "
-                                f"${hitl:,.0f} → forced propose")
+                    auto, why = False, f"amount ${amt:,.0f} ≥ HITL floor ${hitl:,.0f}"
+                    logger.info(f"[a2a] {req.intent} {why} → forced propose")
+            d = "act" if auto else "propose"
+            if float(req.confidence or 0) < governance.propose_min():
+                d = "skip"
             if d == "skip":
                 return A2AResult(False, req.intent, cap.agent, cid,
                                  outcome=REJECTED,
                                  error=f"skipped by governance — confidence "
                                        f"{req.confidence} < {governance.propose_min()}")
+            if d == "act":
+                _policy_exec = pol
+                logger.info(f"[a2a] {req.intent} executes under {why}")
             if d == "propose":
                 # _correlation_id ties the approval to this play's trace. It is
                 # hidden from the approval UI and removed again by
@@ -1496,16 +1508,35 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
                 # params_schema refused its own approved execution.
                 p = dict(req.params)
                 p["_correlation_id"] = cid
-                aid = governance.propose(
-                    req.intent, req.from_agent, p,
-                    req.entity.type if req.entity else None,
-                    req.entity.id if req.entity else None, req.confidence)
+                try:
+                    aid = governance.propose(
+                        req.intent, req.from_agent, p,
+                        req.entity.type if req.entity else None,
+                        req.entity.id if req.entity else None, req.confidence)
+                except governance.ProposalCapReached as capped:
+                    # A POLICY REFUSAL, and therefore a REJECTED result rather
+                    # than an exception. dispatch() promises callers a
+                    # structured outcome for every governed decision; letting
+                    # this escape would turn "the CRO has already had their
+                    # three for today" into a 500 several layers away, which is
+                    # exactly the mislabelling the outcome column exists to
+                    # stop. Nothing was written and nothing executed.
+                    logger.info(f"[a2a] {req.intent} refused — {capped}")
+                    return A2AResult(False, req.intent, cap.agent, cid,
+                                     outcome=REJECTED, error=str(capped),
+                                     data={"status": "deferred_by_cap",
+                                           "daily_cap": capped.cap,
+                                           "authority_role": capped.approver})
                 logger.info(f"[a2a] {req.intent} gated → proposed {aid[:8]} "
-                            f"(conf={req.confidence})")
+                            f"(conf={req.confidence}; {why})")
                 return A2AResult(True, req.intent, cap.agent, cid,
-                                 output=f"proposed for approval (confidence {req.confidence})",
-                                 data={"status": "pending_approval", "approval_uuid": aid})
-            # d == "act" → fall through and execute
+                                 output=f"proposed for approval — {why} "
+                                        f"(confidence {req.confidence})",
+                                 data={"status": "pending_approval", "approval_uuid": aid,
+                                       "decision_mode": pol.get("decision_mode"),
+                                       "authority_role": pol.get("approver_role"),
+                                       "sla_hours": pol.get("sla_hours")})
+            # d == "act" → fall through and execute under the declared policy
 
     # Structured input contract: deterministic params → SP → structured data.
     # No NL parsing, no AI, no HTTP — the default for agent-to-agent calls.
@@ -1533,6 +1564,8 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
                              f"'{req.intent}' returned {outcome}")
         logger.info(f"[a2a] {req.from_agent} → {cap.agent}.{req.intent} "
                     f"(structured) cid={cid[:8]}")
+        if _policy_exec is not None:
+            _ledger_policy_execution(req, cid, _policy_exec, data)
         return A2AResult(True, req.intent, cap.agent, cid, data=data,
                          outcome=ACCEPTED,
                          output=_summarize(req.intent, data))
@@ -1573,6 +1606,9 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
     if outcome != ACCEPTED:
         logger.warning(f"[a2a] {cap.agent}.{req.intent} → {outcome} "
                        f"(HTTP {status}) cid={cid[:8]}")
+    elif _policy_exec is not None:
+        _ledger_policy_execution(req, cid, _policy_exec,
+                                 resp.get("result") if isinstance(resp, dict) else None)
     return A2AResult(
         ok=(outcome == ACCEPTED),
         intent=req.intent, agent=cap.agent, correlation_id=cid,
@@ -1582,6 +1618,43 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
                                     else f"{outcome} (HTTP {status})"),
         raw=resp, outcome=outcome, status=status,
     )
+
+
+def _ledger_policy_execution(req: "A2ARequest", cid: str, pol: Dict[str, Any],
+                             data: Any) -> None:
+    """A write that executed under a declared AUTO_EXECUTE / SAMPLED_REVIEW
+    policy is ledgered in action_approvals with decided_by='policy:<owner>' —
+    the technical decider is the policy, the accountable human is its owner
+    (activation §10, §16). SAMPLED_REVIEW additionally raises a review work
+    item for a `sample_rate` share of executions, owned by the approver role.
+    Best-effort: the customer-visible action already happened."""
+    try:
+        from app.core import governance
+        owner = pol.get("policy_owner") or pol.get("approver_role") or "unowned"
+        result = data if isinstance(data, dict) else {"data": data}
+        aid = governance.record_preauthorized(
+            req.intent, req.from_agent, f"{owner}:{req.intent}",
+            {**{k: v for k, v in dict(req.params).items() if not k.startswith("_")},
+             "_correlation_id": cid,
+             "principal": str(req.principal) if req.principal else None},
+            {"ok": True, **{k: v for k, v in result.items() if k != "ok"}} if isinstance(result, dict) else {"ok": True},
+            entity_type=req.entity.type if req.entity else None,
+            entity_id=req.entity.id if req.entity else None)
+        if pol.get("decision_mode") == "SAMPLED_REVIEW":
+            rate = float(pol.get("sample_rate") or 0)
+            if rate > 0 and random.random() < rate:
+                from app.core import governance_alerts
+                governance_alerts.open_alert(
+                    "sampled_review",
+                    f"Sampled review: {req.intent} executed under policy "
+                    f"({owner}) — confirm it was right",
+                    rule=None, severity="low", source="a2a",
+                    affected_type="approval", affected_id=aid,
+                    detail={"intent": req.intent, "params": dict(req.params),
+                            "correlation_id": cid, "sample_rate": rate},
+                    owner_role=pol.get("approver_role"), correlation_id=cid)
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[a2a] policy execution ledger skipped for {req.intent}: {exc}")
 
 
 # ============================================================================

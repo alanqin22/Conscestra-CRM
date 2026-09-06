@@ -869,11 +869,25 @@ def draft_pass(force: bool = False) -> Dict[str, Any]:
         logger.debug(f"[knowledge] case source skipped: {exc}")
     proposed, skipped = [], 0
 
+    deferred: List[Dict[str, Any]] = []
+
     def _propose(art: Dict[str, Any], source_ref: str) -> None:
         art["source_ref"] = source_ref
         art["source"] = "agent"
-        aid = governance.propose("kb.publish", "knowledge", art,
-                                 confidence=0.6, severity="low")
+        try:
+            aid = governance.propose("kb.publish", "knowledge", art,
+                                     confidence=0.6, severity="low")
+        except governance.ProposalCapReached as capped:
+            # The class has used its daily share of the approver's attention.
+            # The candidate is NOT published, NOT queued and NOT thrown away
+            # silently: it is counted here and the cap itself is a visible work
+            # item. The source is re-minable tomorrow — `source_ref` is the
+            # idempotency anchor, so nothing is duplicated when it returns.
+            deferred.append({"title": art.get("title"), "source_ref": source_ref,
+                             "reason": str(capped)})
+            logger.info(f"[knowledge] deferred '{str(art.get('title'))[:60]}' — "
+                        f"{capped}")
+            return
         proposed.append({"approval_uuid": aid, "title": art.get("title"),
                          "source_ref": source_ref})
         logger.info(f"[knowledge] proposed article '{str(art.get('title'))[:60]}' "
@@ -910,9 +924,13 @@ def draft_pass(force: bool = False) -> Dict[str, Any]:
             _propose(art, c["activity_id"])
         else:
             skipped += 1
+    # `deferred` is reported, never folded into draft_failures: a candidate the
+    # cap held back is not a drafting failure, and a pass that returns
+    # proposed=0 must be distinguishable from one that had nothing to say.
     return {"enabled": DRAFT_ENABLED, "threads": len(threads),
             "calls": len(calls), "cases": len(cases_src),
-            "proposed": proposed, "draft_failures": skipped}
+            "proposed": proposed, "draft_failures": skipped,
+            "deferred_by_cap": deferred}
 
 
 # ============================================================================
@@ -1192,9 +1210,15 @@ async def gap_pass(force: bool = False) -> Dict[str, Any]:
             continue
         art["source"] = "gap"
         art["source_ref"] = f"gap:{g['gap_id']}"
-        aid = await _aio.to_thread(
-            governance.propose, "kb.publish", "knowledge", art,
-            confidence=0.6, severity="low")
+        try:
+            aid = await _aio.to_thread(
+                governance.propose, "kb.publish", "knowledge", art,
+                confidence=0.6, severity="low")
+        except governance.ProposalCapReached as capped:
+            # Leave the gap UNRESOLVED so tomorrow's pass sees it again. Marking
+            # it 'proposed' here would record an approval that does not exist.
+            logger.info(f"[knowledge] gap {g['gap_id']} deferred — {capped}")
+            break
         _set_gap(g["gap_id"], "proposed", aid)
         proposed.append({"approval_uuid": aid, "gap_id": g["gap_id"],
                          "title": art.get("title"), "hits": g["hits"]})

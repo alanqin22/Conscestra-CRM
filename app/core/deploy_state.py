@@ -453,6 +453,61 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # PENDING DEPLOYMENT status is recorded at application time.
     "owners_no_identity_reuse.sql": ("APPLIED TO RAILWAY 2026-09-02. Promotable, not promoted -- see the "
         "note on activities_owner_no_fabrication.sql."),
+    # Governance activation (docs/governance/activation_plan.md): decision
+    # policy by action class, 48h SLA + CEO escalation on approvals, atomic
+    # approval execution, governed alerts with an eligible human owner, and a
+    # durable orphaned state on event_queue.
+    #
+    # PENDING DEPLOYMENT. Applied locally 2026-09-05, NOT yet on Railway. It
+    # sits here rather than in REQUIRED_MIGRATIONS for the rule recorded above:
+    # that list is a claim about what production has RUN. Promote it only once
+    # Railway has it -- the same path promotions_coupons.sql took. Applying it
+    # to Railway is a HUMAN action (plan §23); it is idempotent and additive,
+    # and its self-check WARNs if no eligible CEO owner exists there.
+    "governance_activation.sql": (
+        "PENDING DEPLOYMENT -- applied locally 2026-09-05, not on Railway. A "
+        "governed schema definition; promote to REQUIRED_MIGRATIONS after "
+        "Railway has executed it and the activation tests pass against it."),
+    # Owner decision 2026-09-05 (plan §26): five authorities, not four. Widens
+    # the role CHECKs to include COO, moves technology/data classes to the CTO
+    # and operations rules to the COO, confirms the two grandfathered standing
+    # policies, and adds decided_actor so a decision is bound to the
+    # authenticated person who made it. Must follow governance_activation.sql.
+    "governance_five_authorities.sql": (
+        "PENDING DEPLOYMENT -- applied locally 2026-09-05 after "
+        "governance_activation.sql, not on Railway. Promote both together, in "
+        "that order, once Railway has run them."),
+    # Third and last file of the activation set: an escalation repeats until it
+    # is decided. Measured gap -- five approvals escalated to the CEO and never
+    # mentioned again. Must follow the two files above.
+    "governance_reescalation.sql": (
+        "PENDING DEPLOYMENT -- applied locally 2026-09-05, third in the "
+        "activation set, not on Railway. Promote all three together, in "
+        "order, once Railway has run them."),
+    # The owner's decision on the last undecided action class, plus the
+    # daily-cap primitive it needs. Applies after the three above.
+    "governance_kb_publish_policy.sql": (
+        "PENDING DEPLOYMENT -- applied locally 2026-09-05, fourth and last of "
+        "the activation set, not on Railway. Promote all four together, in "
+        "order, once Railway has run them."),
+    # NOT part of the activation set and deliberately independent of it. A
+    # consumed password-reset token left every sibling token live: measured 64
+    # working keys to the CTO account moments after its owner had finished
+    # securing it. CREATE OR REPLACE on one function, no schema change, safe in
+    # any order relative to the four files above.
+    "reset_token_single_use.sql": (
+        "PENDING DEPLOYMENT -- applied locally 2026-09-06, not on Railway. "
+        "Ships with the password-reset fix in app/agents/auth/router.py and "
+        "should go WITH it or before it, never after: the router change stops "
+        "handing tokens to anonymous callers, and this stops the ones already "
+        "issued outliving the reset that should have retired them."),
+    # Third and last file of the activation set: an escalation repeats until it
+    # is decided. Measured gap -- five approvals escalated to the CEO and never
+    # mentioned again. Must follow the two files above.
+    "governance_reescalation.sql": (
+        "PENDING DEPLOYMENT -- applied locally 2026-09-05, third in the "
+        "activation set, not on Railway. Promote all three together, in "
+        "order, once Railway has run them."),
     # P5 — the eight non-service employee identities attested SYNTHETIC by the
     # owner, 2026-09-02. corpus_provenance held ZERO rows for `employees`, so
     # they were unclassified; real-vs-synthetic cannot be reconstructed on this

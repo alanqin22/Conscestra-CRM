@@ -196,6 +196,7 @@ def ingest(doc_name: str, text: str, cap: int = 0) -> Dict[str, Any]:
     chunks = chunk_text(text)
     _register_document(sha, doc_name, len(chunks))
     proposed, skipped_llm, already = [], 0, 0
+    deferred: list = []          # held back by kb.publish's daily cap, not lost
     for i, chunk in enumerate(chunks):
         if len(proposed) >= cap:
             break
@@ -209,15 +210,26 @@ def ingest(doc_name: str, text: str, cap: int = 0) -> Dict[str, Any]:
             continue
         art["source"] = "doc"
         art["source_ref"] = ref
-        aid = governance.propose("kb.publish", "kb-ingest", art,
-                                 confidence=0.6, severity="low")
+        try:
+            aid = governance.propose("kb.publish", "kb-ingest", art,
+                                     confidence=0.6, severity="low")
+        except governance.ProposalCapReached as capped:
+            # kb.publish is capped by policy (3 CRO decisions a day). An ingest
+            # that raised here would abandon the rest of the document because
+            # the CRO's day was full. The chunk is deferred; `source_ref` is the
+            # idempotency anchor, so re-ingesting tomorrow proposes it once.
+            logger.info(f"[kb_ingest] chunk {i} deferred — {capped}")
+            deferred.append({"chunk": i, "title": art.get("title"),
+                             "reason": str(capped)})
+            continue
         proposed.append({"approval_uuid": aid, "chunk": i,
                          "title": art.get("title")})
         logger.info(f"[ingest] {doc_name} chunk {i} → proposed "
                     f"'{str(art.get('title'))[:60]}' ({aid[:8]})")
     done = already + skipped_llm + len(proposed)
     return {"document": doc_name, "sha": sha, "chunks": len(chunks),
-            "proposed": proposed, "skipped_boilerplate": skipped_llm,
+            "proposed": proposed, "deferred_by_cap": deferred,
+            "skipped_boilerplate": skipped_llm,
             "already_processed": already,
             "remaining_chunks": max(len(chunks) - done, 0),
             "note": ("re-run to continue — the cap bounds each pass"

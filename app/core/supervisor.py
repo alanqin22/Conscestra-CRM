@@ -239,22 +239,36 @@ def detect_bus_stall(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         stale_after = max(agent_bus.POLL_SECS * 10, 600)
         types = list(agent_bus.HANDLERS.keys())
         if agent_bus.ENABLED and types:
+            # NO LOWER BOUND ON AGE. This used to read only events created in
+            # the last 24 hours, so the detector went silent exactly when the
+            # stall mattered most: on 2026-09-02 it fired once at 13:00 UTC and
+            # then said nothing while 39 order events sat unclaimed for 85 h
+            # (assessment D-04). A stranded event is a stranded event at any
+            # age, and a durably 'orphaned' row is counted here too.
             rows = execute_sp(
-                "SELECT count(*) AS n FROM event_queue q "
+                "SELECT count(*) FILTER (WHERE q.status='pending') AS unclaimed, "
+                "       count(*) FILTER (WHERE q.status='orphaned') AS orphaned, "
+                "       min(q.created_at) AS oldest "
+                "FROM event_queue q "
                 "JOIN events e ON e.event_uuid = q.event_uuid "
-                "WHERE q.status='pending' AND q.last_attempt_at IS NULL "
-                "  AND e.event_type = ANY(%(t)s) "
-                "  AND q.created_at BETWEEN now() - interval '1 day' "
-                "                       AND now() - make_interval(secs => %(s)s)",
-                {"t": types, "s": stale_after})
-            n = int(rows[0].get("n") or 0) if rows else 0
-            if n:
+                "WHERE (%(catchall)s OR e.event_type = ANY(%(t)s)) "
+                "  AND ((q.status='pending' AND q.last_attempt_at IS NULL "
+                "        AND q.created_at < now() - make_interval(secs => %(s)s)) "
+                "       OR q.status='orphaned')",
+                {"t": types, "s": stale_after, "catchall": agent_bus.CATCHALL})
+            r0 = rows[0] if rows else {}
+            n = int(r0.get("unclaimed") or 0)
+            o = int(r0.get("orphaned") or 0)
+            if n or o:
+                oldest = r0.get("oldest")
                 return _signal("bus_stalled", "high",
                                f"{n} handler-type event(s) unclaimed for "
-                               f">{stale_after // 60} min — consumer may be wedged",
-                               "unclaimed_events", n, "orchestrator",
-                               "Check GET /agent-bus/status and recent errors; "
-                               "restart if the loop is stuck")
+                               f">{stale_after // 60} min and {o} orphaned"
+                               + (f" — oldest {oldest}" if oldest else "")
+                               + " — consumer may be wedged or the cutoff skipped them",
+                               "unclaimed_events", n + o, "orchestrator",
+                               "Check GET /agent-bus/status; POST /agent-bus/drain "
+                               "replays orphaned rows deliberately (audited)")
     except Exception as exc:
         logger.debug(f"[supervisor] bus heartbeat check failed: {exc}")
     return None
@@ -326,33 +340,77 @@ def _emit_alert(sig: Dict[str, Any]) -> None:
         "SELECT emit_event('supervisor.alert','system',%(id)s::uuid,"
         "%(p)s::jsonb,NULL,'supervisor') AS r",
         {"id": str(_uuid.uuid4()), "p": payload})
+    # ACTIVATION §11: the event is the record that a detector fired; the
+    # governed work item is the OBLIGATION it creates — owned by the authority
+    # the alert policy names, with an SLA and an enforced lifecycle. One live
+    # obligation per rule: a re-detection raises its severity, never a twin.
+    try:
+        from app.core import governance_alerts
+        governance_alerts.open_alert(
+            "supervisor_rule", sig.get("headline") or sig.get("rule") or "supervisor alert",
+            rule=sig.get("rule"), severity=sig.get("severity") or "medium",
+            source="supervisor",
+            detail={k: sig.get(k) for k in ("metric", "value", "owner_agent",
+                                            "recommended_action")},
+            dedupe_key=f"supervisor:{sig.get('rule')}")
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[supervisor] governed alert not opened for "
+                       f"{sig.get('rule')}: {exc}")
 
 
+# Kept ONLY as the confidence recorded on the proposal the supervisor raises.
+# It no longer decides anything: docs/governance/activation_plan.md §10–§11.
 AUTOACT_CONF = float(os.getenv("SUPERVISOR_AUTOACT_CONF", "0.85"))
 
 
 def _govern_autoact(action: str, sig: Dict[str, Any]) -> Optional[str]:
-    """Gate a supervisor auto-action through governance policy. Returns a note
-    when governance DIVERTED the action (proposed/skipped); None means the
-    policy says act — caller executes. With default thresholds (0.85 ≥ ACT_MIN
-    0.8) behavior is unchanged but now policy-evaluated; tightening GOV_ACT_MIN
-    above SUPERVISOR_AUTOACT_CONF routes these into the approval queue."""
+    """Gate a supervisor auto-action through the ACTION-CLASS POLICY.
+
+    Returns a note when governance DIVERTED the action (proposed / refused);
+    None means the declared policy authorises execution and the caller may
+    act. The previous version asked `governance.decide(AUTOACT_CONF)` — a
+    numeric threshold — so lowering `gov.act_min` to 0.75 would have converted
+    every proposal into an execution with no second gate (assessment D-07).
+    Now only a `governance_action_policies` row with decision_mode AUTO_EXECUTE,
+    auto_execute=true AND a named policy_owner can answer "act"."""
     from app.core import governance
+    from app.core import governance_policy as gp
     if not governance.ENABLED:
         return None
-    d = governance.decide(AUTOACT_CONF)
-    if d == "act":
+    pol = gp.policy_for(action)
+    auto, why = gp.may_auto_execute(action, pol)
+    if auto:
         return None
-    if d == "skip":
-        return f"{action} skipped by governance (conf {AUTOACT_CONF} < propose_min)"
     rows = execute_sp(
         "SELECT count(*) AS n FROM action_approvals "
         "WHERE action_type=%(a)s AND status='pending'", {"a": action})
     if rows and int(rows[0].get("n") or 0):
         return f"{action} already awaiting approval"
-    aid = governance.propose(action, "supervisor", {"cap": 25},
-                             severity=sig.get("severity"), confidence=AUTOACT_CONF)
-    return f"proposed {action} for approval ({aid[:8]})"
+    try:
+        aid = governance.propose(action, "supervisor", {"cap": 25},
+                                 severity=sig.get("severity"), confidence=AUTOACT_CONF)
+    except governance.ProposalCapReached as capped:
+        # The detector still fired and still alerted; only the PROPOSAL is
+        # held back. Returning the note (rather than raising) keeps the tick
+        # going for every other breach, and the cap is its own work item.
+        return f"{action} deferred — {capped}"
+    return f"proposed {action} for approval ({aid[:8]}; {why})"
+
+
+def _ledger_autoact(action: str, sig: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """An auto-action that a policy authorised is ledgered as such — technical
+    decider = the policy, accountable owner = its declared owner."""
+    try:
+        from app.core import governance
+        from app.core import governance_policy as gp
+        pol = gp.policy_for(action)
+        governance.record_preauthorized(
+            action, "supervisor",
+            f"{pol.get('policy_owner') or 'unowned'}:{action}",
+            {"rule": sig.get("rule"), "headline": sig.get("headline"), "cap": 25},
+            result, entity_type=None, entity_id=None)
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[supervisor] auto-action ledger skipped for {action}: {exc}")
 
 
 def _autoact(sig: Dict[str, Any]) -> Optional[str]:
@@ -360,14 +418,18 @@ def _autoact(sig: Dict[str, Any]) -> Optional[str]:
         note = _govern_autoact("supervisor.emit_dunning", sig)
         if note:
             return note
-        execute_sp("SELECT fn_emit_overdue_invoice_events(25) AS r")
-        return "emitted overdue-invoice events"
+        r = execute_sp("SELECT fn_emit_overdue_invoice_events(25) AS r")
+        _ledger_autoact("supervisor.emit_dunning", sig,
+                        {"ok": True, "emitted": (r[0].get("r") if r else None)})
+        return "emitted overdue-invoice events (policy-authorised)"
     if sig.get("auto") == "leads":
         note = _govern_autoact("supervisor.emit_hot_leads", sig)
         if note:
             return note
-        execute_sp("SELECT fn_emit_hot_lead_events(25) AS r")
-        return "emitted hot-lead events"
+        r = execute_sp("SELECT fn_emit_hot_lead_events(25) AS r")
+        _ledger_autoact("supervisor.emit_hot_leads", sig,
+                        {"ok": True, "emitted": (r[0].get("r") if r else None)})
+        return "emitted hot-lead events (policy-authorised)"
     if sig.get("auto") == "churn_campaign":
         # An agent INITIATING commercial action — so it goes through policy:
         # the campaign is PROPOSED to the governance queue and routed to the
