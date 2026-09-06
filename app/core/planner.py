@@ -376,8 +376,19 @@ async def run_plan(goal: str, plan: Optional[Dict[str, Any]] = None) -> Dict[str
         intent, params = step["intent"], dict(step.get("params") or {})
         params["plan_goal"] = goal
         params["plan_correlation_id"] = cid
-        aid = governance.propose(intent, "planner", params,
-                                 confidence=0.55, severity="medium")
+        try:
+            aid = governance.propose(intent, "planner", params,
+                                     confidence=0.55, severity="medium")
+        except governance.ProposalCapReached as capped:
+            # The class has used its daily share of the approver's attention.
+            # Report the step as DEFERRED and keep planning: losing the other
+            # steps because the third one was capped would make a bounded plan
+            # silently partial, and a partial play that looks complete is worse
+            # than one that says what it could not queue.
+            logger.info(f"[planner] step {i} ({intent}) deferred — {capped}")
+            proposed.append({"step": i, "intent": intent, "approval_uuid": None,
+                             "deferred": str(capped), "why": step.get("why")})
+            continue
         proposed.append({"step": i, "intent": intent, "approval_uuid": aid,
                          "why": step.get("why")})
         trace.append({"step": i, "intent": intent, "kind": "write",

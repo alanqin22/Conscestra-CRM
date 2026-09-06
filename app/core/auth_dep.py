@@ -239,6 +239,62 @@ async def require_admin(request: Request) -> bool:
     raise HTTPException(status_code=403, detail="Admin authorization required")
 
 
+async def require_governance_actor(request: Request) -> bool:
+    """Gate for the GOVERNANCE surface — the smallest thing wider than admin.
+
+    THE PROBLEM THIS SOLVES (activation plan §26.3). Governance decisions are
+    bound to the signed-in executive, but the governance routers were gated by
+    `require_admin`. An executive could therefore only reach their own approval
+    queue by being a platform administrator, which grants them every admin
+    endpoint in the product: data import, retention purges, the erasure paths,
+    the capability registry, the agent studio. "You may approve a discount"
+    should not imply "you may erase a customer".
+
+    So this dependency admits exactly three callers, and nothing else:
+
+        1. the ops/machine token  — unchanged; it may READ the governance
+           surface. It still cannot DECIDE: `_bound_authority` refuses a
+           request with no session, which is the invariant this whole stage
+           exists to protect.
+        2. an admin session       — unchanged, for operators.
+        3. an ACTIVE EXECUTIVE's session, whatever its application role. This
+           is the new part, and it is deliberately narrow: it opens the
+           governance routers to the five authorities and nothing else in the
+           platform. An executive credential can now carry a read-only
+           application role and still decide governance, which is the
+           separation the previous stage documented as unresolved.
+
+    WHY NOT A NEW ROLE IN `auth_credentials`. A role would be a second place to
+    say who is an executive, and the copy that drifts is the one nobody
+    watches. `executives` already answers it, `session_authority` already reads
+    it, and revoking an executive row revokes governance access in the same
+    act — no orphaned grant left behind.
+    """
+    # 1 + 2: everything require_admin already accepts, with its own errors.
+    try:
+        return await require_admin(request)
+    except HTTPException as admin_refusal:
+        # 3: an active executive, identified by the session's own identifier.
+        token = _bearer(request)
+        if not token:
+            raise
+        from app.agents.auth.router import get_session
+        sess = get_session(token)
+        if not sess:
+            raise
+        from app.core import governance_policy as gp
+        ex = gp.executive_for_identifier(sess.get("identifier"))
+        if not ex:
+            # Not an administrator and not an executive: the admin gate's own
+            # message is the truthful one.
+            raise admin_refusal
+        request.state.session = sess
+        logger.info(f"[security] governance access for {ex['role_code']} "
+                    f"{sess.get('identifier')} (application role "
+                    f"{sess.get('role')!r}, not admin)")
+        return True
+
+
 async def require_session(request: Request) -> Optional[Dict[str, Any]]:
     """Validate a CRM user session on data endpoints.
 

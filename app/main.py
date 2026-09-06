@@ -384,17 +384,29 @@ def _run_emit_sequence_step_events() -> None:
         logger.error(f"[Sequences] step emit failed: {exc}", exc_info=True)
 
 
-def _run_governance_expiry() -> None:
-    """Scheduled job: flip pending approvals past their TTL to 'expired' so the
-    queue stays honest (best-effort; tolerates the table not existing). Also
-    backfills the independent critic onto any pending approval without one."""
+def _run_governance_sla_sweep() -> None:
+    """Scheduled job (every 15 min): the 48-hour clock (activation §7–§9).
+
+    Breaches and ESCALATES overdue approvals to the CEO, recovers stranded
+    executions, escalates overdue alerts, and backfills the critic. It never
+    expires anything: the previous nightly job flipped 59 of 66 Railway
+    proposals to 'expired' with decided_by='system', which was a decision
+    nobody made. Expiry is a governance breach now, and it is owned."""
     try:
-        from app.core.governance import expire_stale
-        res = expire_stale()
-        if res.get("expired"):
-            logger.info(f"[Governance] expired {res['expired']} stale approval(s)")
+        from app.core import governance
+        res = governance.sla_sweep()
+        if res.get("breached") or res.get("stranded"):
+            logger.warning(f"[Governance] SLA sweep breached={res.get('breached')} "
+                           f"escalated={res.get('escalated')} stranded={res.get('stranded')}")
     except Exception as exc:
-        logger.error(f"[Governance] expiry failed: {exc}", exc_info=True)
+        logger.error(f"[Governance] SLA sweep failed: {exc}", exc_info=True)
+    try:
+        from app.core import governance_alerts
+        res = governance_alerts.sweep_sla()
+        if res.get("escalated"):
+            logger.warning(f"[Governance] {res['escalated']} alert(s) escalated to CEO")
+    except Exception as exc:
+        logger.error(f"[Governance] alert SLA sweep failed: {exc}", exc_info=True)
     try:
         from app.core import critic
         res = critic.review_pending()
@@ -402,6 +414,10 @@ def _run_governance_expiry() -> None:
             logger.info(f"[Critic] backfilled {res['reviewed']} critique(s)")
     except Exception as exc:
         logger.error(f"[Critic] backfill failed: {exc}", exc_info=True)
+
+
+# Kept as an alias so anything that imported the old name still resolves.
+_run_governance_expiry = _run_governance_sla_sweep
 
 
 def _run_intelligence_scoring() -> None:
@@ -1026,14 +1042,19 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             misfire_grace_time=1800,
         )
-        # Governance expiry — nightly 21:45 ET: stale pending approvals →
-        # 'expired' (audited) instead of lingering as silent liabilities.
+        # Governance SLA sweep — every 15 minutes, on an INTERVAL so a restart
+        # never skips it (a missed cron fire is exactly the gap an SLA clock
+        # cannot have). Breaches + escalates overdue approvals to the CEO,
+        # recovers stranded executions, escalates overdue alerts. Replaces the
+        # nightly 'governance_expiry' job: nothing expires any more.
         _scheduler.add_job(
-            _run_governance_expiry,
-            trigger=CronTrigger(hour=21, minute=45),
-            id="governance_expiry",
+            _run_governance_sla_sweep,
+            trigger=IntervalTrigger(minutes=15),
+            id="governance_sla_sweep",
             replace_existing=True,
-            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=600,
         )
         # Customer-intelligence scoring — nightly 22:35 ET, after the seed and
         # advance passes so profiles reflect the day's final state. Self-gates
@@ -1614,13 +1635,23 @@ async def normalise_path(request: Request, call_next):
 #   require_admin   : hard gate on privileged COMMAND endpoints — enforced once
 #                     ADMIN_API_TOKEN is set; the frontend never calls these.
 from fastapi import Depends
-from app.core.auth_dep import require_admin, require_data_access
+from app.core.auth_dep import (require_admin, require_data_access,
+                               require_governance_actor)
 
 # _DATA = unified data gate. With API_PUBLIC_READ=1 (demo): anyone may READ, but
 # create/update/delete require a logged-in Admin/authorized (member) session.
 # With API_PUBLIC_READ=0: every data call requires a session (full lockdown).
 _DATA  = [Depends(require_data_access)]
 _ADMIN = [Depends(require_admin)]
+# GOVERNANCE SURFACE — admin OR an active executive (auth_dep.require_governance_actor).
+#
+# Deliberately NOT _ADMIN. Binding decisions to the signed-in executive is
+# pointless if the only way to sign in and reach the queue is to be a platform
+# administrator: the executive would hold every admin endpoint in the product
+# in order to approve a discount. This gate is exactly one step wider than
+# admin — it also admits the five authorities' own sessions — and it applies to
+# the governance routers alone. Every other admin surface is untouched.
+_GOVERNANCE = [Depends(require_governance_actor)]
 
 # -- Home dashboard (registered first for fast routing).
 #    PUBLIC: the landing page / KPI summary must render for anonymous visitors
@@ -2026,8 +2057,22 @@ from app.core.verification_policy import router as verification_policy_router
 app.include_router(verification_policy_router, dependencies=_ADMIN)
 
 # -- Correlation-id trace (one id → the whole play across a2a/events/approvals)
+# THE CORRELATION TRACE IS PART OF THE DECISION, not a platform tool.
+#
+# Measured 2026-09-05: an executive signed in with a non-admin role reached all
+# eleven governance endpoints and was refused `/trace-recent` and `/trace/{cid}`
+# — the one governance function still requiring administration. An approver who
+# cannot see what the play did cannot answer "what am I approving", which is the
+# question the whole queue exists to put in front of them, and the console's
+# recent-plays panel is on that surface.
+#
+# Read-only by construction (trace.py has no write path), so widening it to the
+# governance gate grants sight, never reach. The capability registry and the
+# what-if simulator DELIBERATELY stay admin: the first is an operator kill
+# switch and the second is a business tool, and neither is needed to decide an
+# approval. "Fix only that dependency" means exactly this one.
 from app.core.trace import router as trace_router
-app.include_router(trace_router, dependencies=_ADMIN)
+app.include_router(trace_router, dependencies=_GOVERNANCE)
 
 # -- Scenario simulation (read-only what-if over objectives math; audit #6)
 from app.core.simulator import router as simulator_router
@@ -2134,11 +2179,18 @@ app.include_router(qualification_router, dependencies=_ADMIN)
 
 # -- Governance (Phase 5 — confidence-gating + approval queue)
 from app.core.governance import router as governance_router
-app.include_router(governance_router, dependencies=_ADMIN)
+app.include_router(governance_router, dependencies=_GOVERNANCE)
 # One-click approve/reject from the routed-approval email — PUBLIC because the
 # HMAC token is the authorization (same pattern as the unsubscribe endpoint).
 from app.core.governance import public_router as governance_public_router
 app.include_router(governance_public_router)
+# Governance ACTIVATION (docs/governance/activation_plan.md): decision policy
+# by action class, the four approval authorities, owner eligibility, and the
+# governed alert lifecycle. Admin-gated like the queue itself.
+from app.core.governance_policy import router as governance_policy_router
+app.include_router(governance_policy_router, dependencies=_GOVERNANCE)
+from app.core.governance_alerts import router as governance_alerts_router
+app.include_router(governance_alerts_router, dependencies=_GOVERNANCE)
 
 # -- Admin Users console (manage auth_credentials). Router self-gates on require_admin.
 from app.agents.admin_users.router import router as admin_users_router

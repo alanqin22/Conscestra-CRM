@@ -521,13 +521,17 @@ def _check_public_url() -> Dict[str, Any]:
     if site and _is_local(site):
         return {"control": "public_url", "ok": False, "severity": "advisory",
                 "message": f"PUBLIC_SITE_URL={site} in a deployed environment — "
-                           f"the Order Status button in every order email points "
-                           f"at the recipient's own machine"}
+                           f"the Order Status button in every order email, and "
+                           f"the auth.html link in every password-reset email, "
+                           f"point at the recipient's own machine"}
     if not site:
         # Not an error: one process CAN serve both, and the fallback is
         # deliberate. But on a deployment where it does not, every Order Status
-        # button lands on a host that has no page, so say which case this is
-        # rather than reporting a single origin as though it covered both.
+        # button and every password-reset link lands on a host that has no page,
+        # so say which case this is rather than reporting a single origin as
+        # though it covered both. Since 2026-09-06 the reset link is the one
+        # that bites hardest: it is how an executive recovers their own account,
+        # so a bad origin there is not a broken button, it is a locked door.
         return {"control": "public_url", "ok": True, "severity": "advisory",
                 "message": f"endpoint links resolve to {url}; PUBLIC_SITE_URL is "
                            f"unset so page links fall back to it — correct only "
