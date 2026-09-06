@@ -12,13 +12,17 @@ Companion documents: `activation_plan.md` (the model),
 
 ## 1. Verdict
 
-**Governance is implemented, tested, and locally OPERATIONAL. All five authorities can
-sign in as themselves and decide. The only remaining step is deployment.**
+**Governance is OPERATIONAL IN PRODUCTION. All five authorities can sign in as themselves
+and decide on the deployed system.**
 
-Updated 2026-09-06 09:40. Every executive holds an individual credential, has set their own
-password, and is refused platform administration. The CTO gap is closed, the COO identity is
-reconciled, and `/governance/authorities` reports an empty `missing`, `without_credential`
-and `identity_mismatch` for the first time.
+Updated 2026-09-06 19:32 UTC. Every executive holds an individual credential on **both**
+databases, has set their own password through the production self-service flow, and is
+refused platform administration. The CTO gap is closed on both, the COO identity is
+reconciled on both, and `/governance/authorities` reports an empty `missing`,
+`without_credential` and `identity_mismatch` in production.
+
+This is the line the 2026-09-05 assessment said the platform had not crossed: a governed
+decision is now attributable to a named human on the system that actually serves customers.
 
 **What this changes.** Governance stops being a mechanism that exists and becomes one that
 operates. A decision taken in the console is now bound to an authenticated session and
@@ -64,8 +68,8 @@ Two facts decide everything else:
 4. **An unauthenticated password-reset token disclosure is live on the deployed host.**
    Found while verifying the new credentials. **Now fully fixed in code** — both the
    disclosure and the missing delivery that closing it would otherwise have exposed. See
-   §12. **Still not deployed**, and it is now the only thing between this system and a
-   working governance console.
+   §12. **DEPLOYED 2026-09-06** (commit `bfbfac7a37b9`) and verified live: a real account
+   and an invented one return byte-identical replies with no token.
 
 Everything else in this stage verified. **Every action class is now decided** — the owner
 settled `kb.publish` on 2026-09-05 (CRO, human approval, three a day), and
@@ -101,7 +105,7 @@ act) · **NOT DEPLOYED**.
 | 21 | CTO identity | **VERIFIED (local)** | membership + owner `585f003c…` + credential + `fn_owner_eligible` true; CEO-attested real, the corpus's only `eligible_production` owner | §5.2 |
 | 21b | COO identity | **VERIFIED (local)** | rename reconciled across owner + directory + authority on one uuid; 50 records untouched; credential issued; live round trip signed in as Alex Zhou with `can_decide=true` and 403 on five admin surfaces | §5.3 |
 | 31b | Authority names the person it decides as | **VERIFIED (detector)** | `identity_mismatch` on every authority row; reports the COO divergence today and nothing else | §5.3 |
-| 32 | Reset-token disclosure | **CONTRADICTED BY EVIDENCE** | the reset endpoint handed anonymous callers a working token for any real account, deployed commit included; fixed in code, not deployed | §12 |
+| 32 | Reset-token disclosure | **CLOSED (verified in production)** | was: anonymous callers received a working token for any real account. Now: identical replies, no token, verified against the deployed host 2026-09-06 | §12 |
 | 23 | Every action class decided | VERIFIED | `decision_required` is empty; `kb.publish` v2 → CRO, HUMAN_APPROVAL, cap 3, history records CEO→CRO | — |
 | 24 | Daily cap enforced and visible | VERIFIED | `propose()` raises `ProposalCapReached`; six producers defer; `a2a.dispatch` returns structured `REJECTED`; first refusal each day opens a CRO-owned work item | — |
 | 25 | Executive reaches governance without admin | VERIFIED live | a CEO session with `role='viewer'` returned 200 on all 12 governance and audit endpoints | credentials (#20) |
@@ -111,7 +115,9 @@ act) · **NOT DEPLOYED**.
 | 29 | One identity resolves to one authority | VERIFIED | parametrised over all five; the CTO case skips honestly because it is not yet eligible | CTO identity |
 | 30 | Independent revocation | VERIFIED | deactivating one executive removes exactly that authority; a live session for the revoked executive is refused at the **next request**, not at the next restart | — |
 | 31 | Historical attribution preserved | VERIFIED | all 288 decided rows are pre-activation (`decided_actor IS NULL`); a test fails if any admin-attributed row ever acquires an actor | — |
-| 22 | Deployed | **NOT DEPLOYED** | Railway has 0 of 3 tables, 0 of 4 columns; 0 commits ahead of origin/master | §5.8 |
+| 22 | Deployed | **DEPLOYED 2026-09-06** | commit `bfbfac7a37b9`; all five SQL files applied to Railway; 37 action policies, 4 of 5 authorities eligible, 10 of 10 approval columns present | §5.8 |
+| 22b | Executive sign-ins on Railway | **VERIFIED (production)** | 5 individual `viewer` credentials; all five set their own password through the deployed reset flow between 19:24 and 19:30 UTC, each leaving **zero** live codes | §14 |
+| 22c | CTO owner identity on Railway | **VERIFIED (production)** | granted 2026-09-06 under the CEO's authorisation: membership, owner `dd2afdde…`, credential, `fn_owner_eligible` true, attested real | §14 |
 
 ## 3. Test evidence
 
@@ -349,7 +355,7 @@ not evidence of anything.
 ## 12. Security finding — unauthenticated password-reset token disclosure
 
 **Severity: critical. Found 2026-09-05 while verifying that the new executive credentials
-work. Fixed in code. NOT DEPLOYED. Nothing has been pushed.**
+work. Fixed, pushed, and DEPLOYED 2026-09-06 (commit `bfbfac7a37b9`).**
 
 `POST /auth/password-reset/request` takes no authentication and returned the freshly
 minted `reset_token` in its response body, under a comment reading `# DEMO ONLY — remove
@@ -452,3 +458,130 @@ identity**, and that re-scoping was not on any checklist here. It is now.
 
 **HUMAN ACTION REQUIRED:** authorise deployment of this fix, independently of the four
 governance migrations. It touches one endpoint.
+
+## 13. Production deployment — 2026-09-06
+
+Application commit `bfbfac7a37b9`. All five SQL files applied to Railway, in order.
+
+### What was verified, and how
+
+| Claim | Evidence | Classification |
+|---|---|---|
+| The reset-token disclosure is closed | Posted a **real** identifier and an **invented** one to the deployed host; both returned `"If that account exists, a reset link has been sent"` with `reset_token: null` | **VERIFIED (production)** |
+| A consumed code retires its siblings | `consume_password_reset_token` on the production database carries the sibling-retirement clause | **VERIFIED (production)** |
+| Reset links reach the site, not the API | Release guard logged `page links to https://agentorc.ca` | **VERIFIED (production)** |
+| The new mail call site is declared | Release guard logged `25 send_email call sites, all declared` — matching local exactly | **VERIFIED (production)** |
+| The SQL manifest shipped intact | Release guard logged `41 governed, 238 out-of-band` — matching local exactly | **VERIFIED (production)** |
+| Governed proposals can be created | `resolve_accountable_owner` now finds four eligible authorities where the query previously failed outright | **PARTIALLY VERIFIED** — the underlying query was exercised; no proposal was raised on production |
+
+### The gap this release opened, and closed
+
+The application shipped before its schema. For roughly two hours Railway ran governance
+code against a database with none of its tables, and the failure was measured rather than
+assumed: `column e.owner_id does not exist` and `relation "governance_action_policies" does
+not exist`.
+
+The consequences split cleanly, and the split is worth keeping.
+
+- **Policy lookup failed safe.** No policy row means `may_auto_execute` returns false, so
+  nothing could execute without a human. The fail-closed default did its job.
+- **Proposal creation failed hard.** `resolve_accountable_owner` raises when no eligible
+  authority can be resolved, and `propose()` calls it first, so a governed write could not
+  even queue. Nothing was lost — there were zero pending approvals throughout — but the
+  window is real and it is the reason the four files belong in the same change as the code
+  that reads them.
+
+**The lesson is about how it was communicated, not about the files.** All five were declared
+`PENDING DEPLOYMENT` together, but the handover named the reset SQL and left the other four
+in a commit body. A deployment instruction is part of the deliverable; if only one of five
+files gets applied, the instruction was wrong regardless of what the declarations said.
+
+### Production state after the migrations
+
+| Measure | Value |
+|---|---|
+| Action policies | 37 (35 human-approval) |
+| Active executives | 5 |
+| Eligible owners | 4 of 5 |
+| Executive credentials | **0 of 5** (plus 1 platform admin) |
+| Pending approvals | 0 |
+| Legacy `expired` approvals | 60 |
+| Governance alerts | 1 (opened by the machinery itself) |
+
+### What is still outstanding on Railway
+
+1. **No executive can sign in.** The five credentials exist on the local database only, so
+   the production console can decide nothing. This is D5 holding rather than a fault, and it
+   is the next step.
+2. **The CTO has no owner identity there.** `fn_owner_eligible` is false for that role, so
+   its classes route to the CEO flagged `ownership_exception` — the same designed
+   degradation that applied locally before the grant. `docs/governance/executive_identity_activation.md` §3
+   is the procedure, and it must run **after** the migrations, which it now can.
+3. **60 legacy `expired` approvals remain.** They are historical record and are deliberately
+   left alone; the retired expiry sweep can no longer add to them.
+
+## 14. Production activation — 2026-09-06
+
+The identity procedure was executed against Railway after the migrations, in the order
+`docs/governance/executive_identity_activation.md` §3 specifies.
+
+### What Railway needed that local did not tell us
+
+Railway was **not** a copy of local, and assuming it was would have produced two silent
+faults. Measured before touching anything:
+
+| Finding | On Railway |
+|---|---|
+| CTO identity | absent — no owner, no membership, no credential |
+| COO rename | **half-applied, exactly as it had been locally**: authority row read Alex Zhou, owner row and directory still read Yongmei Qin |
+| Work held by that COO owner | 50 activities, 7 opportunities — more than the 50 held locally |
+| Attestations | none |
+
+The COO row was renamed **in place**, so all 57 records kept their owner. The guard in
+`scripts/provision_executive.py` refused the ambiguous form there too, which is the second
+time that refusal has done real work.
+
+Owner ids differ between the two databases because identity is provisioned per-database.
+The CEO's attestations were therefore recorded against the Railway rows by name rather than
+by copying an id that means nothing there.
+
+### Production state
+
+| Role | Eligible | Credential | Password set (UTC) | Live codes after |
+|---|---|---|---|---|
+| CEO Alan Qin | ✓ | ✓ `viewer` | 19:26:30 | 0 |
+| CRO Daping Qin | ✓ | ✓ `viewer` | 19:24:40 | 0 |
+| CFO Sherman Zhang | ✓ | ✓ `viewer` | 19:27:50 | 0 |
+| CTO Bill Wang | ✓ | ✓ `viewer` | 19:30:07 | 0 |
+| COO Alex Zhou | ✓ | ✓ `viewer` | 19:28:49 | 0 |
+
+`missing`, `without_credential` and `identity_mismatch` are all empty. 37 action policies,
+0 pending approvals, 0 unowned exceptions, 1 governance alert opened by the machinery
+itself. No executive holds `admin`.
+
+Every "0 live codes" in that table is the sibling-retirement rule (§10 of the identity doc)
+firing in production, five times, on real resets rather than in a test.
+
+### The recovery flow, exercised end to end in production
+
+The five codes were requested from the **deployed** endpoint, not locally, so the whole path
+was exercised as customers would meet it: `reset_token: null` in every response, the code
+delivered by mail, and the link resolving to `agentorc.ca` rather than the API host. Each
+send was confirmed against the `info@` BCC archive rather than from the endpoint's own
+report.
+
+One prerequisite was caught before sending rather than after: the site was still serving the
+previous `auth.html`, which ignores `?tab=reset` and would have landed five executives on
+the Sign In form — the exact confusion that had cost time that morning. The updated page was
+uploaded first, and verified byte-for-byte against local (67,811 bytes) before any mail went
+out.
+
+### Still open
+
+- **CEO, CRO and CFO are not attested** as real people on either database. Two of five are.
+  Eligibility does not depend on it; `eligible_production` does.
+- The four governance migrations and `reset_token_single_use.sql` remain classified
+  `OUT_OF_BAND_SQL`. Promotion to `REQUIRED_MIGRATIONS` is now unblocked — Railway has
+  executed them — and is a separate, deliberate act.
+- 60 legacy `expired` approvals stay as historical record. The retired sweep can no longer
+  add to them.

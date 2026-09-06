@@ -39,7 +39,11 @@ customer contact, not a service identity, not an identity collision, membership 
 | CTO | ✓ Bill Wang | ✓ `585f003c…` | ✓ | ✓ `viewer` | ✓ 09:09 | ✓ | ✓ **attested by the CEO** |
 | COO | ✓ Alex Zhou | ✓ `e4d99e38…` | ✓ | ✓ `viewer` | ✓ 09:39 | ✓ | ✓ **attested by the CEO** |
 
-**MILESTONE — 2026-09-06 09:40. All five authorities are operational.** Each executive
+**MILESTONE — 2026-09-06. All five authorities are operational on BOTH databases.**
+Production activation, including the Railway differences that local could not have
+predicted, is recorded in `five_authority_readiness.md` §14.
+
+Locally, 09:40: Each executive
 holds an individual credential, has set their own password through the self-service reset
 flow, and can sign in and decide. `GET /governance/authorities` reports an empty `missing`,
 an empty `without_credential` **and** an empty `identity_mismatch` for the first time.
@@ -141,8 +145,10 @@ not apply and none of them can look like a customer to `fn_owner_eligible`, whos
 test is the shared `contacts.contact_id = owner_id` primary key. Both checked on the data,
 not assumed.
 
-> **Before anyone signs in, read §8.** The password-reset endpoint handed a working reset
-> token to anonymous callers. It is fixed in code and **the fix is not deployed**.
+> **§8 is closed.** The password-reset endpoint handed a working reset token to anonymous
+> callers. Fixed, deployed 2026-09-06 (commit `bfbfac7a37b9`), and verified against the
+> live host: a real account and an invented one now return byte-identical replies with no
+> token.
 
 ## 5. COO identity — a rename that had only half landed. DONE 2026-09-06
 
@@ -272,7 +278,13 @@ is itself an act worth recording — say why in the same place you say who.
 
 ## 8. Security finding — unauthenticated password-reset token disclosure
 
-**Found 2026-09-05 while verifying that these credentials work. Fixed in code. NOT DEPLOYED.**
+**Found 2026-09-05 while verifying that these credentials work. Fixed, and DEPLOYED
+2026-09-06.**
+
+Verified on the deployed host after the release, not inferred from the commit: posting a
+**real** identifier and an **invented** one both return
+`"If that account exists, a reset link has been sent"` with `reset_token: null`. The
+takeover and the account-enumeration oracle are closed together.
 
 `POST /auth/password-reset/request` takes no authentication and returned the freshly minted
 `reset_token` in its response body, under a comment reading `# DEMO ONLY — remove in
@@ -390,7 +402,8 @@ there yet whatever route they use.
 ## 10. A used reset code retires every sibling
 
 **Found 2026-09-06, immediately after the first executive completed a reset. Fixed in
-`governance/sql/reset_token_single_use.sql`, applied locally, PENDING DEPLOYMENT.**
+`governance/sql/reset_token_single_use.sql`, applied locally and to Railway 2026-09-06;
+the function on the production database now carries the sibling-retirement clause.**
 
 `consume_password_reset_token` marked exactly one row used: the row whose hash was
 presented. Every other outstanding code for that credential stayed valid until its own
