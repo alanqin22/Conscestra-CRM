@@ -578,10 +578,91 @@ out.
 
 ### Still open
 
-- **CEO, CRO and CFO are not attested** as real people on either database. Two of five are.
-  Eligibility does not depend on it; `eligible_production` does.
-- The four governance migrations and `reset_token_single_use.sql` remain classified
-  `OUT_OF_BAND_SQL`. Promotion to `REQUIRED_MIGRATIONS` is now unblocked — Railway has
-  executed them — and is a separate, deliberate act.
+- ~~CEO, CRO and CFO are not attested~~ — **all five attested by the CEO, 2026-09-06.** See §15.
+- ~~The five SQL files remain out-of-band~~ — **promoted to `REQUIRED_MIGRATIONS`, 2026-09-06.** See §15.
 - 60 legacy `expired` approvals stay as historical record. The retired sweep can no longer
   add to them.
+
+## 15. Promotion to the governed chain — 2026-09-06
+
+All five owners are now attested, and the five SQL files have been promoted from
+`OUT_OF_BAND_SQL` into `REQUIRED_MIGRATIONS`.
+
+### The full attestation
+
+The CEO stated that all five executives are real people. Recorded on **both** databases,
+against the owner row each one names, since owner ids differ per database. Existing
+attestations were left exactly as first recorded — original date, original attester.
+
+`eligible_production` is now 5 of 5 on both. Note what never moved that number at any point:
+being an eligible owner, being renamed, holding a credential, or signing in. Only the
+sentence "this is a real human", written down and attributed.
+
+**A control flipped, and this time it was earned.** `assignable.environment()` now reports
+`synthetic: false` — "Staffed organisation — all 5 authorised identities are attested as
+real people". That is the transition the rewritten control was built to allow and the old
+`linked <= 4` threshold could never express: it cannot be reached by adding people, only by
+somebody vouching for every one of them. Adding an unattested identity moves it back.
+
+### The promotion
+
+| | Before | After |
+|---|---|---|
+| `REQUIRED_MIGRATIONS` | 41 | **46** |
+| `OUT_OF_BAND_SQL` | 238 | **233** |
+| On disk | 279 | 279 |
+
+Nothing was added or removed; five files changed partition. `declared` moves for the first
+time in this history, in the only direction that is ever legitimate — a file becomes a claim
+about what production has executed *after* production has executed it.
+
+Order is load-bearing for the first four: activation creates the policy table the others
+amend, five_authorities widens the role CHECK before any row names a COO, reescalation adds
+counters to tables activation creates, and kb_publish_policy rewrites a row activation
+seeds.
+
+**Replay safety was checked before promoting, not assumed** — promotion means `migrate.py`
+may replay these. Every seed uses `WHERE NOT EXISTS` and every object `IF NOT EXISTS`. The
+evidence is the schema attestation either side of the replay:
+
+| Database | Before | After |
+|---|---|---|
+| local | `0107851a9939e020` (1428 objects) | `0107851a9939e020` (1428 objects) |
+| railway | `a32886430b94b681` (2388 objects) | `a32886430b94b681` (2388 objects) |
+
+Identical, so the replay changed nothing structurally. `kb.publish` still reads
+CRO / HUMAN_APPROVAL / cap 3 on both — the specific revert risk, since activation seeds that
+row and the fourth file rewrites it. Both databases now report `schema is current`.
+
+### A latent defect found while promoting
+
+`OUT_OF_BAND_SQL` contained **two entries for `governance_reescalation.sql`**. Python keeps
+the last, so one entry's stated reason was dead text that nothing read and no test could
+detect — the dictionary is the control, and a duplicate key silently discards half of it.
+Removed.
+
+### Two test defects the attestation exposed
+
+Both were the suite operating on real records, and both had been latent until a real record
+existed to damage.
+
+1. **`owner_prov` deleted attestations it never created.** Its insert carried
+   `ON CONFLICT DO NOTHING`, so where a row already existed the fixture wrote nothing — then
+   removed the row on teardown regardless. Once the CEO attested the executives, every suite
+   run silently deleted a governance record a named human had made; it was found because the
+   CEO's attestation vanished mid-run. A fixture must undo what it *did*, which is not the
+   same as deleting what it touched. It now snapshots the prior row and restores it exactly:
+   state, rule, evidence, `decided_at` and `decided_by`, because "who said this and when" is
+   the whole value of the record.
+
+2. **The provenance tests classified a real executive as synthetic.** `ELIGIBLE_OWNER` is
+   `ceo@agentorc.ca`. After the attestation the database itself refused —
+   `trgfn_corpus_provenance_settled`: *"already settled as real; a settled classification is
+   not revised"*. The trigger was right and the tests were wrong. They now mint their own
+   subject on `seed.agentorc.ca`, classify it freely and destroy it, so the
+   settled-classification guard stays a real constraint rather than something the suite has
+   to be exempted from.
+
+The pattern is the same one the reset tests hit earlier in the day: **a suite that operates
+on production-shaped records will eventually damage one.** Three fixtures have now been given
+their own throwaway subjects for exactly this reason.

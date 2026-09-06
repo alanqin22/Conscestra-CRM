@@ -15,10 +15,11 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-9e363b892e6dab3ecbae7c7054c0ea487905c4c8
+e802469f6ebd6b06a37320659c6536351c376115
 
-# 9e363b8 -- five executive credentials, the password-reset hardening they
-# depend on, and reset_token_single_use.sql. The pin is what couples them to
-# the declarations in deploy_state.OUT_OF_BAND_SQL: this commit declares five
-# out-of-band files, and CI fails with 'CLASSIFIED BUT ABSENT FROM DISK' if
-# the pinned governance commit does not contain every one of them.
+# e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
+# baseline regenerated to carry the resulting ledger. The pin matters more
+# than usual here: deploy_state now DECLARES five files as part of the
+# governed chain, and migrate --check reads that as a claim about what has
+# run. A public commit pinned to a governance commit without them would
+# fail with 'DECLARED BUT ABSENT FROM DISK'.
