@@ -634,6 +634,42 @@ Identical, so the replay changed nothing structurally. `kb.publish` still reads
 CRO / HUMAN_APPROVAL / cap 3 on both — the specific revert risk, since activation seeds that
 row and the fourth file rewrites it. Both databases now report `schema is current`.
 
+### Verified in production after the promotion
+
+Deployed as commit `62af0c7ccd47` (PR #67). Checked against the running system rather than
+read off the commit:
+
+| Claim | Evidence |
+|---|---|
+| The promoted manifest shipped | release guard logs `SQL manifest consistent (46 governed, 233 out-of-band)` — it read 41/238 before |
+| The chain is complete on production | `migrate --check --target railway` → **schema is current** |
+| All five authorities operate | eligible + credentialed, with empty `missing`, `without_credential` and `identity_mismatch` |
+| Every executive is attested | `eligible_production` = 5 |
+| The reset disclosure is still closed | a real and an invented identifier both return `reset_token: null` and the same sentence |
+
+### The same control gives two different answers, and production's is the honest one
+
+Worth stating because it looks like a discrepancy and is not.
+
+| | Directory | Attested | `environment()` |
+|---|---|---|---|
+| local | 5 | 5 | **staffed** |
+| railway | 12 | 5 | **synthetic** |
+
+Production carries seven seeded employee identities in `assignable_identity` — `dlee`,
+`kpatel`, `ljones`, `mchen`, `rgarcia`, `sjohnson`, `snguyen` — that were never granted on
+the local database. Nobody has vouched for any of them, so production correctly still
+reports a synthetic organisation and `case-mgmt.html` correctly still shows the banner.
+
+This is the rewritten control earning its keep. The threshold it replaced compared a count
+to `4` and would have called production "staffed" the moment it had five linked identities,
+which it has had all along. Measuring attestation instead means the answer tracks *who has
+been vouched for*, so the two databases differ precisely because their populations differ —
+and production, which has more unattested identities, is the one that keeps warning.
+
+It also names the remaining work rather than hiding it: seven identities on production are
+authorised to receive work with nobody having stated they are real people.
+
 ### A latent defect found while promoting
 
 `OUT_OF_BAND_SQL` contained **two entries for `governance_reescalation.sql`**. Python keeps
