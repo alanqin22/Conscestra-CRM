@@ -366,12 +366,14 @@ execution; the CEO always receives it.
 
 ## 20. Human actions required
 
-**Revision 4, 2026-09-06.** Items 1 and 2 are done; what remains is one value, one
-deployment authorisation, and Railway.
+**Revision 5, 2026-09-06 (end of day).** Items 1–4 are all done, on **both** databases,
+and deployed. What remains of this whole plan is one decision (§26.1) and elapsed time
+(§27). Audited against the running system, not against this document — see §28.
 
-1. ~~**Create a sign-in credential for each of the five executives**~~ — **four done
-   2026-09-05.** CEO, CRO, CFO and CTO each hold an individual credential on their own
-   address with `access_role='viewer'`. **None is an admin and none needs to be:** the
+1. ~~**Create a sign-in credential for each of the five executives**~~ — **all five done,
+   on both databases.** Four locally 2026-09-05, the fifth (COO) 2026-09-06, and all five
+   on Railway the same day. Every executive has since set their own password through the
+   deployed self-service flow. Each holds `access_role='viewer'`. **None is an admin and none needs to be:** the
    governance gate admits an executive on the strength of the `executives` row alone.
    Verified live — an executive session reaches `/governance/whoami` with
    `can_decide=true` and is refused 403 on `/executives`, `/agent-bus/status`,
@@ -428,7 +430,11 @@ deployment authorisation, and Railway.
    is no `corpus_provenance` attestation and they do not count toward
    `eligible_production`. A rename is not evidence of realness.
 
-4. **Authorise deployment of the password-reset fix**, independently of the four
+4. ~~**Authorise deployment of the password-reset fix**~~ — **DEPLOYED 2026-09-06** and
+   verified against the running host: a real identifier and an invented one both return
+   `reset_token: null` and the same sentence. The original entry follows.
+
+   ~~Authorise deployment of the password-reset fix~~, independently of the four
    migrations. `POST /auth/password-reset/request` takes no authentication and returned a
    working reset token in its response body for any real account — verified locally, and
    present in the commit Railway reports as deployed. It became critical the moment
@@ -516,8 +522,16 @@ curl -H "X-Admin-Token: $T" $APP/governance/alerts          # event_orphaned ale
 
 - **Governance Development Ready** — schema, policy, UI, API, tests implemented: **met locally**.
 - **Governance Test Ready** — activation suite green (41/41) incl. race, SLA, ownership, escalation, orphan: **met locally**; wider suite: see §22.
-- **Governance Operational Ready** — four executives can see and act on their desks; Alert Center usable: **console built; not yet exercised by the executives**.
-- **Governance Production Verified** — not met (nothing deployed). Criteria: 100% new proposals with eligible owner and SLA timestamps; breaches escalate to CEO **and email**; no silent expiry; 0 stranded; 0 unowned consequential alerts; orphaned events visible; auto actions have explicit policy; every consequential action auditable; **and every console decision bound to an authenticated executive — `decided_actor` never null, never an administrator standing in for an executive**.
+- **Governance Operational Ready** — **met in constitution, NOT in use.** All five
+  executives can sign in and decide on both databases; `/governance/authorities` reports
+  empty `missing`, `without_credential` and `identity_mismatch`. But **no executive has yet
+  decided anything in production**: `decided_actor IS NOT NULL` counts **0** on Railway
+  (9 locally, from tests and probes). There are also 0 pending proposals there, so nothing
+  is currently waiting on them. The console is constituted and unexercised.
+- **Governance Production Verified** — **deployed 2026-09-06; the 14-day window starts
+  now.** Measured on day 0: 0 pending proposals, 0 missing an owner / authority / due date,
+  0 rows expired since the deploy, 1 governance alert opened by the machinery itself.
+  Criteria: 100% new proposals with eligible owner and SLA timestamps; breaches escalate to CEO **and email**; no silent expiry; 0 stranded; 0 unowned consequential alerts; orphaned events visible; auto actions have explicit policy; every consequential action auditable; **and every console decision bound to an authenticated executive — `decided_actor` never null, never an administrator standing in for an executive**.
 - **World-Class Governance Ready** — not claimable: requires 90 days of SLA compliance, external reconstruction, replayable decisions, independent assurance.
 
 ## 25. Rollback plan
@@ -582,10 +596,14 @@ authority. Six producers were made cap-aware; `a2a.dispatch` returns a structure
 5. ~~The COO's own email address.~~ **Settled 2026-09-06 (owner): same person, renamed.**
    Reconciled in place on one identity; all five authorities now hold a credential and
    `/governance/authorities` reports empty `missing`, `without_credential` and
-   `identity_mismatch`. Open sub-item: nobody has stated whether the COO is a real person,
-   so unlike the CTO there is no `corpus_provenance` attestation and they do not count
-   toward `eligible_production`.
-6. **Deploy the password-reset fix?** An unauthenticated caller could obtain a working
+   `identity_mismatch`. ~~Open sub-item: the COO is not attested.~~ **Closed 2026-09-06:
+   the CEO attested all five executives as real people, on both databases.
+   `eligible_production` is 5 of 5.**
+6. ~~**Deploy the password-reset fix?**~~ **DONE 2026-09-06** — deployed, and the closure
+   verified against the running host rather than inferred from the commit. The original
+   entry follows.
+
+   ~~An unauthenticated caller could obtain a working
    reset token for any real account, including every executive and the platform
    administrator — verified locally, and present in the commit Railway reports as
    deployed. Fixed, tested and mutation-checked here; **not pushed**. It is one endpoint
@@ -604,7 +622,72 @@ identity, none an administrator acting on someone's behalf, and none holding adm
 privilege merely in order to decide. Until then this work is `IMPLEMENTED` and `TESTED`,
 not `DEPLOYED` and not `PRODUCTION VERIFIED`.
 
-**Companion documents (Revision 4):** `five_authority_readiness.md` — the evidence matrix
+**Companion documents (Revision 5):** `five_authority_readiness.md` — the evidence matrix
 and what is blocked; `executive_identity_activation.md` — the exact identity procedure,
 its verification and its rollback; `railway_governance_verification.md` — the deployment
 gate and the production evidence that must exist before "production verified" is said.
+
+## 28. Completion audit — 2026-09-06
+
+Audited against the running systems, not against this document. Every "done" below was
+checked by querying the database or calling the endpoint.
+
+### Done
+
+| § | Item | Evidence |
+|---|---|---|
+| 14 | Schema changes | all five SQL files applied to local **and** Railway; `migrate --check` reports **schema is current** on both |
+| 15 | API / backend | governance routers behind `require_governance_actor`; `/governance/whoami`, `/governance/authorities`, SLA sweep every 15 min |
+| 20.1 | Five executive credentials | 5 of 5 on both databases, all `viewer`, none admin; every executive set their own password through the deployed flow |
+| 20.2 | CTO identity grant | membership + owner + credential + `fn_owner_eligible` true, on both |
+| 20.3 | COO identity | half-applied rename reconciled in place on one uuid, on both; 57 records kept their owner on Railway |
+| 20.4 | Password-reset fix | deployed; a real and an invented identifier both return `reset_token: null` |
+| 26.1–26.7 | Owner decisions | all seven settled and implemented |
+| 26.3 | CTO identity decision | granted and attested |
+| 26.4 | Executive credentials | issued |
+| 26.5 | COO | settled as a rename; all five now attested real |
+| 26.6 | Deploy the reset fix | done and verified in production |
+| — | Attestation | all five executives attested real by the CEO, both databases; `eligible_production` 5 of 5 |
+| — | Promotion | the five files moved into `REQUIRED_MIGRATIONS` (41→46 declared, 238→233 out-of-band) after production executed them |
+| — | Baseline | regenerated so its ledger covers the declared chain; verification gate passes every stage |
+| 24 | Development Ready | met |
+| 24 | Test Ready | met — full suite 2,733 passed, 2 skipped, 0 failed |
+
+### Not done, and why
+
+**1. Paging beyond email (§26.1) — the only open DECISION.** Nothing but email exists.
+`email_authority` carries SLA breaches and CEO escalations; there is no SMS or push path,
+and `severity='critical'` reaches an inbox like everything else. The plan already states the
+minimum next step — route critical alerts and CEO escalations through the existing
+transports, reusing `email_authority`'s ledger shape so idempotency and the attention budget
+still apply. It is a delivery decision, not a model change, and it is genuinely undone.
+
+**2. No executive has decided anything in production (§24, Operational Ready).** The console
+is constituted and unexercised: `decided_actor IS NOT NULL` counts **0** on Railway. The
+mechanism is proven — it counts 9 locally, from tests and authorisation probes, each
+carrying a bound identity — but the loop has not yet been closed by a real person on the
+real system. There are also 0 pending proposals there, so nothing is waiting on anyone. This
+is not a defect; it is the difference between a console that works and a console that is
+used, and only time and business activity close it.
+
+**3. Definition of Done (§27) — day 0 of 14.** It requires fourteen consecutive days of
+production evidence. Deployment was today. Measured on day 0, every criterion that can be
+measured yet holds: 0 pending proposals missing an owner, authority or due date; 0 rows
+expired since the deploy; 1 governance alert, opened by the machinery itself and owned.
+
+**The last silent expiry was 2026-09-06 01:45**, roughly seventeen hours before the
+activation code shipped at 18:26. Sixty legacy `expired` rows remain as historical record.
+Nothing can add to them: `expire_stale()` is deprecated and returns `{"expired": 0,
+"deprecated": true}`, and `_run_governance_expiry` is now an alias for the SLA sweep, kept
+only so an old import still resolves. **The clock on "zero silent expiry" therefore starts
+from the deploy, not from this document.**
+
+**4. World-Class Governance Ready (§24) — 90 days,** plus external reconstruction,
+replayable decisions and independent assurance. Not claimable and not claimed.
+
+### The honest summary
+
+Every buildable item in this plan is built, deployed and verified on both databases. What
+remains is one delivery decision, and elapsed time under real use. The plan's own standard
+is the right one to hold to: this work is now `DEPLOYED`, and it becomes
+`PRODUCTION VERIFIED` on the fourteenth consecutive day that the evidence above still holds.
