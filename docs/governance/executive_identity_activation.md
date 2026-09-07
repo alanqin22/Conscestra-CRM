@@ -112,6 +112,21 @@ never counts as real.
 Then the CTO's already-queued work, which had been routed to the CEO as an
 `ownership_exception` while no CTO owner existed, was re-pointed to its policy owner.
 
+> **Re-point ALERTS as well as approvals.** The 2026-09-06 run of this step covered
+> `action_approvals` and not `governance_alerts`, so a high-severity `event_orphaned` alert
+> sat on the CEO's desk for five hours while policy said CTO. Nothing was broken: `route`
+> falls back correctly and both `governance.metrics()` and the alerts summary already report
+> the exception count. The gap was procedural, and it is closed by running one command after
+> **any** identity grant:
+>
+> ```bash
+> python -m scripts.repoint_ownership_exceptions --apply              # local
+> python -m scripts.repoint_ownership_exceptions --apply --target railway
+> ```
+>
+> It touches only OPEN work whose exception is stale, and changes whose desk it is on —
+> never its status, timestamps or history.
+
 **Acceptance criteria, met:** the three tests that were failing truthfully because of this
 gap now pass without being modified —
 `test_assignable_identity::test_31_no_executive_is_missing_from_the_directory`,
