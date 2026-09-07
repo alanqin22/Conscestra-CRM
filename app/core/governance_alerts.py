@@ -224,6 +224,29 @@ def transition(alert_id: str, to_status: str, actor: str, *, note: Optional[str]
     return {"ok": True, "alert_id": r[0], "status": r[1]}
 
 
+def console_link(alert_id: Optional[str] = None) -> str:
+    """Deep link to the Alert Center, for the person the mail is waking up.
+
+    Escalation mail said "Open Governance -> Alert Center" and gave no address.
+    Approval mail has carried one-click links for months; alert mail did not, so
+    the one class of message that means "this is now YOUR problem" was the one
+    that made the reader go and find it. On 2026-09-06 the CEO received seven of
+    them and asked for the link, which is the right instinct: an escalation that
+    costs effort to act on is an escalation that waits.
+
+    Built from the PAGE origin, never the API origin. No `*.html` is in git, so
+    the backend cannot serve this page in production and an APP_URL link would
+    land on a 500 -- the same rule the password-reset mail follows.
+
+    The alert id rides in the fragment rather than the query string. It is not a
+    secret, but a fragment is not sent to the server, stays out of access logs,
+    and is not forwarded as a referrer when the page loads its assets.
+    """
+    from app.core.order_status import _public_site
+    base = f"{_public_site()}/governance-mgmt.html#alertCenter"
+    return f"{base}:{alert_id}" if alert_id else base
+
+
 def escalate(alert_id: str, actor: str = "sla-sweep", note: Optional[str] = None) -> Dict[str, Any]:
     """Escalate to the escalation authority (D4: CEO) and tell them."""
     try:
@@ -270,8 +293,9 @@ def escalate(alert_id: str, actor: str = "sla-sweep", note: Optional[str] = None
                 f"Severity: {h[3]}\n"
                 f"Deadline: {h[4].isoformat() if h[4] else '?'} (passed)\n\n"
                 f"It was not resolved before its deadline, so per policy it is now "
-                f"yours. Open Governance -> Alert Center to acknowledge it, work it, "
-                f"and close it with evidence.",
+                f"yours.\n\n"
+                f"Open it here:\n{console_link(alert_id)}\n\n"
+                f"Acknowledge it, work it, and close it with evidence.",
                 kind="alert_escalated", ref=alert_id)
     except Exception as exc:                                       # noqa: BLE001
         logger.debug(f"[governance_alerts] escalation email skipped: {exc}")
@@ -341,7 +365,9 @@ def remind_escalated(hours: float) -> Dict[str, Any]:
                 f"[Reminder {n}] Escalated alert still open: {headline[:60]}",
                 f"{headline}\n\nSeverity {sev}. Escalated to you and still not "
                 f"acknowledged. This is reminder {n} and repeats every "
-                f"{int(hours)}h. Acknowledging it in Governance -> Alert Center "
+                f"{int(hours)}h.\n\n"
+                f"Open it here:\n{console_link(aid)}\n\n"
+                f"Acknowledging it "
                 f"stops the reminders; resolving and closing it ends the "
                 f"obligation.",
                 kind="alert_reescalation", ref=f"{aid}:reminder:{n}")
