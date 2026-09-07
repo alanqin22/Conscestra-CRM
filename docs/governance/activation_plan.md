@@ -589,10 +589,22 @@ authority. Six producers were made cap-aware; `a2a.dispatch` returns a structure
 
 **Still open — DECISION REQUIRED:**
 
-1. **Paging destination beyond email.** Minimum next step: route `severity='critical'` and
-   CEO escalations to SMS or push through the existing transports, reusing
-   `email_authority`'s ledger shape so idempotency and the attention budget still apply. A
-   delivery decision, not a model change.
+1. ~~**Paging destination beyond email.**~~ **SETTLED 2026-09-06 (owner): email is
+   sufficient for now.** No SMS or push channel will be added, and nothing was implemented.
+   The decision was taken with the operational consequence in front of the owner: a
+   `severity='critical'` alert and a CEO escalation both land in a mailbox, and an overnight
+   breach is seen in the morning. That is accepted.
+
+   What was done instead is cheaper and addresses the actual friction. Escalation mail now
+   carries a **deep link to the Alert Center** — `governance-mgmt.html#alertCenter:<id>` —
+   built from the page origin, with the id in the fragment so it is not sent to the server
+   or logged. Approval mail had carried one-click links for months; the one class of message
+   that means "this is now YOUR problem" was the one that made the reader go and find it.
+   Both senders carry it, `escalate()` and the repeat `remind_escalated()`, and a structural
+   test fails if either loses it.
+
+   Reopen this only if a breach is ever missed *because* nobody saw the mail. That is the
+   evidence that would change the decision.
 5. ~~The COO's own email address.~~ **Settled 2026-09-06 (owner): same person, renamed.**
    Reconciled in place on one identity; all five authorities now hold a credential and
    `/governance/authorities` reports empty `missing`, `without_credential` and
