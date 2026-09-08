@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-8efd4be978a7139d96ea961723c1a5d283b4864f
+feded6cfb68b66d7d35424cee597ea74224de688
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -46,3 +46,5 @@
 # 8efd4be -- the baseline splice fix. CI could not build the database from
 # f84400c: two concatenated dumps left an unpaired \unrestrict directive.
 # Proven by scripts/verify_gate against a scratch database this time.
+
+# feded6c -- the a2a read/write split. The fixture had to mount both routers.

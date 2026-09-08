@@ -219,3 +219,61 @@ only because Decision C supplied a principled owner to resolve to.
   explicitly assigned") is now *answerable* — the action-class mapping is the
   assignment — but answering it is a separate implementation step.
 - The ~4,700 existing customer-owned work items are untouched historical debt.
+
+---
+
+## Decision B — EXECUTION RECORD, 2026-09-08
+
+Executed after deploy #72. **Outcome: 39 events drained, 0 orphaned remaining,
+alert resolved, and ZERO emails sent.**
+
+| | |
+|---|---|
+| `order.status_changed` | 21 processed — that handler has no email half, so nobody was contacted |
+| `order.shipped`, written off by decision | **17** — `order_notifications` rows at `state='skipped'` carrying the Decision B reasoning |
+| `order.shipped`, intended to SEND | **1** — `SO-2026-102219` |
+| Emails actually sent | **0** |
+
+### The one send was refused, and the refusal was correct
+
+```
+lila.brooks-d8cb@seed.agentorc.ca is not a verified, deliverable recipient
+(is_email_verified is false, or the domain is a reserved placeholder)
+```
+
+`SO-2026-102219`'s customer is a **synthetic seed contact**: an unverified
+address on `seed.agentorc.ca`, which is a reserved placeholder domain. The
+outbound guard refused it for two independent reasons, and would have refused it
+on 2026-09-02 exactly as it did today.
+
+### THE CORRECTION, stated plainly because it was asserted repeatedly
+
+Across several exchanges this order was described as **"a real customer with no
+communication at all since 30 August"**, and was written into
+`docs/p2_assessment_brief.md` as the item that *"outranks the assessment"*
+because *"a real customer is waiting"*.
+
+**No real customer was waiting.** That was an INFERENCE presented as a FACT.
+
+The reasoning was: *no notification exists → nobody was told → a person is
+affected*. The first two steps were true. The third does not follow, and the
+evidence to check it — `contacts.is_email_verified` and the recipient domain —
+was available the whole time and was never looked at. It is the same
+proxy-versus-property failure this engagement kept finding, committed by the
+assessor: **"no communication exists" was used as a proxy for "a person is
+waiting", and it diverged for the eighteen records where it mattered.**
+
+The urgency was wrong. **The disposition was not.** Writing off 17 and refusing
+to blind-replay all 39 was correct on its own merits, and the mechanism —
+recording the write-off in the subsystem's own idempotency ledger, so `notify()`
+short-circuits on `TERMINAL_STATES` rather than relying on anything bolted
+alongside — is what a later replay will meet.
+
+### What this says about the corpus, which IS worth carrying forward
+
+An orphaned customer-notification backlog that looked like eighteen unkept
+promises was eighteen synthetic records that could never have been emailed. The
+event fabric defect was real; **the customer harm was not.** A P2 assessor
+weighing "consequential business effect" should establish whether a subject is
+real *before* costing the consequence — `corpus_provenance` and
+`is_email_verified` are the fields that answer it.
