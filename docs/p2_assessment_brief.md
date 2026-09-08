@@ -1,6 +1,7 @@
 # P2 — Independent World-Class Architecture Assessment
 
-**Brief for a NEW session. Authored 2026-09-07 at the close of P1.**
+**Brief for a NEW session. Authored 2026-09-07 at the close of P1;
+state updated 2026-09-08 after both migrations were deployed.**
 
 Start the session with: *"Follow `docs/p2_assessment_brief.md`."*
 
@@ -40,7 +41,7 @@ is architecturally correct merely because its tests pass.
 
 ---
 
-## 2. State at handoff (2026-09-07)
+## 2. State at handoff (2026-09-08)
 
 **FACT — verified locally.**
 
@@ -53,8 +54,9 @@ is architecturally correct merely because its tests pass.
 | `WORKFLOW_OWNER_REQUIRED` | **OFF** — `may_enable: False`, unmet `[2,3,4,5,6,8]` |
 | jmartin identity collision | **HELD**, unresolved by decision |
 | Historical customer-owned work | **~4,700 items** — separate business debt, untouched |
-| Migrations | **2, both PENDING DEPLOYMENT** |
-| Committed / deployed | **nothing** |
+| Migrations | **2, both DEPLOYED and PROMOTED** (see below) |
+| Committed / pushed | `feat/p0-p1-governance-remediation`, both repos, **CI green** |
+| Merged | **not yet** — both PRs open |
 
 Closed in code during P1: workflow owner-resolution (routing is declared data;
 eligibility is an independent gate; unlisted entity types fail closed;
@@ -62,64 +64,82 @@ customer-contact owners cannot be carried through). Seven employee grants were
 applied and then **reversed** — all eight employees are attested SYNTHETIC, so
 the accountable population is the five executives (Decision C).
 
-### The two migrations are PENDING IMPLEMENTATION — verify them, do not touch them
+### The two migrations are DEPLOYED — verify them, do not touch them
 
-Both are applied to LOCAL only and are classified `OUT_OF_BAND_SQL` /
-PENDING DEPLOYMENT. They are **in scope for independent verification and out of
-scope for modification**. Specifically:
+**Superseded 2026-09-08.** An earlier draft of this brief called them
+PENDING DEPLOYMENT. Both are now applied to Railway, promoted into
+`REQUIRED_MIGRATIONS`, and `migrate --check` reports **"schema is
+current"** on local and Railway alike.
+
+They remain **in scope for independent verification and out of scope for
+modification**:
 
 - **Do** read `workflow_owner_resolution.sql` and
-  `governance_decision_link_identity.sql`, identify the invariant each claims,
-  find the alternate routes around it, and try to falsify it.
-- **Do not** amend, extend, re-apply, promote to `REQUIRED_MIGRATIONS`, or
-  "improve" either one. If verification finds a defect, record it as a P2
-  finding with a recommended remediation.
+  `governance_decision_link_identity.sql`, identify the invariant each
+  claims, find the alternate routes around it, and try to falsify it.
+- **Do not** amend, re-apply, or "improve" either one. If verification
+  finds a defect, record it as a P2 finding with a recommendation.
 
-The distinction matters because the owner-routing design is *new and untested by
-anyone but its author*. It is the single most likely place for P2 to find
-something, and it is also the single most likely place for a P2 agent to slip
-from assessing into building.
+The owner-routing design is new and, apart from its author, untested. It
+is the single most likely place for P2 to find something, and the single
+most likely place for a P2 agent to slip from assessing into building.
+
+### What the deployment itself taught, and P2 should carry forward
+
+**FACT.** The application shipped ahead of both schema changes on
+2026-09-08 04:03 UTC. The governance decision path was **down** until they
+were applied ~20 minutes later: `_row()` 500s without
+`decision_link_nonce`, and `_row()` is on `approve`, `reject`, `delegate`,
+`undo` and the SLA sweep.
+
+**The startup log was entirely green throughout.** `release_guard` passed
+every check, all 36 jobs scheduled, the capability registry reported 46 of
+46. The missing columns are only touched when somebody *decides*
+something, and nobody had in the four minutes since boot. **A clean boot
+is not evidence that the schema is present.** The assumption that
+migration 1 would fail loudly *at startup* was wrong; it fails loudly on
+first use, which is a different thing.
+
+**FACT.** Regenerating the baseline to carry the promotion introduced a
+second defect: the file is two `pg_dump` outputs concatenated, and
+splicing the ledger in from its `COPY` block kept that dump's closing
+restrict directive without its opener. CI could not build the database at
+all. It was found by CI rather than by `scripts/verify_gate`, which the
+baseline's own header names as its verification and which had not been run
+after regenerating.
+
+Both belong in the Alternate-Route and Failure-Mode sections: one is *a
+control that only fails when exercised*, the other *a generated artefact
+whose stated verification was skipped*.
 
 ### Where P2 sits in the sequence
 
 ```text
 P0  code complete, test verified
- └─ P1  SUBSTANTIALLY COMPLETE  ← you are here, at its close
+ └─ P1  COMPLETE, DEPLOYED, PRODUCTION-VERIFIED  ← you are here
      └─ P2  INDEPENDENT ASSESSMENT   (this brief — no changes)
          └─ P2 findings / decisions
              └─ P2 remediation
-                 └─ DEPLOY P0 + P1 migrations
+                 └─ (P0 + P1 migrations DEPLOYED 2026-09-08)
                      └─ adversarial production verification
                          └─ final World-Class assessment
 ```
 
-**Deployment comes AFTER P2 remediation, not before it** — deploying mid-
-assessment would mean assessing a moving target, and a P2 agent that discovers a
-defect, patches it, and then assesses its own patch has destroyed the
-independence this separation exists to create.
+**Do NOT deploy anything during P2, and do not merge the open PRs.** A P2
+agent that discovers a defect, patches it, and then assesses its own patch
+has destroyed the independence this separation exists to create.
 
-**Do NOT deploy as part of P2.** When authorized, the order is: push
-`governance/` → update `.governance-pin` →
-`governance_decision_link_identity.sql` → `workflow_owner_resolution.sql` →
-application → adversarial production verification → only then promote both to
-`REQUIRED_MIGRATIONS`.
+### One operational item outranks the assessment
 
-**Both migrations re-apply cleanly** — verified 2026-09-07 by applying each a
-second time; every object skipped, no errors.
+**`SO-2026-102219` has had no communication of any kind** — no order
+confirmation, no shipping notice — and its order shipped 2026-08-30.
+The owner's disposition (Decision B) is: **send that one, write off the
+other 17**, then close the `event_orphaned` alert with closure evidence.
+That alert is owned by CTO Bill Wang and is already past its 24h SLA.
 
-**The two migrations fail differently if the app goes first, and the second
-failure is the dangerous one.** An earlier draft of this brief said only "the
-application depends on both schema changes", which is true but flattens the
-distinction:
-
-| | If the app deploys first |
-|---|---|
-| `governance_decision_link_identity.sql` | **Breaks loudly.** `governance.py` reads and writes `decision_link_nonce / _recipients / _issued_at` in `_row()`, `mint_decision_links()` and `clear_decision_links()` — all on the live decision path. Missing columns error immediately. |
-| `workflow_owner_resolution.sql` | **Breaks silently.** Nothing crashes: `platform_health` calls `workflow_ownership_rate()`, which touches only `activities` and `fn_owner_eligible`, both pre-existing. The app simply keeps calling the OLD `workflow_execute_action`, so **unowned work carries on being created and no alarm fires.** The only app code needing this migration's objects is `workflow_owner_activation_readiness()`, which no endpoint calls. |
-
-So migration order is load-bearing for a different reason in each case, and the
-second must be confirmed by *behaviour* — a workflow-created activity resolving
-to an owner — not by the deploy completing without error.
+This is production work and NOT part of P2. It is recorded here only so
+it is not lost between sessions: a real customer is waiting, and that
+outranks an assessment.
 
 ---
 
