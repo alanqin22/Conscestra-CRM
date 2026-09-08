@@ -1718,10 +1718,31 @@ def _ledger_policy_execution(req: "A2ARequest", cid: str, pol: Dict[str, Any],
 # DISCOVERY + DISPATCH ENDPOINTS
 # ============================================================================
 
+# TWO ROUTERS, SPLIT BY WHAT THE CALL DOES (2026-09-08).
+#
+# The whole a2a surface was mounted under require_admin. That refused the five
+# executives -- who are governance authorities, not platform administrators --
+# and governance-mgmt.html calls GET /a2a/registry, so ONE admin-only read
+# turned into a page-wide "Admin sign-in required" modal on a console the CEO
+# is entitled to use. Signing in again could never clear it.
+#
+# The split follows the same line require_governance_actor drew: READING which
+# capabilities exist is part of deciding a proposal about one of them -- an
+# executive reviewing an `sms.send` approval reasonably needs to see what
+# sms.send IS -- while INVOKING a capability, or enabling and disabling one,
+# is administration and stays where it was.
+#
+#   read_router   GET  capabilities · registry · observed-callers   -> _GOVERNANCE
+#   router        POST dispatch · registry/sync · registry/{intent} -> _ADMIN
+#
+# Reading the catalogue grants no ability to invoke anything: dispatch is on
+# the admin router, and every write capability still passes the governance
+# gate afterwards regardless of who asked.
+read_router = APIRouter(tags=["a2a"])
 router = APIRouter(tags=["a2a"])
 
 
-@router.get("/a2a/capabilities")
+@read_router.get("/a2a/capabilities")
 def a2a_capabilities():
     return manifest()
 
@@ -1736,7 +1757,7 @@ class _RegistryBody(BaseModel):
                                                   # [] = clear (anyone)
 
 
-@router.get("/a2a/registry")
+@read_router.get("/a2a/registry")
 def a2a_registry():
     """The capability manifest merged with runtime availability state."""
     state = _registry_rows()
@@ -1782,7 +1803,7 @@ def a2a_registry_sync():
     return {**sync_capability_registry("api"), "state": registry_state()}
 
 
-@router.get("/a2a/registry/observed-callers")
+@read_router.get("/a2a/registry/observed-callers")
 def a2a_observed_callers(days: int = 90):
     """intent → the agents that have actually dispatched it.
 

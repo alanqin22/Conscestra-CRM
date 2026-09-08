@@ -1728,7 +1728,12 @@ from app.core.agent_bus import router as agent_bus_router
 app.include_router(agent_bus_router, dependencies=_ADMIN)
 
 # -- A2A protocol (Phase 2 — typed capability registry + dispatch)
-from app.core.a2a import router as a2a_router
+from app.core.a2a import router as a2a_router, read_router as a2a_read_router
+# READS on the governance surface, WRITES on the admin surface. See the comment
+# above the routers in a2a.py: an executive deciding a proposal about a
+# capability must be able to see what that capability is; invoking or toggling
+# one remains administration.
+app.include_router(a2a_read_router, dependencies=_GOVERNANCE)
 app.include_router(a2a_router, dependencies=_ADMIN)
 
 # -- Supervisor (Phase 3 — proactive KPI breach detection)
