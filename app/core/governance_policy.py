@@ -49,9 +49,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re as _re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from fastapi.responses import JSONResponse
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
@@ -341,12 +343,32 @@ _EDITABLE = {"decision_mode", "approver_role", "escalation_role", "sla_hours",
 
 
 def set_policy(action_type: str, changes: Dict[str, Any], updated_by: str,
-               reason: str) -> Dict[str, Any]:
+               reason: str, *, actor_role: Optional[str] = None,
+               approval_uuid: Optional[str] = None,
+               allow_widening: bool = False) -> Dict[str, Any]:
     """Change a policy row. Versioned and historied by trigger; the reason is
-    mandatory because widening authority without saying why is the failure
-    mode. Creates the row when absent (a declaration, not a repair)."""
+    mandatory because widening authority without saying why is the failure mode.
+    Creates the row when absent (a declaration, not a repair).
+
+    `updated_by` is now the AUTHENTICATED executive's email, supplied by the
+    caller from the session. It used to arrive in the request body, which meant
+    an ops token could sign its own policy change as the CEO.
+
+    A WEAKENING change raises PolicyWideningRequiresApproval unless
+    `allow_widening` -- which only the approved policy.widen execution sets, and
+    only with the `approval_uuid` that authorised it."""
     if not (reason or "").strip():
         raise ValueError("a reason is required to change a decision policy")
+    _widening = classify_policy_change(action_type, changes or {})
+    if _widening and not allow_widening:
+        from app.core import governance as _gov
+        aid = _gov.propose(
+            "policy.widen", "governance_action_policies",
+            {"scope": "action_policy", "policy_key": action_type,
+             "changes": changes, "reason": reason,
+             "requested_by": updated_by, "widening": _widening},
+            confidence=1.0, severity="high")
+        raise PolicyWideningRequiresApproval(aid, _widening)
     fields = {k: v for k, v in (changes or {}).items() if k in _EDITABLE}
     if not fields:
         raise ValueError(f"nothing to change; editable: {sorted(_EDITABLE)}")
@@ -463,6 +485,24 @@ def executive_for_identifier(identifier: Optional[str]) -> Optional[Dict[str, An
     return None
 
 
+def executive_by_id(executive_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The active executive with this executive_id, or None.
+
+    Separate from executive_for_identifier rather than folded into it: that
+    function answers "who signed in", keyed on the sign-in email, and a decision
+    link answers "who was this issued to", keyed on the id that travels in the
+    URL. Merging them would make one function accept two different kinds of
+    claim, which is how an identifier from an untrusted source ends up matching
+    a field nobody meant it to."""
+    eid = (str(executive_id) or "").strip().lower()
+    if not eid:
+        return None
+    for a in authorities():
+        if str(a.get("executive_id")).lower() == eid:
+            return a
+    return None
+
+
 def session_authority(request) -> Optional[Dict[str, Any]]:
     """The executive an HTTP request is signed in as, or None.
 
@@ -473,6 +513,47 @@ def session_authority(request) -> Optional[Dict[str, Any]]:
     if not sess:
         return None
     return executive_for_identifier(sess.get("identifier") or sess.get("email"))
+
+
+# A bare URL in a plain-text governance email arrived as UNCLICKABLE TEXT.
+# Reported from the CEO's inbox 2026-09-07: the escalated-alert mail carried the
+# right console link and no way to follow it. The cause was the HTML fallback --
+# it escaped the text and wrapped it in <pre>, which is correct for safety and
+# produces no anchors, so the one action the mail exists to prompt needed
+# copy-and-paste from a phone.
+#
+# ESCAPE FIRST, THEN ANCHOR, and never the other way round. The naive fix --
+# regex the raw text into <a> tags and escape afterwards -- would escape the
+# markup it had just written. So the text is split on URL boundaries, every
+# non-URL span is escaped, and each URL is emitted as an anchor whose href and
+# label are escaped independently. `&` inside a decision link therefore becomes
+# `&amp;` in the href, which is what an HTML attribute requires and what the
+# browser hands back as a single `&`.
+_URL_RE = _re.compile(r"https?://[^\s<>\"]+")
+
+# Trailing characters that belong to the SENTENCE, not the URL. A link at the
+# end of a line is the common case and "...alertCenter:uuid." must not resolve
+# to a 404 because the full stop was included.
+_URL_TRAILING = ".,;:!?)]}>\"" + "'"
+
+
+def _text_to_html(body_text: str) -> str:
+    """Plain-text governance mail as safe HTML, with real links."""
+    from html import escape
+    out: List[str] = []
+    pos = 0
+    for m in _URL_RE.finditer(body_text or ""):
+        url = m.group(0).rstrip(_URL_TRAILING)
+        out.append(escape(body_text[pos:m.start()]))
+        out.append(f'<a href="{escape(url, quote=True)}" '
+                   f'style="color:#15233f;">{escape(url)}</a>')
+        # whatever punctuation was trimmed off the URL is still part of the text
+        out.append(escape(m.group(0)[len(url):]))
+        pos = m.end()
+    out.append(escape(body_text[pos:] if body_text else ""))
+    return ('<pre style="font-family:Arial,Helvetica,sans-serif;'
+            'white-space:pre-wrap;font-size:14px;line-height:1.5;">'
+            + "".join(out) + "</pre>")
 
 
 def email_authority(exec_row: Optional[Dict[str, Any]], subject: str, body_text: str,
@@ -491,9 +572,7 @@ def email_authority(exec_row: Optional[Dict[str, Any]], subject: str, body_text:
         return {"sent": False, "why": "GOV_ROUTE_EMAIL off"}
     if not exec_row or not exec_row.get("email") or not exec_row.get("auto_email_enabled"):
         return {"sent": False, "why": "no email on file, or auto_email disabled"}
-    html = body_html or (
-        "<pre style=\"font-family:Arial,Helvetica,sans-serif;white-space:pre-wrap\">"
-        + body_text.replace("&", "&amp;").replace("<", "&lt;") + "</pre>")
+    html = body_html or _text_to_html(body_text)
     claim: Dict[str, Any] = {"proceed": True, "email_id": None}
     try:
         from app.core import staff_email
@@ -508,9 +587,12 @@ def email_authority(exec_row: Optional[Dict[str, Any]], subject: str, body_text:
     if not claim.get("proceed"):
         return {"sent": False, "why": claim.get("why") or "already sent (ledger)"}
     try:
-        from app.agents.email.smtp_imap import send_email
+        from app.agents.email.smtp_imap import send_email, NO_BCC
+        # NO_BCC -- escalation and reminder mail carries live decision links.
+        # See N-01: the shared info@ archive held working approval authority
+        # for all five executives because this call took the default.
         res = send_email(to=exec_row["email"], subject=subject,
-                         body_html=html, body_text=body_text)
+                         body_html=html, body_text=body_text, bcc=NO_BCC)
     except Exception as exc:                                       # noqa: BLE001
         logger.warning(f"[governance_policy] escalation email to "
                        f"{exec_row.get('role_code')} failed: {exc}")
@@ -521,6 +603,165 @@ def email_authority(exec_row: Optional[Dict[str, Any]], subject: str, body_text:
     except Exception as exc:                                       # noqa: BLE001
         logger.debug(f"[governance_policy] staff-email outcome skipped: {exc}")
     return {"sent": bool((res or {}).get("success", False)), "result": res}
+
+
+
+# ============================================================================
+# N-02 — WIDENING: the change class that can disable every other control
+# ============================================================================
+#
+# THE ASYMMETRY THIS CLOSES (reassessment 2026-09-07). Deciding one approval was
+# bound to the signed-in executive: `_bound_authority` refuses an ops token
+# outright, on the reasoning that "an administrator cannot decide on an
+# executive's behalf". Meanwhile PUT /governance/action-policies accepted that
+# same ops token, took `updated_by` FROM THE REQUEST BODY, and could set any
+# action class to AUTO_EXECUTE. The system refused to let an administrator
+# approve one discount and allowed them to abolish approval for the class --
+# and to sign the change as the CEO.
+#
+# The principle the mandate names: AUTHORITY IS A PROPERTY OF THE GOVERNED
+# ASSET, NOT OF AN ENDPOINT. The asset here is "whether a human must look".
+#
+# NARROWING IS NOT WIDENING, and applies directly. Making a control STRONGER --
+# requiring human approval where none was required, lowering a money floor,
+# shortening an SLA -- needs no ceremony, and requiring approval for it would
+# make the safe direction the expensive one. Only the weakening direction is
+# gated.
+
+DECISION_STRENGTH = {"AUTO_EXECUTE": 0, "SAMPLED_REVIEW": 1, "HUMAN_APPROVAL": 2}
+
+
+def classify_policy_change(action_type: str,
+                           changes: Dict[str, Any]) -> List[str]:
+    """The reasons this change WEAKENS the control, or [] if it does not.
+
+    Returned as reasons rather than a bool because the approver has to read
+    them: "widening" is not a decision an executive can make without being told
+    what specifically is being given away."""
+    cur = policy_for(action_type)
+    out: List[str] = []
+    if "decision_mode" in changes:
+        old, new = cur.get("decision_mode"), str(changes["decision_mode"])
+        if DECISION_STRENGTH.get(new, 2) < DECISION_STRENGTH.get(old, 2):
+            out.append(f"decision_mode {old} -> {new}: less human review")
+    if "auto_execute" in changes and bool(changes["auto_execute"])             and not bool(cur.get("auto_execute")):
+        out.append("auto_execute false -> true: the action runs with no decision")
+    if "sla_hours" in changes and cur.get("sla_hours") is not None:
+        try:
+            if float(changes["sla_hours"]) > float(cur["sla_hours"]):
+                out.append(f"sla_hours {cur['sla_hours']} -> {changes['sla_hours']}: "
+                           f"longer before a breach is declared")
+        except (TypeError, ValueError):
+            pass
+    if "sample_rate" in changes and cur.get("sample_rate") is not None:
+        try:
+            if float(changes["sample_rate"]) < float(cur["sample_rate"]):
+                out.append(f"sample_rate {cur['sample_rate']} -> "
+                           f"{changes['sample_rate']}: less is reviewed")
+        except (TypeError, ValueError):
+            pass
+    if "delegation_allowed" in changes and bool(changes["delegation_allowed"])             and not bool(cur.get("delegation_allowed")):
+        out.append("delegation_allowed false -> true: the decision may move desk")
+    if "status" in changes and str(changes["status"]) != "active"             and str(cur.get("status")) == "active":
+        out.append(f"status active -> {changes['status']}: the policy stops applying")
+    return out
+
+
+# The tunables live in governance.py's _KNOWN_POLICIES, but the DIRECTION that
+# weakens each one is a governance fact and belongs beside the other one.
+# +1 = raising it weakens the control; -1 = lowering it weakens the control.
+TUNABLE_WIDENING_DIRECTION = {
+    "gov.hitl_amount":        +1,   # a higher floor sends fewer things to a human
+    "brand.max_discount_pct": +1,   # a higher ceiling permits deeper discounts
+    "gov.act_min":            -1,   # a lower bar auto-executes more
+    "gov.propose_min":        -1,   # a lower bar proposes weaker-evidence writes
+    "planner.max_steps":      +1,   # a longer plan does more per approval
+    "planner.max_writes":     +1,   # more writes per approval
+}
+
+
+def classify_tunable_change(key: str, old_value: Any,
+                            new_value: Any) -> List[str]:
+    d = TUNABLE_WIDENING_DIRECTION.get(key)
+    if d is None:
+        return []
+    try:
+        old_f, new_f = float(old_value), float(new_value)
+    except (TypeError, ValueError):
+        return []
+    if (d > 0 and new_f > old_f) or (d < 0 and new_f < old_f):
+        return [f"{key} {old_f:g} -> {new_f:g}: weakens the control"]
+    return []
+
+
+class PolicyWideningRequiresApproval(Exception):
+    """Raised instead of applying a weakening change. Carries the approval so
+    the caller can tell the requester what is now waiting on the CEO."""
+
+    def __init__(self, approval_uuid: str, reasons: List[str]):
+        self.approval_uuid = approval_uuid
+        self.reasons = reasons
+        super().__init__("this change weakens a governance control and needs "
+                         "CEO approval: " + "; ".join(reasons))
+
+
+def record_policy_change(*, scope: str, policy_key: str, field: str,
+                         old_value: Any, new_value: Any, widening: bool,
+                         widening_reason: Optional[str], actor_email: str,
+                         actor_role: Optional[str], reason: str,
+                         approval_uuid: Optional[str] = None,
+                         policy_version: Optional[int] = None) -> None:
+    """Append the change record. Never silent: this table is what an auditor
+    reads to find out who removed the requirement for human approval, and a
+    failure to write it must not be discovered later as an absence."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO governance_policy_changes
+                     (scope, policy_key, field, old_value, new_value, widening,
+                      widening_reason, actor_email, actor_role, approval_uuid,
+                      reason, policy_version)
+                   VALUES (%(sc)s, %(k)s, %(f)s, %(ov)s, %(nv)s, %(w)s, %(wr)s,
+                           %(ae)s, %(ar)s, %(ap)s::uuid, %(r)s, %(pv)s)""",
+                {"sc": scope, "k": policy_key, "f": field,
+                 "ov": None if old_value is None else str(old_value),
+                 "nv": None if new_value is None else str(new_value),
+                 "w": widening, "wr": widening_reason, "ae": actor_email,
+                 "ar": actor_role, "ap": approval_uuid, "r": reason,
+                 "pv": policy_version})
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def bound_authority(request):
+    """The executive this request is authenticated as, or 403.
+
+    Lives here so governance.py, governance_policy.py and governance_alerts.py
+    all bind identity the SAME way. Three copies of this check would be three
+    places for one of them to be forgotten -- which is the shape of the defect
+    it exists to fix: the check was written once, for approve/reject/delegate,
+    and thirteen other mutating endpoints never got it."""
+    from fastapi import HTTPException
+    ex = session_authority(request)
+    if not ex:
+        sess = getattr(getattr(request, "state", None), "session", None) or {}
+        who = sess.get("identifier") or "an admin token"
+        raise HTTPException(
+            status_code=403,
+            detail=(f"This changes governance itself and is bound to the "
+                    f"signed-in executive. This request is authenticated as "
+                    f"{who}, which is not one of the approval authorities "
+                    f"({', '.join(AUTHORITY_ROLES)}). Sign in with the "
+                    f"executive's own credential -- a machine token may read "
+                    f"the governance surface and may not change it."))
+    if not ex.get("eligible"):
+        raise HTTPException(
+            status_code=403,
+            detail=(f"{ex['role_code']} {ex['full_name']} is signed in but is "
+                    f"not an eligible work owner, so cannot change governance."))
+    return ex
 
 
 def _flag_env(name: str, default: str = "0") -> bool:
@@ -589,15 +830,48 @@ def api_owner_eligibility(owner_id: str):
 
 class _PolicyChange(BaseModel):
     changes: Dict[str, Any]
-    updated_by: str
+    # `updated_by` is accepted and IGNORED. Kept in the model so an existing
+    # caller gets its change applied rather than a 422 it cannot interpret --
+    # and named here so the next reader knows the field is inert rather than
+    # wondering where it went. The actor is the signed-in executive.
+    updated_by: Optional[str] = None
     reason: str
 
 
 @router.put("/governance/action-policies/{action_type}")
-def api_set_policy(action_type: str, body: _PolicyChange):
+def api_set_policy(request: Request, action_type: str, body: _PolicyChange):
+    ex = bound_authority(request)
+    before = policy_for(action_type)
     try:
-        return {"ok": True, "policy": set_policy(action_type, body.changes,
-                                                 body.updated_by, body.reason)}
+        pol = set_policy(action_type, body.changes, ex["email"], body.reason,
+                         actor_role=ex.get("role_code"))
+        # Record EVERY applied change, not only the weakening ones. A history
+        # that holds only the alarming entries cannot answer "what did this
+        # policy permit last Tuesday", which is the question an auditor
+        # reconstructing an old decision actually asks.
+        for field, new_value in (body.changes or {}).items():
+            record_policy_change(
+                scope="action_policy", policy_key=action_type, field=field,
+                old_value=before.get(field), new_value=new_value,
+                widening=False, widening_reason=None,
+                actor_email=ex["email"], actor_role=ex.get("role_code"),
+                reason=body.reason,
+                policy_version=(pol or {}).get("policy_version"))
+        return {"ok": True, "policy": pol, "changed_by": ex["email"]}
+    except PolicyWideningRequiresApproval as widen:
+        # 202: the request was understood, accepted, and is now a governed
+        # decision. Deliberately not a 403 -- nothing was refused, and telling
+        # the caller "forbidden" would hide that the change is in flight.
+        return JSONResponse(status_code=202, content={
+            "ok": False, "requires_approval": True,
+            "approval_uuid": widen.approval_uuid,
+            "approver_role": policy_for("policy.widen").get("approver_role"),
+            "widening": widen.reasons,
+            "detail": ("This change weakens a governance control, so it is "
+                       "itself a governed decision. It has been proposed and "
+                       "is waiting on the " +
+                       str(policy_for("policy.widen").get("approver_role")) +
+                       ". Nothing has changed yet.")})
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:

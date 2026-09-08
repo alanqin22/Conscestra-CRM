@@ -1275,6 +1275,16 @@ _PLACEHOLDER_EMAIL_DOMAINS = {
     "seed.agentorc.ca",
 }
 
+def _e2e_allowlist() -> set:
+    """Named mailboxes that may receive mail on an otherwise blocked domain.
+
+    Read at call time so a test can set it without import-order games. Empty by
+    default: an unset variable exempts nothing, which is the only safe default
+    for a control whose failure mode is sending to addresses we invented."""
+    raw = os.environ.get("EMAIL_E2E_ALLOWLIST", "")
+    return {a.strip().lower() for a in raw.split(",") if a.strip()}
+
+
 def _is_real_email(addr: Optional[str], is_verified: bool) -> bool:
     """A deliverable, opted-in recipient: verified through the OTP flow AND not an
     obvious placeholder/seed domain.
@@ -1297,6 +1307,25 @@ def _is_real_email(addr: Optional[str], is_verified: bool) -> bool:
         return False
     domain = addr.rsplit("@", 1)[-1]
     if domain in _PLACEHOLDER_EMAIL_DOMAINS:
+        # THE ONE WAY PAST A BLOCKED DOMAIN: this exact address, named.
+        #
+        # The blocked seed domain cost something real -- the only end-to-end
+        # send exercise that does not involve a customer, which
+        # test_the_seed_catchall_is_deliverable_when_verified existed to
+        # protect. Restoring that by trusting provenance was investigated and
+        # REFUSED on the data: contacts.is_synthetic marks 176 of the 181
+        # seed-domain contacts NOT synthetic, because the seed-email migration
+        # destroyed the real-vs-synthetic distinction. Gating on that flag would
+        # re-open the quota leak almost exactly -- 176 addresses on a catch-all
+        # we invented would become deliverable again.
+        #
+        # So the exemption is per ADDRESS and never per domain or per flag. An
+        # allow-list of named mailboxes cannot generalise to 176 rows by
+        # accident, is empty by default, is visible in configuration, and fails
+        # closed. Set EMAIL_E2E_ALLOWLIST to a comma-separated list of the
+        # specific mailboxes an end-to-end test may reach.
+        if addr in _e2e_allowlist():
+            return True
         return False
     if any(domain.endswith(sfx) for sfx in (".invalid", ".test", ".example", ".local")):
         return False

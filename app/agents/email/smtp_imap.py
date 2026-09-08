@@ -31,6 +31,11 @@ def _cfg(key: str, default: str = '') -> str:
 EMAIL_ADDRESS  = os.environ.get('EMAIL_ADDRESS',   'info@agentorc.ca')
 BCC_ADDRESS    = os.environ.get('EMAIL_BCC',        'info@agentorc.ca')
 
+# Explicit "do not archive this message". A sentinel rather than '' because ''
+# is falsy and every falsy value already meant "use the default archive" --
+# which is precisely how governance decision links reached a shared mailbox.
+NO_BCC = '__no_bcc__'
+
 def _email_address() -> str:  return os.environ.get('EMAIL_ADDRESS',   'info@agentorc.ca')
 def _email_password() -> str:  return os.environ.get('EMAIL_PASSWORD',  '')
 def _smtp_host()     -> str:  return os.environ.get('EMAIL_SMTP_HOST', 'mail.agentorc.ca')
@@ -163,7 +168,18 @@ def send_email(
     password = _email_password()
     host     = _smtp_host()
     port     = _smtp_port()
-    bcc_addr = bcc or _bcc_address()
+    # THREE STATES, NOT TWO. `bcc or _bcc_address()` had only two: an address,
+    # or the default archive. There was no way to say "archive nothing" —
+    # passing '' fell through to the default, because '' is falsy — and the
+    # governance mailer, which passes no bcc at all, therefore copied every
+    # approval, escalation and reminder (each carrying a live decision link) to
+    # the shared info@ archive. A mailbox several people can read held working
+    # authorisation for five executives. See N-01, reassessment 2026-09-07.
+    #
+    #   bcc is None  -> archive as usual (every ordinary send)
+    #   bcc == NO_BCC-> archive NOTHING (governance mail; see email_call_sites)
+    #   bcc == addr  -> archive there
+    bcc_addr = _bcc_address() if bcc is None else ("" if bcc == NO_BCC else bcc)
 
     resend_key = os.environ.get('RESEND_API_KEY', '')
     logger.info(f"[send_email] to={to!r} | RESEND_API_KEY={'SET' if resend_key else 'NOT SET'} | smtp={host}:{port}")

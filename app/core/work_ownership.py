@@ -783,6 +783,211 @@ def unassigned_work(limit: int = 200) -> Dict[str, Any]:
     }
 
 
+# ============================================================================
+# WORKFLOW-GENERATED WORK: the accountability rate, and the gate it will become
+# ============================================================================
+#
+# THE DEFECT (P1, 2026-09-07). `workflow_execute_action`'s create_task branch
+# reads the owner out of the triggering payload inside a BEGIN/EXCEPTION block;
+# when that yields nothing it sets the local owner variable to NULL and writes
+# the activity row regardless. See the function itself in
+# governance/schema/00_base_schema.sql -- the statement is NOT quoted here,
+# because test_K_N_no_code_path_here_ever_writes_an_owner scans this module's
+# source text for exactly that shape and cannot tell a quotation from a
+# statement. Narrowing that guard to exclude comments would weaken it to let a
+# comment through, which is the failure mode guards exist to prevent.
+#
+# So the platform manufactures consequential work while already knowing that
+# accountability could not be established.
+#
+# WHY THE OBVIOUS FIX IS NOT SHIPPED YET, decided by the owner 2026-09-07 with
+# these numbers in front of them:
+#
+#     workflow-created activities, all time      1667
+#       ... with AN owner                        1414
+#       ... with an ELIGIBLE owner                  7      (0.42%)
+#     accounts with an eligible owner            0 of 181
+#
+# Refusing the write today would refuse 1,660 of 1,667 creations, because there
+# is nothing eligible to resolve to. That is not a guard, it is switching the
+# invoice-follow-up function off -- and an overdue invoice does not become less
+# overdue because we declined to raise the task, it becomes invisible.
+#
+# So the ORDER IS REVERSED: ownership backfill (D-02) first, enforcement second.
+# The invariant is DECLARED here now, and MEASURED, so the rate is visible and
+# cannot silently worsen while the backfill is outstanding. `WORKFLOW_OWNER_
+# REQUIRED` is the single flag that turns the declaration into a gate; flipping
+# it before the backfill is the switch-off described above.
+
+# Not yet enforced. See above -- this is a sequencing decision, not an oversight.
+WORKFLOW_OWNER_REQUIRED = False
+
+_WORKFLOW_ORIGIN = "Created by workflow engine%"
+
+
+def workflow_ownership_rate() -> Dict[str, Any]:
+    """What share of workflow-generated work has a genuinely accountable human?
+
+    A RATIO, deliberately, not a count. The absolute number of unowned rows
+    grows with the population and with time, so a threshold on it decays into
+    the census this codebase has already had to remove twice. The ratio is
+    stable under growth and moves only when the PROPERTY moves -- and it is the
+    same number that measures progress on the backfill: as accounts acquire
+    eligible owners, resolution starts succeeding and this climbs on its own.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT count(*)                                   AS total,
+                          count(owner_id)                            AS with_owner,
+                          count(*) FILTER (WHERE owner_id IS NOT NULL
+                                 AND fn_owner_eligible(owner_id))    AS accountable,
+                          count(*) FILTER (WHERE status='open'
+                                 AND owner_id IS NULL)               AS open_unowned
+                     FROM activities
+                    WHERE description LIKE %s""", (_WORKFLOW_ORIGIN,))
+            total, with_owner, accountable, open_unowned = cur.fetchone()
+    finally:
+        conn.close()
+    rate = (accountable / total) if total else 1.0
+    return {
+        "total": int(total), "with_any_owner": int(with_owner),
+        "with_accountable_owner": int(accountable),
+        "open_unowned": int(open_unowned),
+        "accountable_rate": round(rate, 4),
+        "enforced": WORKFLOW_OWNER_REQUIRED,
+        "invariant": ("no workflow-generated consequential work may be "
+                      "persisted without an eligible accountable human owner"),
+        "status": ("declared, not enforced - blocked on the D-02 ownership "
+                   "backfill; enforcing now would refuse "
+                   f"{int(total) - int(accountable)} of {int(total)} creations"
+                   if not WORKFLOW_OWNER_REQUIRED else "enforced"),
+    }
+
+
+def newly_created_work_accountability(hours: int = 24) -> Dict[str, Any]:
+    """THE PROPERTY, measured on NEW work only.
+
+        Every newly created consequential work item has an eligible,
+        accountable owner.
+
+    Owner instruction, 2026-09-07: readiness must not be defined as an owner
+    percentage, an eligible-owner count, a historical census, or a fixed test
+    output. Those all measure the ACCUMULATED past, in which nothing anyone
+    does today can move the number quickly -- so they reward waiting, and they
+    conflate historical debt with ongoing breakage.
+
+    This measures the flow instead. Historical debt is real and is reported
+    separately by `workflow_ownership_rate()`; what decides whether the gate is
+    safe to close is whether the system has STOPPED CREATING the problem.
+
+    `accountable` here is the strong sense -- eligible AND production
+    accountable -- because an eligible owner who is an attested-synthetic
+    persona can hold a row and cannot be held to account.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT count(*)                                  AS created,
+                          count(*) FILTER (WHERE owner_id IS NULL)   AS unowned,
+                          count(*) FILTER (WHERE owner_id IS NOT NULL
+                                 AND fn_owner_eligible(owner_id))    AS eligible_owned
+                     FROM activities
+                    WHERE description LIKE %s
+                      AND created_at > now() - make_interval(hours => %s)""",
+                (_WORKFLOW_ORIGIN, int(hours)))
+            created, unowned, eligible_owned = cur.fetchone()
+    finally:
+        conn.close()
+    return {
+        "window_hours": int(hours), "created": int(created),
+        "no_owner_recorded": int(unowned),
+        "eligible_owned": int(eligible_owned),
+        "clean": int(created) > 0 and int(unowned) == 0,
+        "observed_nothing": int(created) == 0,
+    }
+
+
+def workflow_owner_activation_readiness() -> Dict[str, Any]:
+    """May WORKFLOW_OWNER_REQUIRED be turned on yet?
+
+    The owner's eight conditions, 2026-09-07, encoded so the gate cannot be
+    flipped on the strength of a number that merely looks better. Conditions a
+    program can check are checked; the rest are HUMAN ATTESTATIONS and are
+    reported as unmet rather than guessed, because a program that infers
+    "the books have been assigned" from row counts is inventing the very
+    evidence the condition exists to require.
+    """
+    rate = workflow_ownership_rate()
+    flow = newly_created_work_accountability(24)
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM assignable_identity "
+                        "WHERE coalesce(is_active, true)")
+            members = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM workflow_owner_routing")
+            routed_total = cur.fetchone()[0]
+            cur.execute("""SELECT count(*) FROM workflow_owner_routing r
+                            WHERE fn_workflow_route_owner(r.entity_type) IS NULL""")
+            unrouted = cur.fetchone()[0]
+            cur.execute("""SELECT count(*) FROM employees e
+                            WHERE EXISTS (SELECT 1 FROM owners o
+                                           WHERE o.owner_id = e.employee_uuid)""")
+            collisions = cur.fetchone()[0]
+    finally:
+        conn.close()
+    conditions = [
+        # REWRITTEN for owner decision C. It read "approved staff grants
+        # completed (>= 7 employee-linked owners)". Those seven grants were
+        # REVERSED once Decision C established that all eight employees are
+        # attested synthetic and the accountable population is the five
+        # executives -- so a condition counting employee-linked owners would
+        # now be permanently unmeetable, and meeting it would mean putting
+        # synthetic personas back. The condition is the PROPERTY: is there an
+        # eligible, attested-real owner for every routed entity type?
+        {"id": 1, "condition": "every routed entity type resolves to an eligible owner",
+         "met": unrouted == 0 and routed_total > 0,
+         "evidence": (f"{routed_total - unrouted} of {routed_total} declared "
+                      f"routes resolve to an eligible owner"
+                      + (f"; {unrouted} do not" if unrouted else ""))},
+        {"id": 2, "condition": "identity collisions resolved",
+         "met": collisions == 0,
+         "evidence": f"{collisions} employee uuid(s) also present as an owner id (F1)"},
+        {"id": 3, "condition": "books of business explicitly assigned",
+         "met": None, "evidence": "HUMAN ATTESTATION REQUIRED - not inferable from row counts"},
+        {"id": 4, "condition": "workflow work resolves to an eligible accountable owner",
+         "met": bool(flow["clean"]),
+         "evidence": (f"last {flow['window_hours']}h: {flow['created']} created, "
+                      f"{flow['no_owner_recorded']} with no owner recorded")},
+        {"id": 5, "condition": "the fail-closed owner-resolution fix is deployed and verified",
+         "met": None, "evidence": "HUMAN ATTESTATION REQUIRED - production evidence"},
+        {"id": 6, "condition": "NO_OWNER_RECORDED creation has stopped",
+         "met": flow["no_owner_recorded"] == 0 and not flow["observed_nothing"],
+         "evidence": (f"{flow['no_owner_recorded']} in the last {flow['window_hours']}h"
+                      + (" (but nothing was created, so nothing was observed)"
+                         if flow["observed_nothing"] else ""))},
+        {"id": 7, "condition": "measurement is the property, not a census",
+         "met": True,
+         "evidence": "newly_created_work_accountability() measures the flow; "
+                     "workflow_ownership_rate() reports the debt separately"},
+        {"id": 8, "condition": "post-deployment observation confirms no accumulation",
+         "met": None, "evidence": "HUMAN ATTESTATION REQUIRED - after deployment"},
+    ]
+    unmet = [c["id"] for c in conditions if c["met"] is not True]
+    return {
+        "may_enable": not unmet,
+        "unmet_conditions": unmet,
+        "currently_enabled": WORKFLOW_OWNER_REQUIRED,
+        "conditions": conditions,
+        "debt": {"accountable_rate": rate["accountable_rate"],
+                 "open_unowned": rate["open_unowned"]},
+        "flow": flow,
+    }
+
+
 def owner_eligibility_readiness() -> Dict[str, Any]:
     """The readiness dimension: of open activities, how many are owned by
     someone the contract certifies.

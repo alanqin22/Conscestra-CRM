@@ -539,6 +539,33 @@ def governance_metrics() -> List[Dict[str, Any]]:
         else:
             out.append(_metric("alerts_live", "Governed alerts open", None, UNKNOWN,
                                "governance_alerts not readable"))
+
+        # P1 2026-09-07. The DECLARED-BUT-UNENFORCED workflow ownership
+        # invariant. Surfaced here so the gap is an operator-visible number
+        # while the D-02 backfill closes it, rather than a fact that has to be
+        # rediscovered by querying. It is WARNING, not CRITICAL: the condition
+        # is known, accepted and sequenced -- the alarming state would be this
+        # number FALLING, which the gated ratchet catches.
+        try:
+            from app.core import work_ownership as _wo
+            r = _wo.workflow_ownership_rate()
+            pct = round(r["accountable_rate"] * 100, 2)
+            unowned = r["total"] - r["with_accountable_owner"]
+            out.append(_metric(
+                "workflow_work_accountable", "Workflow work with an accountable owner",
+                pct, OK if r["enforced"] else WARN,
+                f"{r['with_accountable_owner']} of {r['total']} workflow-created "
+                f"activities name an eligible human · {r['open_unowned']} open and "
+                f"unowned · invariant DECLARED, not enforced (enforcing now would "
+                f"refuse {unowned} of {r['total']} creations — blocked on the D-02 "
+                f"ownership backfill)"
+                if not r["enforced"] else
+                f"{r['with_accountable_owner']} of {r['total']} · invariant ENFORCED",
+                "%"))
+        except Exception as exc:                                   # noqa: BLE001
+            out.append(_metric("workflow_work_accountable",
+                               "Workflow work with an accountable owner", None,
+                               UNKNOWN, f"unavailable: {str(exc)[:80]}", "%"))
     except Exception as exc:                                       # noqa: BLE001
         out.append(_metric("approvals_breached", "Approvals past 48h SLA", None, UNKNOWN,
                            f"governance metrics unavailable: {str(exc)[:80]}"))

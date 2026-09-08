@@ -26,15 +26,19 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import time
 import uuid as _uuid_mod
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.core.database import get_connection
+
+from html import escape as _esc
 
 logger = logging.getLogger("governance")
 
@@ -676,11 +680,19 @@ def _action_summary(action_type: str, params: Optional[Dict[str, Any]]):
 
 def _build_approval_email(action_type: str, params: Optional[Dict[str, Any]],
                           amount: float, label: str, approval_uuid: str,
-                          critique: Optional[Dict[str, Any]]):
+                          critique: Optional[Dict[str, Any]],
+                          links: Optional[Dict[str, str]] = None):
     """Compose the routed-approval email (subject, html, text) — shared by the
     initial routing AND re-notification, so both carry the same rich 'what you
-    are approving' context, critic opinion, and one-click decision links."""
-    links = decision_links(approval_uuid)
+    are approving' context, critic opinion, and one-click decision links.
+
+    `links` is now passed IN rather than minted here. Minting binds a token to
+    a named executive and rotates the row's issuance, which is a decision about
+    WHO is being written to — not something a function whose job is to format
+    HTML should be making on the caller's behalf. A caller with no recipient
+    gets an email with no links and a pointer to the console, which is the
+    correct degradation: no link at all beats a link that decides as nobody."""
+    links = links or {}
     summ_html, summ_text = _action_summary(action_type, params)
     findings = [f for f in (critique or {}).get("findings", [])
                 if f.get("verdict") in ("fail", "warn")][:4]
@@ -704,20 +716,25 @@ def _build_approval_email(action_type: str, params: Optional[Dict[str, Any]],
                  f"<p><b>{action_type}</b>{amt}"
                  f"<br>Approval ID: {approval_uuid}</p>"
                  + summ_html + critic_html +
-                 f'<p style="margin:18px 0;">'
+                 (f'<p style="margin:18px 0;">'
                  f'<a href="{links["approve"]}" style="background:#1e7c45;'
                  f'color:#fff;padding:10px 22px;border-radius:6px;'
                  f'text-decoration:none;font-weight:700;">✓ Approve</a>&nbsp;&nbsp;'
                  f'<a href="{links["reject"]}" style="background:#a33a3a;'
                  f'color:#fff;padding:10px 22px;border-radius:6px;'
                  f'text-decoration:none;font-weight:700;">✕ Reject</a></p>'
-                 f'<p style="color:#7b8497;font-size:12px;">One-click, signed links '
-                 f'— no sign-in needed. Or review the full context in the '
-                 f'governance queue.</p>')
+                 f'<p style="color:#7b8497;font-size:12px;">These links open a '
+                 f'confirmation page and decide as <b>you</b> — they are issued '
+                 f'to your name, they expire, and a reminder replaces them. Or '
+                 f'review the full context in the governance queue.</p>'
+                  if links else
+                  '<p style="color:#7b8497;font-size:12px;">Decide in the '
+                  'governance queue, signed in as yourself.</p>'))
     body_text = (f"Approval needed: {action_type}{amt}\n"
                  f"Approval ID: {approval_uuid}\nAssigned to: {label}\n"
                  + (f"\n{summ_text}" if summ_text else "") + critic_text
-                 + f"\nApprove: {links['approve']}\nReject:  {links['reject']}\n")
+                 + (f"\nApprove: {links['approve']}\nReject:  {links['reject']}\n"
+                    if links else "\nDecide in the governance queue.\n"))
     return subject, body_html, body_text
 
 
@@ -748,11 +765,16 @@ def _deliver_approval_chat(chosen: Dict[str, Any], channel: str, approval_uuid: 
         logger.info(f"[governance] {label} prefers {channel} but has no linked "
                     f"{channel} handle — delivered in-app instead")
         return {"delivered": False, "reason": f"no {channel} handle (in-app fallback)"}
-    links = decision_links(approval_uuid)
+    # The chat card decides through /slack/interactive, which establishes the
+    # deciding identity from the SLACK USER ID and not from the token — so this
+    # path never needed a bearer link and does not mint one. The link-bearing
+    # fallback text is now a pointer to the console rather than a live URL: an
+    # approve link pasted into a channel is readable by everyone in it, which
+    # is the same exposure the BCC archive had.
     amt = f" (${amount:,.0f})" if amount else ""
     text = (f"🛡️ Approval needed: {action_type}{amt}\n"
             + (summ_text + "\n" if summ_text else "")
-            + f"Approve: {links['approve']}\nReject: {links['reject']}")
+            + "Decide with the buttons above, or in the governance queue.")
     from app.core import transports
     if channel == "slack":
         # Native in-thread Approve/Reject buttons (#6). The button values carry the
@@ -932,9 +954,14 @@ def route_approval(approval_uuid: str, action_type: str,
     if want_email and GOV_ROUTE_EMAIL and chosen.get("auto_email_enabled") \
             and chosen.get("email"):
         try:
-            from app.agents.email.smtp_imap import send_email
+            from app.agents.email.smtp_imap import send_email, NO_BCC
+            # Mint this issuance FOR THE EXECUTIVE BEING WRITTEN TO. Rotates
+            # the row's nonce, so any earlier link — including the copy in the
+            # BCC archive — is dead from this moment.
+            _mint = mint_decision_links(approval_uuid, [chosen])
             subject, body_html, body_text = _build_approval_email(
-                action_type, params, amount, label, approval_uuid, critique)
+                action_type, params, amount, label, approval_uuid, critique,
+                links=_mint.get(str(chosen["executive_id"])))
 
             # ── Staff-email Stage 3 ────────────────────────────────────────
             # The recipient, the template and the send are unchanged. The
@@ -970,8 +997,12 @@ def route_approval(approval_uuid: str, action_type: str,
                 logger.info(f"[governance] approval {approval_uuid[:8]} email "
                             f"not sent: {claim_info.get('why')}")
             else:
+                # NO_BCC: this message carries a live decision link, so it
+                # goes to the executive and NOWHERE ELSE. The default archive
+                # is a mailbox several people can read.
                 res = send_email(to=chosen["email"], subject=subject,
-                                 body_html=body_html, body_text=body_text)
+                                 body_html=body_html, body_text=body_text,
+                                 bcc=NO_BCC)
                 # internal/administrative — transactional, not commercial
                 try:
                     from app.core import staff_email
@@ -1022,7 +1053,8 @@ def renotify_pending(to: Optional[str] = None, limit: int = 20,
     finally:
         conn.close()
 
-    from app.agents.email.smtp_imap import send_email
+    from app.agents.email.smtp_imap import send_email, NO_BCC
+    from app.core import governance_policy as gp
     sent, skipped = [], []
     for r in rows:
         dest = to or r.get("exec_email")
@@ -1030,12 +1062,24 @@ def renotify_pending(to: Optional[str] = None, limit: int = 20,
             skipped.append({"approval_uuid": r["approval_uuid"], "reason": "no recipient"})
             continue
         try:
+            # A re-notification is a NEW issuance, not a repeat of the old
+            # one: minting here is what stops renotify() from re-posting a
+            # token that has been sitting in a mailbox since the first send.
+            # `to=` may override the destination for testing, and an override
+            # deliberately gets NO link — a link minted for one executive and
+            # mailed to another is exactly the confusion being removed.
+            _ex = (gp.executive_for_identifier(r.get("exec_email"))
+                   if r.get("exec_email") else None)
+            _mint = (mint_decision_links(r["approval_uuid"], [_ex])
+                     if _ex and not to else {})
             subject, body_html, body_text = _build_approval_email(
                 r["action_type"], r["params"], float(r.get("amount") or 0),
                 r.get("assigned_to") or "the approver", r["approval_uuid"],
-                r.get("critique"))
+                r.get("critique"),
+                links=_mint.get(str(_ex["executive_id"])) if _ex and _mint else None)
             res = send_email(to=dest, subject=subject,
-                             body_html=body_html, body_text=body_text)
+                             body_html=body_html, body_text=body_text,
+                             bcc=NO_BCC)
             ok = bool((res or {}).get("success", True))
             (sent if ok else skipped).append(
                 {"approval_uuid": r["approval_uuid"], "action_type": r["action_type"],
@@ -1061,7 +1105,10 @@ def _row(approval_uuid: str) -> Optional[Dict[str, Any]]:
                           policy_version, sla_hours, due_at, breached_at,
                           escalated_at, escalation_status, executing_at,
                           execution_token, verification, decided_via, assigned_to,
-                          amount, critique
+                          amount, critique, decided_actor,
+                          assigned_executive_id::text AS assigned_executive_id,
+                          decision_link_nonce, decision_link_issued_at,
+                          decision_link_recipients
                    FROM action_approvals WHERE approval_uuid=%s::uuid""",
                 (approval_uuid,))
             r = cur.fetchone()
@@ -1250,6 +1297,31 @@ def principal_for_decider(decided_by: Optional[str]) -> "Any":
     return Principal(kind="user", id=d, display=d, role="approver")
 
 
+def _with_approval_ref(ap: Dict[str, Any],
+                       params: Dict[str, Any]) -> Dict[str, Any]:
+    """Tell a capability WHICH approval authorised it, when it declares that it
+    wants to know.
+
+    Most capabilities must not care: the approval is bookkeeping, and passing it
+    to everything would put a governance concern into every handler. But a
+    capability whose whole job is to change governance has to record the
+    decision that permitted it -- governance_policy_changes has a CHECK that a
+    widening record names its approval -- and it cannot invent that reference.
+
+    Opt-in through params_schema, so the contract stays readable: a capability
+    that declares `approval_uuid` as an optional parameter is asking for it, and
+    validate_params will therefore accept it. Nothing else receives it."""
+    try:
+        from app.core.a2a import CAPABILITIES
+        cap = CAPABILITIES.get(ap["action_type"])
+        schema = getattr(cap, "params_schema", None) if cap else None
+        if schema and "approval_uuid" in (schema[1] or ()):
+            return {**params, "approval_uuid": str(ap["approval_uuid"])}
+    except Exception as exc:                                    # noqa: BLE001
+        logger.debug(f"[governance] approval-ref injection skipped: {exc}")
+    return params
+
+
 async def _execute(ap: Dict[str, Any]) -> Dict[str, Any]:
     """Run an approved action by re-dispatching it through A2A (gate bypassed)."""
     from app.core.a2a import A2ARequest, EntityRef, dispatch
@@ -1276,7 +1348,7 @@ async def _execute(ap: Dict[str, Any]) -> Dict[str, Any]:
     # against the table, not against this dict.
     req = A2ARequest(
         intent=ap["action_type"], from_agent="governance",
-        params=strip_internal(params),
+        params=_with_approval_ref(ap, strip_internal(params)),
         principal=principal_for_decider(ap.get("decided_by")),
         entity=EntityRef(ap["entity_type"], ap["entity_id"]) if ap.get("entity_type") else None,
         confidence=1.0, govern_bypass=True,
@@ -1341,11 +1413,14 @@ def _authority_check(ap: Dict[str, Any], decided_by: Optional[str],
     """{ok, role, reason}. Who may decide THIS row."""
     from app.core import governance_policy as gp
     row_role = (ap.get("authority_role") or "").upper() or None
-    if via == "email-link":
-        # The token was mailed to the assigned executive; possession decides as
-        # that authority. principal_for_decider records the kind truthfully.
-        return {"ok": True, "role": row_role or gp.ESCALATION_ROLE,
-                "reason": "HMAC decision link mailed to the assigned authority"}
+    # THERE IS NO LONGER AN email-link BRANCH HERE, and its absence is the fix.
+    # It used to return ok=True on sight, deciding as whatever authority the row
+    # named, because possession of the token was treated as the authorisation.
+    # The token now carries an executive id, verify_decision_token resolves it
+    # to a real, eligible executive, and that executive is passed to this
+    # function exactly like a signed-in one — so a link mailed to the CFO cannot
+    # decide a row assigned to the CRO, and a revoked executive's outstanding
+    # links decide nothing.
     role = gp.decider_role(decided_by)
     if role is None and via == "chat":
         # Slack / Teams: the user id must link to an executive through the
@@ -1396,6 +1471,13 @@ def _claim_execution(approval_uuid: str, decided_by: str, reason: Optional[str],
                  "id": approval_uuid, "actor": actor or decided_by})
             r = cur.fetchone()
         conn.commit()
+        if r:
+            # The row has left 'pending', so its outstanding decision link is
+            # spent. verify_decision_token would refuse it anyway on the status
+            # check; retiring the nonce means a stale link in a mailbox fails on
+            # the FIRST check rather than the last, and stops the row carrying a
+            # live-looking credential it no longer honours.
+            clear_decision_links(approval_uuid)
         return {"approval_uuid": r[0], "action_type": r[1]} if r else None
     finally:
         conn.close()
@@ -1594,6 +1676,7 @@ def reject(approval_uuid: str, decided_by: str = "human",
     if n != 1:
         cur_status = (_row(approval_uuid) or {}).get("status")
         return {"ok": False, "error": f"not pending (status={cur_status})", "status": cur_status}
+    clear_decision_links(approval_uuid)
     _decision_event(approval_uuid, ap, "reject", decided_by, auth["role"], via,
                     {"actor": actor or decided_by})
     return {"ok": True, "status": "rejected", "approval_uuid": approval_uuid,
@@ -1773,8 +1856,14 @@ def sla_sweep() -> Dict[str, Any]:
         # escalated to are mailed, with the one-click decision links, and the
         # send is ledgered idempotently per (approval, role).
         try:
-            _links = decision_links(aid)
-            _text = (
+            # BOTH recipients are minted in ONE issuance. Minting per recipient
+            # would rotate the nonce twice and leave the first executive holding
+            # a dead link — which is why the row stores a recipient SET rather
+            # than a single executive id.
+            _roles = [r for r in {ap.get("authority_role"), gp.ESCALATION_ROLE} if r]
+            _execs = [x for x in (gp.authority_owner(r) for r in _roles) if x]
+            _mint = mint_decision_links(aid, _execs)
+            _head = (
                 f"Approval SLA breached: {ap.get('action_type')} "
                 f"(approval {aid[:8]})\n"
                 f"Assigned authority: {ap.get('authority_role')}\n"
@@ -1782,20 +1871,27 @@ def sla_sweep() -> Dict[str, Any]:
                 f"Due:                {ap.get('due_at')}\n\n"
                 f"Per policy this is now escalated to the {gp.ESCALATION_ROLE}. It has "
                 f"NOT been executed, rejected or expired — the decision is still "
-                f"yours to make.\n\n"
-                f"Decide in the governance console signed in as yourself, or with "
-                f"these one-click links:\n"
-                f"  approve: {_links['approve']}\n"
-                f"  reject:  {_links['reject']}\n")
-            for _role in {ap.get("authority_role"), gp.ESCALATION_ROLE}:
-                _ex = gp.authority_owner(_role) if _role else None
-                if _ex:
-                    gp.email_authority(
-                        _ex,
-                        f"[Action needed] Approval SLA breached: {ap.get('action_type')}",
-                        _text, kind="approval_breach", ref=f"{aid}:{_role}")
+                f"yours to make.\n\n")
+            for _ex in _execs:
+                _l = _mint.get(str(_ex["executive_id"]))
+                _tail = (
+                    f"Decide in the governance console signed in as yourself, or "
+                    f"with these links, which are issued to you by name and ask "
+                    f"you to confirm before anything happens:\n"
+                    f"  approve: {_l['approve']}\n"
+                    f"  reject:  {_l['reject']}\n"
+                    if _l else
+                    "Decide in the governance console, signed in as yourself.\n")
+                gp.email_authority(
+                    _ex,
+                    f"[Action needed] Approval SLA breached: {ap.get('action_type')}",
+                    _head + _tail, kind="approval_breach",
+                    ref=f"{aid}:{_ex.get('role_code')}")
         except Exception as exc:                                   # noqa: BLE001
-            logger.debug(f"[governance] breach email skipped for {aid[:8]}: {exc}")
+            # N-05: was logger.debug. An escalation that fails to send is the
+            # failure this whole path exists to prevent, and DEBUG is where a
+            # control goes to degrade unobserved.
+            logger.warning(f"[governance] breach email FAILED for {aid[:8]}: {exc}")
 
         # The breach is itself a governed work item owned by the CEO.
         try:
@@ -1917,9 +2013,16 @@ def sla_sweep() -> Dict[str, Any]:
             conn.close()
         out["reminded"].append(aid)
         try:
-            links = decision_links(aid)
+            # THE UNBOUNDED-TOKEN DEFECT WAS HERE. This loop re-sent THE SAME
+            # link every REESCALATE_HOURS for as long as the row stayed pending,
+            # so one undecided proposal emitted an endless stream of identical
+            # live bearer tokens into a mailbox that is archived. Re-minting is
+            # the fix and it is cheap: reminder n+1 invalidates reminder n.
+            _ceo = gp.authority_owner(gp.ESCALATION_ROLE)
+            _l = (mint_decision_links(aid, [_ceo]) or {}).get(
+                str(_ceo["executive_id"])) if _ceo else None
             gp.email_authority(
-                gp.authority_owner(gp.ESCALATION_ROLE),
+                _ceo,
                 f"[Reminder {n}] Still undecided after escalation: {at}",
                 f"{at} (approval {aid[:8]}) was escalated to you and has still "
                 f"not been decided.\n"
@@ -1928,10 +2031,16 @@ def sla_sweep() -> Dict[str, Any]:
                 f"Reminder number: {n}\n\n"
                 f"This repeats every {int(REESCALATE_HOURS)}h until a decision "
                 f"exists. There is no way to acknowledge it without deciding.\n\n"
-                f"  approve: {links['approve']}\n  reject:  {links['reject']}\n",
+                + (f"  approve: {_l['approve']}\n  reject:  {_l['reject']}\n"
+                   f"(These replace the links in reminder {n - 1}, which no "
+                   f"longer work.)\n"
+                   if _l else "Decide in the governance console.\n"),
                 kind="approval_reescalation", ref=f"{aid}:reminder:{n}")
         except Exception as exc:                                   # noqa: BLE001
-            logger.debug(f"[governance] reminder email skipped for {aid[:8]}: {exc}")
+            # N-05: was logger.debug. A reminder that silently fails to send is
+            # the escalation not happening.
+            logger.warning(f"[governance] reminder email FAILED for "
+                           f"{aid[:8]}: {exc}")
 
     if any(out.values()):
         logger.warning(f"[governance] SLA sweep — breached {len(out['breached'])}, "
@@ -2164,12 +2273,52 @@ async def undo(approval_uuid: str, decided_by: str = "human",
 
 
 # ============================================================================
-# One-click decisions — HMAC-signed approve/reject links (like unsubscribe)
+# One-click decisions — identity-bound, expiring, rotated decision links
 # ============================================================================
-# The routed-approval email carries per-action signed links, so the executive
-# decides from their phone without a CRM session. The token binds
-# (approval_uuid, action) to a server secret; approve()/reject() refuse
-# non-pending rows, so links are single-use by construction.
+# THE DEFECT THIS REPLACES (reassessment 2026-09-07, N-01, P0).
+#
+# The first version signed `HMAC(secret, "uuid:action")`. That token proved one
+# thing: POSSESSION OF A URL. It carried no executive, no expiry and no
+# issuance, and the endpoint that consumed it was an unauthenticated GET that
+# executed the action on sight. Four things followed, and all four were
+# measured on production rather than imagined:
+#
+#   * Of every decision in production history, NOT ONE was made through the
+#     session path that `_bound_authority` so carefully protects. All were
+#     `email-link` or the expiry sweep. The bound-identity architecture was
+#     guarding a door nobody used.
+#   * Three proposals assigned to TWO DIFFERENT executives were decided inside
+#     69 seconds, each recording `decided_actor = NULL`. The system could not
+#     say who, because the token never knew.
+#   * Every governance mail is BCC'd to a shared archive mailbox, so each of
+#     those links was copied to an inbox that is not the executive's.
+#   * The escalation reminder re-sent THE SAME ETERNAL TOKEN every 24 hours,
+#     without bound, for as long as the row stayed pending.
+#
+# WHAT THE TOKEN BINDS NOW. `HMAC(secret, "uuid:action:executive_id:nonce")`,
+# with the executive id travelling in the URL so tampering with it breaks the
+# signature rather than selecting a different authority:
+#
+#   uuid + action  — as before: this decision, this direction
+#   executive_id   — WHO. The decision is recorded as this person.
+#   nonce          — WHICH ISSUANCE. Rotated on every mint, so the previous
+#                    link — including every copy of it sitting in the archive —
+#                    stops working the moment a reminder goes out.
+#   issued_at      — WHEN, on the row. Expiry is measured from the mint, not
+#                    from the proposal, so a reminder grants a fresh window
+#                    instead of extending an unbounded one.
+#
+# WHAT IT STILL DOES NOT PROVE, stated plainly because the previous version's
+# comment overclaimed and that is how this survived: possession of a mailbox.
+# A token in the right mailbox still decides. What has changed is that it
+# decides AS A NAMED PERSON, within a window, for one issuance, and only if
+# that person is still an eligible authority for this row — so the audit
+# answers "who", the exposure is bounded in time, and revocation works. The
+# GET/POST split below is what stops a machine that merely READS the mailbox
+# from deciding at all.
+
+GOV_LINK_TTL_HOURS = float(os.getenv("GOV_LINK_TTL_HOURS", "72"))
+
 
 def _link_secret() -> bytes:
     s = (os.getenv("GOV_LINK_SECRET") or os.getenv("UNSUBSCRIBE_SECRET")
@@ -2177,25 +2326,156 @@ def _link_secret() -> bytes:
     return s.encode("utf-8")
 
 
-def decision_token(approval_uuid: str, action: str) -> str:
+def decision_token(approval_uuid: str, action: str,
+                   executive_id: str = "", nonce: str = "") -> str:
+    """The signed value in a decision link.
+
+    `executive_id` and `nonce` are keyword-optional ONLY so that the Slack
+    interactive path (transports.approval_blocks) can keep calling this with the
+    identity it already establishes from the Slack user id. An email link with
+    an empty executive is refused by verify_decision_token, so the default is
+    not a way back to the bearer token."""
     import hashlib
     import hmac as _hmac
-    return _hmac.new(_link_secret(), f"{approval_uuid}:{action}".encode("utf-8"),
+    payload = f"{approval_uuid}:{action}:{executive_id}:{nonce}"
+    return _hmac.new(_link_secret(), payload.encode("utf-8"),
                      hashlib.sha256).hexdigest()[:32]
 
 
 def _verify_token(approval_uuid: str, action: str, token: str) -> bool:
+    """Legacy shape, kept for the Slack interactive endpoint, which establishes
+    identity from the Slack user id rather than from the token."""
     import hmac as _hmac
     if not _link_secret() or not token:
         return False
     return _hmac.compare_digest(decision_token(approval_uuid, action), token)
 
 
-def decision_links(approval_uuid: str) -> Dict[str, str]:
+def mint_decision_links(approval_uuid: str,
+                        recipients: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    """Rotate this row's issuance and return per-executive approve/reject links.
+
+    {executive_id: {"approve": url, "reject": url}}, empty when the row is not
+    pending — a decided row must never be handed a live link.
+
+    ROTATION IS THE POINT. Every send calls this, so the escalation reminder
+    that used to re-post an eternal token now issues a new one and kills the
+    old. `recipients` is the whole set for this issuance because a breached
+    approval is mailed to two people at once (the desk whose clock ran out and
+    the CEO); minting them separately would have the second send silently
+    invalidate the first."""
+    ids = [str(r["executive_id"]) for r in recipients if r and r.get("executive_id")]
+    if not ids:
+        return {}
+    nonce = secrets.token_hex(16)
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE action_approvals
+                      SET decision_link_nonce=%(n)s,
+                          decision_link_recipients=%(r)s::uuid[],
+                          decision_link_issued_at=now()
+                    WHERE approval_uuid=%(id)s::uuid AND status='pending'
+                RETURNING approval_uuid""",
+                {"n": nonce, "r": ids, "id": approval_uuid})
+            if cur.fetchone() is None:
+                conn.rollback()
+                return {}
+        conn.commit()
+    finally:
+        conn.close()
     base = (os.getenv("APP_URL", "") or "http://localhost:8000").rstrip("/")
-    return {a: (f"{base}/governance/decide?g={approval_uuid}"
-                f"&a={a}&t={decision_token(approval_uuid, a)}")
-            for a in ("approve", "reject")}
+    return {
+        eid: {a: (f"{base}/governance/decide?g={approval_uuid}&a={a}"
+                  f"&e={eid}&t={decision_token(approval_uuid, a, eid, nonce)}")
+              for a in ("approve", "reject")}
+        for eid in ids}
+
+
+def verify_decision_token(approval_uuid: str, action: str, executive_id: str,
+                          token: str) -> Dict[str, Any]:
+    """{ok, executive, role, reason}. Everything a decision link must satisfy.
+
+    Ordered cheapest-first, and every failure is a refusal rather than a
+    fallback. There is deliberately no branch here that ends in "decide anyway":
+    the previous implementation's single branch — verify the HMAC, then decide
+    as whichever authority the row named — is the whole defect."""
+    from app.core import governance_policy as gp
+    if action not in ("approve", "reject"):
+        return {"ok": False, "reason": "unknown action"}
+    if not _link_secret():
+        return {"ok": False, "reason": "decision links are not configured"}
+    if not token or not executive_id:
+        # An old-format link: no executive travelled with it. Refused rather
+        # than honoured, which is what makes rotating GOV_LINK_SECRET optional
+        # rather than urgent — every pre-rotation link is already invalid here.
+        return {"ok": False, "reason": "this decision link predates identity "
+                                       "binding and is no longer valid"}
+    ap = _row(approval_uuid)
+    if not ap:
+        return {"ok": False, "reason": "not found"}
+    nonce = ap.get("decision_link_nonce")
+    recipients = [str(x) for x in (ap.get("decision_link_recipients") or [])]
+    if not nonce:
+        return {"ok": False, "reason": "no decision link is outstanding for "
+                                       "this approval"}
+    import hmac as _hmac
+    if not _hmac.compare_digest(
+            decision_token(approval_uuid, action, str(executive_id), nonce), token):
+        # Covers both a forged token and a superseded issuance: a link from
+        # before the last reminder carries the old nonce and lands here.
+        return {"ok": False, "reason": "this link is invalid or has been "
+                                       "superseded by a newer notification"}
+    if str(executive_id) not in recipients:
+        return {"ok": False, "reason": "this link was not issued to that "
+                                       "executive"}
+    issued = ap.get("decision_link_issued_at")
+    if issued is not None:
+        age_h = (datetime.now(timezone.utc) - issued).total_seconds() / 3600.0
+        if age_h > GOV_LINK_TTL_HOURS:
+            return {"ok": False, "reason": f"this link expired "
+                    f"({int(age_h)}h old; links are valid for "
+                    f"{int(GOV_LINK_TTL_HOURS)}h). Decide in the governance "
+                    f"console, or wait for the next reminder."}
+    ex = gp.executive_by_id(str(executive_id))
+    if not ex:
+        return {"ok": False, "reason": "that executive no longer exists"}
+    if not ex.get("eligible"):
+        # The session path already refuses an ineligible executive. The email
+        # path used to skip this check entirely, so a revoked executive's
+        # outstanding links kept deciding.
+        return {"ok": False, "reason": f"{ex.get('role_code')} is no longer an "
+                                       f"eligible work owner and cannot decide"}
+    chk = _authority_check(ap, ex.get("email"), via="session")
+    if not chk.get("ok"):
+        return {"ok": False, "reason": chk.get("reason")}
+    return {"ok": True, "executive": ex, "role": chk.get("role")}
+
+
+def clear_decision_links(approval_uuid: str) -> None:
+    """Retire the outstanding issuance. Called when a row leaves 'pending', so
+    a link cannot be replayed against a decided row even if the status check
+    were ever loosened. Best-effort by design: failing to tidy a nonce must not
+    fail a decision that already executed."""
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE action_approvals
+                          SET decision_link_nonce=NULL,
+                              decision_link_recipients=NULL,
+                              decision_link_issued_at=NULL
+                        WHERE approval_uuid=%(id)s::uuid
+                          AND decision_link_nonce IS NOT NULL""",
+                    {"id": approval_uuid})
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:                                    # noqa: BLE001
+        logger.warning(f"[governance] could not retire decision link for "
+                       f"{approval_uuid[:8]}: {exc}")
 
 
 # ============================================================================
@@ -2268,7 +2548,11 @@ def governance_delegate(request: Request, approval_uuid: str, body: _Delegate):
 
 class _PolicyBody(BaseModel):
     value: float
+    # Accepted and IGNORED, like _PolicyChange.updated_by. The actor is the
+    # signed-in executive; a body-supplied name was how an ops token signed its
+    # own change as somebody else.
     updated_by: Optional[str] = None
+    reason: Optional[str] = None
 
 
 @router.get("/governance/policies")
@@ -2287,7 +2571,9 @@ def governance_policies():
 
 
 @router.put("/governance/policies/{key}")
-def governance_policy_put(key: str, body: _PolicyBody):
+def governance_policy_put(request: Request, key: str, body: _PolicyBody):
+    from app.core import governance_policy as gp
+    ex = gp.bound_authority(request)
     spec = _KNOWN_POLICIES.get(key)
     if not spec:
         return {"ok": False, "error": f"unknown policy '{key}' — known: "
@@ -2305,6 +2591,47 @@ def governance_policy_put(key: str, body: _PolicyBody):
     if key == "gov.propose_min" and v > act_min():
         return {"ok": False, "error": f"propose_min {v} would exceed "
                                       f"act_min {act_min()}"}
+    # WIDENING IS A DECISION, NOT AN UPDATE. Raising gov.hitl_amount sends
+    # fewer things to a human; raising brand.max_discount_pct permits deeper
+    # discounts; lowering gov.act_min auto-executes more. Each of those is a
+    # bigger act than approving one proposal, and each was reachable with an
+    # ops token. Tightening any of them still applies directly.
+    before = policy_value(key)
+    widening = gp.classify_tunable_change(key, before, v)
+    reason = (body.reason or "").strip()
+    if widening:
+        if not reason:
+            return {"ok": False, "error": "a reason is required to weaken a "
+                                          "governance control"}
+        aid = propose("policy.widen", "governance_policies",
+                      {"scope": "tunable", "policy_key": key,
+                       "changes": {"value": v}, "reason": reason,
+                       "requested_by": ex["email"], "widening": widening},
+                      confidence=1.0, severity="high")
+        return JSONResponse(status_code=202, content={
+            "ok": False, "requires_approval": True, "approval_uuid": aid,
+            "widening": widening,
+            "approver_role": gp.policy_for("policy.widen").get("approver_role"),
+            "detail": "This weakens a governance control, so it is itself a "
+                      "governed decision. Nothing has changed yet."})
+    write_policy_value(key, v, ex["email"], spec["description"])
+    gp.record_policy_change(
+        scope="tunable", policy_key=key, field="value", old_value=before,
+        new_value=v, widening=False, widening_reason=None,
+        actor_email=ex["email"], actor_role=ex.get("role_code"),
+        reason=reason or "tightened a governance control")
+    logger.info(f"[governance] policy {key} → {v} (by {ex['email']})")
+    return {"ok": True, "key": key, "effective": policy_value(key),
+            "source": "db", "changed_by": ex["email"]}
+
+
+def write_policy_value(key: str, v: Any, actor: str,
+                       description: Optional[str] = None) -> None:
+    """The ONLY writer of governance_policies. Separated from the endpoint so
+    the approved policy.widen execution and the direct tightening path share one
+    implementation -- two writers would be two places for the widening gate to
+    be missing from one of them."""
+    spec = _KNOWN_POLICIES.get(key) or {}
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -2315,19 +2642,37 @@ def governance_policy_put(key: str, body: _PolicyBody):
                    ON CONFLICT (policy_key) DO UPDATE SET
                      value=EXCLUDED.value, updated_by=EXCLUDED.updated_by,
                      updated_at=now()""",
-                (key, json.dumps(v), spec["description"],
-                 body.updated_by or "admin"))
+                (key, json.dumps(v), description or spec.get("description", ""),
+                 actor))
         conn.commit()
     finally:
         conn.close()
     invalidate_policy_cache()
-    logger.info(f"[governance] policy {key} → {v} (by {body.updated_by or 'admin'})")
-    return {"ok": True, "key": key, "effective": policy_value(key), "source": "db"}
 
 
 @router.delete("/governance/policies/{key}")
-def governance_policy_delete(key: str):
-    """Remove the override — the env/code default applies again."""
+def governance_policy_delete(request: Request, key: str):
+    """Remove the override — the env/code default applies again.
+
+    Bound to an executive because removing an override CHANGES the effective
+    value, and the direction it changes in is not knowable from the verb."""
+    from app.core import governance_policy as gp
+    ex = gp.bound_authority(request)
+    before = policy_value(key)
+    after = _KNOWN_POLICIES.get(key, {}).get("default")
+    widening = gp.classify_tunable_change(key, before, after)
+    if widening:
+        aid = propose("policy.widen", "governance_policies",
+                      {"scope": "tunable", "policy_key": key,
+                       "changes": {"value": after},
+                       "reason": "remove the override, reverting to the default",
+                       "requested_by": ex["email"], "widening": widening},
+                      confidence=1.0, severity="high")
+        return JSONResponse(status_code=202, content={
+            "ok": False, "requires_approval": True, "approval_uuid": aid,
+            "widening": widening,
+            "detail": "Removing this override would weaken the control, so it "
+                      "is itself a governed decision."})
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -2338,8 +2683,14 @@ def governance_policy_delete(key: str):
     finally:
         conn.close()
     invalidate_policy_cache()
+    gp.record_policy_change(
+        scope="tunable", policy_key=key, field="value", old_value=before,
+        new_value=policy_value(key), widening=False, widening_reason=None,
+        actor_email=ex["email"], actor_role=ex.get("role_code"),
+        reason="override removed; the default applies again")
     return {"ok": True, "removed": n, "key": key,
-            "effective": policy_value(key), "source": "default"}
+            "effective": policy_value(key), "source": "default",
+            "changed_by": ex["email"]}
 
 
 @router.get("/governance/queue")
@@ -2359,7 +2710,7 @@ class _DeleteBody(BaseModel):
 
 
 @router.post("/governance/history/delete")
-def governance_history_delete(body: _DeleteBody):
+def governance_history_delete(request: Request, body: _DeleteBody):
     """Clear decided rows (executed/failed/rejected/expired) out of the queue.
 
     NOT destructive any more. trg_action_approvals_deletion_log archives the
@@ -2371,7 +2722,13 @@ def governance_history_delete(body: _DeleteBody):
 
     Pending actions can never be deleted — they must be approved or rejected
     first.
+
+    BOUND (N-02). The archive means nothing is lost, so this is not tampering —
+    but "who cleared the record of that approval" is a question the archive can
+    only answer if a real identity reached it, and `deleted_by` came from the
+    request body on a route a machine token could call.
     """
+    ex = _bound_authority(request)
     ids = [i for i in (body.ids or []) if i]
     if not ids:
         return {"deleted": 0}
@@ -2396,7 +2753,8 @@ def governance_history_delete(body: _DeleteBody):
                            f"record an authorised action. Give a reason to "
                            f"clear them (the row is archived either way).")
 
-            actor = (body.deleted_by or "").strip() or "admin"
+            # The SESSION, not the body. body.deleted_by is inert.
+            actor = ex["email"]
             # Read by log_governed_deletion(). The repair_key must NOT be
             # 'undeclared': that tier is purged after 30 days, which would
             # quietly undo the archive. A declared key is kept for a year.
@@ -2497,24 +2855,44 @@ def governance_reject(request: Request, approval_uuid: str,
 
 
 @router.post("/governance/undo/{approval_uuid}")
-async def governance_undo(approval_uuid: str, body: _Decision = _Decision()):
+async def governance_undo(request: Request, approval_uuid: str,
+                          body: _Decision = _Decision()):
     """Reverse an executed action (within GOV_UNDO_WINDOW_HOURS, if its
-    action_type has an undo handler)."""
-    return await undo(approval_uuid, body.decided_by, body.reason)
+    action_type has an undo handler).
+
+    BOUND (N-02). Reversing a decision an executive made is at least as
+    consequential as making one, and this took `decided_by` from the request
+    body on a route an ops token could reach -- so a machine could undo a CEO
+    decision and record someone else as having done it."""
+    ex = _bound_authority(request)
+    return await undo(approval_uuid, ex["email"], body.reason)
 
 
 @router.post("/governance/expire")
 def governance_expire():
-    """RETIRED name, kept for callers: runs the SLA sweep. Nothing expires."""
+    """RETIRED name, kept for callers: runs the SLA sweep. Nothing expires.
+
+    Deliberately NOT bound to an executive: it decides nothing. It is the same
+    sweep the scheduler runs every 15 minutes, and requiring a human session
+    would mean the scheduler could not call it. Left machine-callable because
+    the audit answer -- "what did this change" -- is "a breach was declared",
+    which is an observation, not an authorisation."""
     return expire_stale()
 
 
 @router.post("/governance/renotify")
-def governance_renotify(to: Optional[str] = None, limit: int = 20,
-                        action_type: Optional[str] = None):
+def governance_renotify(request: Request, to: Optional[str] = None,
+                        limit: int = 20, action_type: Optional[str] = None):
     """Re-send informative approval emails for pending items (current template).
     ?to= overrides the recipient (testing); ?action_type= filters; ?limit= caps.
-    Re-sends email only — never executes or changes the approval."""
+    Never executes or changes a decision.
+
+    BOUND since N-01 changed what this does. It used to only re-send mail; it
+    now RE-MINTS decision links, which invalidates the ones the executives are
+    holding. An unbound caller could therefore repeatedly kill every outstanding
+    link -- a denial of service against the decision path, delivered as a helpful
+    reminder. Binding it also puts a name on a bulk send."""
+    _ = _bound_authority(request)
     return renotify_pending(to=to, limit=limit, action_type=action_type)
 
 
@@ -2551,36 +2929,108 @@ _DECIDE_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
 
 
 @public_router.get("/governance/decide", response_class=HTMLResponse)
-async def governance_decide_link(g: str = "", a: str = "", t: str = ""):
-    """One-click approve/reject from the routed-approval email. The HMAC token
-    binds (approval, action); non-pending rows refuse re-decisions, so a link
-    can only ever be used once."""
-    action = (a or "").strip().lower()
-    if action not in ("approve", "reject") or not _verify_token(g, action, t):
+async def governance_decide_confirm(g: str = "", a: str = "", e: str = "",
+                                    t: str = ""):
+    """RENDER A CONFIRMATION. This endpoint does not decide anything.
+
+    THE DEFECT THIS REPLACES (N-01). This was a GET that executed the governed
+    action on sight. A GET is fetched by things that are not people: enterprise
+    mail security scanners, URL-rewriting gateways, chat unfurlers, browser
+    prefetchers, archiving crawlers. Any one of them, merely by SCANNING the
+    message, approved the action — and the audit recorded a decision the
+    executive never made. The mail is also BCC'd to a shared archive, so the
+    set of machines that could reach the link was larger than the set of people
+    entitled to.
+
+    The split is the whole mitigation, and it needs no allow-list of user
+    agents to maintain: a scanner follows links, it does not submit forms. The
+    executive sees what they are deciding before they decide it, which is worth
+    having on its own."""
+    v = verify_decision_token(g, a, e, t)
+    if not v.get("ok"):
         return HTMLResponse(_DECIDE_PAGE.format(
             title="Link not valid",
-            body="This decision link is invalid or was tampered with. "
-                 "Open the governance queue in the CRM instead."), status_code=403)
+            body=f"{_esc(str(v.get('reason') or 'This decision link is invalid.'))}"
+                 f"<br><br>Open the governance queue in the CRM and decide "
+                 f"there, signed in as yourself."), status_code=403)
     ap = _row(g)
-    if not ap:
-        return HTMLResponse(_DECIDE_PAGE.format(
-            title="Not found", body="This approval no longer exists."), status_code=404)
     if ap["status"] != "pending":
         return HTMLResponse(_DECIDE_PAGE.format(
             title="Already decided",
-            body=f"This approval was already <b>{ap['status']}</b>. "
+            body=f"This approval was already <b>{_esc(ap['status'])}</b>. "
                  f"Nothing further happened."))
-    if action == "approve":
-        res = await approve(g, decided_by="email-link", via="email-link",
-                            actor="email-link")
+    ex = v["executive"]
+    summ_html, _ = _action_summary(ap["action_type"], ap.get("params"))
+    verb = "Approve" if a == "approve" else "Reject"
+    colour = "#1e7c45" if a == "approve" else "#a33a3a"
+    amount = float(ap.get("amount") or 0)
+    amt = f" &middot; ${amount:,.0f}" if amount else ""
+    body = (
+        f'<b>{_esc(ap["action_type"])}</b>{amt}<br>'
+        f'<span style="color:#5b6478;font-size:13px;">Deciding as '
+        f'{_esc(ex["role_code"])} {_esc(ex["full_name"])} '
+        f'({_esc(ex["email"])})</span>'
+        f'{summ_html}'
+        f'<form method="post" action="/governance/decide" style="margin-top:18px;">'
+        f'<input type="hidden" name="g" value="{_esc(g)}">'
+        f'<input type="hidden" name="a" value="{_esc(a)}">'
+        f'<input type="hidden" name="e" value="{_esc(e)}">'
+        f'<input type="hidden" name="t" value="{_esc(t)}">'
+        f'<button type="submit" style="background:{colour};color:#fff;border:0;'
+        f'border-radius:5px;padding:11px 22px;font-size:15px;cursor:pointer;">'
+        f'{verb} this action</button></form>'
+        f'<p style="color:#8a93a6;font-size:12px;margin-top:14px;">'
+        f'Nothing has happened yet. This link is valid for '
+        f'{int(GOV_LINK_TTL_HOURS)}h from the notification that carried it, '
+        f'decides only as the executive named above, and stops working once a '
+        f'newer reminder is sent.</p>')
+    return HTMLResponse(_DECIDE_PAGE.format(
+        title=f"{verb}: {_esc(ap['action_type'])}", body=body))
+
+
+@public_router.post("/governance/decide", response_class=HTMLResponse)
+async def governance_decide_submit(request: Request):
+    """DECIDE. Reached only by submitting the confirmation form above.
+
+    The token is re-verified here rather than trusted from the GET: the two
+    requests are independent, and a form that carried an already-checked flag
+    would just move the bearer problem into a hidden input."""
+    form = await request.form()
+    g = str(form.get("g") or "")
+    a = str(form.get("a") or "").strip().lower()
+    e = str(form.get("e") or "")
+    t = str(form.get("t") or "")
+    v = verify_decision_token(g, a, e, t)
+    if not v.get("ok"):
+        return HTMLResponse(_DECIDE_PAGE.format(
+            title="Link not valid",
+            body=_esc(str(v.get("reason") or "This decision link is invalid."))),
+            status_code=403)
+    ap = _row(g)
+    if ap["status"] != "pending":
+        return HTMLResponse(_DECIDE_PAGE.format(
+            title="Already decided",
+            body=f"This approval was already <b>{_esc(ap['status'])}</b>. "
+                 f"Nothing further happened."))
+    ex = v["executive"]
+    # decided_by is the AUTHORITY and decided_actor the AUTHENTICATED IDENTITY.
+    # On this path they are the same named executive, which is the point: the
+    # column that used to read 'email-link' with a NULL actor now reads a
+    # person, and principal_for_decider therefore returns kind='user' honestly.
+    if a == "approve":
+        res = await approve(g, decided_by=ex["email"], via="email-link",
+                            actor=ex["email"])
         ok = res.get("ok")
         return HTMLResponse(_DECIDE_PAGE.format(
-            title="Approved ✓" if ok else "Approved — execution failed",
-            body=(f"<b>{ap['action_type']}</b> was approved and "
+            title="Approved &#10003;" if ok else "Approved — execution failed",
+            body=(f"<b>{_esc(ap['action_type'])}</b> was approved by "
+                  f"{_esc(ex['role_code'])} {_esc(ex['full_name'])} and "
                   f"{'executed' if ok else 'queued but FAILED to execute'}."
-                  + (f"<br><br>{res.get('result', {}).get('error') or ''}"
+                  + (f"<br><br>{_esc(str((res.get('result') or {}).get('error') or ''))}"
                      if not ok else ""))))
-    res = reject(g, decided_by="email-link", via="email-link", actor="email-link")
+    reject(g, decided_by=ex["email"], via="email-link", actor=ex["email"])
     return HTMLResponse(_DECIDE_PAGE.format(
-        title="Rejected ✓",
-        body=f"<b>{ap['action_type']}</b> was rejected. No action was taken."))
+        title="Rejected &#10003;",
+        body=f"<b>{_esc(ap['action_type'])}</b> was rejected by "
+             f"{_esc(ex['role_code'])} {_esc(ex['full_name'])}. "
+             f"No action was taken."))

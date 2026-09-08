@@ -491,6 +491,51 @@ def _sp_campaign_winback(p: Dict[str, Any]) -> Any:
     return marketing.winback_campaign_sp(p or {})
 
 
+def _sp_policy_widen(p: Dict[str, Any]) -> Any:
+    """Apply a governance-widening change that the CEO approved (N-02).
+
+    THE ONLY PATH THAT MAY WEAKEN A CONTROL. set_policy refuses a widening
+    change outright; this is the single caller allowed to pass
+    allow_widening=True, and it does so carrying the approval_uuid that
+    authorised it. `_execute` reaches here only after the atomic claim, so the
+    approval is real, decided, and recorded against a named executive."""
+    from app.core import governance_policy as gp
+    scope = str((p or {}).get("scope") or "action_policy")
+    key = str((p or {}).get("policy_key") or "")
+    changes = (p or {}).get("changes") or {}
+    reason = str((p or {}).get("reason") or "approved policy widening")
+    approval_uuid = (p or {}).get("approval_uuid")
+    requested_by = str((p or {}).get("requested_by") or "unknown")
+    if not key:
+        raise ValueError("policy.widen requires policy_key")
+    if scope == "tunable":
+        from app.core import governance as _gov
+        before = _gov.policy_value(key)
+        _gov.write_policy_value(key, changes.get("value"), requested_by)
+        after = _gov.policy_value(key)
+        gp.record_policy_change(
+            scope="tunable", policy_key=key, field="value",
+            old_value=before, new_value=after, widening=True,
+            widening_reason="; ".join((p or {}).get("widening") or []),
+            actor_email=requested_by, actor_role=None, reason=reason,
+            approval_uuid=approval_uuid)
+        return {"policy_key": key, "old": before, "new": after,
+                "widened": True, "approval_uuid": approval_uuid}
+    before = gp.policy_for(key)
+    pol = gp.set_policy(key, changes, requested_by, reason,
+                        approval_uuid=approval_uuid, allow_widening=True)
+    for field, new_value in (changes or {}).items():
+        gp.record_policy_change(
+            scope="action_policy", policy_key=key, field=field,
+            old_value=before.get(field), new_value=new_value, widening=True,
+            widening_reason="; ".join((p or {}).get("widening") or []),
+            actor_email=requested_by, actor_role=None, reason=reason,
+            approval_uuid=approval_uuid,
+            policy_version=(pol or {}).get("policy_version"))
+    return {"policy_key": key, "changes": changes, "widened": True,
+            "approval_uuid": approval_uuid}
+
+
 def _sp_supervisor_emit_dunning(p: Dict[str, Any]) -> Any:
     """Supervisor auto-action (executed on approval): kick the dunning loop."""
     from app.core.database import execute_sp
@@ -787,6 +832,18 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "on churn spikes; executes on governance approval",
                sp=_sp_campaign_winback,
                params_schema=((), ('segment', 'name', 'goal', 'proposed_by'))),
+    Capability("policy.widen", "governance", "", "write",
+               lambda p: (f"weaken the governance policy for "
+                          f"{p.get('policy_key', '')}"),
+               "apply an approved change that WEAKENS a governance control "
+               "(less human review, auto-execution, a longer SLA, a higher "
+               "money floor). Never auto-executes: governance_action_policies "
+               "declares it HUMAN_APPROVAL with the CEO as approver, so the "
+               "only way here is a decision by a named executive",
+               sp=_sp_policy_widen,
+               params_schema=(('policy_key',),
+                              ('scope', 'changes', 'reason', 'requested_by',
+                               'widening', 'approval_uuid'))),
     Capability("supervisor.emit_dunning", "supervisor", "", "write",
                lambda p: "emit overdue-invoice dunning events",
                "kick the Accounting dunning loop (supervisor auto-action; "

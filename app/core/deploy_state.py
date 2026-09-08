@@ -342,6 +342,34 @@ _PENDING_IDENTITY_CONFIRM = (
     "capability. Nothing had merged; nothing prevented it. Also makes "
     "materialized_at unreachable without status='confirmed'.")
 
+_PENDING_WORKFLOW_OWNER = (
+    "PENDING DEPLOYMENT -- authored 2026-09-07 and applied to LOCAL only. "
+    "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
+    "records its Railway application, and not before. Closes the P1 ownership "
+    "defect: workflow_execute_action wrote activities with a NULL owner "
+    "whenever the triggering entity had none (1,660 of 1,667 had no eligible "
+    "accountable owner). Resolves through a DECLARED entity-type -> authority "
+    "-> eligible-owner routing (owner decision C: at this scale authority is "
+    "ownership) and FAILS CLOSED with a durable workflow_action_exceptions row "
+    "when nothing resolves. Adds workflow_owner_routing, "
+    "workflow_action_exceptions, fn_workflow_route_role/owner. The 153-line "
+    "function body is carried over VERBATIM from the base schema; only the "
+    "owner resolution differs.")
+
+_PENDING_LINK_IDENTITY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-07 and applied to LOCAL only. "
+    "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
+    "records its Railway application, and not before. N-01/N-02 of the "
+    "2026-09-07 reassessment. Gives action_approvals the three facts a "
+    "decision link must carry -- which executive it was minted for, when, and "
+    "which issuance -- so an emailed token binds to a person instead of "
+    "proving possession of a URL; adds the policy.widen action policy so that "
+    "WEAKENING a governance control is itself a governed decision; and adds "
+    "append-only governance_policy_changes, which records the authenticated "
+    "actor, the value before and after, and the approval that authorised a "
+    "widening. Historical email-link rows are NOT rewritten: a decision the "
+    "system could not attribute stays unattributed.")
+
 _SCHEMA_OOB = (
     "Historical schema operation applied out-of-band; it never entered the "
     "governed chain. This records what is true, not that the objects are "
@@ -590,6 +618,8 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "corpus_provenance.sql": _PENDING_CORPUS_PROVENANCE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
+    "governance_decision_link_identity.sql": _PENDING_LINK_IDENTITY,
+    "workflow_owner_resolution.sql": _PENDING_WORKFLOW_OWNER,
     "escalations.sql": _SCHEMA_OOB,
     "event_correlation_propagation.sql": _PENDING_CORRELATION,
     "event_types_voice_learning.sql": _CORRECTION,

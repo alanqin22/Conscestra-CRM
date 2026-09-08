@@ -40,7 +40,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.core.database import get_connection
@@ -532,13 +532,26 @@ _ACTIONS = {"assign": "assigned", "acknowledge": "acknowledged", "start": "in_pr
             "reopen": "in_progress"}
 
 
+# Transitions that CLEAR an accountability signal. Anyone may acknowledge that
+# they have seen an alert; saying it is dealt with is a claim about the world,
+# and N-02's rule is that a claim of that kind carries a name from the session
+# rather than from a request body.
+from app.core.governance_policy import bound_authority
+
+_BOUND_ACTIONS = {"resolve", "close"}
+
+
 @router.post("/governance/alerts/{alert_id}/{action}")
-def api_step(alert_id: str, action: str, body: _Step):
+def api_step(request: Request, alert_id: str, action: str, body: _Step):
+    actor = body.actor
+    if action in _BOUND_ACTIONS:
+        ex = bound_authority(request)
+        actor = ex["email"]
     if action == "escalate":
-        return escalate(alert_id, body.actor, body.note)
+        return escalate(alert_id, actor, body.note)
     if action not in _ACTIONS:
         raise HTTPException(status_code=404, detail=f"unknown action; one of {sorted(_ACTIONS)} or escalate")
-    res = transition(alert_id, _ACTIONS[action], body.actor, note=body.note,
+    res = transition(alert_id, _ACTIONS[action], actor, note=body.note,
                      assignee=body.assignee, evidence=body.evidence)
     if not res.get("ok"):
         raise HTTPException(status_code=409, detail=res.get("error"))
