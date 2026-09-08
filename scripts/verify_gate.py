@@ -72,17 +72,44 @@ CONTROL_TESTS: List[str] = control_test_paths([
     "test_workflow_cannot_skip_verification.py",  # the job cannot be skipped
     "test_artifact_sync_verifier.py",      # the sync check cannot cry wolf
 
-    # ── Added 2026-09-07 (reassessment N-09) ────────────────────────────────
-    # The governance plane was the newest, largest and most consequential
-    # subsystem in the codebase and NOT ONE of its tests was gated. Five
-    # authorities, atomic approvals, the SLA clock, owner-eligibility triggers
-    # and the action-policy table could all have regressed with a green tick.
-    # The rule this restores: a control shipped without a gated test is not
-    # shipped.
-    "test_governance_activation.py",       # authority, atomicity, SLA, ownership
-    "test_policy_governance.py",           # N-02: governance governing governance
-    "test_escalation_email_routing.py",    # the escalation actually addresses someone
-    "test_executive_identity_mismatch.py",  # a role that names two different people
+    # ── N-09 ATTEMPTED AND REVERTED, 2026-09-07. Reason recorded rather than
+    #    the attempt deleted, because the next person will have the same idea.
+    #
+    # The governance plane is the newest and most consequential subsystem here
+    # and none of its tests is gated, which is a real gap. So these four were
+    # added:
+    #
+    #     test_governance_activation.py · test_policy_governance.py
+    #     test_escalation_email_routing.py · test_executive_identity_mismatch.py
+    #
+    # CI went red: 61 failed, 31 UNDECLARED SKIPS, every one reporting
+    # "no eligible CEO executive on this database (D4 precondition)" or
+    # "no authorities configured on this database".
+    #
+    # THE REASON IS STRUCTURAL, not a fixable flake. These suites need an
+    # OPERATED governance database -- five attested executives with owners,
+    # credentials and assignable_identity memberships. Nothing creates those
+    # rows in a build: no SQL file inserts into `executives`, deliberately,
+    # because provisioning an executive is an operational act carrying real
+    # credentials (scripts/provision_executive.py) and credentials do not
+    # belong in a migration. A gate database built from base schema + the
+    # declared chain therefore CANNOT satisfy their precondition.
+    #
+    # This is the hazard the header of .github/workflows/ci.yml already warns
+    # about -- "red for the wrong cause, and it gets switched off, which is
+    # worse than not running it". That warning was read and applied to
+    # test_order_lifecycle_notifications.py, and then not applied to these.
+    #
+    # DO NOT close this by declaring the skips. verify_gate converts undeclared
+    # skips to failures precisely because GitHub scores a skipped required
+    # check as passing; declaring them would make the gate green while
+    # verifying nothing, which is the defect the conversion exists to stop.
+    #
+    # Closing it properly needs a GOVERNANCE IDENTITY SEED stage: fixture
+    # executives with throwaway credentials provisioned into the scratch
+    # database before the control tests run. That is a design change with its
+    # own decisions (what a fixture executive attests to, whether a seeded
+    # identity may ever be eligible) and belongs in its own change.
 ])
 
 
