@@ -164,6 +164,54 @@ def open_alert(alert_class: str, headline: str, *, rule: Optional[str] = None,
                           {"kind": "governance_alert", "alert_id": aid,
                            "alert_class": alert_class, "rule": rule, "severity": sev})
         conn.commit()
+
+        # EMAIL THE OWNER, not just the CEO on breach.
+        #
+        # Reported 2026-09-08: alerts owned by the CTO and the CFO were arriving
+        # in the CEO's inbox instead. They were -- and correctly, because the
+        # ONLY two alert emails in this module were escalate() and
+        # remind_escalated(), and both address gp.ESCALATION_ROLE. An alert
+        # owned by Bill Wang was notified to Bill Wang IN-APP and emailed to
+        # nobody, sat until its SLA breached, and then emailed the CEO. So the
+        # CEO received mail about every alert in the system, and no other
+        # executive ever received any.
+        #
+        # This is the activation plan's own reasoning (§26.6), applied to
+        # approvals and never to alerts: "an in-app notice is only seen by
+        # someone already looking at the CRM, and the failure this whole
+        # activation exists to fix is precisely that nobody was looking."
+        # route_for_approval mails the assigned executive; open_alert did not.
+        # An owned obligation whose owner is never told is functionally unowned.
+        #
+        # ONLY ON CREATION. A dedupe fold returns the live alert and must not
+        # re-mail -- the supervisor re-raises these every tick, and a rule that
+        # mails on every tick is the alert storm this module already refuses
+        # elsewhere. email_authority is additionally ledgered per (kind, ref)
+        # through staff_email, so a retry cannot double-send.
+        try:
+            _owner_row = gp.authority_owner(owner.get("role")) if owner.get("role") else None
+            if _owner_row:
+                gp.email_authority(
+                    _owner_row,
+                    f"[Action needed] Alert assigned to you: {headline[:70]}",
+                    f"{headline}\n\n"
+                    f"Class:    {alert_class}\n"
+                    f"Rule:     {rule or '-'}\n"
+                    f"Severity: {sev}\n"
+                    f"Due:      {due.isoformat() if due else '?'} (SLA {hours}h)\n\n"
+                    + ("This was routed to you as an ownership exception, because "
+                       "the responsible role has no eligible executive.\n\n"
+                       if owner.get("exception") else
+                       "It is yours to work. If it is not decided by the deadline "
+                       f"it escalates to the {pol.get('escalation_role') or gp.ESCALATION_ROLE}.\n\n")
+                    + f"Open it here:\n{console_link(aid)}\n\n"
+                    f"Acknowledge it, work it, and close it with evidence.",
+                    kind="alert_assigned", ref=aid)
+        except Exception as exc:                                   # noqa: BLE001
+            # WARNING, not debug: an owner who is never told is the defect this
+            # block exists to fix, and a silent failure recreates it exactly.
+            logger.warning(f"[governance_alerts] owner email FAILED for "
+                           f"{alert_class}/{rule}: {str(exc)[:160]}")
     except Exception as exc:
         conn.rollback()
         logger.warning(f"[governance_alerts] open failed ({alert_class}/{rule}): "
