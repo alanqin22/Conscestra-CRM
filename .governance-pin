@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-f84400c25ebc15b69bf0926ac1ef49a543de592b
+8efd4be978a7139d96ea961723c1a5d283b4864f
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -42,3 +42,7 @@ f84400c25ebc15b69bf0926ac1ef49a543de592b
 # This pin is the e802469 hazard again and in the same direction: deploy_state
 # now declares 48 files, and a public commit pinned to a governance commit
 # without them would fail with 'DECLARED BUT ABSENT FROM DISK'.
+
+# 8efd4be -- the baseline splice fix. CI could not build the database from
+# f84400c: two concatenated dumps left an unpaired \unrestrict directive.
+# Proven by scripts/verify_gate against a scratch database this time.
