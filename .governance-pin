@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-dadcc5362969e10149df9feafba75020942d1710
+f84400c25ebc15b69bf0926ac1ef49a543de592b
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -36,3 +36,9 @@ dadcc5362969e10149df9feafba75020942d1710
 #
 # Also carries the test changes those files are verified by, including
 # test_policy_governance.py, which is new and gated.
+
+# f84400c -- the two P0/P1 files PROMOTED into REQUIRED_MIGRATIONS after Railway
+# executed them, and the baseline regenerated to carry the resulting ledger.
+# This pin is the e802469 hazard again and in the same direction: deploy_state
+# now declares 48 files, and a public commit pinned to a governance commit
+# without them would fail with 'DECLARED BUT ABSENT FROM DISK'.

@@ -202,6 +202,26 @@ REQUIRED_MIGRATIONS: List[str] = [
     #    CREATE OR REPLACE on one function so that consuming a password-reset
     #    token retires every sibling token for that credential.
     "reset_token_single_use.sql",
+
+    # ── P0/P1 remediation. PROMOTED 2026-09-08, after Railway executed both and
+    #    the objects were verified there directly:
+    #      * GET /governance/decide went 500 -> 403 with the correct refusal,
+    #        which is the _row() path that reads the new columns; and
+    #      * undeclared_write_capabilities went ['policy.widen'] -> [], which is
+    #        the policy row the first file seeds.
+    #
+    #    THE APP SHIPPED AHEAD OF BOTH on 2026-09-08 04:03 UTC and the
+    #    governance decision path was down until they were applied at 04:2x.
+    #    The startup log was entirely green throughout: release_guard passed
+    #    every check and the capability registry reported 46 of 46, because the
+    #    missing columns are only touched when somebody decides something. A
+    #    clean boot is not evidence that the schema is present.
+    #
+    #    ORDER IS NOT LOAD-BEARING between these two -- they share no objects --
+    #    but both are idempotent (verified by applying each twice) so migrate.py
+    #    may replay them safely.
+    "governance_decision_link_identity.sql",
+    "workflow_owner_resolution.sql",
 ]
 
 
@@ -618,8 +638,6 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "corpus_provenance.sql": _PENDING_CORPUS_PROVENANCE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
-    "governance_decision_link_identity.sql": _PENDING_LINK_IDENTITY,
-    "workflow_owner_resolution.sql": _PENDING_WORKFLOW_OWNER,
     "escalations.sql": _SCHEMA_OOB,
     "event_correlation_propagation.sql": _PENDING_CORRELATION,
     "event_types_voice_learning.sql": _CORRECTION,
