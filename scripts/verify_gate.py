@@ -71,6 +71,18 @@ CONTROL_TESTS: List[str] = control_test_paths([
     "test_baseline_provenance.py",         # the baseline is truthful
     "test_workflow_cannot_skip_verification.py",  # the job cannot be skipped
     "test_artifact_sync_verifier.py",      # the sync check cannot cry wolf
+
+    # ── Added 2026-09-07 (reassessment N-09) ────────────────────────────────
+    # The governance plane was the newest, largest and most consequential
+    # subsystem in the codebase and NOT ONE of its tests was gated. Five
+    # authorities, atomic approvals, the SLA clock, owner-eligibility triggers
+    # and the action-policy table could all have regressed with a green tick.
+    # The rule this restores: a control shipped without a gated test is not
+    # shipped.
+    "test_governance_activation.py",       # authority, atomicity, SLA, ownership
+    "test_policy_governance.py",           # N-02: governance governing governance
+    "test_escalation_email_routing.py",    # the escalation actually addresses someone
+    "test_executive_identity_mismatch.py",  # a role that names two different people
 ])
 
 

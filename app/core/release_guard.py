@@ -64,6 +64,69 @@ def is_deployed() -> bool:
 _unattended_refusals_logged: set = set()
 
 
+# ── The test seam ───────────────────────────────────────────────────────────
+#
+# WHY THIS EXISTS. Adding `is_deployed()` to the autosend gate stopped a laptop
+# becoming a second live sender — and, because the check sits BELOW the seam the
+# order-notification tests exercise, it also turned 21 of them red. Every one
+# now gets `state='queued'` where it asserts `'accepted'`, so the subsystem
+# responsible for the 18 unnotified shipped orders has no working local
+# verification. A deployment guard must never silently disable the tests of the
+# control it protects.
+#
+# THE OBVIOUS FIXES ARE BOTH WRONG.
+#   * Relaxing the assertion to accept 'queued' makes the suite agree that
+#     notifications are not sent, which is the live production failure.
+#   * Setting AGENT_BUS_AUTOSEND_LOCAL=1 in the fixture uses the OPERATOR's
+#     escape hatch to do it. That switch means "this laptop is deliberately a
+#     live sender"; borrowing it for tests is pretending a laptop is production,
+#     and it stays set for anything else the process does afterwards.
+#
+# So the seam is deliberately NOT an environment variable, and is strictly
+# narrower than the override it sits beside. It opens only when BOTH hold:
+#
+#   1. pytest is imported — production installs requirements.txt, which does
+#      not contain it, so this is false wherever it matters; and
+#   2. `is_deployed()` is FALSE — so even a test run ON a deployment cannot
+#      open it. The seam exists for machines that are not the sender.
+#
+# It cannot be reached from config, environment, a request, or an LLM. The only
+# way in is an in-process call from a test fixture, and enable() refuses rather
+# than returns False when either condition fails, so a misuse is loud.
+
+_test_seam_open = False
+
+
+def enable_unattended_for_tests() -> None:
+    """Open the seam. Raises unless this really is a non-deployed test run."""
+    global _test_seam_open
+    import sys
+    if "pytest" not in sys.modules:
+        raise RuntimeError(
+            "release_guard test seam refused: pytest is not running. This seam "
+            "exists so the notification tests can exercise the real send path "
+            "on a developer machine; it is not an operator switch. Use "
+            "AGENT_BUS_AUTOSEND_LOCAL=1 to send unattended from here "
+            "deliberately.")
+    if is_deployed():
+        raise RuntimeError(
+            "release_guard test seam refused: this process looks DEPLOYED. A "
+            "test must never be able to turn a deployment into an unattended "
+            "sender, which is the exact failure the guard was added to stop.")
+    _test_seam_open = True
+
+
+def disable_unattended_for_tests() -> None:
+    """Close it. Fixtures call this on teardown so the seam never outlives the
+    test that opened it — a seam left open is indistinguishable from no guard."""
+    global _test_seam_open
+    _test_seam_open = False
+
+
+def unattended_for_tests_open() -> bool:
+    return _test_seam_open
+
+
 def unattended_allowed(channel: str, override_env: str) -> bool:
     """May this process act UNATTENDED on `channel` — send with nobody waiting?
 
@@ -95,6 +158,10 @@ def unattended_allowed(channel: str, override_env: str) -> bool:
 
     Returns True when the override is set, or when this looks deployed.
     """
+    # The test seam. Checked first because it is the narrowest of the three and
+    # can only be open on a non-deployed process under pytest — see above.
+    if _test_seam_open:
+        return True
     if _flag(override_env):
         return True
     if is_deployed():

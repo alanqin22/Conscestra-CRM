@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-e802469f6ebd6b06a37320659c6536351c376115
+dadcc5362969e10149df9feafba75020942d1710
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -23,3 +23,16 @@ e802469f6ebd6b06a37320659c6536351c376115
 # governed chain, and migrate --check reads that as a claim about what has
 # run. A public commit pinned to a governance commit without them would
 # fail with 'DECLARED BUT ABSENT FROM DISK'.
+
+# dadcc53 -- the P0/P1 remediation. TWO new SQL files arrive with this pin and
+# NEITHER is in REQUIRED_MIGRATIONS: governance_decision_link_identity.sql and
+# workflow_owner_resolution.sql are both classified out_of_band, PENDING
+# DEPLOYMENT. That is the opposite of the e802469 hazard above and needs the
+# same care for the mirror-image reason. There, a public commit pinned too
+# EARLY would fail 'DECLARED BUT ABSENT FROM DISK'. Here, promoting either file
+# before Railway has executed it would make migrate --check assert a chain
+# production has not run -- so the promotion belongs in the same change that
+# records the Railway application, and not in this one.
+#
+# Also carries the test changes those files are verified by, including
+# test_policy_governance.py, which is new and gated.
