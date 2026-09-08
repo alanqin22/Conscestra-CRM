@@ -129,17 +129,26 @@ P0  code complete, test verified
 agent that discovers a defect, patches it, and then assesses its own patch
 has destroyed the independence this separation exists to create.
 
-### One operational item outranks the assessment
+### The orphaned-event backlog is CLEARED — and it was never customer harm
 
-**`SO-2026-102219` has had no communication of any kind** — no order
-confirmation, no shipping notice — and its order shipped 2026-08-30.
-The owner's disposition (Decision B) is: **send that one, write off the
-other 17**, then close the `event_orphaned` alert with closure evidence.
-That alert is owned by CTO Bill Wang and is already past its 24h SLA.
+**Resolved 2026-09-08.** All 39 orphaned events drained, 0 remaining, the
+`event_orphaned` alert resolved. 17 `order.shipped` written off per Decision B;
+the 1 intended send (`SO-2026-102219`) was **refused by the outbound guard** —
+its contact is a synthetic seed record, unverified, on a reserved placeholder
+domain. **Zero emails were sent.**
 
-This is production work and NOT part of P2. It is recorded here only so
-it is not lost between sessions: a real customer is waiting, and that
-outranks an assessment.
+**An earlier draft of this brief said this item "outranks the assessment"
+because "a real customer is waiting". That was wrong**, and it is left recorded
+rather than deleted because the mistake is instructive: *no notification exists*
+was used as a proxy for *a person is affected*, and the evidence that would have
+falsified it — `contacts.is_email_verified` and the recipient domain — was
+available throughout and never checked. The event-fabric defect was real; the
+customer harm was not.
+
+**Carry this into the assessment.** Before costing any "consequential business
+effect", establish whether the subject is REAL. `corpus_provenance` and
+`is_email_verified` are the fields that answer it, and this corpus is largely
+synthetic — the same trap swallowed a whole day's urgency.
 
 ---
 
