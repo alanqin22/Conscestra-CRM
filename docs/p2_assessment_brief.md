@@ -56,7 +56,7 @@ is architecturally correct merely because its tests pass.
 | Historical customer-owned work | **~4,700 items** — separate business debt, untouched |
 | Migrations | **2, both DEPLOYED and PROMOTED** (see below) |
 | Committed / pushed | `feat/p0-p1-governance-remediation`, both repos, **CI green** |
-| Merged | **not yet** — both PRs open |
+| Merged | **yes**, into `master`; production on deploy #74 |
 
 Closed in code during P1: workflow owner-resolution (routing is declared data;
 eligibility is an independent gate; unlisted entity types fail closed;
@@ -125,9 +125,9 @@ P0  code complete, test verified
                          └─ final World-Class assessment
 ```
 
-**Do NOT deploy anything during P2, and do not merge the open PRs.** A P2
-agent that discovers a defect, patches it, and then assesses its own patch
-has destroyed the independence this separation exists to create.
+**Do NOT deploy or change anything during P2.** A P2 agent that discovers a
+defect, patches it, and then assesses its own patch has destroyed the
+independence this separation exists to create.
 
 ### The orphaned-event backlog is CLEARED — and it was never customer harm
 
@@ -149,6 +149,154 @@ customer harm was not.
 effect", establish whether the subject is REAL. `corpus_provenance` and
 `is_email_verified` are the fields that answer it, and this corpus is largely
 synthetic — the same trap swallowed a whole day's urgency.
+
+### An OPEN finding, handed over rather than guessed at
+
+**FACT — measured on production 2026-09-08.** `staff_email_ledger` holds 65
+rows. Every one is `digest` (42) or `approval` (23). There is **not one row**
+of `alert_escalated`, `alert_reescalation` or `alert_assigned` — yet the CEO's
+inbox holds 196 messages, most of them escalated-alert notices that demonstrably
+were sent.
+
+**Why it matters, beyond bookkeeping.** Governance alert mail goes through
+`governance_policy.email_authority`, which calls
+`staff_email.begin_send(kind=…, ref=…)` and treats the returned claim as the
+idempotency guard — one send per `(kind, ref)`. If no row is being written, that
+guard is not operating, and the only thing left preventing duplicate escalations
+is the `escalation_notices` counter on the alert row: a different mechanism, with
+a different failure mode, doing a job the code believes the ledger is doing.
+
+`email_authority` is documented as **FAIL-OPEN on the bookkeeping, never on the
+address** — "an executive must not miss an escalation because an audit table was
+missing" — and the claim is wrapped in `logger.debug`. So a ledger failure is
+silent *by design*, which is defensible for delivery and is exactly what makes
+this hard to notice.
+
+**INFERENCE, NOT FACT:** that the missing rows explain the 196-message inbox.
+I did not trace why they are absent. Candidates a P2 assessor should separate:
+the claim raising and being swallowed; `staff_email` gating alert kinds out
+before it writes; or a tier/kind mismatch that silently declines. **Do not
+assume the first one.**
+
+This is the shape §17 of this brief warns about — *where can an operation occur
+without producing the corresponding durable record?* — found in the wild, on the
+last day of P1, by a query nobody planned. It is left open deliberately: the end
+of a long session is the wrong time to guess at a mechanism, and a wrong guess
+recorded confidently is worse than an open question.
+
+---
+
+### A SCOPED ASSESSMENT ITEM — does "Resolve" execute the executive's request?
+
+**Observed 2026-09-09.** The CEO clicked **Resolve** on the `ar_spike` alert and
+typed an instruction into the dialog. Production now holds:
+
+```
+status          : resolved
+resolved_by     : ceo@agentorc.ca
+resolution_note : 'email this alter to CFO'
+closure_evidence: None
+```
+
+The 16 invoices are still overdue. No email reached the CFO.
+
+**The architectural question underneath it — assess this, not the symptom:**
+
+> **Is `Resolve` an ATTESTATION ("I, the CEO, have dealt with this") or an
+> EXECUTION REQUEST ("system, do what I just typed")?**
+
+The dangerous state is not "the CFO did not get an email." It is that the system
+records `resolved` in a way that can lead an executive, another agent, or an
+auditor to believe a business problem was dealt with **while the underlying
+condition is unchanged**.
+
+#### The P1 implementer's conclusion — treat it as a HYPOTHESIS, not a finding
+
+I inspected `governance_alerts.transition()` (lines 229-272) and concluded:
+
+> *"`Resolve` means the human has handled the alert; it is not a work order.
+> `transition()` only UPDATEs status/resolved_by/resolution_note, sets the
+> `app.actor` and `app.note` GUCs so a trigger writes history, and logs. Nothing
+> parses the note; nothing dispatches."*
+
+**Independently falsify this.** What I did NOT check, and a P2 assessor must:
+
+- the **UI layer** — `governance-mgmt.html`'s Resolve handler, and whether it
+  calls anything besides the transition endpoint;
+- **SQL triggers** on `governance_alerts` — a trigger could act on the note
+  without any Python touching it;
+- whether an **agent, workflow, or supervisor pass** reads `resolution_note` on
+  a later tick;
+- the `escalations` table's own `resolution_note` (a *different* subsystem,
+  `escalation.py`) — I confirmed those hits are unrelated, but not exhaustively.
+
+#### Do NOT pre-judge `closure_evidence: None`
+
+The schema draws a real distinction — `resolved` takes a free-text *note*,
+`closed` takes structured *evidence* — and the lifecycle is
+`open → assigned → acknowledged → in progress → resolved → closed`.
+
+**Establish the intended semantics FIRST.** If `resolved` genuinely means "a
+human attests they handled it", then a null `closure_evidence` at that stage is
+correct, and the finding is a different and possibly sharper one: **the UI
+accepts command-shaped text on an action-shaped button and returns success,
+without making its non-executable nature explicit at the point of action.**
+
+If instead `Resolve` is presented anywhere as *completing the requested
+remediation*, this becomes a governance-integrity defect rather than a UX one.
+
+#### Classify into exactly one, and only after verifying implementation + UI + tests + lifecycle
+
+| | |
+|---|---|
+| **A. Intentional semantic design** | Resolve is clearly acknowledgment; the UI does not imply execution |
+| **B. UX/semantic ambiguity** | Non-execution is intended, but an executive may reasonably believe otherwise |
+| **C. Governance integrity defect** | A request is recorded as resolved, presented as completion, with no evidence the outcome occurred |
+| **D. Execution architecture defect** | Resolve IS meant to execute and the dispatch is missing |
+
+#### Mandatory comparisons
+
+1. **Against the governed execution model.** An approval runs
+   `claim → execute → verify → durable evidence`, and stores
+   `verification: {ok, checks[], verified_at}`. Does an alert resolution that
+   purports to cause work have any equivalent chain? **Where exactly does it
+   terminate?** The principle to test: *a state transition is not evidence that
+   the requested business outcome occurred.*
+
+2. **Alternate routes.** For the same alert — Resolve, Close, Escalate, Cancel,
+   Assign, agent action, workflow action, supervisor tick, direct API, direct DB
+   — which merely change state, which execute, which verify, which leave durable
+   evidence? Specifically: **can an executive use Resolve to bypass the
+   execution-and-verification machinery that approvals are subject to?**
+
+3. **The general pattern, not this one field.** Search for other free-text fields
+   whose surrounding interaction implies execution: notes that look like
+   commands, "handled by", "completed", remediation fields, agent-instruction
+   fields that are persisted but never dispatched. **Not every free-text field is
+   defective** — flag only those where the interaction reasonably implies an
+   action will follow.
+
+#### Reproduce safely
+
+Do **not** send a real email or mutate consequential production data to answer
+this. Use a rolled-back transaction, a mocked transport, or the existing
+dry-run tooling (`scripts/verify_workflow_owner_resolution.py` shows the
+pattern). Establish separately: was an agent invoked · an action created · a
+lease taken · an event emitted · an email queued · an email transmitted · a
+recipient resolved · verification recorded · or **was only the alert row
+changed?**
+
+**Do not infer execution from `status='resolved'`.**
+
+#### The question the finding must answer
+
+> **Can an executive reliably distinguish "the system executed my request" from
+> "the system recorded that I typed something into a note field"?**
+
+If not, determine whether that is UX clarity or governance integrity — and say
+which, with evidence.
+
+---
 
 ---
 
