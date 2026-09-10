@@ -757,6 +757,29 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "seed_kb_articles.sql": _SEED,
     "seed_kb_articles_round2.sql": _SEED,
     "session_memory.sql": _SCHEMA_OOB,
+    # MIGRATION B, deliberately separate from the reminder allocation migration
+    # below. Both touch `escalations` and they are not the same change: this one
+    # closes an independent data-integrity leak that exists today, while that
+    # one establishes state a future producer needs. Installed NOT VALID because
+    # four historical test-origin rows violate it and their disposition is a
+    # separate decision -- a capability migration must not quietly repair
+    # history. PENDING DEPLOYMENT; applied locally 2026-09-09, not on Railway.
+    "escalation_assigned_requires_claim_time.sql":
+        "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.",
+    # Defect A (docs/remediation_plan_2026-09-09_defects_A_B_C.md). Widens the
+    # ledger's send vocabulary to the canonical set so the identity boundary in
+    # staff_email.py has nothing legitimate left to refuse.
+    #
+    # PENDING DEPLOYMENT. Applied locally 2026-09-09, NOT yet on Railway. It
+    # sits here rather than in REQUIRED_MIGRATIONS for the reason recorded at
+    # the top of that list: it is a claim about what production has RUN, and
+    # `migrate --check` reads it as one. Promote it only after Railway has
+    # executed it AND the constraint has been read back there directly --
+    # revision 2 of the assessment could only INFER production's constraint
+    # from the migration ledger, and promoting on an inference would repeat
+    # exactly that gap.
+    "staff_email_ledger_governance_kinds.sql":
+        "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.",
     "settle_immaterial_overdue.sql": _CORRECTION,
     "telephony.sql": _CORRECTION,
     "tenants.sql": _SCHEMA_OOB,
