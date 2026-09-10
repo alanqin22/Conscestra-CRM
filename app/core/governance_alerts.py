@@ -323,7 +323,7 @@ def escalate(alert_id: str, actor: str = "sla-sweep", note: Optional[str] = None
         conn.commit()
     except Exception as exc:                                       # noqa: BLE001
         conn.rollback()
-        logger.debug(f"[governance_alerts] escalation notice skipped: {exc}")
+        logger.warning(f"[governance_alerts] escalation notice skipped: {exc}")
     finally:
         conn.close()
     # EMAIL IMMEDIATELY (§26.6). An escalation that only exists in-app is seen
@@ -346,7 +346,7 @@ def escalate(alert_id: str, actor: str = "sla-sweep", note: Optional[str] = None
                 f"Acknowledge it, work it, and close it with evidence.",
                 kind="alert_escalated", ref=alert_id)
     except Exception as exc:                                       # noqa: BLE001
-        logger.debug(f"[governance_alerts] escalation email skipped: {exc}")
+        logger.warning(f"[governance_alerts] escalation email skipped: {exc}")
     return res
 
 
