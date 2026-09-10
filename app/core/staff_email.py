@@ -168,7 +168,44 @@ TIER_INTERRUPT = "critical"        # Tier 1 — may email immediately
 TIER_WORKLIST = "actionable"       # Tier 2 — digest only
 TIER_AMBIENT = "informational"     # Tier 3 — never
 
-EMAIL_KINDS = ("approval", "escalation", "escalation_remind", "digest")
+# THE CANONICAL SEND VOCABULARY. Derived 2026-09-09 from the semantics of the
+# four writers, NOT from the literals callers happened to pass.
+#
+# `kind` names the EVENT CLASS that justifies a send; `ref` names the SUBJECT
+# instance. Together they are the send's identity, so `kind` must distinguish
+# two sends that share a `ref`. That is not decoration — it is load-bearing,
+# and it is what fixes the shape below:
+#
+#   alert_assigned  ref=<alert_id>          "this is now yours"
+#   alert_escalated ref=<alert_id>          "your clock ran out"   <- SAME ref
+#
+# Give those one kind and the escalation collides with the assignment and is
+# suppressed as a duplicate. They are therefore separate kinds by necessity.
+#
+# Repeats take the `_remind` suffix and carry the ordinal in `ref`. That suffix
+# is not invented here: `escalation_remind` established it, and the callers'
+# `*_reescalation` spellings are the accident. The callers are renamed to the
+# convention rather than the convention widened to the callers.
+#
+# `approval` and `digest` keep their names because rows exist under them (1,734
+# locally). The five governance kinds have NEVER written a row in either
+# database — which is precisely what makes it possible to choose their names
+# deliberately instead of ratifying whatever was passed.
+EMAIL_KINDS = (
+    # approvals — a proposal awaiting a human decision
+    "approval",             # routed to the authority for decision
+    "approval_breach",      # the decision SLA passed; ref carries the role
+    "approval_remind",      # still undecided after escalation; ref carries n
+    # alerts — a governed obligation with an owner and a deadline
+    "alert_assigned",       # it became someone's obligation
+    "alert_escalated",      # its SLA passed and ownership moved
+    "alert_remind",         # still open after escalation; ref carries n
+    # customer escalations (escalation.py)
+    "escalation",
+    "escalation_remind",    # declared since inception; still no producer
+    # the daily worklist
+    "digest",
+)
 
 # WHY A ZERO-SEND HAPPENED. Six distinct facts that a single "0 sent" collapses
 # into one, and the collapse is what let a structural dead end read as a quiet
@@ -555,6 +592,73 @@ def idempotency_key(kind: str, ref: str, ordinal: Optional[int] = None) -> str:
     return f"{base}:remind:{ordinal}" if ordinal is not None else base
 
 
+# ── THE LEDGER'S IDENTITY BOUNDARY ──────────────────────────────────────────
+#
+# THE DEFECT THIS REMOVES (docs/assessment_2026-09-09_defects_A_B_C_r2.md).
+# `claim()` documents its argument as "this decision", and until now that
+# argument was a plain dict. `begin_send()` built one by hand — structurally
+# similar to what `decide()` returns, materially different: no `send`, no
+# `ledgerable`, no `reason_class`. Every field by which a decision records that
+# it WAS DECIDED was absent. The type was satisfied and the provenance was
+# forged, so five undeclared kinds reached PostgreSQL, where the CHECK became
+# the only enforcement and the fail-open turned it into a WARNING.
+#
+# It was never true that `begin_send()` "forgot to validate". The gate existed
+# and still exists. What was missing is any guarantee that a writer traverses
+# it. Duplicating the check inside each writer would have restored the rule and
+# left that guarantee absent — two copies diverge, and the next writer inherits
+# neither. So the identity itself becomes the proof of traversal.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO. It does not bind `decide()`'s POLICY half
+# — enabled(), may_email(tier), the tier-2 deferral. Governance mail is
+# fail-open on purpose ("an executive must not miss an escalation because an
+# audit table was missing"), and routing it through the whole of decide() would
+# let STAFF_EMAIL_ENABLED=0 suppress an executive escalation. Identity binds;
+# send policy must not. The boundary refuses the ROW, never the SEND.
+_MINT = object()
+
+
+class LedgerIdentity:
+    """Proof that a send passed the vocabulary gate.
+
+    Minted only by `ledger_identity()`. Constructing one directly raises, so a
+    caller cannot assemble an identity the gate never issued — which is the
+    difference between a rule that is enforced and a rule that is followed.
+    """
+
+    __slots__ = ("kind", "ref", "ordinal", "key")
+
+    def __init__(self, kind: str, ref: str, ordinal: Optional[int],
+                 key: str, *, _token: Any = None) -> None:
+        if _token is not _MINT:
+            raise TypeError(
+                "LedgerIdentity is minted by ledger_identity(), never "
+                "constructed. A hand-built identity is exactly the bypass this "
+                "type exists to remove.")
+        self.kind, self.ref, self.ordinal, self.key = kind, ref, ordinal, key
+
+    def __repr__(self) -> str:                                     # pragma: no cover
+        return f"LedgerIdentity(kind={self.kind!r}, key={self.key!r})"
+
+
+def ledger_identity(kind: str, ref: str, ordinal: Optional[int] = None
+                    ) -> Tuple[Optional["LedgerIdentity"], Optional[str]]:
+    """Mint the identity for one send, or refuse it BY NAME.
+
+    The single place the vocabulary is enforced. `decide()` calls it, so the
+    rule has one implementation and cannot drift between the policy path and
+    the ledger path.
+
+    Returns (identity, None) or (None, reason). It NEVER raises into a send
+    path: a refusal here must cost a ledger row, never a message.
+    """
+    if kind not in EMAIL_KINDS:
+        return None, f"unknown email kind {kind!r}"
+    return (LedgerIdentity(kind, ref, ordinal,
+                           idempotency_key(kind, ref, ordinal), _token=_MINT),
+            None)
+
+
 def alert_key(rule: Optional[str], headline: Optional[str]) -> str:
     """A CONTENT-ADDRESSED idempotency ref for an alert-driven interrupt.
 
@@ -662,8 +766,13 @@ def decide(*, kind: str, tier: str, ref: str,
         out["reason"], out["reason_class"] = reason, cls
         return out
 
-    if kind not in EMAIL_KINDS:
-        return _no(f"unknown email kind {kind!r}", "unknown_kind")
+    # Delegated to the identity boundary so the vocabulary has exactly ONE
+    # implementation. Two copies of this rule — one here, one in the writer —
+    # is the arrangement that let the ledger path drift away from the policy
+    # path in the first place.
+    _ident, _why = ledger_identity(kind, ref, ordinal)
+    if _ident is None:
+        return _no(_why or "unknown email kind", "unknown_kind")
     if not enabled():
         return _no("STAFF_EMAIL_ENABLED=0", "disabled")
     if not may_email(tier):
@@ -799,13 +908,26 @@ def _one(sql: str, args=()) -> Optional[tuple]:
         conn.close()
 
 
-def claim(decision: Dict[str, Any], *, subject: str = "",
+def claim(identity: LedgerIdentity, *, tier: str,
+          recipient: Optional[Dict[str, Any]] = None,
+          reason: Optional[str] = None,
+          subject: str = "",
           subject_ref_type: Optional[str] = None,
           subject_ref_id: Optional[str] = None,
           event_uuid: Optional[str] = None,
           correlation_id: Optional[str] = None
           ) -> Tuple[Optional[Dict[str, Any]], bool]:
     """Take ownership of this decision. Returns (row, is_new).
+
+    THE FIRST ARGUMENT IS THE POINT. It was a dict, and a dict can be
+    assembled by any caller — which is how five kinds the vocabulary has never
+    admitted reached this INSERT. `LedgerIdentity` can only be minted by
+    `ledger_identity()`, so reaching this function is now proof that the
+    vocabulary gate was traversed, rather than a claim that it was.
+
+    `kind` and `idempotency_key` are read FROM the identity and are not
+    parameters: there is no longer a way to write a row whose kind differs
+    from the kind that was validated.
 
     The INSERT runs BEFORE any provider call. That ordering is the whole
     guarantee: if this process dies mid-send, the next delivery of the event
@@ -815,7 +937,11 @@ def claim(decision: Dict[str, Any], *, subject: str = "",
     INSERT — so two replicas racing the same event cannot both conclude the row
     is absent. Same shape as order_notifications.claim(), for the same reason.
     """
-    rec = decision.get("recipient") or {}
+    if not isinstance(identity, LedgerIdentity):
+        raise TypeError(
+            "claim() takes a minted LedgerIdentity, not "
+            f"{type(identity).__name__}. Obtain one from ledger_identity().")
+    rec = recipient or {}
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -831,13 +957,13 @@ def claim(decision: Dict[str, Any], *, subject: str = "",
                             %(ev)s::uuid, %(cid)s::uuid, %(origin)s)
                     ON CONFLICT (idempotency_key) DO NOTHING
                     RETURNING {_COLS}""",
-                {"key": decision["idempotency_key"], "kind": decision["kind"],
-                 "tier": decision["tier"], "oid": rec.get("owner_id"),
+                {"key": identity.key, "kind": identity.kind,
+                 "tier": tier, "oid": rec.get("owner_id"),
                  "to": rec.get("email") or role_mailbox(),
                  "rkind": rec.get("kind") or "role_mailbox",
                  "srt": subject_ref_type, "sri": subject_ref_id,
                  "subj": (subject or "")[:400] or None,
-                 "why": decision.get("reason"),
+                 "why": reason,
                  "ev": event_uuid, "cid": correlation_id,
                  "origin": _origin()})
             row = _row(cur)
@@ -845,7 +971,7 @@ def claim(decision: Dict[str, Any], *, subject: str = "",
                 conn.commit()
                 return row, True
             cur.execute(f"SELECT {_COLS} FROM staff_email_ledger "
-                        "WHERE idempotency_key=%s", (decision["idempotency_key"],))
+                        "WHERE idempotency_key=%s", (identity.key,))
             row = _row(cur)
         conn.commit()
         return row, False
@@ -1220,15 +1346,30 @@ def begin_send(*, kind: str, tier: str, ref: str,
       proceed=True,  recorded=False  -> ledger unavailable; send anyway
       proceed=False                  -> already sent, or another worker owns it
     """
-    key = idempotency_key(kind, ref, ordinal)
-    decision = {
-        "idempotency_key": key, "kind": kind, "tier": tier,
-        "reason": decision_reason,
-        "recipient": {"owner_id": recipient_owner_id, "email": recipient_email,
-                      "kind": recipient_kind, "why": decision_reason},
-    }
+    # THE IDENTITY IS MINTED, NOT ASSEMBLED. This function used to build the
+    # dict `claim()` called "this decision"; that is what let five undeclared
+    # kinds reach the INSERT, where the CHECK rejected them and the fail-open
+    # below turned the rejection into silence.
+    identity, why = ledger_identity(kind, ref, ordinal)
+    if identity is None:
+        # FAIL-OPEN, DELIBERATELY AND NARROWLY. An undeclared kind costs the
+        # send its LEDGER ROW, never the message: suppressing an executive
+        # escalation because a vocabulary was out of date would be a worse
+        # failure than the one this whole boundary exists to fix. What changes
+        # is that the gap is now named at the point it occurs instead of being
+        # inferred later from an empty table.
+        logger.warning(f"[staff_email] {kind}:{ref} refused a ledger row — "
+                       f"{why}; proceeding UNRECORDED")
+        return {"proceed": True, "recorded": False, "email_id": None,
+                "why": f"{why}; sent without a record"}
+    key = identity.key
 
-    row, is_new = claim(decision, subject=subject,
+    row, is_new = claim(identity, tier=tier,
+                        recipient={"owner_id": recipient_owner_id,
+                                   "email": recipient_email,
+                                   "kind": recipient_kind,
+                                   "why": decision_reason},
+                        reason=decision_reason, subject=subject,
                         subject_ref_type=subject_ref_type,
                         subject_ref_id=subject_ref_id,
                         event_uuid=event_uuid, correlation_id=correlation_id)
