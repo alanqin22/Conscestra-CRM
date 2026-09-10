@@ -766,6 +766,18 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # history. PENDING DEPLOYMENT; applied locally 2026-09-09, not on Railway.
     "escalation_assigned_requires_claim_time.sql":
         "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.",
+    # Escalation reminder allocation (docs/decision_escalation_reminder_state.md,
+    # Option A). Two columns so that eligibility and ordinal allocation are ONE
+    # atomic UPDATE -- the scheduling guarantee the ledger cannot provide,
+    # because the ledger proves exactly-once for an ordinal it is GIVEN and
+    # cannot decide which ordinal is next.
+    #
+    # PENDING DEPLOYMENT. Applied locally 2026-09-09, NOT on Railway. No
+    # producer consumes these columns yet: `unclaimed_reminders()` does not
+    # exist and is not authorised. Promote only after Railway has run it AND
+    # the columns have been read back there directly.
+    "escalation_reminder_allocation.sql":
+        "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.",
     # Defect A (docs/remediation_plan_2026-09-09_defects_A_B_C.md). Widens the
     # ledger's send vocabulary to the canonical set so the identity boundary in
     # staff_email.py has nothing legitimate left to refuse.
