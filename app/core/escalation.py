@@ -702,10 +702,96 @@ def list_open(limit: int = 100, include_resolved: bool = False) -> Dict[str, Any
 
 
 def assign(escalation_id: str, agent: str) -> Dict[str, Any]:
-    return _update(escalation_id,
-                   """SET status='assigned', assigned_to=%(who)s,
-                          assigned_at=now(), updated_at=now()""",
-                   {"who": (agent or "agent")[:120]})
+    """Claim this escalation. A CLAIM IS A COMPARE-AND-SWAP, NOT AN UPDATE.
+
+    THE DEFECT THIS REPLACES, measured 2026-09-09. The claim ran through
+    `_update()`, whose only predicate is `WHERE escalation_id=…`. Two reps
+    claiming the same escalation therefore BOTH succeeded:
+
+        first claim  -> ok=True, status=assigned
+        second claim -> ok=True, status=assigned
+        final owner  -> rep-bob
+
+    The second silently replaced the first's `assigned_to`, both were told
+    `ok: True`, and nothing told the loser. `assign_for_conversation()` has
+    always guarded the same transition with `AND status='open'`; the direct
+    API path -- `POST /escalations/{id}/assign` -- did not. Same shape as the
+    conversation takeover defect `agent_console._set_handling` was fixed for,
+    on a different object.
+
+    WHY THE PREDICATE KEYS ON `assigned_at`, NOT `assigned_to`. Measured on
+    this database: `assigned_to` and `assigned_at` are written together by both
+    claim paths -- except for 36 `open` rows carrying a free-text `assigned_to`
+    with NO `assigned_at`, which no claim path produced. Those hold values like
+    a customer's address and a person's name (the F2 defect). Treating
+    `assigned_to IS NOT NULL` as "claimed" would make 36 live escalations
+    permanently unclaimable on the strength of text nobody claimed with.
+    **`assigned_at` is the marker a claim actually writes.**
+
+    Liveness is `status IN ('open','assigned')`, which is the same test
+    `sla_breaches()` and the console's queue badges already apply -- assignment
+    owns an escalation without discharging it, so an assigned one is still
+    live and its clock still runs.
+
+    Re-claiming your OWN escalation stays idempotent, so a double-click is not
+    an error, and `assigned_at` is refreshed only when the holder actually
+    changes so "how long have they had it" survives a re-click. Both rules are
+    taken from `_set_handling`, deliberately: this is the same invariant on a
+    different table and it should not be expressed a second way.
+
+    NO TAKEOVER PATH IS INTRODUCED. None exists for escalations today, and
+    inventing one here would be a new authorization surface rather than a fix.
+    """
+    who = (agent or "agent")[:120]
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE escalations
+                      SET status='assigned',
+                          assigned_to=%(who)s,
+                          assigned_at = CASE
+                              WHEN assigned_to IS DISTINCT FROM %(who)s
+                              THEN now() ELSE assigned_at END,
+                          updated_at=now()
+                    WHERE escalation_id=%(id)s::uuid
+                      AND status IN ('open','assigned')
+                      AND (assigned_at IS NULL OR assigned_to = %(who)s)
+                RETURNING escalation_id::text, status""",
+                {"who": who, "id": escalation_id})
+            row = cur.fetchone()
+            if row is None:
+                # A MISS IS THREE SITUATIONS AND THE CALLER MUST TELL THEM
+                # APART: "someone else has it" is a conflict a rep can act on,
+                # "already finished" is not, and "no such escalation" is a bug
+                # in whatever called this. Read AFTER the attempt and used only
+                # to explain it -- reading first, then deciding, would rebuild
+                # the race this method exists to remove.
+                cur.execute(
+                    """SELECT status, assigned_to, assigned_at IS NOT NULL
+                         FROM escalations WHERE escalation_id=%s::uuid""",
+                    (escalation_id,))
+                state = cur.fetchone()
+        conn.commit()
+    except Exception as exc:                                       # noqa: BLE001
+        conn.rollback()
+        logger.warning(f"[escalation] claim failed: {exc}")
+        return {"ok": False, "error": str(exc)[:200]}
+    finally:
+        conn.close()
+
+    if row is not None:
+        return {"ok": True, "escalation_id": row[0], "status": row[1],
+                "claimed_by": who}
+    if not state:
+        return {"ok": False, "error": "escalation not found"}
+    status, holder, held = state
+    if status not in ("open", "assigned"):
+        return {"ok": False, "error": f"escalation is {status}",
+                "status": status}
+    return {"ok": False, "status": status, "assigned_to": holder,
+            "error": f"already claimed by {holder}" if held
+                     else "escalation could not be claimed"}
 
 
 def resolve(escalation_id: str, agent: str = "agent",

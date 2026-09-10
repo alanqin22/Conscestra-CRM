@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-feded6cfb68b66d7d35424cee597ea74224de688
+f32c69128f94dad64b077b7d1d9044ae7da41b87
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -48,3 +48,25 @@ feded6cfb68b66d7d35424cee597ea74224de688
 # Proven by scripts/verify_gate against a scratch database this time.
 
 # feded6c -- the a2a read/write split. The fixture had to mount both routers.
+
+# f32c691 -- the Defect A/B remediation set, and the pin matters in the
+# e802469 direction again: deploy_state now declares THREE more files as
+# out_of_band, so a public commit pinned earlier than this would fail with
+# 'DECLARED BUT ABSENT FROM DISK'.
+#
+# Two of the three have been applied to Railway and are deliberately NOT
+# promoted into REQUIRED_MIGRATIONS -- that list is a claim about what
+# production has RUN, and promotion belongs in the change that records the
+# read-back, not in the change that applies the file:
+#     staff_email_ledger_governance_kinds.sql       applied, not promoted
+#     escalation_assigned_requires_claim_time.sql   applied NOT VALID, not promoted
+#     escalation_reminder_allocation.sql             NOT applied anywhere
+#
+# The third is dormant capability: no producer, no scheduler, no REMIND_*
+# configuration, no ledger integration, and zero reminder_* columns on Railway.
+# Its SQL and its design proofs are committed so the reasoning is auditable; a
+# committed migration is not an activated one.
+#
+# Also carries: the ledger identity boundary's tests, the escalation claim
+# concurrency proofs, the cap-ownership fixture correction, and the fixture
+# leak that opened the global send breaker and failed twelve unrelated tests.
