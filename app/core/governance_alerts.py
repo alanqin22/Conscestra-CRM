@@ -418,7 +418,10 @@ def remind_escalated(hours: float) -> Dict[str, Any]:
                 f"Acknowledging it "
                 f"stops the reminders; resolving and closing it ends the "
                 f"obligation.",
-                kind="alert_reescalation", ref=f"{aid}:reminder:{n}")
+                # `_remind` is the vocabulary's repeat suffix (staff_email.
+                # EMAIL_KINDS); `reescalation` was this caller's own spelling
+                # and was never a declared kind.
+                kind="alert_remind", ref=f"{aid}:reminder:{n}")
         except Exception as exc:                                   # noqa: BLE001
             logger.debug(f"[governance_alerts] reminder email skipped: {exc}")
     if sent:

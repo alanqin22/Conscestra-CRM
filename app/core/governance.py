@@ -2035,7 +2035,10 @@ def sla_sweep() -> Dict[str, Any]:
                    f"(These replace the links in reminder {n - 1}, which no "
                    f"longer work.)\n"
                    if _l else "Decide in the governance console.\n"),
-                kind="approval_reescalation", ref=f"{aid}:reminder:{n}")
+                # `_remind` is the vocabulary's repeat suffix (staff_email.
+                # EMAIL_KINDS); `reescalation` was this caller's own spelling
+                # and was never a declared kind.
+                kind="approval_remind", ref=f"{aid}:reminder:{n}")
         except Exception as exc:                                   # noqa: BLE001
             # N-05: was logger.debug. A reminder that silently fails to send is
             # the escalation not happening.
