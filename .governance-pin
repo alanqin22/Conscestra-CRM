@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-f32c69128f94dad64b077b7d1d9044ae7da41b87
+48332dc39b288c33b646d34d3d5b25cdd5725fec
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -70,3 +70,22 @@ f32c69128f94dad64b077b7d1d9044ae7da41b87
 # Also carries: the ledger identity boundary's tests, the escalation claim
 # concurrency proofs, the cap-ownership fixture correction, and the fixture
 # leak that opened the global send breaker and failed twelve unrelated tests.
+
+# 48332dc -- the alert ack-window and resolution-disposition change (A-02,
+# A-06). The e802469 hazard once more: deploy_state declares ONE more
+# out_of_band file, governance_alert_ack_and_disposition.sql, so a public
+# commit pinned earlier than this would fail with 'DECLARED BUT ABSENT FROM
+# DISK'.
+#
+# NOT promoted into REQUIRED_MIGRATIONS, and it must not be until Railway has
+# run it. It is also the first pin in this file whose DEPLOY ORDER is
+# load-bearing across two deployment paths: governance-mgmt.html has to ship
+# BEFORE the app and the SQL, because the console is what sends the new
+# disposition field and an older console against the new rule makes every
+# Resolve button fail. The console is hand-deployed and untracked, so nothing
+# in CI can enforce that ordering -- it is written here because this is the
+# file the next person reads when they wonder why the pin moved.
+#
+# Also carries the three test files it is verified by: one new
+# (test_alert_ack_and_disposition.py, 15 cases) and two updated, where the
+# updates supply the new field rather than relax what the tests measure.
