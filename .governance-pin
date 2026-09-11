@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-5284513a08748b3d2001d016aacb008d8c47432a
+18e7e4bcc2310edf0112cabdcbaaea4688fddc61
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -108,4 +108,12 @@
 #
 # Not promoted, and promotion is NOT what closes D-08 -- rotating the postgres
 # password is, and no file in this repository can do that.
+
+# 18e7e4b -- the A-05 notification-delivery test suite. Tests only; no SQL file
+# arrives with this pin, so neither the e802469 hazard (declared-but-absent) nor
+# its mirror applies. It is a DESCENDANT of 5284513, so this commit also carries
+# readonly_role.sql and depends on the deploy_state entry that declares it --
+# which is why this branch is stacked on feat/readonly-role-d08 rather than cut
+# from master. Merging it before that one would fail the disposition test with a
+# file on disk and no classification.
 

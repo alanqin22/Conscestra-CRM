@@ -85,6 +85,14 @@ LLM_ERROR_WARN_PCT = _int("PH_LLM_ERROR_WARN_PCT", 5)
 LATENCY_WARN_MS = _int("PH_LATENCY_WARN_MS", 6000)
 SLA_RISK_MINUTES = _int("PH_SLA_RISK_MINUTES", 30)
 OVERRIDE_WARN_DAILY = _int("PH_OVERRIDE_WARN_DAILY", 3)
+# A-05. Customer-notification delivery is watched for MOVEMENT, not level: the
+# intended rate today is 0% delivered, because every contact is on a blocked
+# catch-all. 20 points is wide enough that ordinary day-to-day mix (a quiet day
+# of order.created versus a busy day of order.delivered) does not trip it, and
+# narrow enough to catch a gate change. The sample floor exists so a weekend
+# with four notifications cannot produce a 100-point "change".
+NOTIFY_DRIFT_POINTS = _int("PH_NOTIFY_DRIFT_POINTS", 20)
+NOTIFY_MIN_SAMPLE = _int("PH_NOTIFY_MIN_SAMPLE", 10)
 
 OK, WARN, CRIT, UNKNOWN = "ok", "warning", "critical", "unknown"
 
@@ -420,6 +428,84 @@ def obligation_metrics() -> List[Dict[str, Any]]:
         WARN if unreachable else OK,
         "we promised a follow-up to someone we have no email or phone for"
         if unreachable else "every open escalation has a contact route", "open"))
+    out.extend(_notification_delivery_metrics())
+    return out
+
+
+# ── A-05: the promise we make to a customer and do not keep ──────────────────
+#
+# This section asks "are we keeping the promises we made?" and, until now, it
+# answered using escalations alone. Meanwhile the ORDER NOTIFICATION path — the
+# thing that tells a customer their order shipped — accepted ZERO messages
+# between 2026-09-05 and 2026-09-11: 372 notifications, 100% skipped, while this
+# section reported all-green.
+#
+# THE SUPPRESSION IS CORRECT. Every one of the 129 production contacts sits on
+# seed.agentorc.ca, a catch-all this system invented for itself, and sending
+# there burned a 100/day provider quota on a mailbox nobody reads. The domain
+# block is the right answer and is not being changed.
+#
+# WHAT WAS WRONG IS THAT NOTHING SAID SO. A revoked provider key, an SMTP
+# outage, or a bad recipient-gate deploy would produce exactly the surface this
+# system showed for six days: silence, and a green health page. The 18 shipped
+# orders behind D-04 were not an incident — they were a sample of this.
+#
+# SO THE RATE IS REPORTED AND THE CHANGE IS ALERTED, not the level. A control
+# that fires permanently on an intended state trains its operators to clear it
+# without reading it, which is how 89% approval expiry and 782 cancelled alerts
+# both happened here. `state` stays OK at 100% suppression; what raises a signal
+# is the rate MOVING (detect_notification_delivery_change).
+#
+# THE PROOF PATH, decided 2026-09-11. Reporting a rate of 0% delivered forever
+# still leaves "does delivery work at all?" permanently unproven, which is the
+# same class of gap as the metric being absent. So exactly one existing seed
+# address is exempted, by name, through EMAIL_E2E_ALLOWLIST:
+#
+#     EMAIL_E2E_ALLOWLIST=mia.roy-b63e@seed.agentorc.ca
+#
+# Chosen because it is an EXISTING contact with the most suppressed traffic (10
+# in 7 days), so the path is exercised by ordinary business events rather than
+# by anyone remembering to test it. No corpus row was created or altered to
+# manufacture that traffic -- inventing a customer to prove a delivery path is
+# how a test corpus stops being evidence of anything.
+#
+# The exemption is per ADDRESS and empty by default (agent_bus._e2e_allowlist),
+# so it cannot generalise back into the 1,306-message quota leak the domain
+# block was added to stop. Expect this metric to read ~98% suppressed rather
+# than 100% once it is set; that step change is a DEPLOYMENT event and, if it
+# crosses PH_NOTIFY_DRIFT_POINTS, the detector is correct to announce it once.
+
+def _notification_delivery_metrics() -> List[Dict[str, Any]]:
+    row = _q("""SELECT count(*),
+                       count(*) FILTER (WHERE state = 'accepted'),
+                       count(*) FILTER (WHERE state = 'skipped'),
+                       count(*) FILTER (WHERE state = 'failed')
+                  FROM order_notifications
+                 WHERE created_at > now() - interval '24 hours'""")
+    if row is None:
+        return [_metric("notifications_24h", "Customer notifications (24h)",
+                        None, UNKNOWN,
+                        "order_notifications not readable")]
+    total, accepted, skipped, failed = (int(x) for x in row)
+    out = [_metric("notifications_accepted_24h",
+                   "Customer notifications delivered (24h)", accepted, OK,
+                   f"{accepted} of {total} reached the provider"
+                   if total else "no notifications were due", "accepted")]
+    # A FAILURE IS NOT A SUPPRESSION. `skipped` is a decision not to send;
+    # `failed` is a send that did not work. Collapsing them into one rate is how
+    # a real outage would hide inside an intended silence.
+    out.append(_metric("notifications_failed_24h",
+                       "Customer notifications failed (24h)", failed,
+                       WARN if failed else OK,
+                       "provider refused or errored" if failed
+                       else "no delivery failures", "failed"))
+    rate = round(100.0 * skipped / total, 1) if total else 0.0
+    out.append(_metric(
+        "notification_skip_rate", "Customer notifications suppressed (24h)",
+        rate, OK,
+        f"{skipped} of {total} had no deliverable recipient — expected while "
+        f"the corpus is on a blocked domain; the SIGNAL is this rate MOVING, "
+        f"not its level" if total else "no notifications were due", "%"))
     return out
 
 
@@ -665,7 +751,65 @@ def detect_governance_drift(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "evaluation is wrong or the changes are.")
 
 
-DETECTORS = [detect_platform_degraded, detect_governance_drift]
+def detect_notification_delivery_change(pack: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """A-05. Signals when customer notification delivery MOVES, not when it is low.
+
+    WHY A CHANGE AND NOT A THRESHOLD. The current suppression rate is 100% and
+    that is the intended state: every production contact is on a blocked
+    catch-all domain. A fixed threshold would fire on the first tick and every
+    tick afterwards, and a control that can never be cleared is one operators
+    learn to clear without reading. Both of this system's worst governance
+    numbers — 89% approval expiry, 782 alerts cancelled in two days — are that
+    same habit.
+
+    So the baseline is the last 7 days EXCLUDING the last 24 hours, and the
+    signal is the gap. The exclusion matters: a baseline that contains today
+    drifts toward today, and the detector goes quiet exactly as the change it
+    exists to catch becomes established.
+
+    BOTH DIRECTIONS ARE REPORTED. A drop in delivery is the outage case. A RISE
+    is just as interesting here and would have caught the 1,306-message quota
+    leak: notifications suddenly reaching a provider that were not reaching one
+    yesterday means the recipient gate changed, and that gate is the only thing
+    standing between a synthetic corpus and a real send."""
+    row = _q("""SELECT
+        count(*) FILTER (WHERE created_at > now() - interval '24 hours'),
+        count(*) FILTER (WHERE created_at > now() - interval '24 hours'
+                           AND state = 'accepted'),
+        count(*) FILTER (WHERE created_at <= now() - interval '24 hours'
+                           AND created_at >  now() - interval '7 days'),
+        count(*) FILTER (WHERE created_at <= now() - interval '24 hours'
+                           AND created_at >  now() - interval '7 days'
+                           AND state = 'accepted')
+        FROM order_notifications""")
+    if row is None:
+        return None
+    today_n, today_ok, base_n, base_ok = (int(x) for x in row)
+    # Too little traffic to say anything. Reporting "0 of 0 changed" as a
+    # signal is how a detector earns its reputation for noise.
+    if today_n < NOTIFY_MIN_SAMPLE or base_n < NOTIFY_MIN_SAMPLE:
+        return None
+    today_rate = 100.0 * today_ok / today_n
+    base_rate = 100.0 * base_ok / base_n
+    delta = today_rate - base_rate
+    if abs(delta) < NOTIFY_DRIFT_POINTS:
+        return None
+    direction = "fell" if delta < 0 else "rose"
+    return _signal(
+        "notification_delivery_change",
+        "critical" if abs(delta) >= NOTIFY_DRIFT_POINTS * 2 else "warning",
+        f"Customer notification delivery {direction} "
+        f"{abs(delta):.0f} points in 24h — {today_rate:.0f}% accepted today "
+        f"against {base_rate:.0f}% over the previous 6 days",
+        "notification_delivery_rate", round(today_rate, 1),
+        "Check order_notifications.failure_reason for the last 24h. A FALL is a "
+        "delivery outage or a recipient-gate change; a RISE means addresses that "
+        "were being suppressed are now reaching the provider, which is how the "
+        "1,306-message quota leak happened.")
+
+
+DETECTORS = [detect_platform_degraded, detect_governance_drift,
+             detect_notification_delivery_change]
 
 
 # ============================================================================
