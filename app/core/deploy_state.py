@@ -329,6 +329,27 @@ _PENDING_ALERT_DISPOSITION = (
     "exist. This file is safe to apply at any time against any app version, "
     "because nothing reads or requires the columns it adds.")
 
+_PENDING_READONLY_ROLE = (
+    "PENDING DEPLOYMENT -- authored 2026-09-11 and applied to LOCAL only. "
+    "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
+    "records its Railway application, and not before. Creates crm_readonly for "
+    "D-08: the production SUPERUSER DSN has been sitting in .env on the "
+    "developer laptop since the first assessment, beside ADMIN_API_TOKEN and "
+    "RAILWAY_ADMIN_API_TOKEN, and was used (read-only) to produce the two most "
+    "recent audits. SELECT only, no function privileges -- so no SECURITY "
+    "DEFINER path can write on its behalf -- and "
+    "default_transaction_read_only=on, so a write is refused by the "
+    "transaction rather than by a missing grant. "
+    "A REPLACEMENT, NOT A DELETION: removing the line would close the exposure "
+    "and the evidence channel together, and direct read-only SQL is the single "
+    "thing that made the 2026-09-09 audit stronger than its predecessor. "
+    "APPLYING THIS FILE DOES NOT CLOSE D-08. It makes the replacement "
+    "available; D-08 closes when the postgres password is ROTATED, because "
+    "until then the old DSN still works from everywhere it was ever copied. "
+    "scripts/verify_readonly_role.py proves the role by ATTEMPTING the writes "
+    "and requiring each to be refused, and reports the rotation separately as "
+    "an outstanding item rather than folding it into a pass.")
+
 _PENDING_ALERT_RESOLUTION_REQUIRED = (
     "PENDING DEPLOYMENT -- authored 2026-09-10 and applied to LOCAL only. "
     "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
@@ -681,6 +702,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "corpus_provenance.sql": _PENDING_CORPUS_PROVENANCE,
     "governance_alert_ack_and_disposition.sql": _PENDING_ALERT_DISPOSITION,
     "governance_alert_resolution_required.sql": _PENDING_ALERT_RESOLUTION_REQUIRED,
+    "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
     "escalations.sql": _SCHEMA_OOB,

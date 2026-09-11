@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-09735961063b4558c58dfc6abda9f3e3799422ec
+5284513a08748b3d2001d016aacb008d8c47432a
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -101,4 +101,11 @@
 # trigger demand a field the running app does not write and app-first makes the
 # app write a column that does not exist -- both break Resolve. Neither file is
 # promoted, and the LAST of them must not be applied until the app is live.
+
+# 5284513 -- readonly_role.sql (D-08). The e802469 direction again: deploy_state
+# declares one more out_of_band file, so a public commit pinned earlier than
+# this would fail 'DECLARED BUT ABSENT FROM DISK'.
+#
+# Not promoted, and promotion is NOT what closes D-08 -- rotating the postgres
+# password is, and no file in this repository can do that.
 
