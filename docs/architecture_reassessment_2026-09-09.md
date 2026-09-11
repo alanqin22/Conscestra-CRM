@@ -63,6 +63,10 @@ Six facts define the current state. Each is measured, not inferred.
    notifications since 2026-09-05: 372 in five days, 100% skipped, because all 129 production
    contacts sit on `seed.agentorc.ca`, a deliberately blocked domain. The suppression is
    correct. **Nothing measures or reports it** (A-04, A-05).
+   **UPDATE 2026-09-11: the A-04 half of this is RETRACTED and replaced by a worse finding.**
+   A governed decision (Decision B, 2026-09-07) had split these 18 into 17 WRITE OFF and one
+   SEND, and explicitly forbade the bulk drain. The bulk drain ran anyway and foreclosed the
+   authorised SEND into a terminal `skipped`. See §1a / C-6 → **A-04R**.
 
 6. **The deployed governance console is a stale build.** `agentorc.ca/governance-mgmt.html`
    is byte-identical (SHA-256 `53dd741ab437c305…`) to the local backup
@@ -245,6 +249,103 @@ The 2026-09-10 sequence did not re-exercise it (the CFO acknowledged at 20:18:49
 52 seconds later, before the next sweep). The finding stands on the 2026-09-08 evidence:
 acknowledged 15:55:05 → re-escalated 15:56:28, **82 seconds**.
 
+### C-6 · A-04 is RETRACTED and replaced by A-04R, which is a worse defect
+
+**Original claim (§9, A-04):** *"it was drained into a suppression, and the write-off decision
+the invariant contemplates was never recorded."* **WITHDRAWN. That sentence was wrong.**
+
+**What the evidence actually shows — DATABASE-VERIFIED and DOCUMENT-VERIFIED.**
+`docs/governance/decisions_2026-09-07.md` records **Decision B**, authored the day *before*
+the drain and the day before this audit began. It is careful work, and 17 of the 18
+`order_notifications` rows carry its reasoning verbatim in `failure_reason`:
+
+> *"The write-off reason is NOT 'it probably arrived.' These orders have not been touched
+> since 2026-09-02, so the system's knowledge stopped five days ago — 'the customer already
+> has it' is an assumption about a state that is not being tracked. The honest reason is that
+> the only available message is stale."*
+
+That is a better disposition than my finding credited, and my claim that no write-off was
+recorded should never have been made: the reasoning was sitting in the `failure_reason` column
+I had already queried.
+
+---
+
+## A-04R · HIGH · A bulk drain can irreversibly override an undischarged governed disposition
+
+- **Component:** `POST /agent-bus/drain` → `order_notifications.claim()`
+- **Violated property:** *A governed per-item disposition survives a later bulk operation, or
+  the bulk operation refuses to run.*
+
+**Decision B was not 18 write-offs. It was 17 WRITE OFF and one SEND:**
+
+| Action | Orders | Decision B's stated reason |
+|---|---|---|
+| **SEND** | **`SO-2026-102219`** (1) | *"Has received no communication of any kind — no confirmation, no shipping notice. The customer does not know the order exists."* |
+| WRITE OFF | the other 17 | only a stale template exists; sending it would state something misleading |
+
+Decision B also gave the execution constraint, explicitly:
+
+> *"Do **not** `POST /agent-bus/drain` for all 39: it does not honour this split. The one send
+> goes through the governed notification path for that order alone."*
+
+**The bulk drain was run for all 39 the next day.** Evidence chain, every link
+DATABASE-VERIFIED on production:
+
+1. Decision B (2026-09-07) establishes the 17/1 split and forbids the bulk drain.
+2. The drain ran 2026-09-08 13:35, claiming all 39 events.
+3. Order `e140a6d9-e2f0-4250-8218-f7d17a2b653a` **is** `SO-2026-102219` — the authorised SEND.
+4. Its complete notification history:
+
+   | event | state | at |
+   |---|---|---|
+   | `order.created` | **skipped** | 2026-08-30 02:15 |
+   | `order.delivered` | **skipped** | 2026-09-08 02:10 |
+   | `order.shipped` | **skipped** | 2026-09-08 13:35:44 ← claimed by the drain |
+
+5. Its `failure_reason` is the generic recipient-gate text, **not** Decision B's — the drain
+   overwrote the disposition rather than honouring it. The other 17 kept theirs; this one did
+   not, and it is the only one that was supposed to be treated differently.
+6. `order_notifications` is `UNIQUE(order_id, event_type)` and **`skipped` is in
+   `TERMINAL_STATES`**.
+7. **Therefore the authorised SEND is permanently unexecutable through the governed
+   notification path.** Not deferred — foreclosed.
+8. The alert was resolved with `"replayed 39 orphaned row(s); processed 39; breakdown
+   {'order.shipped:ok': 18, …}"` — a **false success signal** over the exact row where a
+   governed decision had just been destroyed.
+
+**Why the delivery outcome does not close this.** All 18 orders are now `delivered`, so the
+customer consequence is moot. The control consequence is not: nothing in the system prevented
+a bulk operational tool from overriding a governed per-item disposition, nothing detected that
+it had, and the audit record reported the result as success. The next decision with a
+per-item split is exposed identically.
+
+**This is not a logging defect and must not be recorded as one.** Better logging would have
+made the override visible after the fact. The override would still have happened, and the
+terminal state would still have made it irreversible.
+
+**Recommended control — an interlock, NOT IMPLEMENTED IN THIS AUDIT:**
+
+> `/agent-bus/drain` must refuse to claim any event whose order carries an undischarged
+> governed disposition.
+
+Deliberately left unimplemented here, at the owner's direction, so the evidence record settles
+before code moves. The precise formulation — in particular what "undischarged" is read from,
+since Decision B lives in a Markdown document and a `failure_reason` string rather than in a
+queryable disposition table — is itself part of the remediation and may require a structured
+disposition record before the interlock can be written at all.
+
+**Grade:** DATABASE-VERIFIED (every numbered link above) · DOCUMENT-VERIFIED (Decision B).
+
+**What this says about the audit method.** Two of this report's findings have now been
+overturned by evidence that existed before the audit started — C-1 by a mailbox screenshot and
+C-6 by a column I had already queried. Both original claims were of the same shape: *an
+absence I observed was read as an absence of the thing itself.* An empty ledger was read as
+"no mail was sent"; a resolution note that did not mention a write-off was read as "no
+write-off exists." In both cases the record was elsewhere and I did not look for it before
+concluding.
+
+---
+
 ### Revised severity after this correction record
 
 | ID | Was | Now | Why |
@@ -253,7 +354,8 @@ acknowledged 15:55:05 → re-escalated 15:56:28, **82 seconds**.
 | **A-06** | HIGH | **HIGH** | Drift closed, but the measured extent is far larger than first reported: **7 of 8 resolutions are unexecuted instructions, 8 of 8 have no closure evidence, and 4 of 4 currently-open alerts are re-raises of them** |
 | **A-02** | HIGH | **HIGH** | Unchanged — still the defect that manufactures A-06's failure |
 | **A-03** | HIGH | **HIGH** | Unchanged |
-| **A-04** | HIGH | **HIGH** | Unchanged |
+| ~~**A-04**~~ | HIGH | **RETRACTED** | The write-off WAS recorded (Decision B). Replaced by A-04R |
+| **A-04R** | — | **HIGH** | New (C-6): a bulk drain irreversibly overrode a governed 17-WRITE-OFF/1-SEND disposition and reported success |
 | **A-05** | HIGH | **HIGH** | Unchanged |
 | **A-15** | — | **MEDIUM** | New (C-4) |
 
@@ -794,11 +896,13 @@ violated property, evidence, failure path, consequence, remediation class.
     `accepted` and `already_*` alike. The drain's breakdown therefore **cannot** distinguish
     "told" from "not told", and the resolution note was written from it.
 - **Consequence:** An auditor reading the alert concludes the 18 customers were notified. The
-  database says they were not. The September 7 remediation invariant was *"an orphaned
-  consequential event is drained or explicitly written off, never aged out"* — it was drained
-  into a suppression, and the write-off decision the invariant contemplates was never
-  recorded. `closure_evidence` is NULL on **all 11** production alerts; not one has reached
-  `closed`.
+  database says they were not. `closure_evidence` is NULL on **all 11** production alerts; not
+  one has reached `closed`.
+- ~~*"…it was drained into a suppression, and the write-off decision the invariant
+  contemplates was never recorded."*~~ **RETRACTED 2026-09-11 — this sentence was WRONG.**
+  The write-off decision **was** recorded, before this audit began, and 17 of the 18
+  notification rows carry its reasoning verbatim. See **§1a / C-6**, which supersedes this
+  entry with a stronger finding: **A-04R**.
 - **Note on scope:** every affected recipient is on `seed.agentorc.ca`. Recorded corpus
   provenance holds that real-vs-synthetic **cannot** be reconstructed for this data
   (`contacts.is_synthetic` marks 176 of 181 seed-domain contacts *not* synthetic), so "no real
@@ -1347,7 +1451,8 @@ qualified are closed and proven closed.
 | ~~**A-01**~~ | ~~Alert escalation email has never delivered~~ **MOVED TO MEDIUM — see §1a/C-1. Mail delivers; recording is unreliable** | — | — |
 | **A-02** | Acknowledging an overdue alert re-escalates it within 82 seconds | Acknowledgement is a usable state | code + policy decision |
 | **A-03** | `cancel`/`acknowledge`/`assign`/`escalate` unbound, actor from the request body | An accountability signal is cleared only by a named human | code |
-| **A-04** | An alert was resolved on a handler status that does not mean the outcome occurred | A resolution record states what happened | code + operational decision |
+| ~~**A-04**~~ | ~~resolved on a handler status~~ **RETRACTED — see §1a/C-6** | — | — |
+| **A-04R** | A bulk drain irreversibly overrode a governed per-item disposition (17 WRITE OFF / 1 SEND) and the audit recorded `processed 39 ok` | A governed disposition survives a later bulk operation, or that operation refuses to run | code (an interlock) + a structured disposition record |
 | **A-05** | Customer notification delivery 100% suppressed for 5 days, unmonitored | A delivery outage is distinguishable from normal operation | code + decision |
 | ~~**A-06**~~ | ~~The deployed governance console is a stale build~~ **DRIFT CLOSED 2026-09-10; structural half + 3 misleading records MOVED TO MEDIUM — see §1a/C-3** | — | — |
 | **D-01/N-03** | Anonymous PII: 129 contacts with addresses and staff names; 284 KB OpenAPI | Customer data is not disclosed to anonymous callers | decision, then configuration |
