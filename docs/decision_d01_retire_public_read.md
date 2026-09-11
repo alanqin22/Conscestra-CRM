@@ -90,11 +90,91 @@ aggregates — `active_pipeline`, `open_leads`, `pending_orders`, `unread_alerts
 `contact_id`, `full_name` or address field. Exempting it would not expose a
 subject and would restore the marketing homepage.
 
-**It is deliberately NOT exempted in this change.** The approved scope was
+**It was deliberately NOT exempted in this change.** The approved scope was
 retirement; carving an exemption in the same change would mean the retirement
 ships together with its first exception, and the exception would be reviewed as
-part of a change whose headline is the opposite. It is recorded here as an
+part of a change whose headline is the opposite. It was recorded here as an
 available, evidenced option and left as a separate decision.
+
+### UPDATE 2026-09-11 — that decision has now been made: `/home-index` IS exempt
+
+Taken as a separate change, on its own evidence, after retirement was live and
+verified.
+
+**It is not an exception to the invariant — it is outside it.** The invariant
+governs customer SUBJECTS; `/home-index` exposes none, so there is no `s` for
+`PublicRead(s) -> ProvenDemo(s)` to range over. Verified twice, because "no PII
+in the sample I looked at" is an observation and not a property:
+
+- **BY CONSTRUCTION** — the route declares `response_model=HomeIndexResponse`
+  (four KPI objects plus metadata). FastAPI filters the response to the declared
+  fields, so an SP that began returning a contact could not deliver one through
+  this route. 30 declared fields, none naming a person, account or lead.
+- **IN FACT** — the whole production payload of `sp_home_index` was read
+  read-only on 2026-09-11 and probed for `contact_id`, `account_id`, `lead_id`,
+  `email`, a bare `@`, `phone`, `first_name`, `last_name`, `street` and `name`.
+  All absent. The two untyped `list` fields — the ones the response model does
+  **not** bound — carry `[{count,status}]` and `[{day,count}]`.
+
+**What it discloses, stated rather than glossed:** aggregate pipeline value and
+lead / order / alert counts. Anyone may infer business scale. That is the point;
+it is a marketing dashboard.
+
+**Residual:** `owner_id` and `employee_uuid` query parameters scope the
+aggregates, so a caller who already holds a valid owner UUID can learn that
+owner's counts. They cannot enumerate UUIDs from here and the answer is still
+only counts. If that stops being acceptable, restrict the parameters rather than
+re-gating the route — re-gating takes the front page down again.
+
+**A latent contradiction this surfaced.** The registration comment in `main.py`
+already said *"PUBLIC ... so it is not session-gated"* while the code gated it
+with `_DATA`. Under `public-read` the contradiction was invisible, because
+anonymous reads passed the gate anyway. Retirement is what made it visible: the
+front page went 401. The comment recorded the intent; the code had quietly
+diverged from it, and only the stricter posture revealed which was true.
+
+**A PRIOR DECISION THIS CHANGE REVERSES, and how it was honoured rather than
+overridden.** `test_60_home_index_carries_the_data_dependency` already required
+the gate on this route, for a reason that was **not** about customer data:
+
+> *"Aggregate pipeline / leads / orders / alert counts. No customer records, but
+> anonymous access lets anyone infer business scale."*
+
+That reason is correct and was measured live before acting on it: **pipeline
+$1,209,865.57, weighted $369,988.26**, 98 opportunities, 93 leads, 69 orders. The
+front page's main card displays exactly those dollar figures.
+
+The two requirements are not in conflict once separated:
+
+| | |
+|---|---|
+| the route may be public | because it exposes no customer **subject** |
+| the **money** must not be public | because business scale is nobody's by default |
+
+So the route is ungated **and the pipeline value is redacted server-side** for
+callers without a session. Counts to everyone; amounts only to a session.
+
+- `total_amount` / `weighted_amount` are `Optional[float]`, `None` for
+  anonymous. **Null, never `0.0`** — `0.0` asserts an empty pipeline, which is a
+  false statement rather than a withheld one.
+- `metadata.amounts_disclosed` says which state the payload is in, so a client
+  never infers "withheld" from a null.
+- Redaction is **server-side**. A client-side choice is not a control; the value
+  would still travel in the payload.
+- A trap caught on the way: `_kpi_pipeline` coerced with `float(x or 0)`, which
+  silently turned the withheld `None` back into `0.0` and would have republished
+  the redacted state as a false claim.
+
+`test_60` was **inverted and re-justified, not deleted.** Deleting it would have
+left the strongest argument for the old behaviour with nowhere to live, and the
+next person would rediscover it the hard way.
+
+**The front page needs a small edit to match:** Card 1 currently renders
+`fmtK(P.total_amount)`. With the amount withheld it should show the opportunity
+count. `index.html` / `index2.html` are hand-deployed and not in this repository.
+
+**`/order-chat` remains un-exempt and must stay that way.** It discloses
+`contact_id`, `account_id`, `email`, `phone` and `account_name`.
 
 ## Verification required
 

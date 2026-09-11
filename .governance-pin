@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-206c9073f60c00aec463fca46e17c0bae94dbec1
+fb91a7be570ab4b40004345cc02dce3ef0647a37
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -133,4 +133,11 @@
 # mean something -- that the same reads are ALLOWED under public-read, so the
 # suite cannot pass on a gate that refuses everything or on a machine already
 # configured locked.
+
+# fb91a7b -- /home-index made public with the pipeline VALUE redacted. Tests
+# only here; the app half is in the paired public commit. Notable because it
+# INVERTS test_60 rather than deleting it: that test required the data gate on
+# this route for a reason that was never about customer data ("anonymous access
+# lets anyone infer business scale"), and that reason is preserved as the
+# assertion that the amount fields still default to None.
 

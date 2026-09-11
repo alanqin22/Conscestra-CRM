@@ -1654,12 +1654,46 @@ _ADMIN = [Depends(require_admin)]
 _GOVERNANCE = [Depends(require_governance_actor)]
 
 # -- Home dashboard (registered first for fast routing).
-#    PUBLIC: the landing page / KPI summary must render for anonymous visitors
-#    (the marketing front page), so it is not session-gated.
-# /home-index returns aggregate pipeline / leads / orders / alert counts. No
-# customer records, but anonymous access lets anyone infer business scale, so it
-# carries the same data dependency as every other CRM read.
-app.include_router(home_router, dependencies=_DATA)
+#
+# PUBLIC, DELIBERATELY, AND THIS IS THE ONE EXEMPTION FROM THE DATA GATE.
+#
+# The comment here used to say "PUBLIC ... so it is not session-gated" while the
+# code gated it, and the contradiction survived because under `public-read`
+# anonymous reads passed through `_DATA` anyway. Retiring public-read (D-01) is
+# what made it visible: the marketing front page went 401 and stopped rendering.
+#
+# WHY THIS ONE IS SAFE WHEN THE OTHERS ARE NOT. The invariant retirement enforces
+# is `PublicRead(s) -> ProvenDemo(s)` for every customer SUBJECT s. /home-index
+# exposes no subject at all, so it is outside the invariant rather than an
+# exception to it. That was verified twice, because "no PII in the sample I
+# looked at" is not a property:
+#
+#   BY CONSTRUCTION  the endpoint declares response_model=HomeIndexResponse,
+#                    which is four KPI objects plus metadata. FastAPI filters the
+#                    response to the declared fields, so an SP that started
+#                    returning a contact could not deliver one through here.
+#   IN FACT          the whole production payload of sp_home_index was read
+#                    2026-09-11 and probed for contact_id / account_id / lead_id /
+#                    email / '@' / phone / first_name / last_name / street / name.
+#                    All absent. The two untyped `list` fields -- the ones the
+#                    response_model does NOT bound -- carry [{count,status}] and
+#                    [{day,count}].
+#
+# WHAT IT DOES DISCLOSE, stated rather than glossed: aggregate pipeline value and
+# lead / order / alert counts. Anyone may infer business scale. That is the
+# point -- it is a marketing dashboard, and it is what the front page renders.
+#
+# RESIDUAL, recorded so nobody has to rediscover it: `owner_id` and
+# `employee_uuid` query parameters scope the aggregates. A caller who already
+# holds a valid owner UUID can learn that owner's counts. They cannot enumerate
+# UUIDs from here, and the answer is still only counts -- but if that ever stops
+# being acceptable, restrict the parameters rather than re-gating the route,
+# because re-gating takes the front page down again.
+#
+# DO NOT WIDEN THIS. Every other router below serves customer subjects. The
+# gate is what enforces D-01; this line is outside it only because there is no
+# subject here to protect.
+app.include_router(home_router)
 
 # -- Register all 10 AI agent routers
 app.include_router(accounts_router,      dependencies=_DATA)
