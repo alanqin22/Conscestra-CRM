@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-18e7e4bcc2310edf0112cabdcbaaea4688fddc61
+fdce6f36f803400902e004aa1ffd413e7e63282e
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -116,4 +116,9 @@
 # which is why this branch is stacked on feat/readonly-role-d08 rather than cut
 # from master. Merging it before that one would fail the disposition test with a
 # file on disk and no classification.
+
+# fdce6f3 -- a comments-only correction to readonly_role.sql's runbook. No SQL
+# statement changed and no database needs re-applying it; the pin moves only so
+# a checkout of this commit gets the corrected instructions rather than the ones
+# that would have produced a Railway password desync.
 
