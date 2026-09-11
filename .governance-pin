@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-fdce6f36f803400902e004aa1ffd413e7e63282e
+80a7b648544aa8407cc23ba19c752df4dddf7751
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -121,4 +121,9 @@ fdce6f36f803400902e004aa1ffd413e7e63282e
 # statement changed and no database needs re-applying it; the pin moves only so
 # a checkout of this commit gets the corrected instructions rather than the ones
 # that would have produced a Railway password desync.
+
+# 80a7b64 -- the A-15 declaration tests. Tests only, no SQL, so neither the
+# e802469 hazard nor its mirror applies. They pin an ABSENCE -- that alert
+# discharge does not consult accountable_owner -- which is the kind of property
+# a later reader removes by mistake, believing they are fixing an oversight.
 
