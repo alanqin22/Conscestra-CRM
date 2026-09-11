@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-80a7b648544aa8407cc23ba19c752df4dddf7751
+206c9073f60c00aec463fca46e17c0bae94dbec1
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -126,4 +126,11 @@
 # e802469 hazard nor its mirror applies. They pin an ABSENCE -- that alert
 # discharge does not consult accountable_owner -- which is the kind of property
 # a later reader removes by mistake, believing they are fixing an oversight.
+
+# 206c907 -- the D-01 retirement tests. Tests only; no SQL, no application code.
+# They assert that auth_dep.require_data_access refuses anonymous customer-subject
+# reads under the posture `locked` sets, and -- the half that makes the first half
+# mean something -- that the same reads are ALLOWED under public-read, so the
+# suite cannot pass on a gate that refuses everything or on a machine already
+# configured locked.
 
