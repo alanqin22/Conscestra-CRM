@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-f32c69128f94dad64b077b7d1d9044ae7da41b87
+09735961063b4558c58dfc6abda9f3e3799422ec
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -70,3 +70,35 @@ f32c69128f94dad64b077b7d1d9044ae7da41b87
 # Also carries: the ledger identity boundary's tests, the escalation claim
 # concurrency proofs, the cap-ownership fixture correction, and the fixture
 # leak that opened the global send breaker and failed twelve unrelated tests.
+
+# 48332dc -- the alert ack-window and resolution-disposition change (A-02,
+# A-06). The e802469 hazard once more: deploy_state declares ONE more
+# out_of_band file, governance_alert_ack_and_disposition.sql, so a public
+# commit pinned earlier than this would fail with 'DECLARED BUT ABSENT FROM
+# DISK'.
+#
+# NOT promoted into REQUIRED_MIGRATIONS, and it must not be until Railway has
+# run it. It is also the first pin in this file whose DEPLOY ORDER is
+# load-bearing across two deployment paths: governance-mgmt.html has to ship
+# BEFORE the app and the SQL, because the console is what sends the new
+# disposition field and an older console against the new rule makes every
+# Resolve button fail. The console is hand-deployed and untracked, so nothing
+# in CI can enforce that ordering -- it is written here because this is the
+# file the next person reads when they wonder why the pin moved.
+#
+# Also carries the three test files it is verified by: one new
+# (test_alert_ack_and_disposition.py, 15 cases) and two updated, where the
+# updates supply the new field rather than relax what the tests measure.
+
+# 0973596 -- the same change split into two SQL files. deploy_state now
+# declares TWO more out_of_band files rather than one, so the e802469 hazard
+# applies to this pin and not to 48332dc: a public commit pinned to 48332dc
+# would fail 'DECLARED BUT ABSENT FROM DISK' on
+# governance_alert_resolution_required.sql.
+#
+# The split exists because the deploy order could not be made safe otherwise.
+# With the requirement in the same file as the columns, schema-first makes the
+# trigger demand a field the running app does not write and app-first makes the
+# app write a column that does not exist -- both break Resolve. Neither file is
+# promoted, and the LAST of them must not be applied until the app is live.
+

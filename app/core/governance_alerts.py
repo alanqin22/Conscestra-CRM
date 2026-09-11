@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -51,6 +52,34 @@ logger = logging.getLogger("governance_alerts")
 LIVE = ("open", "assigned", "acknowledged", "in_progress", "escalated")
 TERMINAL = ("resolved", "closed", "cancelled")
 _SEV_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+# HOW LONG AN ACKNOWLEDGEMENT QUIETS THE SWEEP (A-02).
+#
+# `sweep_sla` re-escalates anything live whose due_at has passed, and nothing
+# moved due_at, so an already-overdue alert re-escalated on the next 15-minute
+# tick however many times a human acknowledged it. Measured on production: the
+# CEO acknowledged alert b9a224e2 at 15:55:05 and the sweep re-escalated it at
+# 15:56:28 — 82 seconds. Three acknowledgements, none of which held.
+#
+# A WINDOW, NOT A NEW DEADLINE. due_at is deliberately untouched: the breach is
+# a true fact and the audit trail keeps saying so. Extending due_at instead
+# would let an alert be held forever by acknowledging it, and would erase the
+# breach while doing so. What this suppresses is re-ANNOUNCEMENT, not the
+# breach.
+ACK_WINDOW_HOURS = float(os.getenv("GOV_ALERT_ACK_WINDOW_HOURS", "4"))
+
+# THE CLOSED VOCABULARY FOR A RESOLUTION (A-06).
+#
+# Seven of the eight resolution notes in production are instructions that never
+# executed — "bill these 5 shipped orders", "email this alter to CFO", "find the
+# root cause, then resolve the issue". All four alerts open in production today
+# are re-raises of rules "resolved" that way. Free text let an instruction
+# masquerade as an outcome, so the outcome is now a separate, closed field.
+#
+# `delegated` is the entry that matters. It is the honest answer an executive
+# had no way to give: somebody else will do this. Without it, the only way to
+# get an alert off the desk was to claim it was handled.
+DISPOSITIONS = ("worked", "no_action_needed", "delegated")
 
 
 def _norm_sev(s: Optional[str]) -> str:
@@ -228,10 +257,19 @@ def open_alert(alert_class: str, headline: str, *, rule: Optional[str] = None,
 
 def transition(alert_id: str, to_status: str, actor: str, *, note: Optional[str] = None,
                assignee: Optional[str] = None, evidence: Optional[Dict[str, Any]] = None,
-               escalated_to_owner_id: Optional[str] = None) -> Dict[str, Any]:
+               escalated_to_owner_id: Optional[str] = None,
+               disposition: Optional[str] = None) -> Dict[str, Any]:
     """One lifecycle step. The trigger decides legality; this records who and why."""
     if not (actor or "").strip():
         return {"ok": False, "error": "actor is required"}
+    if to_status == "resolved" and disposition not in DISPOSITIONS:
+        # Refused HERE as well as by the trigger, so a caller gets a sentence it
+        # can act on rather than a CheckViolation from two layers down. The
+        # trigger stays the enforcement point — this is the error message.
+        return {"ok": False,
+                "error": f"resolving an alert requires a disposition, one of "
+                         f"{', '.join(DISPOSITIONS)}. A note records what you "
+                         f"thought; the disposition records what happened."}
     sets = ["status=%(st)s"]
     params: Dict[str, Any] = {"st": to_status, "id": alert_id, "actor": actor[:120],
                               "note": note}
@@ -240,8 +278,15 @@ def transition(alert_id: str, to_status: str, actor: str, *, note: Optional[str]
         params["assignee"] = assignee or actor
     if to_status == "acknowledged":
         sets.append("acknowledged_by=%(actor)s")
+        # A-02: quiet the sweep for a window WITHOUT moving due_at. The alert
+        # stays breached and keeps saying so; it simply stops being re-announced
+        # every 15 minutes at somebody who has already said they have it.
+        sets.append("ack_suppressed_until=now() + make_interval(secs => %(ackw)s)")
+        params["ackw"] = ACK_WINDOW_HOURS * 3600.0
     if to_status == "resolved":
-        sets += ["resolved_by=%(actor)s", "resolution_note=%(note)s"]
+        sets += ["resolved_by=%(actor)s", "resolution_note=%(note)s",
+                 "resolution_disposition=%(disp)s"]
+        params["disp"] = disposition
     if to_status == "closed":
         sets += ["closed_by=%(actor)s", "closure_evidence=%(ev)s::jsonb"]
         params["ev"] = json.dumps(evidence or {}, default=str) if evidence is not None else None
@@ -435,10 +480,16 @@ def sweep_sla() -> Dict[str, Any]:
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            # A-02: `ack_suppressed_until` is the ONLY new clause. due_at is
+            # still the breach test, so a breached alert is still breached and
+            # still reported as such — it is merely not re-announced while
+            # somebody who acknowledged it is inside their window.
             cur.execute(
                 """SELECT alert_id::text FROM governance_alerts
                     WHERE status IN ('open','assigned','acknowledged','in_progress')
                       AND due_at < now()
+                      AND (ack_suppressed_until IS NULL
+                           OR ack_suppressed_until < now())
                     ORDER BY due_at LIMIT 200""")
             ids = [r[0] for r in cur.fetchall()]
     except Exception as exc:
@@ -460,9 +511,22 @@ def sweep_sla() -> Dict[str, Any]:
 
 
 def resolve_by_class(alert_class: str, actor: str, note: str,
-                     rule: Optional[str] = None) -> Dict[str, Any]:
+                     rule: Optional[str] = None,
+                     disposition: str = "worked") -> Dict[str, Any]:
     """Resolve (not close) every live alert of a class — used by the bus after a
-    replay proves the queue is drained. Closure stays human."""
+    replay proves the queue is drained. Closure stays human.
+
+    `disposition` defaults to 'worked' because the only caller reaches here
+    having actually replayed the rows, and a machine that did the work should
+    say so in the same vocabulary a human uses. It is a PARAMETER rather than a
+    literal so the next caller has to choose rather than inherit.
+
+    WHAT THIS DISPOSITION DOES NOT CLAIM (A-04). 'worked' says the queue was
+    drained, which is true and verifiable. It does NOT say a customer was
+    notified: the 18 order.shipped events replayed on 2026-09-08 all produced
+    order_notifications rows in state 'skipped', and the alert's note —
+    "processed 39" — was read as if it meant delivery. Correcting that claim is
+    a separate change to what the bus WRITES in the note, not to this field."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -480,7 +544,8 @@ def resolve_by_class(alert_class: str, actor: str, note: str,
         st = transition(aid, "acknowledged", actor, note=note)
         if not st.get("ok") and "cannot move" not in (st.get("error") or ""):
             out.append(st); continue
-        out.append(transition(aid, "resolved", actor, note=note))
+        out.append(transition(aid, "resolved", actor, note=note,
+                              disposition=disposition))
     return {"resolved": sum(1 for o in out if o.get("ok")), "results": out}
 
 
@@ -576,6 +641,10 @@ class _Step(BaseModel):
     note: Optional[str] = None
     assignee: Optional[str] = None
     evidence: Optional[Dict[str, Any]] = None
+    # A-06. Required to resolve; ignored on every other action. Accepted from
+    # the body because it is a STATEMENT BY the actor, not a claim ABOUT them —
+    # unlike `actor` itself, which is now taken from the session below.
+    disposition: Optional[str] = None
 
 
 _ACTIONS = {"assign": "assigned", "acknowledge": "acknowledged", "start": "in_progress",
@@ -583,13 +652,31 @@ _ACTIONS = {"assign": "assigned", "acknowledge": "acknowledged", "start": "in_pr
             "reopen": "in_progress"}
 
 
-# Transitions that CLEAR an accountability signal. Anyone may acknowledge that
-# they have seen an alert; saying it is dealt with is a claim about the world,
-# and N-02's rule is that a claim of that kind carries a name from the session
-# rather than from a request body.
+# Transitions that CLEAR an accountability signal or MOVE it to someone else.
+# Anyone may acknowledge that they have seen an alert; saying it is dealt with,
+# that it never needed doing, or that it is now somebody else's, is a claim
+# about the world — and N-02's rule is that a claim of that kind carries a name
+# from the session rather than from a request body.
 from app.core.governance_policy import bound_authority
 
-_BOUND_ACTIONS = {"resolve", "close"}
+# A-03. `resolve` and `close` were bound; the other three were not, and an ops
+# token reached them with an actor of its own choosing. Verified against
+# production on 2026-09-09: cancel, acknowledge, assign and escalate all
+# returned "alert not found" (i.e. reached the handler) for a request carrying
+# `"actor": "audit-probe-not-a-person"`.
+#
+#   cancel    removes the alert from the live surface exactly as resolve does —
+#             `cancelled` is not in LIVE — and is the strongest claim of the
+#             three: this never needed working. It was the one unbound
+#             transition the local database had used 1,982 times.
+#   assign    makes the alert someone else's obligation.
+#   escalate  moves it to the escalation authority.
+#
+# `acknowledge` is deliberately still open, and that is a decision rather than
+# an oversight: it asserts only that a human has seen the alert, it cannot
+# clear or move accountability, and automation legitimately acknowledges on
+# receipt. It is the one transition where a body-supplied actor costs nothing.
+_BOUND_ACTIONS = {"resolve", "close", "cancel", "assign", "escalate"}
 
 
 @router.post("/governance/alerts/{alert_id}/{action}")
@@ -603,7 +690,8 @@ def api_step(request: Request, alert_id: str, action: str, body: _Step):
     if action not in _ACTIONS:
         raise HTTPException(status_code=404, detail=f"unknown action; one of {sorted(_ACTIONS)} or escalate")
     res = transition(alert_id, _ACTIONS[action], actor, note=body.note,
-                     assignee=body.assignee, evidence=body.evidence)
+                     assignee=body.assignee, evidence=body.evidence,
+                     disposition=body.disposition)
     if not res.get("ok"):
         raise HTTPException(status_code=409, detail=res.get("error"))
     return res

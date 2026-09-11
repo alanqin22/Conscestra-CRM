@@ -306,6 +306,49 @@ _PENDING_PGVECTOR = (
     "structure only -- coverage is filled by content_index.rebuild_vectors(), "
     "not claimed here.")
 
+_PENDING_ALERT_DISPOSITION = (
+    "PENDING DEPLOYMENT -- authored 2026-09-10 and applied to LOCAL only. "
+    "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
+    "records its Railway application, and not before. Closes A-02 and A-06 of "
+    "docs/architecture_reassessment_2026-09-09.md. Adds "
+    "governance_alerts.ack_suppressed_until so an acknowledgement quiets the "
+    "15-minute sweep WITHOUT moving due_at -- production acknowledged one "
+    "alert three times and it re-escalated 82 seconds after the last one -- "
+    "and governance_alerts.resolution_disposition (worked | no_action_needed "
+    "| delegated), which entering status='resolved' now requires. Seven of "
+    "the eight resolution notes in production were INSTRUCTIONS that never "
+    "executed, and all four alerts open afterwards were re-raises of those "
+    "same rules. NOT RETROACTIVE: the requirement is tested only on the "
+    "transition INTO 'resolved', so the eight existing rows keep their NULL "
+    "and can still move to 'closed'. "
+    "PHASE 1 OF TWO, AND IT ENFORCES NOTHING -- the requirement lives in "
+    "governance_alert_resolution_required.sql. Split because with the "
+    "requirement in this file, EVERY deploy order has a window where Resolve "
+    "is broken: schema-first makes the trigger demand a field the running app "
+    "does not write, app-first makes the app write a column that does not "
+    "exist. This file is safe to apply at any time against any app version, "
+    "because nothing reads or requires the columns it adds.")
+
+_PENDING_ALERT_RESOLUTION_REQUIRED = (
+    "PENDING DEPLOYMENT -- authored 2026-09-10 and applied to LOCAL only. "
+    "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
+    "records its Railway application, and not before. PHASE 2 OF TWO and the "
+    "LAST step of the sequence: it makes resolution_disposition REQUIRED to "
+    "enter status='resolved', replacing trgfn_governance_alerts_lifecycle "
+    "whole (CREATE OR REPLACE takes the entire body). "
+    "APPLY ORDER, and it is not a preference: "
+    "(1) governance_alert_ack_and_disposition.sql -- columns, no enforcement; "
+    "(2) governance-mgmt.html -- starts SENDING the field, hand-deployed; "
+    "(3) the app -- starts WRITING it; "
+    "(4) THIS FILE -- starts REQUIRING it. "
+    "Applying it before (3) makes every Resolve fail, which is the shape "
+    "recorded above for 2026-09-08: the app shipped ahead of its schema, the "
+    "governance decision path was down, and the startup log stayed green "
+    "throughout. Nothing in CI can enforce the ordering because step (2) is "
+    "untracked. NOT RETROACTIVE: the requirement is tested only on the "
+    "transition INTO 'resolved', so rows resolved earlier keep their NULL and "
+    "can still reach 'closed'.")
+
 _PENDING_CORPUS_PROVENANCE = (
     "PENDING DEPLOYMENT -- authored 2026-08-31 and applied to LOCAL only. "
     "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
@@ -636,6 +679,8 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "employee_service_seed.sql": _SCHEMA_OOB,
     "content_embeddings_pgvector.sql": _PENDING_PGVECTOR,
     "corpus_provenance.sql": _PENDING_CORPUS_PROVENANCE,
+    "governance_alert_ack_and_disposition.sql": _PENDING_ALERT_DISPOSITION,
+    "governance_alert_resolution_required.sql": _PENDING_ALERT_RESOLUTION_REQUIRED,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
     "escalations.sql": _SCHEMA_OOB,
