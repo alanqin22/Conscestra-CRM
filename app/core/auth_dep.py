@@ -313,6 +313,26 @@ async def require_session(request: Request) -> Optional[Dict[str, Any]]:
     return sess
 
 
+async def session_if_present(request: Request) -> Optional[Dict[str, Any]]:
+    """The caller's session if they have one, else None. NEVER raises.
+
+    For a route that is PUBLIC but must render differently for a signed-in
+    caller — today only /home-index, which shows opportunity counts to everyone
+    and pipeline VALUE only to a session.
+
+    Deliberately not `require_session` with the exception swallowed: that
+    function's job is to refuse, and a caller that silently discards its refusal
+    is how a gate stops being one. This has the opposite contract, and says so
+    in its name.
+
+    It reuses `_bearer` rather than re-reading the header, because a second
+    place that decides what counts as a token is a second place to forget that
+    'X-Session-Token' is also one."""
+    from app.agents.auth.router import get_session
+    token = _bearer(request)
+    return get_session(token) if token else None
+
+
 async def _request_mode(request: Request) -> Optional[str]:
     """Best-effort extract of the operation 'mode'/'action' from a JSON body.
     Returns None for non-JSON / bodyless requests (treated as a read)."""
