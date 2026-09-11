@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-48332dc39b288c33b646d34d3d5b25cdd5725fec
+09735961063b4558c58dfc6abda9f3e3799422ec
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -89,3 +89,16 @@
 # Also carries the three test files it is verified by: one new
 # (test_alert_ack_and_disposition.py, 15 cases) and two updated, where the
 # updates supply the new field rather than relax what the tests measure.
+
+# 0973596 -- the same change split into two SQL files. deploy_state now
+# declares TWO more out_of_band files rather than one, so the e802469 hazard
+# applies to this pin and not to 48332dc: a public commit pinned to 48332dc
+# would fail 'DECLARED BUT ABSENT FROM DISK' on
+# governance_alert_resolution_required.sql.
+#
+# The split exists because the deploy order could not be made safe otherwise.
+# With the requirement in the same file as the columns, schema-first makes the
+# trigger demand a field the running app does not write and app-first makes the
+# app write a column that does not exist -- both break Resolve. Neither file is
+# promoted, and the LAST of them must not be applied until the app is live.
+
