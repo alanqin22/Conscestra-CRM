@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-fdb53470ab78f1603736e3604020b1ae7d477500
+25e6e9f4e8366e668fbb519711d4d62b0aa57747
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -225,3 +225,20 @@ fdb53470ab78f1603736e3604020b1ae7d477500
 # asserts something it did not assert before.
 #
 # Still stacked, by way of feat/owner-reminder, for the reason at 28e6be6.
+
+# 25e6e9f -- A1, registering accounting.generate_invoice. The e802469 hazard in
+# its usual direction: deploy_state declares one more out_of_band file,
+# governance_policy_generate_invoice.sql, so a public commit pinned earlier
+# would fail with DECLARED BUT ABSENT FROM DISK.
+#
+# NO DEPLOY-ORDER CONSTRAINT, unlike b0f47e9 and 0973596 either way. The policy
+# row is read when a proposal is DECIDED, not when the capability is
+# registered, and an undeclared write capability already fails closed to the
+# CEO under human approval. Applying the SQL before or after the app changes
+# who approves, never whether the call is permitted.
+#
+# What this pin does NOT carry is worth stating, because the commit title could
+# be read as the opposite: the capability performs no discovery, both
+# identifiers must be supplied by the caller, and run_plan still passes write
+# steps the params the model drafted. The supervisor's revenue-leakage goal
+# remains unserveable, deliberately. Two tests fail if either boundary moves.
