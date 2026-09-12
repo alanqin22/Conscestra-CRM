@@ -1,8 +1,27 @@
 """Declared inventory of routes that are reachable without authentication.
 
-Every HTTP route in this application must either carry an authentication
+Every route object this application serves must either carry an authentication
 dependency or be declared here with the reason it does not. A route that is
 neither gated nor declared is an error, not a default.
+
+The population is every object in `app.routes`, not only the `APIRoute`
+objects. The first version of this module filtered on `isinstance(route,
+APIRoute)`, which silently excluded four Starlette `Route` objects and one
+`APIWebSocketRoute` while reporting complete coverage. A type filter is not a
+security-relevance judgement, and a WebSocket serving customer data is exactly
+the case this module exists to catch.
+
+There are two kinds of declaration, and they are held apart deliberately.
+
+`UNGATED_ROUTES` lists routes that are reachable without authentication.
+
+`HANDLER_AUTHORIZED_ROUTES` lists routes that ARE authorised, but not by a
+dependency the gate detector can see, because the check runs inside the
+handler. Recording those in `UNGATED_ROUTES` would be false in one direction:
+it would describe an authorised route as ungated. Recording them as gated would
+be false in the other, and worse, because it would credit the dependency
+mechanism with a control it does not perform and hide the route from anyone
+auditing that mechanism.
 
 Rationale. Enforcement of D-01 currently rests on an enumerated list of
 customer-subject routers: a test asserts that six named routers carry the data
@@ -120,6 +139,19 @@ _DSAR = ("Data-subject request intake. A subject exercising Article 15 or 17 "
 
 _CONTACT_FORM = ("Public contact form. Accepts a message and creates no "
                  "customer subject on the read side.")
+
+_FRAMEWORK_DOCS = (
+    "Framework documentation route, served by FastAPI's defaults. The "
+    "application does not set `docs_url`, `openapi_url` or `redoc_url`, so "
+    "anonymous access here is the framework default rather than a decision "
+    "this repository has recorded. These routes are outside customer-subject "
+    "authorisation: they publish the API description, which is route names, "
+    "methods and schemas, and no customer record. They are not thereby "
+    "approved for public exposure. The 2026-09-07 architecture reassessment "
+    "recorded the exposure as N-03, graded it a reconnaissance aid rather than "
+    "a direct breach, and marked it DECISION REQUIRED; that decision is still "
+    "open and is not this module's to make. Declared here so the route is "
+    "visible to the audit, and so that N-03 is reachable from the code.")
 
 _CALENDAR_TOKEN = (
     "Calendar subscription feed, consumed by a calendar client that cannot "
@@ -266,6 +298,12 @@ UNGATED_ROUTES: Dict[str, str] = {
     "GET /compliance/posture": _PUBLIC_PRODUCT,
     "GET /compliance/summary": _PUBLIC_PRODUCT,
 
+    # Framework documentation. See N-03; the decision is open.
+    "GET /openapi.json": _FRAMEWORK_DOCS,
+    "GET /docs": _FRAMEWORK_DOCS,
+    "GET /docs/oauth2-redirect": _FRAMEWORK_DOCS,
+    "GET /redoc": _FRAMEWORK_DOCS,
+
     # Governance decision link
     "GET /governance/decide": _DECISION_LINK,
     "POST /governance/decide": _DECISION_LINK,
@@ -274,6 +312,45 @@ UNGATED_ROUTES: Dict[str, str] = {
     "GET /embed/v1/{embed_key}/config": _EMBED_KEY,
     "POST /embed/v1/{embed_key}/chat": _EMBED_KEY,
     "OPTIONS /embed/v1/{embed_key}/{rest:path}": _EMBED_KEY,
+}
+
+
+# ── Authorised, but not by a dependency ──────────────────────────────────────
+#
+# Routes that perform their own authorisation inside the handler. They are not
+# ungated, and they are not gated in the sense this module can verify. The
+# distinction is kept in the type of the declaration rather than only in its
+# prose, because a reader scanning for the word "ungated" would otherwise
+# either miss the route or misread it.
+#
+# Two things follow from an entry here, and both are the point of it.
+#
+# The gate detector cannot verify the control. `gates_on` reads dependencies,
+# and there is no dependency to read, so nothing in this module confirms the
+# handler still performs the check it is credited with.
+#
+# The route therefore needs governance and tests of its own. An entry here
+# records that requirement; it does not satisfy it.
+
+HANDLER_AUTHORIZED_ROUTES: Dict[str, str] = {
+    "WS /voice/stream/{line}": (
+        "WebSocket carrying one carrier media stream per call. It is NOT "
+        "dependency-gated: `include_router(voice_stream_ws_router)` passes no "
+        "dependencies, and the route is registered unconditionally, "
+        "irrespective of VOICE_STREAM_ENABLED. Authorisation is performed in "
+        "the handler, which closes the connection with code 4403 unless the "
+        "line is known and the HMAC token verifies, before `ws.accept()` and "
+        "before any application work. The token is minted inside the "
+        "signature-verified inbound webhook, which is why the carrier can "
+        "present it and an arbitrary caller cannot: a WebSocket connect cannot "
+        "itself be signed by the carrier. "
+        "Two limits are recorded rather than implied. The control sits outside "
+        "the dependency-gate mechanism, so nothing in this module verifies it "
+        "and a regression in the handler would not fail this audit. No test in "
+        "the governance suite exercises the WebSocket's authorisation at all, "
+        "verified by search on 2026-09-12. Separate governance and test "
+        "coverage are therefore outstanding for this route, and this entry is "
+        "a record of that, not a substitute for it."),
 }
 
 
@@ -337,41 +414,89 @@ def gates_on(route: Any) -> set:
     return found & GATE_DEPENDENCIES
 
 
+def route_keys(route: Any) -> List[str]:
+    """The manifest keys for one route object, or [] if it serves no request.
+
+    Three representations, one per route class the application registers:
+
+        APIRoute, Route      "GET /contacts"      one key per method
+        APIWebSocketRoute    "WS /voice/stream/{line}"
+
+    A WebSocket has no HTTP method, so it is keyed on the `WS` prefix rather
+    than being forced into a method slot. An unrecognised class returns [] and
+    is reported by `classify` as unclassified, which fails the audit. That is
+    deliberate: a route class nobody has considered must stop the build rather
+    than be dropped the way `APIWebSocketRoute` was dropped by the type filter
+    this function replaces.
+    """
+    from fastapi.routing import APIWebSocketRoute
+    from starlette.routing import Route as StarletteRoute
+
+    if isinstance(route, APIWebSocketRoute):
+        return [f"WS {route.path}"]
+    if isinstance(route, StarletteRoute):
+        return [route_key(m, route.path)
+                for m in sorted(route.methods or []) if m != "HEAD"]
+    return []
+
+
 def classify(app: Any) -> Dict[str, List[str]]:
     """Compare the application's live routes against this manifest.
 
-    Returns `gated`, `declared`, `undeclared` and `stale`.
+    Returns `gated`, `declared`, `handler_authorized`, `undeclared`, `stale`
+    and `unclassified`.
 
     `undeclared` is the failure this module exists to produce: a route that is
     reachable without authentication and that nobody has stated a reason for.
 
-    `stale` is the opposite and matters for a different reason. A declaration
-    that no longer matches a live route is a permission granted to nothing, and
-    it will be read by the next person as evidence that an exposure was
-    considered and accepted when in fact the route has been renamed or removed.
+    `unclassified` is the failure that keeps the population honest. A route
+    object whose class this function does not recognise is reported rather than
+    skipped, so the audit cannot quietly shrink when a new route class appears.
+    The first version of this module skipped everything that was not an
+    `APIRoute` and reported full coverage while omitting five routes.
+
+    `handler_authorized` is separated from `declared` because the two make
+    different statements. A declared route is reachable without authentication.
+    A handler-authorized route is authorised by a check this module cannot see,
+    and collapsing them would describe one as the other.
+
+    `stale` matters for its own reason. A declaration that no longer matches a
+    live route is a permission granted to nothing, and it will be read by the
+    next person as evidence that an exposure was considered and accepted when
+    in fact the route has been renamed or removed.
     """
-    from fastapi.routing import APIRoute
+    from starlette.routing import Mount
 
     gated: List[str] = []
     declared: List[str] = []
+    handler_authorized: List[str] = []
     undeclared: List[str] = []
+    unclassified: List[str] = []
     seen: set = set()
 
     for route in app.routes:
-        if not isinstance(route, APIRoute):
+        keys = route_keys(route)
+        if not keys:
+            # A Mount serves a whole sub-application and cannot be gated per
+            # route; it is named so a reviewer sees it, rather than skipped.
+            label = ("MOUNT " if isinstance(route, Mount) else
+                     type(route).__name__ + " ")
+            unclassified.append(label + str(getattr(route, "path", "?")))
             continue
-        for method in sorted(route.methods or []):
-            if method == "HEAD":
-                continue
-            key = route_key(method, route.path)
+        for key in keys:
             seen.add(key)
             if gates_on(route):
                 gated.append(key)
+            elif key in HANDLER_AUTHORIZED_ROUTES:
+                handler_authorized.append(key)
             elif key in UNGATED_ROUTES:
                 declared.append(key)
             else:
                 undeclared.append(key)
 
-    stale = [k for k in UNGATED_ROUTES if k not in seen]
+    stale = [k for k in list(UNGATED_ROUTES) + list(HANDLER_AUTHORIZED_ROUTES)
+             if k not in seen]
     return {"gated": sorted(gated), "declared": sorted(declared),
-            "undeclared": sorted(undeclared), "stale": sorted(stale)}
+            "handler_authorized": sorted(handler_authorized),
+            "undeclared": sorted(undeclared), "stale": sorted(stale),
+            "unclassified": sorted(unclassified)}
