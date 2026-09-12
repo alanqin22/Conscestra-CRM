@@ -262,7 +262,9 @@ def open_alert(alert_class: str, headline: str, *, rule: Optional[str] = None,
 def transition(alert_id: str, to_status: str, actor: str, *, note: Optional[str] = None,
                assignee: Optional[str] = None, evidence: Optional[Dict[str, Any]] = None,
                escalated_to_owner_id: Optional[str] = None,
-               disposition: Optional[str] = None) -> Dict[str, Any]:
+               disposition: Optional[str] = None,
+               clear_escalation: bool = False,
+               suppress_hours: Optional[float] = None) -> Dict[str, Any]:
     """One lifecycle step. The trigger decides legality; this records who and why."""
     if not (actor or "").strip():
         return {"ok": False, "error": "actor is required"}
@@ -297,6 +299,20 @@ def transition(alert_id: str, to_status: str, actor: str, *, note: Optional[str]
     if to_status == "escalated":
         sets.append("escalated_to_owner_id=%(esc)s::uuid")
         params["esc"] = escalated_to_owner_id
+    # Both of these exist for `return_to_owner` and are off by default, because
+    # they change what the SLA sweep sees and no other caller should.
+    if clear_escalation:
+        # The alert is no longer sitting with the escalation authority. Leaving
+        # the id set would keep addressing reminders at someone who has handed
+        # it back.
+        sets.append("escalated_to_owner_id=NULL")
+    if suppress_hours is not None:
+        # The alert is still breached and due_at is NOT moved. Without this the
+        # sweep would re-escalate it on the next fifteen-minute tick and the
+        # hand-back would be undone before the owner read the email. Same
+        # mechanism A-02 gave `acknowledged`, for the same reason.
+        sets.append("ack_suppressed_until=now() + make_interval(secs => %(sup)s)")
+        params["sup"] = float(suppress_hours) * 3600.0
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -397,6 +413,99 @@ def escalate(alert_id: str, actor: str = "sla-sweep", note: Optional[str] = None
     except Exception as exc:                                       # noqa: BLE001
         logger.warning(f"[governance_alerts] escalation email skipped: {exc}")
     return res
+
+
+def return_to_owner(alert_id: str, actor: str, note: Optional[str] = None) -> Dict[str, Any]:
+    """Hand an escalated alert back to the person accountable for it.
+
+    WHY THIS EXISTS. Escalation moves the NOTIFICATION to the escalation
+    authority and leaves `accountable_owner_id` where it was, which is correct:
+    accountability should not transfer because a deadline was missed. But there
+    was no way back. On 2026-09-11 three alerts owned by the CFO and the CRO
+    escalated to the CEO, who was then re-notified about work belonging to two
+    other people with no action available except to resolve or cancel it --
+    that is, to claim it was handled or that it never needed doing. Neither was
+    true, and both are the kind of false record A-06 exists to prevent.
+
+    IT DOES NOT MOVE THE DEADLINE. `due_at` is untouched and the alert remains
+    breached. What it does is stop the alert being announced at someone who is
+    not accountable for it, and say so to the person who is.
+
+    IT DOES SUPPRESS RE-ESCALATION FOR A WINDOW, and that is not the same
+    thing. The sweep escalates anything live whose deadline has passed, so
+    without a window the next fifteen-minute tick would escalate it straight
+    back and the hand-back would be undone before the owner read the email.
+    The suppression is the ack window A-02 already defined, applied for the
+    same reason it was defined: an alert somebody has just taken responsibility
+    for should not be re-announced every quarter of an hour.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT status, headline, accountable_owner_id::text,
+                                  accountable_owner
+                             FROM governance_alerts WHERE alert_id=%s::uuid""",
+                        (alert_id,))
+            row = cur.fetchone()
+            cur.execute("""SELECT count(*) FROM governance_alert_transitions
+                            WHERE alert_id=%s::uuid AND to_status='assigned'""",
+                        (alert_id,))
+            prior_returns = int((cur.fetchone() or [0])[0] or 0)
+    except Exception as exc:                                       # noqa: BLE001
+        return {"ok": False, "error": str(exc).splitlines()[0][:200]}
+    finally:
+        conn.close()
+    if not row:
+        return {"ok": False, "error": "alert not found"}
+    status, headline, owner_id, owner_label = row
+    if status != "escalated":
+        return {"ok": False,
+                "error": f"alert is {status}; only an escalated alert can be "
+                         f"returned to its owner"}
+
+    res = transition(alert_id, "assigned", actor,
+                     note=note or "returned to the accountable owner",
+                     assignee=owner_label or owner_id,
+                     clear_escalation=True,
+                     suppress_hours=ACK_WINDOW_HOURS)
+    if not res.get("ok"):
+        return res
+
+    # Tell the owner. `alert_assigned` is the right kind -- it became someone's
+    # obligation again -- and the ORDINAL is what keeps it from being suppressed
+    # as a duplicate of the original assignment, which carried the same kind and
+    # the same ref. Counting prior returns from the transition log means no new
+    # column is needed to number them.
+    try:
+        who = next((a for a in gp.authorities()
+                    if a.get("owner_id") == owner_id), None)
+        if who:
+            body = chr(10).join([
+                headline,
+                "",
+                f"This was escalated to the {gp.ESCALATION_ROLE} when its "
+                f"deadline passed, and {actor} has returned it to you.",
+                "",
+                f"Note: {note}" if note else "",
+                "",
+                "It is past its deadline and the deadline has NOT been moved. "
+                "It will escalate again if it is not worked.",
+                "",
+                f"Open it here:{chr(10)}{console_link(alert_id)}",
+            ])
+            gp.email_authority(
+                who, f"[Returned to you] {headline[:60]}", body,
+                kind="alert_assigned", ref=alert_id,
+                ordinal=prior_returns + 1)
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[governance_alerts] return notice failed for "
+                       f"{alert_id[:8]}: {str(exc)[:160]}")
+
+    logger.info(f"[governance_alerts] {alert_id[:8]} RETURNED to "
+                f"{owner_label or owner_id} by {actor}")
+    return {"ok": True, "alert_id": alert_id, "status": "assigned",
+            "returned_to": owner_label or owner_id,
+            "suppressed_hours": ACK_WINDOW_HOURS}
 
 
 def delegate_to_agent(alert_id: str, actor: str, instruction: str,
@@ -600,7 +709,17 @@ def remind_escalated(hours: float) -> Dict[str, Any]:
                 # `_remind` is the vocabulary's repeat suffix (staff_email.
                 # EMAIL_KINDS); `reescalation` was this caller's own spelling
                 # and was never a declared kind.
-                kind="alert_remind", ref=f"{aid}:reminder:{n}")
+                #
+                # THE ORDINAL GOES IN `ordinal`, NOT IN `ref`. This read
+                # `ref=f"{aid}:reminder:{n}"`, and `ref` is written to
+                # staff_email_ledger.subject_ref_id, which is uuid-typed. Every
+                # insert therefore failed its cast, `claim()` caught it, and
+                # `begin_send` fell open with "proceeding UNRECORDED" -- so the
+                # mail went and the row never did. Production holds ZERO rows of
+                # any remind kind, and escalation_notices is 0 on every alert.
+                # `begin_send` has taken an `ordinal` for exactly this since it
+                # was written.
+                kind="alert_remind", ref=aid, ordinal=n)
         except Exception as exc:                                   # noqa: BLE001
             logger.debug(f"[governance_alerts] reminder email skipped: {exc}")
     if sent:
@@ -922,7 +1041,7 @@ from app.core.governance_policy import bound_authority
 # clear or move accountability, and automation legitimately acknowledges on
 # receipt. It is the one transition where a body-supplied actor costs nothing.
 _BOUND_ACTIONS = {"resolve", "close", "cancel", "assign", "escalate",
-                  "delegate"}
+                  "delegate", "return"}
 
 # `delegate` is bound for the same reason as the five above: it states
 # that the work is now the agent's, which is a claim about the world and
@@ -939,6 +1058,13 @@ def api_step(request: Request, alert_id: str, action: str, body: _Step):
         actor = ex["email"]
     if action == "escalate":
         return escalate(alert_id, actor, body.note)
+    if action == "return":
+        # Bound: it states that the work is someone else's again, which is a
+        # claim about the world in exactly the sense resolve and assign are.
+        res = return_to_owner(alert_id, actor, body.note)
+        if not res.get("ok"):
+            raise HTTPException(status_code=409, detail=res.get("error"))
+        return res
     if action == "delegate":
         # The principal is built from the session, not from `actor`, so the
         # plan and every proposal it queues are attributed to the executive who
@@ -951,7 +1077,7 @@ def api_step(request: Request, alert_id: str, action: str, body: _Step):
             raise HTTPException(status_code=409, detail=res.get("error"))
         return res
     if action not in _ACTIONS:
-        raise HTTPException(status_code=404, detail=f"unknown action; one of {sorted(_ACTIONS)}, escalate or delegate")
+        raise HTTPException(status_code=404, detail=f"unknown action; one of {sorted(_ACTIONS)}, escalate, delegate or return")
     res = transition(alert_id, _ACTIONS[action], actor, note=body.note,
                      assignee=body.assignee, evidence=body.evidence,
                      disposition=body.disposition)

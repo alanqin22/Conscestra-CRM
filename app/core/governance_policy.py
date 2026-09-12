@@ -557,7 +557,7 @@ def _text_to_html(body_text: str) -> str:
 
 
 def email_authority(exec_row: Optional[Dict[str, Any]], subject: str, body_text: str,
-                    *, kind: str, ref: str,
+                    *, kind: str, ref: str, ordinal: Optional[int] = None,
                     body_html: Optional[str] = None) -> Dict[str, Any]:
     """Email an executive about a governance event — a breached approval, an
     escalation, an alert now theirs (§26.6: email immediately; a real paging
@@ -577,7 +577,11 @@ def email_authority(exec_row: Optional[Dict[str, Any]], subject: str, body_text:
     try:
         from app.core import staff_email
         claim = staff_email.begin_send(
-            kind=kind, tier=staff_email.TIER_INTERRUPT, ref=ref,
+            # `ordinal` distinguishes repeats of the same (kind, ref) and is
+            # the ONLY place a repeat counter belongs. It must not be folded
+            # into `ref`, which is written to subject_ref_id -- a uuid column
+            # that refuses anything else, silently costing the send its row.
+            kind=kind, tier=staff_email.TIER_INTERRUPT, ref=ref, ordinal=ordinal,
             recipient_email=exec_row["email"], recipient_kind="executive",
             recipient_owner_id=exec_row.get("owner_id"), subject=subject,
             subject_ref_type="approval", subject_ref_id=ref,
