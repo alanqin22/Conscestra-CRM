@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-b0f47e9e14d840a4ff8ef6c1e141a0ec1300e9d2
+fdb53470ab78f1603736e3604020b1ae7d477500
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -211,3 +211,17 @@ b0f47e9e14d840a4ff8ef6c1e141a0ec1300e9d2
 #
 # Still stacked on feat/ungated-route-manifest by way of feat/alert-delegation,
 # for the reason recorded at 28e6be6.
+
+# fdb5347 -- plan-effect verification. Tests only; no SQL, so neither the
+# e802469 hazard nor its mirror applies, and the usual inverted dependency
+# holds: they import app.core.governance._no_observable_effect, which arrives
+# in the paired public commit.
+#
+# What changes at this pin is what a PASSING verification means. Before it,
+# _verify_execution answered "was the call made" for every action type outside
+# the three with specific checks, and a no-op verified. After it, an approval
+# carrying plan_goal whose result is all zero counts does not verify, and the
+# existing verification_failed alert fires. A suite green at this pin therefore
+# asserts something it did not assert before.
+#
+# Still stacked, by way of feat/owner-reminder, for the reason at 28e6be6.

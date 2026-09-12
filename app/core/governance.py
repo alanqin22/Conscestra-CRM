@@ -1504,6 +1504,30 @@ def _finish_execution(approval_uuid: str, token: str, status: str,
         conn.close()
 
 
+def _no_observable_effect(data: Any) -> bool:
+    """True when a result reports counts and every one of them is zero.
+
+    Deliberately conservative: it claims "nothing happened" only when the
+    result is all zeros and carries nothing that looks like a created record.
+    Anything ambiguous -- an identifier, a non-empty collection, a non-zero
+    number, an empty payload -- returns False, because a verifier that guesses
+    wrong in this direction raises a false alarm on legitimate work.
+    """
+    if not isinstance(data, dict) or not data:
+        return False
+    numbers: List[float] = []
+    for v in data.values():
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            numbers.append(float(v))
+        elif isinstance(v, str) and v.strip():
+            return False          # an id, a message, anything substantive
+        elif isinstance(v, (list, tuple, dict)) and len(v):
+            return False          # records came back
+    return bool(numbers) and all(n == 0 for n in numbers)
+
+
 def _verify_execution(ap: Dict[str, Any], res: Dict[str, Any]) -> Dict[str, Any]:
     """Post-action verification: is the effect OBSERVABLE, not just returned?
 
@@ -1556,6 +1580,39 @@ def _verify_execution(ap: Dict[str, Any], res: Dict[str, Any]) -> Dict[str, Any]
                     good = cur.fetchone() is not None
                     checks.append({"check": "marketing_campaigns.exists", "ok": good})
                     ok_all &= good
+
+                # A PLAN STEP THAT DID NOTHING DID NOT SERVE ITS GOAL.
+                #
+                # Every check above this point is either specific to three
+                # action types or is `dispatch_audit_row`, which asks whether
+                # the CALL WAS MADE. For any other capability that is the whole
+                # of the verification, and "the call was made" was then read as
+                # "the effect happened" -- a proxy standing in for the property.
+                #
+                # It cost five days. The supervisor composed the goal "Close
+                # revenue leakage ... generate their invoices", the planner had
+                # no invoice-creation capability in its manifest and, instead of
+                # returning the error its prompt asks for, proposed
+                # supervisor.emit_dunning. Three executives approved it on three
+                # days. Each run returned {"ok": true, "emitted_invoice_overdue
+                # _events": 0} -- a clean no-op -- and verified, because the
+                # dispatch really had been accepted. The alert recurred each
+                # time with an identical headline and nobody connected the two.
+                #
+                # NARROWED TO PLAN-DERIVED APPROVALS ON PURPOSE. A scheduled
+                # action that finds nothing to do is doing its job, and alerting
+                # on it would be the storm that gets a control switched off. An
+                # action PROPOSED TO SERVE A STATED GOAL is different: zero
+                # effect means the goal is not served, whatever the step
+                # returned.
+                plan_goal = (ap.get("params") or {}).get("plan_goal")
+                if plan_goal and _no_observable_effect(data):
+                    checks.append({
+                        "check": "plan_effect",
+                        "ok": False,
+                        "note": (f"executed with no observable effect ({data}) "
+                                 f"against the goal: {str(plan_goal)[:120]}")})
+                    ok_all = False
             except Exception as exc:                          # noqa: BLE001
                 conn.rollback()
                 checks.append({"check": f"{at}.state", "ok": None,
