@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-25e6e9f4e8366e668fbb519711d4d62b0aa57747
+186264e4831b5cbc7dda544f35ee708e59d3d622
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -242,3 +242,16 @@
 # identifiers must be supplied by the caller, and run_plan still passes write
 # steps the params the model drafted. The supervisor's revenue-leakage goal
 # remains unserveable, deliberately. Two tests fail if either boundary moves.
+
+# 186264e -- the apply-path honesty change. Tests only; no SQL, so neither the
+# e802469 hazard nor its mirror applies. They import
+# app.core.deploy_state.read_only_refusal, which arrives in the paired public
+# commit, so the usual inverted dependency holds.
+#
+# WHAT CHANGES FOR ANYONE READING THIS FILE LATER. apply_sql and migrate now
+# REFUSE a --target railway apply when the resolved DSN is read-only, with exit
+# 2 and a sentence naming the role and D-08 rather than libpq's "cannot execute
+# ALTER TABLE in a read-only transaction". --check and --dry-run are exempt.
+# And an apply that succeeds while its attestation fails now exits 3 behind a
+# banner, instead of one NOTE among four and exit 0. Three out-of-band files
+# reached Railway in September with no attestation row precisely that quietly.
