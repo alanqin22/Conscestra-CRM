@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid as _uuid
 import os
 from typing import Any, Dict, List, Optional
 
@@ -80,6 +81,9 @@ ACK_WINDOW_HOURS = float(os.getenv("GOV_ALERT_ACK_WINDOW_HOURS", "4"))
 # had no way to give: somebody else will do this. Without it, the only way to
 # get an alert off the desk was to claim it was handled.
 DISPOSITIONS = ("worked", "no_action_needed", "delegated")
+
+# A paragraph break inside a composed planner goal.
+_BLANK_LINE = chr(10) + chr(10)
 
 
 def _norm_sev(s: Optional[str]) -> str:
@@ -395,6 +399,136 @@ def escalate(alert_id: str, actor: str = "sla-sweep", note: Optional[str] = None
     return res
 
 
+def delegate_to_agent(alert_id: str, actor: str, instruction: str,
+                      *, principal: Optional[Any] = None) -> Dict[str, Any]:
+    """Hand a live alert to the planner as governed work.
+
+    WHY THIS EXISTS. On 2026-09-09 five alerts were closed by typing an
+    instruction into the Resolve dialog: "bill these 5 shipped orders", "find
+    the root cause, then resolve the issue", "remove them". Nothing executed
+    them, because the resolution note is an audit field and not a command
+    channel. The conditions were unchanged, the supervisor re-detected them the
+    same morning, and the re-raised alerts breached their deadline and
+    escalated to the CEO. A-06 has since made that particular mistake
+    impossible, but it closed the wrong door on its own: it stopped an
+    executive recording a delegation as an outcome without giving them any way
+    to actually delegate. This is that way.
+
+    IT DOES NOT RESOLVE THE ALERT, AND THAT IS THE POINT. Delegation is the
+    start of work, not its completion. The alert moves to `in_progress`, the
+    deadline keeps running, and the SLA sweep still escalates it if the plan
+    produces nothing. Resolving on delegation would let an alert leave the desk
+    on a promise, which is a quieter version of the failure above.
+
+    THE TRANSITION IS CONTINGENT ON THE DISPATCH. If the planner cannot be
+    reached, or refuses, the alert is left exactly where it was and the caller
+    is told. An alert that says `in_progress` when nothing was dispatched would
+    reproduce the original defect in a new place.
+
+    WHAT THE PLANNER MAY DO. `crm.plan_execute` runs reads and turns writes into
+    governed proposals; it sends nothing outbound. Delegating therefore queues
+    work for approval and does not perform it.
+
+    IT DOES NOT CONSULT `SUPERVISOR_PLANNER`, DELIBERATELY. That flag gates the
+    scheduled tick, where the question is whether the platform may compose plans
+    UNATTENDED. This path is attended by definition: a named executive pressed a
+    button and typed the instruction. Requiring the flag would leave the button
+    silently inert until an unrelated environment change, which is the failure
+    mode the whole engagement keeps finding -- a control that appears to work
+    and does nothing. If the intent is disabled at the mesh, the dispatch fails
+    and the alert is left alone, which is the correct outcome and a visible one.
+    """
+    instruction = (instruction or "").strip()
+    if not instruction:
+        return {"ok": False,
+                "error": "delegation requires an instruction saying what the "
+                         "agent should do. Without one there is nothing to "
+                         "dispatch, and the alert would move on an empty act."}
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, headline, rule, severity "
+                        "FROM governance_alerts WHERE alert_id=%s::uuid",
+                        (alert_id,))
+            row = cur.fetchone()
+    except Exception as exc:                                       # noqa: BLE001
+        return {"ok": False, "error": str(exc).splitlines()[0][:200]}
+    finally:
+        conn.close()
+    if not row:
+        return {"ok": False, "error": "alert not found"}
+    status, headline, rule, severity = row
+    if status not in LIVE:
+        return {"ok": False,
+                "error": f"alert is {status}; only a live alert can be delegated"}
+
+    # Imported rather than restated. `_breach_goal` already holds the business
+    # play for each rule -- "Close revenue leakage ... find the shipped-but-
+    # unbilled orders and generate their invoices" -- and a second copy here
+    # would drift from the one the scheduled tick uses. The import is local
+    # because supervisor imports this module.
+    from app.core import supervisor as _sup
+
+    base = _sup._breach_goal({"rule": rule, "headline": headline,
+                              "severity": severity}) or headline
+    goal = base + _BLANK_LINE + f"Instruction from {actor}: {instruction}"
+
+    # Dedupe on the COMPOSED goal, which is what the planner tags its proposals
+    # with. Re-sending the same instruction for the same breach is the double
+    # dispatch worth refusing; a different instruction is different work and is
+    # allowed through.
+    if _sup._plan_already_queued(goal):
+        return {"ok": False,
+                "error": "a plan for this instruction is already queued for "
+                         "approval; decide that one before dispatching another"}
+
+    cid = str(_uuid.uuid4())
+    try:
+        res = _sup._run_coro(_sup._dispatch_plan(
+            goal, cid, principal=principal, from_agent="governance-alerts"))
+    except Exception as exc:                                       # noqa: BLE001
+        res = {"ok": False, "error": str(exc).splitlines()[0][:200]}
+    if not res or not res.get("ok"):
+        err = (res or {}).get("error") or "unknown error"
+        logger.warning(f"[governance_alerts] delegation dispatch FAILED for "
+                       f"{alert_id[:8]}: {err}")
+        return {"ok": False, "dispatched": False,
+                "error": f"the agent could not be given this work ({err}). "
+                         f"The alert is unchanged."}
+
+    data = res.get("data") or {}
+    steps = len(data.get("trace") or [])
+    proposed = len(data.get("proposed_approvals") or [])
+    note = (f"Delegated to the agent by {actor}: {instruction[:140]} "
+            f"-- planned {steps} step(s), {proposed} queued for approval "
+            f"(correlation {cid[:8]})")
+
+    # open and assigned cannot reach in_progress directly; the lifecycle routes
+    # them through acknowledged. Delegating an alert means the delegator has
+    # read it, so acknowledging on their behalf states something already true.
+    if status in ("open", "assigned"):
+        ack = transition(alert_id, "acknowledged", actor, note=note)
+        if not ack.get("ok"):
+            return {"ok": False, "dispatched": True, "correlation_id": cid,
+                    "error": f"the plan was dispatched but the alert could not "
+                             f"be acknowledged: {ack.get('error')}"}
+        status = "acknowledged"
+
+    if status != "in_progress":
+        mv = transition(alert_id, "in_progress", actor, note=note)
+        if not mv.get("ok"):
+            return {"ok": False, "dispatched": True, "correlation_id": cid,
+                    "error": f"the plan was dispatched but the alert could not "
+                             f"be moved to in_progress: {mv.get('error')}"}
+
+    logger.info(f"[governance_alerts] {alert_id[:8]} DELEGATED by {actor} -- "
+                f"{steps} step(s), {proposed} queued, cid={cid[:8]}")
+    return {"ok": True, "alert_id": alert_id, "status": "in_progress",
+            "dispatched": True, "steps": steps, "queued_for_approval": proposed,
+            "correlation_id": cid, "goal": goal, "note": note}
+
+
 def remind_escalated(hours: float) -> Dict[str, Any]:
     """Re-announce alerts that are ESCALATED and still nobody's work.
 
@@ -676,7 +810,14 @@ from app.core.governance_policy import bound_authority
 # an oversight: it asserts only that a human has seen the alert, it cannot
 # clear or move accountability, and automation legitimately acknowledges on
 # receipt. It is the one transition where a body-supplied actor costs nothing.
-_BOUND_ACTIONS = {"resolve", "close", "cancel", "assign", "escalate"}
+_BOUND_ACTIONS = {"resolve", "close", "cancel", "assign", "escalate",
+                  "delegate"}
+
+# `delegate` is bound for the same reason as the five above: it states
+# that the work is now the agent's, which is a claim about the world and
+# must carry a name from the session. It is also the only action that
+# causes work to be dispatched, so the identity it records is the one the
+# resulting plan and its proposals are attributed to.
 
 
 @router.post("/governance/alerts/{alert_id}/{action}")
@@ -687,8 +828,19 @@ def api_step(request: Request, alert_id: str, action: str, body: _Step):
         actor = ex["email"]
     if action == "escalate":
         return escalate(alert_id, actor, body.note)
+    if action == "delegate":
+        # The principal is built from the session, not from `actor`, so the
+        # plan and every proposal it queues are attributed to the executive who
+        # asked for them rather than to a background service.
+        from app.core.a2a import Principal
+        principal = Principal.from_session(getattr(request.state, "session", None))
+        res = delegate_to_agent(alert_id, actor, body.note or "",
+                                principal=principal)
+        if not res.get("ok"):
+            raise HTTPException(status_code=409, detail=res.get("error"))
+        return res
     if action not in _ACTIONS:
-        raise HTTPException(status_code=404, detail=f"unknown action; one of {sorted(_ACTIONS)} or escalate")
+        raise HTTPException(status_code=404, detail=f"unknown action; one of {sorted(_ACTIONS)}, escalate or delegate")
     res = transition(alert_id, _ACTIONS[action], actor, note=body.note,
                      assignee=body.assignee, evidence=body.evidence,
                      disposition=body.disposition)

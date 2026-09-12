@@ -529,18 +529,27 @@ def _run_coro(coro) -> Any:
         return ex.submit(lambda: asyncio.run(coro)).result()
 
 
-async def _dispatch_plan(goal: str, cid: str) -> Dict[str, Any]:
+async def _dispatch_plan(goal: str, cid: str,
+                         principal: Optional[Any] = None,
+                         from_agent: str = "supervisor") -> Dict[str, Any]:
     """Execute the plan through the typed A2A layer (crm.plan_execute) so the
     play is audited + correlation-chained in one place — reads run, writes queue
-    for governance. Never sends anything outbound."""
+    for governance. Never sends anything outbound.
+
+    `principal` and `from_agent` are parameters because this same dispatch now
+    serves two callers with different authority. The scheduled tick is
+    unattended and speaks as a service. A delegation from the Alert Center is
+    initiated by a named executive, and recording that as `service:supervisor`
+    would attribute a person's instruction to the scheduler. The default keeps
+    the tick's behaviour exactly as it was."""
     from app.core.a2a import A2ARequest, Principal, dispatch
     res = await dispatch(A2ARequest(
-        intent="crm.plan_execute", from_agent="supervisor",
+        intent="crm.plan_execute", from_agent=from_agent,
         # Unattended work is not anonymous work. `from_agent` names the
         # component; the principal names the authority, and a write now
         # requires one. A scheduled supervisor tick that could not say who it
         # was would be indistinguishable from a request with a lost identity.
-        principal=Principal.service("supervisor"),
+        principal=principal or Principal.service("supervisor"),
         params={"goal": goal}, correlation_id=cid))
     return {"ok": res.ok, "error": res.error, "data": res.data}
 
