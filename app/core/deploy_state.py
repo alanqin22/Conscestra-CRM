@@ -350,6 +350,21 @@ _PENDING_READONLY_ROLE = (
     "and requiring each to be refused, and reports the rotation separately as "
     "an outstanding item rather than folding it into a pass.")
 
+_PENDING_GENERATE_INVOICE_POLICY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-12. One governance_action_policies "
+    "row for accounting.generate_invoice: financial class, HUMAN_APPROVAL, CFO "
+    "approves, CEO escalates, never auto-executes. Additive and idempotent; "
+    "inserts only when the action_type is absent. "
+    "IT DOES NOT CHANGE WHAT IS PERMITTED. An undeclared write capability "
+    "already fails closed to the CEO with human approval, so this row moves the "
+    "decision to the authority who owns the money and makes it explicit rather "
+    "than making it safer. "
+    "NO DEPLOY ORDER CONSTRAINT relative to the app: the capability is refused "
+    "for want of its required identifiers whether or not this row exists, and "
+    "the policy is read at decision time rather than at registration. "
+    "Promote to REQUIRED_MIGRATIONS in the same change that records its Railway "
+    "application, and not before.")
+
 _PENDING_OWNER_REMIND_KIND = (
     "PENDING DEPLOYMENT -- authored 2026-09-12. Additive and idempotent: it "
     "widens the staff_email_ledger send vocabulary by one kind, "
@@ -718,6 +733,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "governance_alert_ack_and_disposition.sql": _PENDING_ALERT_DISPOSITION,
     "governance_alert_resolution_required.sql": _PENDING_ALERT_RESOLUTION_REQUIRED,
     "staff_email_ledger_owner_remind_kind.sql": _PENDING_OWNER_REMIND_KIND,
+    "governance_policy_generate_invoice.sql": _PENDING_GENERATE_INVOICE_POLICY,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,

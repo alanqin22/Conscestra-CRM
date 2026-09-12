@@ -396,6 +396,25 @@ def _sp_exec(build: Callable, params: Dict[str, Any]) -> Any:
     return rows
 
 
+def _sp_generate_invoice(p: Dict[str, Any]) -> Any:
+    """Invoice an EXPLICIT list of orders for an EXPLICIT account.
+
+    It performs no discovery, and that is the contract rather than an omission.
+    The stored procedure raises on a missing accountId or an empty orderIds,
+    and `validate_params` refuses the call before it gets that far.
+    """
+    from app.agents.accounting.sql_builder import build_accounting_query
+    # Named explicitly rather than splatted. `**p` would honour contactId in
+    # fact while hiding it from any reader -- and from the integrity check that
+    # asks whether a declared field is actually read.
+    call = {"mode": "generate_invoice",
+            "accountId": p.get("accountId"),
+            "orderIds": p.get("orderIds")}
+    if p.get("contactId"):
+        call["contactId"] = p["contactId"]
+    return _sp_exec(build_accounting_query, call)
+
+
 def _sp_accounting_summary(p: Dict[str, Any]) -> Any:
     from app.agents.accounting.sql_builder import build_accounting_query
     return _sp_exec(build_accounting_query, {"mode": "accounting_summary"})
@@ -787,6 +806,42 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                lambda p: "accounting summary",
                "AR/AP financial health summary",
                sp=_sp_accounting_summary),
+    # REGISTERED SO THAT IT FAILS HONESTLY, not so that invoicing is automated.
+    #
+    # Between 2026-09-07 and 2026-09-11 the supervisor asked for "Close revenue
+    # leakage ... find the shipped-but-unbilled orders and generate their
+    # invoices". No invoice-creation capability was registered, so the planner
+    # -- told to return an error when a goal cannot be served -- instead
+    # proposed supervisor.emit_dunning, which three executives approved and
+    # which did nothing on all three days.
+    #
+    # WHAT THIS DOES AND DOES NOT CHANGE. The capability now exists with its
+    # REAL contract: both identifiers are required and neither is discoverable
+    # from here. A plan that cannot supply them is refused by validate_params
+    # at dispatch instead of being answered with a different action. That is an
+    # improvement in truthfulness, not an invoicing feature.
+    #
+    # IT REMAINS UNSERVEABLE FROM A BREACH GOAL, deliberately. run_plan passes
+    # each write step the params the model drafted, and read results reach only
+    # the trace, so an accountId discovered at runtime cannot travel into this
+    # call. Closing that gap is a planner data-flow change (A2) and creating a
+    # discover-and-bill capability is a financial-control decision (A3); both
+    # are separate, and neither is implemented here.
+    #
+    # The description says "no discovery" in as many words because it is what
+    # the drafting model reads: a capability that looks like it can find its own
+    # orders is one the model will reach for without identifiers.
+    Capability("accounting.generate_invoice", "accounting", "/accounting-chat", "write",
+               lambda p: (f"generate an invoice for account "
+                          f"{p.get('accountId', '')} covering orders "
+                          f"{p.get('orderIds', '')}"),
+               "create an invoice for one EXISTING account from an EXPLICIT "
+               "list of order ids. Performs NO discovery: it cannot find which "
+               "orders are unbilled, and both accountId and orderIds must be "
+               "supplied by the caller from data it already holds. If you do "
+               "not have both, this capability cannot serve the goal",
+               sp=_sp_generate_invoice,
+               params_schema=(("accountId", "orderIds"), ("contactId",))),
     Capability("accounting.account_balance", "accounting", "/accounting-chat", "read",
                lambda p: f"account balance: {p.get('account', '')}",
                "outstanding / paid / overdue balance for an account"),
