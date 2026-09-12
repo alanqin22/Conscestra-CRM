@@ -2597,13 +2597,46 @@ async def health():
     return _payload
 
 
-@app.delete("/sessions/{session_id}")
+# ── Conversation-memory operations. Administrator access only. ───────────
+#
+# Both routes were anonymous until 2026-09-11. The DELETE was the material one.
+# `clear_session` calls `memory._db_delete`, which issues a raw
+# `DELETE FROM agent_session_memory WHERE session_id = %s`. That is durable
+# state rather than an in-process cache, and the deletion is permanent.
+#
+# The route was reachable without authentication, on an identifier that is
+# neither secret nor difficult to guess. "default-session" is the literal
+# default across the agent graphs and is returned in ordinary chat responses.
+# Production held a `default-session` row updated the same day, so an
+# unauthenticated caller could have destroyed it.
+#
+# The route also sat outside `require_data_access`, and `set_request_role` was
+# therefore never invoked for it. The deep write guard
+# (`write_guard.readonly_context`, consulted in `execute_sp`) consequently had
+# no role to act on. It would not have observed this write in any case, because
+# `_db_delete` uses `get_connection()` directly rather than going through
+# `execute_sp`. An ungated route is not only unauthenticated; it is also
+# invisible to the layer beneath it.
+#
+# The administrator gate was selected in preference to the data gate because
+# neither route belongs to a CRM user. Nothing in the product calls them, and
+# they exist for operator introspection and manual resets. This was verified
+# before the gate was chosen: no page in the repository requests /sessions.
+#
+# The GET is gated as well, and not solely for symmetry. `active_sessions()`
+# returns the keys held by the calling process, and its own docstring notes
+# that the database may hold more, so on a two-worker deployment it
+# under-reports by construction. That behaviour is what made the endpoint
+# appear harmless, as it returned `{"sessions": []}` while 13 durable rows
+# existed. Publishing session identifiers is also the precondition the DELETE
+# above requires.
+@app.delete("/sessions/{session_id}", dependencies=_ADMIN)
 async def delete_session(session_id: str):
     clear_session(session_id)
     return {"status": "cleared", "session_id": session_id}
 
 
-@app.get("/sessions")
+@app.get("/sessions", dependencies=_ADMIN)
 async def list_sessions():
     return {"sessions": active_sessions()}
 
