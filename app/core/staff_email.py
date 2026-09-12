@@ -200,6 +200,11 @@ EMAIL_KINDS = (
     "alert_assigned",       # it became someone's obligation
     "alert_escalated",      # its SLA passed and ownership moved
     "alert_remind",         # still open after escalation; ref carries n
+    "alert_owner_remind",   # NOT yet breached: the owner is nudged before the
+                            # deadline. Separate from alert_remind because that
+                            # one announces a breach to the escalation
+                            # authority, and both carry ref=<alert_id>; one kind
+                            # would suppress the second send as a duplicate.
     # customer escalations (escalation.py)
     "escalation",
     "escalation_remind",    # declared since inception; still no producer

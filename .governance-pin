@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-28e6be69ec4f739682ee49464d05801f956c0a3d
+b0f47e9e14d840a4ff8ef6c1e141a0ec1300e9d2
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -189,3 +189,25 @@
 # pin governance to a commit whose tests cannot import, and CI would fail on
 # collection rather than on anything this change did. Same shape as the
 # 18e7e4b entry above, and the same remedy: stack rather than cut from master.
+
+# b0f47e9 -- the pre-deadline owner reminder (P3). NOT tests only, and this is
+# the e802469 hazard in its usual direction: deploy_state now declares one more
+# out_of_band file, staff_email_ledger_owner_remind_kind.sql, so a public commit
+# pinned earlier than this would fail with DECLARED BUT ABSENT FROM DISK.
+#
+# THE DEPLOY ORDER IS THE REVERSE OF 0973596 AND MUST NOT BE COPIED FROM IT.
+# There, the SQL had to be applied LAST, because the trigger would otherwise
+# demand a field the running app did not write. Here the SQL must be applied
+# FIRST, because the app emits a send kind the CHECK does not yet admit, and an
+# undeclared kind does not fail the send -- it costs the send its ledger row and
+# proceeds. That is not a hypothesis: the alert_assigned kind shipped in that
+# order on 2026-09-08 and the three owner emails of 2026-09-09 were delivered
+# and recorded nowhere.
+#
+# Not promoted into REQUIRED_MIGRATIONS, and for this file the reason is
+# sharper than "Railway has not run it": declaring a vocabulary file into the
+# governed chain before the database holds the constraint would assert a kind
+# the CHECK still refuses.
+#
+# Still stacked on feat/ungated-route-manifest by way of feat/alert-delegation,
+# for the reason recorded at 28e6be6.

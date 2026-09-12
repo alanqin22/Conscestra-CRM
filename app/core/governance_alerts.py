@@ -608,6 +608,111 @@ def remind_escalated(hours: float) -> Dict[str, Any]:
     return {"reminded": len(sent), "ids": sent}
 
 
+OWNER_REMIND_FRACTION = float(os.getenv("GOV_OWNER_REMIND_FRACTION", "0.75"))
+
+
+def remind_owners_before_deadline(fraction: Optional[float] = None) -> Dict[str, Any]:
+    """Nudge an alert's accountable owner once, BEFORE its deadline.
+
+    WHY THIS EXISTS. Until now an owner heard about their alert exactly once, at
+    creation. The next message the system sent about it went to the escalation
+    authority, after the deadline had already passed. Three alerts raised on
+    2026-09-09 followed that path precisely: the CFO and the CRO were each told
+    once, nothing happened for 48 hours, and on 2026-09-11 all three escalated
+    to the CEO, who then held work owned by two other people. An obligation
+    whose owner is reminded only after they have missed it is not being managed;
+    it is being recorded.
+
+    IT IS SENT ONCE, AND THE LEDGER IS WHAT GUARANTEES THAT. The identity is
+    (kind='alert_owner_remind', ref=<alert_id>), so `begin_send` refuses the
+    second attempt even though the sweep runs every fifteen minutes. Two things
+    had to be true for that guard to work, and both were broken elsewhere in
+    this module until they were checked: the kind must be admitted by
+    EMAIL_KINDS and by the ledger CHECK, or the row is refused and the send
+    falls open unrecorded; and `ref` must be a bare uuid, because it is written
+    to `subject_ref_id`, which is uuid-typed. `remind_escalated` passes
+    "<uuid>:reminder:<n>" and has therefore never written a ledger row.
+
+    WHICH ALERTS. Live, not yet breached, and past `fraction` of their SLA.
+    `escalated` is excluded because the deadline has already gone and the
+    escalation path owns it from there. `in_progress` is excluded because
+    somebody has demonstrably picked the work up, and nudging them is the alert
+    storm this module refuses elsewhere. `acknowledged` is INCLUDED: it means
+    the alert was seen, which is not the same as it being worked, and an
+    acknowledgement 30 hours ago with 12 hours left is exactly the case worth a
+    reminder.
+
+    IT DOES NOT MOVE THE DEADLINE, and it does not change the alert's status. A
+    reminder is a message, not a lifecycle event; if the owner still does not
+    act, the alert breaches and escalates on the ordinary schedule.
+    """
+    frac = OWNER_REMIND_FRACTION if fraction is None else float(fraction)
+    frac = min(max(frac, 0.0), 1.0)
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT alert_id::text, headline, severity, rule,
+                          accountable_owner_id::text, due_at
+                     FROM governance_alerts
+                    WHERE status IN ('open','assigned','acknowledged')
+                      AND due_at IS NOT NULL
+                      AND now() < due_at
+                      AND now() >= created_at + (due_at - created_at) * %(f)s
+                    ORDER BY due_at LIMIT 50""", {"f": frac})
+            rows = cur.fetchall()
+    except Exception as exc:                                       # noqa: BLE001
+        return {"ok": False, "error": str(exc).splitlines()[0][:160], "reminded": 0}
+    finally:
+        conn.close()
+
+    by_owner = {a.get("owner_id"): a for a in gp.authorities() if a.get("owner_id")}
+    sent: List[str] = []
+    for aid, headline, sev, rule, owner_id, due in rows:
+        who = by_owner.get(owner_id)
+        if not who:
+            # An owner with no executive record cannot be emailed. Logged rather
+            # than skipped silently, because "nobody was reminded" and "there
+            # was nobody to remind" are different facts.
+            logger.warning(f"[governance_alerts] no executive for owner "
+                           f"{str(owner_id)[:8]} on alert {aid[:8]}; not reminded")
+            continue
+        body = chr(10).join([
+            headline,
+            "",
+            f"Rule:     {rule or '-'}",
+            f"Severity: {sev}",
+            f"Due:      {due.isoformat() if due else '?'}",
+            "",
+            "This is still open and its deadline has not passed yet. It is "
+            "yours to work.",
+            "",
+            "If it is not decided by the deadline it escalates to the "
+            f"{gp.ESCALATION_ROLE}, and it stays yours on the record even then.",
+            "",
+            "If you want the agent to do the work, open it and use "
+            "'Delegate to agent' -- typing an instruction into 'Mark handled' "
+            "records an outcome and dispatches nothing.",
+            "",
+            f"Open it here:{chr(10)}{console_link(aid)}",
+        ])
+        try:
+            res = gp.email_authority(
+                who, f"[Reminder] Still yours, due soon: {headline[:60]}",
+                body, kind="alert_owner_remind", ref=aid)
+            if res.get("sent"):
+                sent.append(aid)
+        except Exception as exc:                                   # noqa: BLE001
+            logger.warning(f"[governance_alerts] owner reminder FAILED for "
+                           f"{aid[:8]}: {str(exc)[:160]}")
+    if sent:
+        logger.info(f"[governance_alerts] reminded {len(sent)} owner(s) before "
+                    f"deadline at {frac:.0%} of SLA")
+    return {"ok": True, "reminded": len(sent), "considered": len(rows),
+            "ids": sent, "fraction": frac}
+
+
 def sweep_sla() -> Dict[str, Any]:
     """Escalate every live, un-escalated alert past its deadline, then
     re-announce anything escalated that nobody has picked up. Idempotent."""
@@ -640,8 +745,14 @@ def sweep_sla() -> Dict[str, Any]:
                        f"{gp.ESCALATION_ROLE}")
     import os as _os
     rem = remind_escalated(float(_os.getenv("GOV_REESCALATE_HOURS", "24")))
+    # The pre-deadline half. Runs AFTER escalation so that an alert which just
+    # breached on this same tick is escalated rather than nudged -- the query
+    # below excludes anything past due_at, but doing it in this order means the
+    # two never race over the same alert.
+    own = remind_owners_before_deadline()
     return {"ok": True, "escalated": len(done), "failed": failed, "ids": done,
-            "reminded": rem.get("reminded", 0)}
+            "reminded": rem.get("reminded", 0),
+            "owners_reminded": own.get("reminded", 0)}
 
 
 def resolve_by_class(alert_class: str, actor: str, note: str,

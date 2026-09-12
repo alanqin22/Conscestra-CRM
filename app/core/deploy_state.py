@@ -350,6 +350,21 @@ _PENDING_READONLY_ROLE = (
     "and requiring each to be refused, and reports the rotation separately as "
     "an outstanding item rather than folding it into a pass.")
 
+_PENDING_OWNER_REMIND_KIND = (
+    "PENDING DEPLOYMENT -- authored 2026-09-12. Additive and idempotent: it "
+    "widens the staff_email_ledger send vocabulary by one kind, "
+    "alert_owner_remind, for the pre-deadline nudge to an alert's accountable "
+    "owner. "
+    "APPLY THIS BEFORE THE APP THAT EMITS THE KIND. The reverse order has "
+    "already cost this system a record: on 2026-09-08 the owner-notice code "
+    "shipped emitting alert_assigned before either EMAIL_KINDS or the CHECK "
+    "admitted it, so the three owner emails raised on 2026-09-09 were SENT and "
+    "NOT recorded -- begin_send falls open, which costs the send its ledger "
+    "row and never the message. The absence of rows was then read for two days "
+    "as the absence of mail. "
+    "Promote to REQUIRED_MIGRATIONS in the same change that records its "
+    "Railway application, and not before.")
+
 _PENDING_ALERT_RESOLUTION_REQUIRED = (
     "PENDING DEPLOYMENT -- authored 2026-09-10 and applied to LOCAL only. "
     "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
@@ -702,6 +717,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "corpus_provenance.sql": _PENDING_CORPUS_PROVENANCE,
     "governance_alert_ack_and_disposition.sql": _PENDING_ALERT_DISPOSITION,
     "governance_alert_resolution_required.sql": _PENDING_ALERT_RESOLUTION_REQUIRED,
+    "staff_email_ledger_owner_remind_kind.sql": _PENDING_OWNER_REMIND_KIND,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
