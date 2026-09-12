@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-d420f8b208c4debe536b82465907b226deb1dad6
+28e6be69ec4f739682ee49464d05801f956c0a3d
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -176,3 +176,16 @@ d420f8b208c4debe536b82465907b226deb1dad6
 # ungated would be false, and its authorisation is an in-handler HMAC check
 # with no dependency to read, so reporting it as gated would credit the
 # dependency mechanism with a control it does not perform.
+
+# 28e6be6 -- the alert delegation tests. Tests only, so neither the e802469
+# hazard nor its mirror applies, and the same inverted dependency as 0b6b491
+# holds: they import app.core.governance_alerts.delegate_to_agent, which
+# arrives in the paired public commit.
+#
+# THIS BRANCH IS STACKED on feat/ungated-route-manifest and must merge after
+# it. The reason is this file. 28e6be6 is a DESCENDANT of d420f8b, so a
+# checkout at this pin also carries test_ungated_routes_are_declared.py, which
+# imports app/core/route_exposure.py. A public commit cut from master would
+# pin governance to a commit whose tests cannot import, and CI would fail on
+# collection rather than on anything this change did. Same shape as the
+# 18e7e4b entry above, and the same remedy: stack rather than cut from master.
