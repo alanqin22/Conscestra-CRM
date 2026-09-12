@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-fb91a7be570ab4b40004345cc02dce3ef0647a37
+0b6b49166e46e12f967cb912baad6ae200815fbe
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -141,3 +141,19 @@ fb91a7be570ab4b40004345cc02dce3ef0647a37
 # lets anyone infer business scale"), and that reason is preserved as the
 # assertion that the amount fields still default to None.
 
+# 0b6b491 -- the ungated-route manifest and the /sessions gate. Tests only, so
+# neither the e802469 hazard nor its mirror applies. The pin is worth reading
+# for a different reason.
+#
+# test_ungated_routes_are_declared enumerates the live application and requires
+# every route to be gated or declared in app/core/route_exposure. It therefore
+# depends on that module, which arrives in the paired public commit, and a
+# governance checkout at this pin against an earlier public commit will fail on
+# the import rather than on an assertion. The dependency runs in the direction
+# opposite to the usual one recorded in this file.
+#
+# It also changes what a passing suite means. Enforcement previously rested on a
+# list of six named routers, so a router added afterwards was outside the check.
+# From this pin, a new route that is neither gated nor declared fails the suite.
+# That is intended, and the remedy is to add the gate or write the declaration,
+# not to widen the manifest to make the run green.
