@@ -350,6 +350,48 @@ _PENDING_READONLY_ROLE = (
     "and requiring each to be refused, and reports the rotation separately as "
     "an outstanding item rather than folding it into a pass.")
 
+_PENDING_A3_FINANCIAL_STATE = (
+    "PENDING DEPLOYMENT -- authored 2026-09-13. The A3 financial-state "
+    "implementation: order_invoiceability (mutable current decision), "
+    "order_invoiceability_transitions and order_financial_assertions (both "
+    "append-only via the existing trgfn_append_only), product_tax_treatment "
+    "(created EMPTY by design), five nullable proposition columns on "
+    "action_approvals, and seven guard functions. "
+    "THE AUDIT PATH IS ENFORCED, NOT ASSERTED. order_invoiceability is a "
+    "MUTABLE current decision, so three controls make it auditable rather "
+    "than merely documented: an AFTER trigger records every eligibility "
+    "change into order_invoiceability_transitions with the predecessor and "
+    "successor read from OLD and NEW; a BEFORE DELETE trigger refuses "
+    "deletion, because absence of a row means NO DECISION RECORDED and "
+    "deleting one would silently restate a decision as an unrecorded one; "
+    "and BEFORE TRUNCATE triggers close the same removal on all three A3 "
+    "tables. A BEFORE INSERT trigger on the transition table enforces the "
+    "CONVERSE, that every transition corresponds to a real eligibility "
+    "change: the successor must equal the current decision, the predecessor "
+    "must equal the end of the recorded chain, and the two must differ. "
+    "Those conditions cannot all hold for any row written outside the "
+    "recorder, so the table is recorder-owned by construction rather than by "
+    "permission -- which matters because ALTER DEFAULT PRIVILEGES grants "
+    "crm_app full DML on every new table, so a REVOKE here would neither be "
+    "durable nor bind the superuser the application connects as locally. "
+    "order_invoiceability_transitions also gains transition_seq "
+    "(bigserial), the ordering authority, for the reason assertion_seq "
+    "exists: `at` is transaction-scoped and the uuid primary key broke the "
+    "tie by chance, which read a five-step history back in the wrong order "
+    "in 12 of 12 runs. "
+    "ADDITIVE AND IDEMPOTENT. It creates tables, adds nullable columns and "
+    "attaches triggers; it reads no existing row, writes no existing row and "
+    "backfills nothing. "
+    "NO TABLE-WIDE CONSTRAINT IS ADDED, and that is the design rather than an "
+    "omission: 2,463 of 2,521 orders carry no currency, all 415 products are "
+    "unclassified for tax, and 2,032 orders have no fulfilment event, so a "
+    "blanket NOT NULL would force a value onto historical rows that do not "
+    "have one. Every invariant is enforced at the transition that requires it. "
+    "Applying it therefore changes no existing behaviour: nothing writes to "
+    "the new tables until the A3 application path does. "
+    "Promote to REQUIRED_MIGRATIONS in the same change that records its "
+    "Railway application, and not before.")
+
 _PENDING_GENERATE_INVOICE_POLICY = (
     "PENDING DEPLOYMENT -- authored 2026-09-12. One governance_action_policies "
     "row for accounting.generate_invoice: financial class, HUMAN_APPROVAL, CFO "
@@ -734,6 +776,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "governance_alert_resolution_required.sql": _PENDING_ALERT_RESOLUTION_REQUIRED,
     "staff_email_ledger_owner_remind_kind.sql": _PENDING_OWNER_REMIND_KIND,
     "governance_policy_generate_invoice.sql": _PENDING_GENERATE_INVOICE_POLICY,
+    "a3_financial_state.sql": _PENDING_A3_FINANCIAL_STATE,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
