@@ -1523,6 +1523,52 @@ def schema_fingerprint(dsn: Optional[str] = None) -> Dict[str, Any]:
             "objects": objs, "object_count": len(objs), "database": db}
 
 
+def read_only_refusal(dsn: Optional[str] = None,
+                      label: str = "the target") -> Optional[str]:
+    """A sentence explaining why this connection cannot apply DDL, or None.
+
+    WHY THIS EXISTS. D-08 repointed RAILWAY_DB_URL at `crm_readonly`, which
+    carries `default_transaction_read_only=on`. Every Railway-targeting tool
+    reads that one variable, so `apply_sql --target railway` and
+    `migrate --target railway` -- the sanctioned path for a governed migration
+    -- now fail with libpq's
+
+        cannot execute ALTER TABLE in a read-only transaction
+
+    which describes the symptom and hides the cause. Nothing in it mentions
+    roles, D-08, or that the DSN was downgraded deliberately, so an operator
+    meets a puzzle instead of a stated policy. This says the policy instead.
+
+    Best-effort and fail-open: if the check itself cannot run, it returns None
+    and the apply proceeds to fail the old way. Refusing an apply because a
+    diagnostic could not connect would be worse than the message it replaces.
+    """
+    try:
+        conn = _attestation_conn(dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT current_user, "
+                            "current_setting('default_transaction_read_only')")
+                user, read_only = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:                                       # noqa: BLE001
+        logger.debug(f"read-only preflight skipped: {exc}")
+        return None
+    if str(read_only).lower() not in ("on", "true", "yes"):
+        return None
+    nl = chr(10)
+    return (f"{label} resolves to the role {user!r}, which is READ-ONLY "
+            f"(default_transaction_read_only=on).{nl}"
+            f"Nothing was applied.{nl}{nl}"
+            f"This is D-08 working as intended: the default connection for "
+            f"this environment cannot write, so an accidental apply is "
+            f"impossible. A governed migration needs a privileged DSN supplied "
+            f"deliberately for the single invocation -- set the target DSN in "
+            f"the shell for this command only, and close the shell afterwards, "
+            f"rather than writing a superuser DSN into .env.")
+
+
 def record_schema_attestation(source: str, detail: str = "",
                               dsn: Optional[str] = None) -> Dict[str, Any]:
     """Record what the schema looks like now, because a TOOL just changed it.

@@ -86,6 +86,20 @@ def main() -> int:
     else:
         dsn = get_settings().db_dsn
 
+    # PREFLIGHT: the same refusal apply_sql makes, for the same reason.
+    # D-08 repointed RAILWAY_DB_URL at crm_readonly, so THIS -- the sanctioned
+    # path for a governed migration -- fails with libpq's "cannot execute
+    # ALTER TABLE in a read-only transaction", which names the symptom and
+    # hides the cause. --check and --dry-run are exempt: both are read-only by
+    # design, and a read-only connection is the right place to run them.
+    if not (args.check or args.dry_run):
+        from app.core.deploy_state import read_only_refusal
+        refusal = read_only_refusal(
+            dsn, "RAILWAY" if args.target == "railway" else "the local target")
+        if refusal:
+            print("REFUSED — " + refusal)
+            return 2
+
     conn = psycopg2.connect(dsn)
     # AUTOCOMMIT OFF. It used to be on, which meant the migration DDL committed
     # and the ledger INSERT committed separately -- a crash between them left a

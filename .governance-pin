@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-25e6e9f4e8366e668fbb519711d4d62b0aa57747
+4d3b3916ac89e9613bc256a28f6f1037c774e586
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -242,3 +242,28 @@
 # identifiers must be supplied by the caller, and run_plan still passes write
 # steps the params the model drafted. The supervisor's revenue-leakage goal
 # remains unserveable, deliberately. Two tests fail if either boundary moves.
+
+# 186264e -- the apply-path honesty change. Tests only; no SQL, so neither the
+# e802469 hazard nor its mirror applies. They import
+# app.core.deploy_state.read_only_refusal, which arrives in the paired public
+# commit, so the usual inverted dependency holds.
+#
+# WHAT CHANGES FOR ANYONE READING THIS FILE LATER. apply_sql and migrate now
+# REFUSE a --target railway apply when the resolved DSN is read-only, with exit
+# 2 and a sentence naming the role and D-08 rather than libpq's "cannot execute
+# ALTER TABLE in a read-only transaction". --check and --dry-run are exempt.
+# And an apply that succeeds while its attestation fails now exits 3 behind a
+# banner, instead of one NOTE among four and exit 0. Three out-of-band files
+# reached Railway in September with no attestation row precisely that quietly.
+
+# 4d3b391 -- the alert-lifecycle pair: the escalation reminder's ledger
+# identity, and return_to_owner. Tests only, and a DESCENDANT of 186264e, so a
+# checkout here also carries the apply-path tests.
+#
+# The reminder half is the one to read twice. `ref` is written to
+# subject_ref_id, a uuid column, and the ordinal was being folded into it -- so
+# every reminder insert failed its cast and begin_send fell open. The mail went
+# and the row never did, which is why production holds zero rows of any remind
+# kind. The fix uses the `ordinal` begin_send has always taken. Two tests are
+# needed rather than one: a bare ref with no ordinal would suppress reminder 2
+# as a duplicate of reminder 1.

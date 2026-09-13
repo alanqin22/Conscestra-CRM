@@ -119,6 +119,21 @@ def main() -> int:
         print("MODE:   applying to PRODUCTION")
     print()
 
+    # PREFLIGHT: say why, instead of letting libpq say what.
+    #
+    # D-08 repointed RAILWAY_DB_URL at crm_readonly, so this script and
+    # migrate.py -- the sanctioned path for a governed migration -- began
+    # failing with "cannot execute ALTER TABLE in a read-only transaction",
+    # a message that names the symptom and hides the cause. A dry run is
+    # exempt: it rolls back by design and a read-only connection is a
+    # perfectly good place to check that a file parses.
+    if not args.dry_run:
+        from app.core.deploy_state import read_only_refusal
+        refusal = read_only_refusal(dsn, label)
+        if refusal:
+            print("REFUSED — " + refusal)
+            return 2
+
     conn = psycopg2.connect(dsn)
     try:
         with conn.cursor() as cur:
@@ -154,6 +169,7 @@ def main() -> int:
         print("ROLLED BACK — nothing changed.")
     else:
         print(f"APPLIED to {label}.")
+        attested, attest_error, unattested = True, "", False
         # Record what the schema looks like now, because a TOOL just
         # changed it. Anything that shifts the fingerprint WITHOUT
         # leaving one of these used neither door — which is the only
@@ -161,21 +177,46 @@ def main() -> int:
         try:
             from app.core.deploy_state import record_schema_attestation
             att = record_schema_attestation("apply_sql", path.name, dsn=dsn)
-            print(f"  schema attested on {att.get('database')!r}: "
-                  f"{att.get('fingerprint')} "
-                  f"({att.get('objects')} objects)"
-                  if att.get("ok") else
-                  f"  NOTE schema NOT attested on "
-                  f"{att.get('database')!r}: {att.get('error')}")
+            if att.get("ok"):
+                print(f"  schema attested on {att.get('database')!r}: "
+                      f"{att.get('fingerprint')} "
+                      f"({att.get('objects')} objects)")
+            else:
+                attested = False
+                attest_error = (f"on {att.get('database')!r}: "
+                                f"{att.get('error')}")
         except Exception as exc:
             # Never fail an apply that succeeded. The cost is one
             # unexplained-looking drift next check — a false positive in
             # the safe direction.
-            print(f"  NOTE could not attest the schema: {exc}")
+            attested = False
+            attest_error = str(exc)[:200]
+
+        # SAID LOUDLY, BECAUSE IT WAS SAID QUIETLY BEFORE.
+        #
+        # This was one "NOTE" line among four, and the script still exited 0.
+        # Three out-of-band files reached Railway in September with no
+        # attestation row, and nobody noticed until the table was read weeks
+        # later. The attestation IS the detector for changes that used neither
+        # governed door, so an apply that does not leave one has silently
+        # disarmed it for that change.
+        #
+        # The exit code is 3 rather than 1 to keep the two outcomes apart: the
+        # SQL DID apply and must not be treated as failed, so a caller that
+        # retries on failure will not re-run it believing nothing happened.
+        if not attested:
+            print()
+            print("  " + "!" * 66)
+            print("  APPLIED, BUT NOT ATTESTED — the change is live and there")
+            print("  is NO RECORD that a tool made it. The drift detector will")
+            print("  report this as a change that used neither governed door.")
+            print(f"  reason: {attest_error}")
+            print("  " + "!" * 66)
+            unattested = True
     print(f"NOT recorded in schema_migrations — {path.name} is classified "
           f"'{disposition_of(path.name)}'. That classification is the "
           f"provenance record; the ledger deliberately has no row.")
-    return 0
+    return 3 if locals().get("unattested") else 0
 
 
 if __name__ == "__main__":
