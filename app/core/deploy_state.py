@@ -222,6 +222,17 @@ REQUIRED_MIGRATIONS: List[str] = [
     #    may replay them safely.
     "governance_decision_link_identity.sql",
     "workflow_owner_resolution.sql",
+    # 48 -> 49 on 2026-09-13. Not a new deployment: the three triggers this
+    # wires -- trg_contacts_touch, trg_leads_touch, trg_accounts_touch -- were
+    # verified present on Railway read-only as crm_readonly, and locally, before
+    # the promotion. What changes is the DECLARATION. The file was applied out
+    # of band and filed in tri_fn/ among function definitions, so it sat outside
+    # the census with no disposition and no schema_migrations row: applied, with
+    # no record that it had been. Declaring it re-applies it idempotently
+    # (DROP TRIGGER IF EXISTS + CREATE) and writes the ledger row that was never
+    # created. It depends on trgfn_touch_updated_at from
+    # executives_audit_and_touch.sql, already required at position 25.
+    "trg_fn_contacts_leads_accounts_touch.sql",
 ]
 
 
