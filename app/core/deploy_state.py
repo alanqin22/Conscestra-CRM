@@ -403,6 +403,32 @@ _PENDING_A3_FINANCIAL_STATE = (
     "Promote to REQUIRED_MIGRATIONS in the same change that records its "
     "Railway application, and not before.")
 
+_PENDING_A3_INVOICE_ECONOMIC_INTEGRITY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-14. The A3 invoice economic "
+    "integrity control: invoices.snapshot_sealed_at, an append-only "
+    "invoice_economic_authorization table, and six triggers. "
+    "THE INVARIANT is subtotal_amount = SUM(invoice_orders.line_total), "
+    "evaluated at TRANSACTION COMMIT and not at INSERT -- measured, the "
+    "invoice row is written first, a payment is created against it by "
+    "trigger, and only then are its lines written; 446 payments exist that "
+    "predate their invoice's lines, so an INSERT-time check would fail on "
+    "every invoice ever produced. "
+    "SEALING THE 2,102 EXISTING INVOICES IS DONE BY THE COLUMN DEFAULT, not "
+    "by an UPDATE: ADD COLUMN ... DEFAULT now() gives pre-existing rows that "
+    "value through the catalogue, and the default is dropped immediately so "
+    "future invoices are born unsealed. NO STATEMENT WRITES AN ECONOMIC "
+    "COLUMN OF ANY EXISTING RECORD. "
+    "SEALED IS NOT A CERTIFICATE OF CORRECTNESS: ~188 historical invoices "
+    "carry a generation defect corrected between May and June 2026 "
+    "($35,108 overstated, $2,577 understated), two were issued at $0.00 "
+    "against $398.75 of delivered goods, and one is a pytest artifact. Their "
+    "financial disposition is open finance work and is not settled here. "
+    "LIVE-PATH CHANGE: fn_recalc_order_totals, called by sp_orders, will be "
+    "refused when it would rewrite a sealed invoice. Measured exposure is "
+    "nil -- 0 of 4,310 invoice lines have drifted since May 2026. "
+    "Promote to REQUIRED_MIGRATIONS in the same change that records its "
+    "Railway application, and not before.")
+
 _PENDING_FINANCIAL_PROPOSITION_BINDING = (
     "PENDING DEPLOYMENT -- authored 2026-09-13. Widens "
     "trgfn_approval_proposition_immutable from the five proposition* columns "
@@ -807,6 +833,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "governance_policy_generate_invoice.sql": _PENDING_GENERATE_INVOICE_POLICY,
     "a3_financial_state.sql": _PENDING_A3_FINANCIAL_STATE,
     "financial_proposition_binding.sql": _PENDING_FINANCIAL_PROPOSITION_BINDING,
+    "a3_invoice_economic_integrity.sql": _PENDING_A3_INVOICE_ECONOMIC_INTEGRITY,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
