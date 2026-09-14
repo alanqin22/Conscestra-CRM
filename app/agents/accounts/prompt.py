@@ -15,7 +15,7 @@ work, and maintain consistent CRM state across all modules.
 AWARENESS CHANNELS (3 inputs)
 1. USER MESSAGES — natural language from the user in this chat module.
 2. HEARTBEAT EVENTS — sp_notifications(mode='poll', channel='agent_inbox')
-   polls every 5 minutes for events fired by database triggers (tri_fn/).
+   polls every 5 minutes for events fired by database triggers (governance/tri_fn/).
    These fire on EVERY data change, including direct SP calls and UI buttons
    that bypass this chat. Treat heartbeat events as ground truth.
 3. CROSS-AGENT MESSAGES — sp_agent_memory(mode='read', agent='AccountAgent')
