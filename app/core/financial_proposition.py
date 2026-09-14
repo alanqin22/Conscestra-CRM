@@ -437,6 +437,17 @@ def rebuild_and_compare(cur, stored: Dict[str, Any],
     divergence the executive never authorised even though nobody tampered with
     the approval record.
     """
+    # A STORED PROPOSITION THAT IS NOT ONE IS A REFUSAL, NOT AN EXCEPTION.
+    # Every field is required to rebuild, and a missing one raised KeyError out
+    # of the caller -- so a malformed proposition crashed the approval instead
+    # of failing it closed. An error that escapes the gate is not the gate
+    # refusing; it is the gate not running.
+    missing = [f for f in PROPOSITION_FIELDS if f not in stored]
+    if missing:
+        return {"ok": False, "rebuilt_hash": None,
+                "reason": f"the stored proposition is not a complete "
+                          f"proposition (missing {', '.join(missing[:6])}); it "
+                          f"cannot be verified against current state"}
     declared = {f: stored.get(f) for f in DECLARED_FIELDS
                 if stored.get(f) is not None}
     declared["order_ids"] = stored.get("order_ids") or []

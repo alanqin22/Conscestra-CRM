@@ -1322,7 +1322,17 @@ def _row(approval_uuid: str) -> Optional[Dict[str, Any]]:
                           amount, critique, decided_actor,
                           assigned_executive_id::text AS assigned_executive_id,
                           decision_link_nonce, decision_link_issued_at,
-                          decision_link_recipients
+                          decision_link_recipients,
+                          -- THE ECONOMIC PROPOSITION. Omitting these was a
+                          -- silent, total failure rather than a partial one:
+                          -- every consumer reads the row through this function,
+                          -- so the execution gate saw no proposition and
+                          -- refused EVERY financial approval, the decision link
+                          -- signed the empty string instead of the stored hash,
+                          -- and the approval summary fell back to caller params.
+                          -- The unit tests could not see it because they build
+                          -- row dicts directly and never come through here.
+                          proposition, proposition_hash
                    FROM action_approvals WHERE approval_uuid=%s::uuid""",
                 (approval_uuid,))
             r = cur.fetchone()
