@@ -298,6 +298,26 @@ def propose(action_type: str, proposed_by: str, params: Dict[str, Any],
                                              entity_type, entity_id, critique)
         except Exception as exc:
             logger.warning(f"[governance] revise cycle skipped for {aid[:8]}: {exc}")
+        # ── the economic proposition (A3) ───────────────────────────────────
+        #
+        # HERE, and not at the INSERT above, because _revise_cycle may have
+        # just rewritten `params`. A proposition built at the INSERT would hash
+        # a draft that the intervening lines replaced, and the executive would
+        # then authenticate a superseded economic statement.
+        #
+        # And BEFORE route_approval, because routing mints the decision link,
+        # and the link signature binds the proposition hash. Minting first
+        # would issue a link bound to a proposition that did not yet exist.
+        if not _persist_financial_proposition(aid, action_type, params or {}):
+            # The proposition could not be established from authoritative
+            # state. The row keeps its blocking reasons and is NOT routed: an
+            # executive must not be shown a financial decision the system
+            # cannot state. It is also un-approvable -- the database refuses a
+            # financial approval with no proposition -- so this fails closed
+            # rather than queuing work nobody can action honestly.
+            logger.warning(f"[governance] {aid[:8]} not routed: its financial "
+                           f"proposition could not be established")
+            return aid
         # Route to the right decision-maker (best-effort: tolerates the
         # governance_routing migration not being applied yet).
         try:
@@ -592,12 +612,195 @@ _ACTION_DESC = {
 }
 
 
-def _summary_rows(action_type: str, params: Optional[Dict[str, Any]]):
+
+
+# ── A3: the economic proposition ────────────────────────────────────────────
+#
+# These three helpers are the whole integration surface between governance and
+# app.core.financial_proposition. They exist because the library was written,
+# tested and then connected to nothing -- which reproduced, one level up, the
+# defect the A3 review opened on: a mechanism with no producer and no consumer.
+
+def _is_financial(action_type: str) -> bool:
+    """Whether a DEPLOYED POLICY classes this action financial.
+
+    Read from governance_action_policies rather than a list repeated here, so a
+    capability that becomes financial later is covered without editing this
+    file -- and so the classification has one owner.
+    """
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT action_class FROM governance_action_policies
+                                WHERE action_type = %s""", (action_type,))
+                r = cur.fetchone()
+                return bool(r and r[0] == "financial")
+        finally:
+            conn.close()
+    except Exception as exc:                                       # noqa: BLE001
+        # Fail CLOSED on the classification question: if we cannot tell whether
+        # this is financial, treating it as ordinary would skip the proposition
+        # entirely, which is the permissive answer to an unknown.
+        logger.warning(f"[governance] action_class unreadable for "
+                       f"{action_type}: {exc}")
+        return True
+
+
+def _declared_from_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """The subset of `params` a proposer is allowed to declare.
+
+    Everything else in `params` is either a derived financial fact -- which the
+    proposition takes from authoritative state, never from the caller -- or
+    platform bookkeeping. Filtering here rather than passing `params` through
+    means a caller cannot smuggle a derived field in and have build() raise on
+    an otherwise valid proposal.
+    """
+    from app.core import financial_proposition as fp
+    alias = {"accountId": "account_id", "orderIds": "order_ids",
+             "invoiceType": "invoice_type", "dueDate": "due_date",
+             "contactId": "contact_id", "discountAmount": "discount_amount",
+             "shippingAmount": "shipping_amount",
+             "adjustmentAmount": "adjustment_amount"}
+    out: Dict[str, Any] = {}
+    for k, v in (params or {}).items():
+        key = alias.get(k, k)
+        if key in fp.DECLARED_FIELDS and v not in (None, "", []):
+            out[key] = v
+    return out
+
+
+def _persist_financial_proposition(aid: str, action_type: str,
+                                   params: Dict[str, Any]) -> bool:
+    """Build and store the proposition. True when the row may be routed.
+
+    Returns True unchanged for a non-financial action: kb.publish has no
+    economic proposition, and requiring one would block every non-financial
+    approval in the system.
+
+    On PropositionBlocked the reasons are written to decision_reason and False
+    is returned. The row stays pending and unrouted, and the database refuses
+    to approve a financial action with no proposition -- so a proposal the
+    system cannot state is never put in front of a human as though it could be.
+    """
+    from app.core import financial_proposition as fp
+    if not _is_financial(action_type):
+        return True
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            try:
+                prop = fp.build(cur, aid, action_type,
+                                _declared_from_params(params))
+            except fp.PropositionBlocked as blocked:
+                cur.execute(
+                    """UPDATE action_approvals
+                          SET decision_reason = %(r)s
+                        WHERE approval_uuid = %(id)s::uuid AND status='pending'""",
+                    {"r": "financial proposition not established: "
+                          + "; ".join(blocked.reasons)[:900], "id": aid})
+                conn.commit()
+                logger.warning(f"[governance] {aid[:8]} financial proposition "
+                               f"BLOCKED: {'; '.join(blocked.reasons)}")
+                return False
+            except ValueError as exc:
+                # build() refuses a caller-authored derived field. That is a
+                # programming error in the proposer, not a data condition, and
+                # it must not be recorded as though the ORDER were at fault.
+                conn.rollback()
+                logger.error(f"[governance] {aid[:8]} proposition rejected: {exc}")
+                return False
+            phash = fp.proposition_hash(prop)
+            cur.execute(
+                """UPDATE action_approvals
+                      SET proposition = %(p)s::jsonb,
+                          proposition_hash = %(h)s,
+                          proposition_order_id = %(oid)s::uuid,
+                          proposition_currency = %(ccy)s,
+                          proposition_total = %(tot)s,
+                          amount = %(tot)s
+                    WHERE approval_uuid = %(id)s::uuid AND status='pending'""",
+                {"p": json.dumps(prop, default=str), "h": phash,
+                 # The promoted scalars are INDEXES over the proposition, not a
+                 # second authority: each is copied from it rather than
+                 # recomputed, so they cannot disagree with what was hashed.
+                 "oid": (prop.get("order_ids") or [None])[0],
+                 "ccy": prop.get("currency"),
+                 "tot": prop.get("total_amount"), "id": aid})
+            if cur.rowcount != 1:
+                conn.rollback()
+                logger.error(f"[governance] {aid[:8]} proposition not stored: "
+                             f"the row is no longer pending")
+                return False
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def _stored_proposition(ap: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The proposition on an approval row, or None. Tolerates jsonb arriving
+    as text, which it does through some read paths."""
+    p = ap.get("proposition")
+    if isinstance(p, str):
+        try:
+            return json.loads(p)
+        except Exception:                                          # noqa: BLE001
+            return None
+    return p if isinstance(p, dict) else None
+
+
+def _proposition_rows(prop: Dict[str, Any]) -> List:
+    """The 'what you are approving' rows for a financial action, read straight
+    off the stored proposition.
+
+    Every economically material field appears. A field omitted here would be
+    one the executive authenticates without seeing, which is the same defect as
+    showing a value that was never approved -- in the other direction.
+    """
+    ccy = prop.get("currency") or ""
+    money = lambda v: (f"{v} {ccy}".strip() if v not in (None, "") else "not stated")
+    rows = [("Account", str(prop.get("account_id") or "")),
+            ("Orders", ", ".join(prop.get("order_ids") or []) or "none"),
+            ("Currency", ccy or "not stated"),
+            ("Subtotal", money(prop.get("subtotal")))]
+    if prop.get("subtotal_is_override"):
+        # Named, never implied: an override replaces the derived subtotal
+        # outright, and an executive must not have to infer that from a number.
+        rows.append(("Subtotal basis",
+                     f"DECLARED OVERRIDE of {prop.get('adjustment_amount')} "
+                     f"-- not derived from the order lines"))
+    else:
+        rows.append(("Subtotal basis", "derived from the order lines"))
+    rows += [("Tax jurisdiction", str(prop.get("tax_jurisdiction") or "not stated")),
+             ("Tax treatment", str(prop.get("tax_treatment_basis") or "not stated")),
+             ("Tax rate", str(prop.get("tax_rate") or "not stated")),
+             ("Tax", money(prop.get("tax_amount"))),
+             ("Discount", money(prop.get("discount_amount"))),
+             ("Shipping", money(prop.get("shipping_amount"))),
+             ("Total", money(prop.get("total_amount"))),
+             ("Invoiceability", str(prop.get("invoiceability_basis") or "not stated")),
+             ("Effective date", str(prop.get("effective_financial_date") or ""))]
+    return rows
+
+
+def _summary_rows(action_type: str, params: Optional[Dict[str, Any]],
+                  proposition: Optional[Dict[str, Any]] = None):
     """The '(label, value)' rows describing WHAT an action does — the single
     source of truth shared by the email, the in-app notification, AND the
     governance queue UI. Never empty: falls back to an action description, then
     the goal it serves, then the action name."""
     p = params or {}
+
+    # A FINANCIAL ACTION IS DESCRIBED BY ITS PROPOSITION, NOT BY `params`.
+    # `params` is what the proposer supplied and is mutable while the row is
+    # pending; the proposition is what was constructed from authoritative state
+    # and is what the decision link signature binds. Rendering `params` meant
+    # the executive could be shown one set of economics while authenticating
+    # another. Non-financial actions keep the `params` rendering: they have no
+    # proposition, and requiring one would leave them with no summary at all.
+    if isinstance(proposition, dict):
+        return _proposition_rows(proposition)
 
     def g(*keys, default=""):
         for k in keys:
@@ -663,11 +866,12 @@ def _summary_rows(action_type: str, params: Optional[Dict[str, Any]]):
     return rows
 
 
-def _action_summary(action_type: str, params: Optional[Dict[str, Any]]):
+def _action_summary(action_type: str, params: Optional[Dict[str, Any]],
+                    proposition: Optional[Dict[str, Any]] = None):
     """Render the summary rows as a 'what you are approving' block (html, text)
     for the email + in-app notification. Never empty (see _summary_rows)."""
     from html import escape as _esc
-    rows = _summary_rows(action_type, params)
+    rows = _summary_rows(action_type, params, proposition)
     html = ('<div style="background:#f6f8fb;border:1px solid #e1e6ef;border-radius:6px;'
             'padding:10px 14px;margin:12px 0;font-size:13px;">'
             '<div style="font-weight:700;color:#15233f;margin-bottom:6px;">'
@@ -681,7 +885,8 @@ def _action_summary(action_type: str, params: Optional[Dict[str, Any]]):
 def _build_approval_email(action_type: str, params: Optional[Dict[str, Any]],
                           amount: float, label: str, approval_uuid: str,
                           critique: Optional[Dict[str, Any]],
-                          links: Optional[Dict[str, str]] = None):
+                          links: Optional[Dict[str, str]] = None,
+                          proposition: Optional[Dict[str, Any]] = None):
     """Compose the routed-approval email (subject, html, text) — shared by the
     initial routing AND re-notification, so both carry the same rich 'what you
     are approving' context, critic opinion, and one-click decision links.
@@ -693,7 +898,7 @@ def _build_approval_email(action_type: str, params: Optional[Dict[str, Any]],
     gets an email with no links and a pointer to the console, which is the
     correct degradation: no link at all beats a link that decides as nobody."""
     links = links or {}
-    summ_html, summ_text = _action_summary(action_type, params)
+    summ_html, summ_text = _action_summary(action_type, params, proposition)
     findings = [f for f in (critique or {}).get("findings", [])
                 if f.get("verdict") in ("fail", "warn")][:4]
     critic_html = critic_text = ""
@@ -882,7 +1087,14 @@ def route_approval(approval_uuid: str, action_type: str,
 
             cur.execute(
                 """UPDATE action_approvals
-                   SET amount=%s, assigned_executive_id=%s::uuid, assigned_to=%s
+                   -- THE PROPOSITION WINS. `amount` here is _amount_from(params),
+                   -- a caller-derived figure; proposition_total is copied from
+                   -- the proposition that was built from authoritative state and
+                   -- hashed. Overwriting it would leave the promoted index
+                   -- disagreeing with the statement the executive authenticates,
+                   -- which is a false index rather than a harmless duplicate.
+                   SET amount = COALESCE(proposition_total, %s),
+                       assigned_executive_id=%s::uuid, assigned_to=%s
                    WHERE approval_uuid=%s::uuid""",
                 (amount, chosen["executive_id"], label, approval_uuid))
 
@@ -961,7 +1173,8 @@ def route_approval(approval_uuid: str, action_type: str,
             _mint = mint_decision_links(approval_uuid, [chosen])
             subject, body_html, body_text = _build_approval_email(
                 action_type, params, amount, label, approval_uuid, critique,
-                links=_mint.get(str(chosen["executive_id"])))
+                links=_mint.get(str(chosen["executive_id"])),
+                proposition=_stored_proposition(_row(approval_uuid) or {}))
 
             # ── Staff-email Stage 3 ────────────────────────────────────────
             # The recipient, the template and the send are unchanged. The
@@ -1076,7 +1289,8 @@ def renotify_pending(to: Optional[str] = None, limit: int = 20,
                 r["action_type"], r["params"], float(r.get("amount") or 0),
                 r.get("assigned_to") or "the approver", r["approval_uuid"],
                 r.get("critique"),
-                links=_mint.get(str(_ex["executive_id"])) if _ex and _mint else None)
+                links=_mint.get(str(_ex["executive_id"])) if _ex and _mint else None,
+                proposition=_stored_proposition(r))
             res = send_email(to=dest, subject=subject,
                              body_html=body_html, body_text=body_text,
                              bcc=NO_BCC)
@@ -1320,6 +1534,40 @@ def _with_approval_ref(ap: Dict[str, Any],
     except Exception as exc:                                    # noqa: BLE001
         logger.debug(f"[governance] approval-ref injection skipped: {exc}")
     return params
+
+
+def _verify_proposition_unchanged(ap: Dict[str, Any]) -> Dict[str, Any]:
+    """{ok, reason}. Is the approved proposition still true right now?
+
+    Non-financial actions have no proposition and pass unchanged: kb.publish
+    has no economic statement to diverge from.
+
+    A financial action with no stored proposition is REFUSED rather than
+    waved through. That combination should be impossible -- the database
+    refuses such an approval -- so reaching it means a control failed, and the
+    permissive reading of a failed control is how this class of defect survives.
+    """
+    from app.core import financial_proposition as fp
+    action_type = ap.get("action_type") or ""
+    if not _is_financial(action_type):
+        return {"ok": True, "reason": "not a financial action"}
+    stored = _stored_proposition(ap)
+    stored_hash = ap.get("proposition_hash")
+    if not stored or not stored_hash:
+        return {"ok": False,
+                "reason": "this financial approval carries no economic "
+                          "proposition; there is nothing to verify the "
+                          "execution against"}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            res = fp.rebuild_and_compare(cur, stored, stored_hash)
+    finally:
+        # Read-only by construction: rebuild_and_compare only SELECTs, and the
+        # rollback makes that structural rather than a promise.
+        conn.rollback()
+        conn.close()
+    return {"ok": bool(res.get("ok")), "reason": res.get("reason") or ""}
 
 
 async def _execute(ap: Dict[str, Any]) -> Dict[str, Any]:
@@ -1671,6 +1919,32 @@ async def approve(approval_uuid: str, decided_by: str = "human",
         cur_status = (_row(approval_uuid) or {}).get("status")
         return {"ok": False, "error": f"not pending (status={cur_status}) — already "
                                       f"decided by someone else", "status": cur_status}
+    # ── APPROVED MUST EQUAL EXECUTED (A3) ──────────────────────────────────
+    #
+    # The row is claimed; nothing else can decide it now. Before anything is
+    # dispatched, the proposition is REBUILT from authoritative state as it
+    # stands at this moment and compared to the hash the executive
+    # authenticated.
+    #
+    # `ap` is deliberately NOT reused for this. It was read before the claim,
+    # so verifying against it would check the same snapshot the caller already
+    # held -- the stale value this control exists to catch. A fresh read is the
+    # whole point.
+    #
+    # This catches the case with no attacker in it: an order line edited
+    # between approval and execution changes the money, and the executive
+    # authorised the earlier figure.
+    fresh = _row(approval_uuid) or {}
+    verdict = _verify_proposition_unchanged(fresh)
+    if not verdict["ok"]:
+        _finish_execution(approval_uuid, token, "failed",
+                          {"ok": False, "error": verdict["reason"]},
+                          {"ok": False, "checks": [],
+                           "note": "proposition diverged; nothing dispatched"})
+        logger.warning(f"[governance] {approval_uuid[:8]} REFUSED at execution: "
+                       f"{verdict['reason']}")
+        return {"ok": False, "refused": "proposition", "error": verdict["reason"],
+                "approval_uuid": approval_uuid}
     try:
         res = await _execute(ap)
     except Exception as exc:                                       # noqa: BLE001
@@ -2387,17 +2661,33 @@ def _link_secret() -> bytes:
 
 
 def decision_token(approval_uuid: str, action: str,
-                   executive_id: str = "", nonce: str = "") -> str:
+                   executive_id: str = "", nonce: str = "",
+                   proposition_hash: str = "") -> str:
     """The signed value in a decision link.
 
     `executive_id` and `nonce` are keyword-optional ONLY so that the Slack
     interactive path (transports.approval_blocks) can keep calling this with the
     identity it already establishes from the Slack user id. An email link with
     an empty executive is refused by verify_decision_token, so the default is
-    not a way back to the bearer token."""
+    not a way back to the bearer token.
+
+    `proposition_hash` binds WHAT was approved to WHO approved it. The previous
+    payload bound this decision, this direction and this person, and nothing
+    about the economic content -- so the page could display one proposition,
+    the content could change, and the same token would still decide. Both mint
+    and verify read the hash from the row, so a proposition that moves between
+    issuance and decision invalidates the signature rather than being approved
+    unnoticed.
+
+    An empty hash is the honest encoding for an approval that has no economic
+    proposition -- kb.publish and the rest -- and reproduces the previous
+    payload exactly. It is not a way to opt a FINANCIAL action out: that is
+    refused where the proposition is required, at proposal time, because a
+    token cannot tell whether a missing hash means "not applicable" or
+    "removed"."""
     import hashlib
     import hmac as _hmac
-    payload = f"{approval_uuid}:{action}:{executive_id}:{nonce}"
+    payload = f"{approval_uuid}:{action}:{executive_id}:{nonce}:{proposition_hash}"
     return _hmac.new(_link_secret(), payload.encode("utf-8"),
                      hashlib.sha256).hexdigest()[:32]
 
@@ -2437,18 +2727,31 @@ def mint_decision_links(approval_uuid: str,
                           decision_link_recipients=%(r)s::uuid[],
                           decision_link_issued_at=now()
                     WHERE approval_uuid=%(id)s::uuid AND status='pending'
-                RETURNING approval_uuid""",
+                RETURNING approval_uuid, coalesce(proposition_hash, ''), action_type""",
                 {"n": nonce, "r": ids, "id": approval_uuid})
-            if cur.fetchone() is None:
+            row = cur.fetchone()
+            if row is None:
                 conn.rollback()
                 return {}
+            if _is_financial(row[2]) and not row[1]:
+                # A financial link with an empty proposition hash would bind
+                # the empty string -- an authenticated decision about nothing.
+                conn.rollback()
+                logger.error(f"[governance] refusing to mint a financial "
+                             f"decision link for {approval_uuid[:8]}: it "
+                             f"carries no proposition hash")
+                return {}
+            # Read inside the same statement that rotates the nonce, so the
+            # issuance and the proposition it was issued for cannot be taken
+            # from two different moments.
+            phash = row[1]
         conn.commit()
     finally:
         conn.close()
     base = (os.getenv("APP_URL", "") or "http://localhost:8000").rstrip("/")
     return {
         eid: {a: (f"{base}/governance/decide?g={approval_uuid}&a={a}"
-                  f"&e={eid}&t={decision_token(approval_uuid, a, eid, nonce)}")
+                  f"&e={eid}&t={decision_token(approval_uuid, a, eid, nonce, phash)}")
               for a in ("approve", "reject")}
         for eid in ids}
 
@@ -2481,12 +2784,21 @@ def verify_decision_token(approval_uuid: str, action: str, executive_id: str,
         return {"ok": False, "reason": "no decision link is outstanding for "
                                        "this approval"}
     import hmac as _hmac
+    # The proposition hash is read from the row NOW, not from the URL. A
+    # proposition that changed since the link was minted therefore produces a
+    # different expected signature, and the decision is refused rather than
+    # applied to content the executive was never shown.
+    phash = ap.get("proposition_hash") or ""
     if not _hmac.compare_digest(
-            decision_token(approval_uuid, action, str(executive_id), nonce), token):
-        # Covers both a forged token and a superseded issuance: a link from
-        # before the last reminder carries the old nonce and lands here.
-        return {"ok": False, "reason": "this link is invalid or has been "
-                                       "superseded by a newer notification"}
+            decision_token(approval_uuid, action, str(executive_id), nonce,
+                           phash), token):
+        # Covers a forged token, a superseded issuance -- a link from before the
+        # last reminder carries the old nonce -- and a proposition that moved
+        # after the link went out.
+        return {"ok": False, "reason": "this link is invalid, has been "
+                                       "superseded by a newer notification, or "
+                                       "the economic proposition it was issued "
+                                       "for has changed"}
     if str(executive_id) not in recipients:
         return {"ok": False, "reason": "this link was not issued to that "
                                        "executive"}

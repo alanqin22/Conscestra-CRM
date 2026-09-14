@@ -403,6 +403,24 @@ _PENDING_A3_FINANCIAL_STATE = (
     "Promote to REQUIRED_MIGRATIONS in the same change that records its "
     "Railway application, and not before.")
 
+_PENDING_FINANCIAL_PROPOSITION_BINDING = (
+    "PENDING DEPLOYMENT -- authored 2026-09-13. Widens "
+    "trgfn_approval_proposition_immutable from the five proposition* columns "
+    "to the fields execution actually consumes -- params, amount, "
+    "action_type, entity_type, entity_id -- and to the identity a decision is "
+    "attributed to. Adds a delete guard for decided approvals, and requires a "
+    "canonical proposition before an action whose policy class is 'financial' "
+    "may be approved. "
+    "THE MEASUREMENT: all five guarded columns were empty in all 1446 rows "
+    "because nothing wrote them, while UPDATE of amount, params and "
+    "decided_by on genuine executed approvals was accepted by direct SQL. The "
+    "guarded set was narrower than the content it protected. "
+    "NOT AN ACTIVATION. It constrains how an approval may change; it opens no "
+    "execution path, and the financial-proposition requirement binds only "
+    "actions a deployed policy already classifies 'financial'. "
+    "Promote to REQUIRED_MIGRATIONS in the same change that records its "
+    "Railway application, and not before.")
+
 _PENDING_GENERATE_INVOICE_POLICY = (
     "PENDING DEPLOYMENT -- authored 2026-09-12. One governance_action_policies "
     "row for accounting.generate_invoice: financial class, HUMAN_APPROVAL, CFO "
@@ -788,6 +806,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "staff_email_ledger_owner_remind_kind.sql": _PENDING_OWNER_REMIND_KIND,
     "governance_policy_generate_invoice.sql": _PENDING_GENERATE_INVOICE_POLICY,
     "a3_financial_state.sql": _PENDING_A3_FINANCIAL_STATE,
+    "financial_proposition_binding.sql": _PENDING_FINANCIAL_PROPOSITION_BINDING,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
