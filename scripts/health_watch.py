@@ -91,6 +91,21 @@ MAX_GAP_MIN = float(os.getenv("HEALTH_MAX_GAP_MIN", "45"))
 # The overdue-job audit runs hourly; 150 min allows one missed pass plus slack
 # before its cached answer is treated as unusable.
 MAX_AUDIT_AGE_MIN = float(os.getenv("HEALTH_MAX_AUDIT_AGE_MIN", "150"))
+
+# The newest backup that actually contains data, in hours.
+#
+# This check exists because its absence let a backup outage run for sixteen
+# nights while this monitor reported healthy every thirty minutes. It was not
+# wrong: backup freshness was simply outside everything it looked at. The
+# nightly dump ran, failed at pg_dump, and left a dated zero-byte file, so the
+# directory kept looking like a working backup from the outside.
+#
+# Size is the check, not presence. A zero-byte dump is the exact artifact a
+# failed run produces, so a check for "a recent file" would have passed
+# throughout the outage. The default allows one missed night, because the
+# machine taking the backup is not on continuously.
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(ROOT / "backups")))
+MAX_BACKUP_AGE_H = float(os.getenv("HEALTH_MAX_BACKUP_AGE_H", "48"))
 ALERT_ON_GAP = os.getenv("HEALTH_ALERT_ON_GAP", "0").strip().lower() in (
     "1", "true", "yes", "on")
 
@@ -261,6 +276,53 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
     return problems, facts
 
 
+def check_backups(directory: Path = None,
+                  max_age_h: float = None) -> Tuple[List[str], Dict[str, Any]]:
+    """Report whether a backup exists that is both recent and non-empty.
+
+    Kept separate from main() so it can be exercised directly. A monitoring
+    check that can only be run by running the monitor is a check nobody tests,
+    and this one was added precisely because an untested gap stayed open for
+    sixteen nights.
+    """
+    directory = BACKUP_DIR if directory is None else directory
+    max_age_h = MAX_BACKUP_AGE_H if max_age_h is None else max_age_h
+    problems: List[str] = []
+    facts: Dict[str, Any] = {}
+    try:
+        present = list(directory.glob("railway-*.dump"))
+        dumps = [f for f in present if f.stat().st_size > 0]
+    except OSError as exc:
+        return ([f"could not read {directory}: {type(exc).__name__}: {exc}"],
+                facts)
+    empty = len(present) - len(dumps)
+    if empty:
+        facts["empty_dump_files"] = empty
+    if not dumps:
+        facts["newest_backup"] = "NONE"
+        problems.append(
+            f"no backup containing data exists in {directory}. "
+            + (f"{empty} dump file(s) are present but empty, which is what a "
+               f"failed run leaves behind."
+               if empty else "The directory holds no dumps at all."))
+        return problems, facts
+    newest = max(dumps, key=lambda f: f.stat().st_mtime)
+    age_h = (time.time() - newest.stat().st_mtime) / 3600
+    facts["newest_backup"] = (f"{newest.name} "
+                              f"({newest.stat().st_size / 1e6:.0f} MB, "
+                              f"{age_h:.0f}h old)")
+    if age_h > max_age_h:
+        problems.append(
+            f"newest usable backup is {age_h / 24:.1f} days old "
+            f"({newest.name}), threshold {max_age_h / 24:.1f} days. Recovery "
+            f"would lose everything written since. "
+            + (f"{empty} zero-byte dump file(s) are present, so the nightly "
+               f"job is running and failing."
+               if empty else
+               "Check that the nightly backup task still exists."))
+    return problems, facts
+
+
 def check_confirmed(url: str) -> Tuple[List[str], Dict[str, Any], int]:
     """check(), but a failure has to survive a re-check to count.
 
@@ -420,6 +482,11 @@ def main() -> int:
             f"{BLIP_WINDOW_HOURS:.0f}h — each recovered within "
             f"{CONFIRM_DELAY_S:.0f}s, so the service is restarting repeatedly "
             f"rather than being down. Check the platform's restart history.")
+
+    # ── is there a recent backup that contains anything? ────────────────────
+    backup_problems, backup_facts = check_backups()
+    facts.update(backup_facts)
+    problems.extend(backup_problems)
 
     healthy = not problems
 

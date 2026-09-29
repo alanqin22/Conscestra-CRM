@@ -414,6 +414,68 @@ def _schema_drift(target_dsn: str) -> Optional[str]:
             if total_missing else "schema differs (target has extra objects)")
     return lead + suffix + " || " + " || ".join(parts)
 
+def _cancellation_path_available(target_dsn: str) -> str:
+    """Is there a working way to cancel an order on this database?
+
+    Two artifacts have to arrive in order, and they travel by different
+    mechanisms. sp_orders_v5e.sql is a stored procedure, applied per file by
+    deploy_sp.ps1; cancellation_enforcement.sql is a governed SQL file applied by
+    apply_sql.py. Nothing coordinates the two, so the order is a runbook step,
+    and a runbook step is the kind of thing that gets done in the wrong order at
+    22:00 on a Friday.
+
+    The unsafe state is specific. sp_orders refuses a cancelled status write, and
+    cancel_order_sp reports 'cancellation authority is not installed' whenever
+    fn_authorize_cancellation is absent. With the procedure deployed and the
+    authority absent, BOTH paths refuse and the platform cannot cancel an order
+    at all. The traffic is low -- three governed cancellations in the six months
+    to 2026-09-25 -- which is exactly why the outage would be discovered late,
+    by a customer, rather than by the next deploy.
+
+    This detects the state rather than preventing it. Preventing it would mean
+    making the procedure's refusal conditional on the authority existing, and a
+    control that switches itself off when its counterpart is missing is a worse
+    thing to own than a runbook step with a detector behind it.
+
+    Reports skipped rather than clean when it cannot look."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(target_dsn)
+    except Exception as exc:                                    # noqa: BLE001
+        return f"SKIPPED — could not connect: {type(exc).__name__}"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM pg_proc WHERE proname = "
+                        "'fn_authorize_cancellation'")
+            authority = cur.fetchone()[0] > 0
+            # The procedure's refusal is identified by its error code, which is
+            # unique to it, rather than by a version string the file does not
+            # carry.
+            cur.execute("SELECT count(*) FROM pg_proc WHERE proname = 'sp_orders' "
+                        "AND prosrc LIKE '%Cancelling an order is not a status "
+                        "assignment%'")
+            refuses = cur.fetchone()[0] > 0
+    except Exception as exc:                                    # noqa: BLE001
+        return f"SKIPPED — could not inspect routines: {type(exc).__name__}"
+    finally:
+        conn.close()
+
+    if refuses and not authority:
+        return ("NO WORKING CANCELLATION PATH — sp_orders refuses a cancelled "
+                "status write and fn_authorize_cancellation is absent, so "
+                "cancel_order_sp cannot run either. Apply "
+                "cancellation_authority.sql then cancellation_enforcement.sql, "
+                "or roll the procedure back.")
+    if refuses and authority:
+        return "OK — sp_orders refuses cancellation and the governed path is installed"
+    if authority:
+        return ("OK — the governed path is installed; sp_orders predates the "
+                "refusal and can still write a cancelled status")
+    return ("cancellation is ungoverned on this database — neither the "
+            "procedure refusal nor fn_authorize_cancellation is present "
+            "(the state before this work; not a regression)")
+
+
 def _app_identity(app_url: str) -> Optional[str]:
     """Ask the RUNNING APPLICATION which database role it connects as.
 
@@ -610,6 +672,17 @@ def main(argv: Optional[list] = None) -> int:
         print(f"        {drift}\n")
         if not verdict and not skipped:
             failures.append("schema drift")
+
+    # The two cancellation artifacts travel by different mechanisms and must
+    # arrive in order. This is the only check that looks at both at once.
+    cancel = _cancellation_path_available(dsn)
+    _ok = cancel.startswith("OK") or cancel.startswith("cancellation is ungoverned")
+    _skip = cancel.startswith("SKIPPED")
+    print(f"  {'PASS' if _ok else 'SKIP' if _skip else 'FAIL'}  "
+          f"cancellation path available")
+    print(f"        {cancel}\n")
+    if not _ok and not _skip:
+        failures.append("no working cancellation path")
 
     # A DIFFERENT QUESTION FROM THE CHECK ABOVE, and they are easy to confuse.
     #
