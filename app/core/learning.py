@@ -213,7 +213,9 @@ def detect_bottlenecks() -> Dict[str, Any]:
                          i.due_date AS due
                   FROM invoices i
                   LEFT JOIN accounts a ON a.account_id = i.account_id
-                  WHERE i.status='overdue'
+                  JOIN accounting_invoice_pipeline v ON v.invoice_id = i.invoice_id
+                  WHERE v.payment_status IN ('unpaid','partial')
+                    AND v.due_date::date < CURRENT_DATE
                     AND (i.is_deleted IS NULL OR i.is_deleted=false)
                     AND COALESCE(i.balance_due,0) > 0
                     AND NOT EXISTS (SELECT 1 FROM activities t

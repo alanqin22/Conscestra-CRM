@@ -182,8 +182,15 @@ def _checks_campaign_winback(ap: Dict[str, Any]) -> List[Dict[str, str]]:
 
 def _checks_emit_dunning(ap: Dict[str, Any]) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
-    n = int(_one("SELECT count(*) FROM invoices "
-                 "WHERE status='overdue' AND deleted_at IS NULL") or 0)
+    # Evaluated live rather than read from invoices.status: the stored overdue
+    # marker is refreshed only when the invoice row is next written, so a
+    # precondition check reading it under-reports the population the dunning loop
+    # would actually work.
+    n = int(_one("SELECT count(*) FROM invoices i "
+                 "JOIN accounting_invoice_pipeline v ON v.invoice_id = i.invoice_id "
+                 "WHERE v.payment_status IN ('unpaid','partial') "
+                 "  AND v.due_date::date < CURRENT_DATE "
+                 "  AND i.deleted_at IS NULL") or 0)
     if not n:
         out.append(_f("overdue_exists", "fail",
                       "no overdue invoices right now — the dunning loop would "

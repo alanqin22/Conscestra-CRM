@@ -60,14 +60,22 @@ TREND_LOOKBACK_DAYS = 3      # compare against the newest snapshot at least this
 # ============================================================================
 
 METRICS: Dict[str, Dict[str, str]] = {
+    # Overdue is a temporal predicate evaluated at the moment the metric is
+    # taken, not a value read from invoices.status, which is refreshed only when
+    # the invoice row is next written. The same predicate seeds the baseline in
+    # governance/sql/business_objectives.sql; the two must not diverge.
     "overdue_invoice_count": {
         "label": "Overdue invoices", "unit": "count",
-        "sql": "SELECT count(*)::float AS v FROM invoices "
-               "WHERE status='overdue' AND deleted_at IS NULL"},
+        "sql": "SELECT count(*)::float AS v FROM invoices i "
+               "JOIN accounting_invoice_pipeline v ON v.invoice_id = i.invoice_id "
+               "WHERE v.payment_status IN ('unpaid','partial') "
+               "  AND v.due_date::date < CURRENT_DATE AND i.deleted_at IS NULL"},
     "ar_outstanding": {
         "label": "Overdue AR balance", "unit": "$",
-        "sql": "SELECT COALESCE(sum(balance_due),0)::float AS v FROM invoices "
-               "WHERE status='overdue' AND deleted_at IS NULL"},
+        "sql": "SELECT COALESCE(sum(i.balance_due),0)::float AS v FROM invoices i "
+               "JOIN accounting_invoice_pipeline v ON v.invoice_id = i.invoice_id "
+               "WHERE v.payment_status IN ('unpaid','partial') "
+               "  AND v.due_date::date < CURRENT_DATE AND i.deleted_at IS NULL"},
     "high_churn_accounts": {
         "label": "High-churn-band customers", "unit": "count",
         "sql": "SELECT count(*)::float AS v FROM account_intelligence "

@@ -941,15 +941,21 @@ def _account_read(viewer: Dict[str, Any], user_text: str) -> str:
                     "account. Would you like me to list your recent orders?")
 
         if _BALANCE_RE.search(user_text):
+            # Overdue is evaluated against the current date rather than read from
+            # invoices.status, which holds an overdue value only until the row is
+            # next written. A customer asking for their balance is told the
+            # amount that is genuinely past due.
             rows = _scoped_rows(
                 """SELECT count(*) AS n,
-                          COALESCE(SUM(balance_due),0)::float AS due,
-                          COALESCE(SUM(balance_due) FILTER (WHERE status='overdue'),
-                                   0)::float AS overdue
-                     FROM invoices
-                     WHERE account_id=%(account_id)s::uuid
-                       AND (is_deleted IS NULL OR is_deleted=false)
-                       AND COALESCE(balance_due,0) > 0""", {})
+                          COALESCE(SUM(i.balance_due),0)::float AS due,
+                          COALESCE(SUM(i.balance_due) FILTER (
+                              WHERE v.payment_status IN ('unpaid','partial')
+                                AND v.due_date::date < CURRENT_DATE), 0)::float AS overdue
+                     FROM invoices i
+                     JOIN accounting_invoice_pipeline v ON v.invoice_id = i.invoice_id
+                     WHERE i.account_id=%(account_id)s::uuid
+                       AND (i.is_deleted IS NULL OR i.is_deleted=false)
+                       AND COALESCE(i.balance_due,0) > 0""", {})
             r = rows[0] if rows else {}
             n = int(r.get("n") or 0)
             if not n:
