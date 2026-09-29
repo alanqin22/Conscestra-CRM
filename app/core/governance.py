@@ -417,6 +417,280 @@ def record_preauthorized(action_type: str, performed_by: str, policy: str,
 
 
 # ============================================================================
+# Policy execution — the same durable contract approve() uses (G-2a)
+# ============================================================================
+#
+# WHY THESE EXIST. `record_preauthorized` above writes a TERMINAL row AFTER the
+# side effect, best-effort, returning None on failure. Measured 2026-09-24:
+# 1,821 of 1,977 local approvals took that path, carrying zero execution tokens
+# and zero verification records, against 156 on the approve() path.
+#
+# The failure that makes it untenable is not hypothetical. With the financial
+# INSERT boundary in place, a refused record on that path leaves the external
+# action DONE, the record ABSENT, and the dispatch reporting ok=True — strictly
+# less evidence than the ungoverned row it replaced.
+#
+# WHAT THESE DO NOT DO. They invent nothing. `approve()` already establishes
+# durable authority before acting: an atomic claim into 'executing' carrying an
+# execution_token, a fresh re-read, post-execution verification, a
+# compare-and-set finish, and a lease whose sweep recovers anything stranded.
+# These two functions give the policy path the same contract. The Path A
+# functions are deliberately NOT generalised to accommodate this — the proven
+# path is left alone and the unproven one is made to conform to it.
+#
+# THE ONE REAL DIFFERENCE is who authorises: an executive's session there, a
+# standing policy here. That distinction already has a home in the schema and
+# needs no new vocabulary — decided_by='policy:<owner>' with accountable_owner
+# naming the executive who owns the policy (activation §10/§16).
+
+
+def claim_policy_execution(action_type: str, performed_by: str, policy: str,
+                           params: Dict[str, Any],
+                           entity_type: Optional[str] = None,
+                           entity_id: Optional[str] = None
+                           ) -> Optional[Dict[str, Any]]:
+    """Claim the right to execute under a standing policy, BEFORE acting.
+
+    Returns {'approval_uuid', 'token'} when the claim is durably committed, and
+    **None when it is not — in which case the caller MUST NOT execute.**
+
+    That return contract is the whole point, and it is the opposite of
+    `record_preauthorized`'s. This function is called before the side effect,
+    so returning None costs a refused action; returning None from the other one
+    costs a lost record for an action that already happened.
+
+    WHY status='executing' AND NOT A NEW STATE. `sla_sweep` recovers rows left
+    in 'executing' past the lease, marking them failed and alerting that the
+    side effect is unknown. Reusing the state inherits that recovery exactly;
+    a parallel state would have needed its own sweep, its own alert and its own
+    proof, to say the same thing.
+
+    WHY IT MAY BE REFUSED, AND WHY THAT IS CORRECT. 'executing' is one of the
+    three states the financial controls guard. A financial-class action with no
+    canonical proposition is refused here — before the send — instead of
+    afterwards. The action stops. That is the invariant doing its job, and for
+    `email.send_payment_reminder` it is the point at which D.3 stops being
+    deferrable: an action cannot be both auto-executing and unable to state
+    what it is executing.
+
+    The accountable owner and the assigned executive are resolved from the
+    policy's declared owner. That is attribution, not fabrication: a human
+    ratified the standing policy at design time, and §10/§16 says the policy is
+    the technical decider while its owner is the accountable human. Nothing
+    here asserts that a person decided this particular execution.
+    """
+    token = str(_uuid_mod.uuid4())
+    try:
+        owner_id = owner_label = exec_id = None
+        mode = pver = None
+        try:
+            from app.core import governance_policy as gp
+            pol = gp.policy_for(action_type)
+            mode, pver = pol.get("decision_mode"), pol.get("policy_version")
+            role = (pol.get("policy_owner")
+                    if (pol.get("policy_owner") or "").upper() in gp.AUTHORITY_ROLES
+                    else pol.get("approver_role"))
+            resolved = gp.resolve_accountable_owner(role)
+            owner_id, owner_label = resolved["owner_id"], resolved.get("label")
+            # authority_owner carries executive_id; resolve_accountable_owner
+            # does not surface it. Read it directly rather than widening that
+            # function's contract for one caller.
+            a = gp.authority_owner(resolved.get("role") or "")
+            exec_id = (a or {}).get("executive_id")
+        except Exception as exc:                              # noqa: BLE001
+            # Deliberately NOT swallowed into a successful claim: a financial
+            # action whose owner cannot be resolved will be refused by the
+            # trigger below, which is the right outcome. This only records why.
+            logger.warning(f"[governance] policy owner unresolved for "
+                           f"{action_type}: {exc}")
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO action_approvals
+                         (action_type, proposed_by, entity_type, entity_id,
+                          params, confidence, status, decided_by, decided_at,
+                          executing_at, execution_token, decided_via,
+                          accountable_owner_id, accountable_owner,
+                          assigned_executive_id, decision_mode, policy_version)
+                       VALUES (%(at)s,%(by)s,%(et)s,%(eid)s,%(p)s::jsonb,1.0,
+                               'executing', %(db)s, now(), now(), %(tok)s,
+                               'policy', %(oid)s, %(ol)s, %(ex)s, %(dm)s, %(pv)s)
+                    RETURNING approval_uuid::text""",
+                    {"at": action_type, "by": performed_by,
+                     "et": entity_type, "eid": entity_id,
+                     "p": json.dumps(params, default=str),
+                     "db": f"policy:{policy}", "tok": token,
+                     "oid": owner_id, "ol": owner_label, "ex": exec_id,
+                     "dm": mode, "pv": pver})
+                aid = cur.fetchone()[0]
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info(f"[governance] claimed {action_type} under policy:{policy} "
+                    f"→ {aid[:8]} (token {token[:8]})")
+        return {"approval_uuid": aid, "token": token}
+    except Exception as exc:                              # noqa: BLE001
+        logger.error(f"[governance] REFUSED to claim {action_type} under "
+                     f"policy:{policy} — not executing: {exc}")
+        return None
+
+
+def finish_policy_execution(claim: Dict[str, Any], action_type: str,
+                            result: Any, ok: bool) -> bool:
+    """Close a policy claim. Mirrors approve()'s finish, including verification.
+
+    Best-effort by necessity — the side effect has already happened by the time
+    this runs, so a failure here must not raise into the caller. Unlike the old
+    path, a failure is NOT silent in its consequences: the row is already
+    committed in 'executing', so the lease sweep will find it, mark it failed
+    and alert that the outcome is unknown. Losing the finish degrades the
+    record to 'we permitted this and cannot confirm it', which is true, rather
+    than to nothing at all.
+
+    THE CLAIM IS THE AUTHORITY, AND THIS FUNCTION READS IT. The first version
+    built the verification argument from its own parameters:
+
+        _verify_execution({"approval_uuid": ..., "action_type": action_type},
+                          {"ok": True, **payload})
+
+    Two defects followed from that one line, and they are the same defect.
+
+    FIRST, the action type steering verification was the caller's, not the
+    claim's. `_finish_execution` matches on approval_uuid, token and status and
+    has no action_type predicate, so a finish issued while holding a different
+    intent was accepted: measured at rowcount=1 with a claim of 'order.cancel'
+    finished as 'kb.publish'. The stored action_type was NOT overwritten, so no
+    record could be falsified -- but the verifier queried the dispatch audit for
+    the wrong intent and selected the wrong entity branch. The record stayed
+    true while the evidence attached to it described another action.
+
+    SECOND, and more costly, that two-key dict carried no `params`. Every
+    entity-specific check in `_verify_execution` reads `ap["params"]`, so all of
+    them were unreachable from this path. Measured against a real cancelled
+    order: the approve() argument shape produces two checks including
+    `orders.status=cancelled`; this shape produced one. The policy path was
+    running a strictly weaker verification than the path it is documented as
+    mirroring, on the only capability that can reach it.
+
+    Reading the row closes both. Nothing new is stored -- action_type and params
+    were already committed by the claim. A supplied action_type that disagrees
+    with the claim REFUSES the finish rather than being ignored: the parameter
+    is kept for exactly that reason. Dropping it would silently tolerate the
+    disagreement, and a caller holding one claim and another intent has lost
+    track of which action it is closing.
+
+    Refusing leaves the row in 'executing' for the lease sweep, which is the
+    truthful outcome: an effect has happened, and the only account of it
+    contradicts the claim it belongs to.
+
+    WHY NOT A ROW LOCK. Eligibility to finish is still decided by the CAS in
+    `_finish_execution` -- status='executing' AND the token -- exactly as
+    before. This read is advisory, in the same way approve() re-reads the row
+    before dispatching. Adding a second authority for "may I finish" would be
+    two answers to one question, and the one that drifts is the one nobody
+    watches.
+    """
+    payload = result if isinstance(result, dict) else {"result": result}
+    aid = claim["approval_uuid"]
+
+    ap = _row(aid)
+    if ap is None:
+        logger.error(f"[governance] claim {aid[:8]} could not be read back and "
+                     f"will not be finished — the lease sweep will recover it")
+        return False
+
+    claimed = ap.get("action_type")
+    if action_type != claimed:
+        logger.error(f"[governance] REFUSED to finish claim {aid[:8]}: it was "
+                     f"claimed as '{claimed}' and the finish was issued as "
+                     f"'{action_type}'. Nothing was closed; the lease sweep "
+                     f"will recover the row as stranded.")
+        return False
+
+    try:
+        # `res` is shaped as `_execute` shapes it for approve(): the structured
+        # payload under 'data', which is where `_verify_execution` reads the
+        # identifiers the kb.publish and campaign.winback checks need. The
+        # flattened `{"ok": ok, **payload}` below is the STORED result and is
+        # deliberately left alone -- changing the persisted shape would change
+        # what undo() and every existing row mean.
+        verification = (_verify_execution(ap, {"ok": True, "data": payload})
+                        if ok else
+                        {"ok": False, "checks": [], "note": "not executed"})
+    except Exception as exc:                                  # noqa: BLE001
+        verification = {"ok": False, "checks": [],
+                        "note": f"verification raised: {exc}"}
+    try:
+        finished = _finish_execution(aid, claim["token"],
+                                     "executed" if ok else "failed",
+                                     {"ok": ok, **payload}, verification)
+    except Exception as exc:                                  # noqa: BLE001
+        logger.error(f"[governance] could not finish claim {aid[:8]} — the "
+                     f"lease sweep will recover it as stranded: {exc}")
+        return False
+    if finished and ok:
+        _alert_unverified_policy_execution(aid, claimed, verification)
+    return finished
+
+
+def _alert_unverified_policy_execution(approval_uuid: str, action_type: str,
+                                       verification: Dict[str, Any]) -> None:
+    """Raise the governance obligation when a policy execution is not verified.
+
+    approve() has done this since it was written: an action that dispatched but
+    could not be confirmed opens a `verification_failed` alert owned by the
+    escalation authority. The policy path did not, so a claim could close with
+    `verification.ok = false` and nobody was told. An auto-executed action is
+    the case where that silence costs most, because no human was in the loop at
+    any earlier point either.
+
+    THREE OUTCOMES ARE DISTINGUISHED, because collapsing them is how a control
+    becomes noise:
+
+        a known refusal          the caller passed ok=False. No alert: the SP
+                                 said no, or the endpoint did not accept, and
+                                 the row records which. Nothing to investigate.
+        transport uncertainty    also reaches here as ok=False, carrying the
+                                 UNKNOWN outcome in `result`. No alert for the
+                                 same reason -- the row already says the call
+                                 may or may not have arrived.
+        a verified-false check   a check ran and returned false. The effect was
+                                 reported and cannot be confirmed.
+        nothing could be checked every check came back 'unverified'. Different
+                                 from the line above and said differently: the
+                                 action may well have worked and this system
+                                 has no way to know.
+
+    Never raises, and never changes the execution result. The row is already in
+    its terminal state before this runs; an alert that could fail a finish would
+    be a control able to rewrite the record it is reporting on.
+    """
+    if verification.get("ok"):
+        return
+    checks = verification.get("checks") or []
+    failed = [c for c in checks if c.get("ok") is False]
+    if failed:
+        headline = (f"{action_type} executed under policy, and the effect could "
+                    f"not be confirmed ({approval_uuid[:8]})")
+    else:
+        headline = (f"{action_type} executed under policy with nothing this "
+                    f"system can verify ({approval_uuid[:8]})")
+    try:
+        from app.core import governance_alerts
+        governance_alerts.open_alert(
+            "verification_failed", headline,
+            rule="verification_failed", severity="high", source="governance",
+            affected_type="approval", affected_id=approval_uuid,
+            detail={"action_type": action_type, "decided_via": "policy",
+                    "verification": verification},
+            dedupe_key=f"verification_failed:{approval_uuid}")
+    except Exception as exc:                                  # noqa: BLE001
+        logger.warning(f"[governance] verification alert skipped for "
+                       f"{approval_uuid[:8]}: {exc}")
+
+
+# ============================================================================
 # Critic→revise loop — one bounded self-correction before the human sees it
 # ============================================================================
 
@@ -1795,24 +2069,54 @@ def _verify_execution(ap: Dict[str, Any], res: Dict[str, Any]) -> Dict[str, Any]
     is distinct from 'verified false'."""
     checks: List[Dict[str, Any]] = []
     ok_all = True
+    # A POLICY EXECUTION CANNOT SATISFY THE DISPATCH-AUDIT CHECK, AND SAYING SO
+    # IS NOT THE SAME AS FAILING IT.
+    #
+    # The check below is calibrated to approve(): that path re-dispatches
+    # through the public `dispatch()` entry with from_agent='governance', so the
+    # trace row is written and carries that agent before verification runs.
+    #
+    # A policy execution satisfies neither half. The dispatch carries the real
+    # caller -- measured: 1,620 order.cancel trace rows, every one from_agent
+    # ='orders', none from 'governance' -- and the row is written by the public
+    # entry AFTER dispatch() returns, which is after this function has run. The
+    # check is therefore false for structural reasons on every policy execution,
+    # for ever, whatever happened.
+    #
+    # Left as a false check it would fail every successful auto-execution, and
+    # the alert on the other side of that verdict would fire on all of them. An
+    # alert that fires on every success is the storm this function already warns
+    # about further down, and the control gets switched off.
+    #
+    # 'unverified' is the state this function already has for a check that
+    # cannot run, and it is the truthful one here. `decided_via` is read from
+    # the claim rather than passed in, so no caller can select it.
+    _is_policy = (ap.get("decided_via") == "policy")
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    """SELECT outcome FROM a2a_dispatches
-                        WHERE intent=%s AND from_agent='governance'
-                          AND at > now() - interval '10 minutes'
-                        ORDER BY at DESC LIMIT 1""", (ap["action_type"],))
-                r = cur.fetchone()
-                dispatched = bool(r and r[0] == "accepted")
-                checks.append({"check": "dispatch_audit_row", "ok": dispatched,
-                               "note": f"outcome={r[0] if r else 'none'}"})
-                ok_all &= dispatched
-            except Exception as exc:                          # noqa: BLE001
-                conn.rollback()
-                checks.append({"check": "dispatch_audit_row", "ok": None,
-                               "note": f"unverified: {str(exc)[:80]}"})
+            if _is_policy:
+                checks.append({
+                    "check": "dispatch_audit_row", "ok": None,
+                    "note": "unverified: a policy execution's trace row is "
+                            "written by the calling agent after this "
+                            "verification runs, and never names governance"})
+            else:
+                try:
+                    cur.execute(
+                        """SELECT outcome FROM a2a_dispatches
+                            WHERE intent=%s AND from_agent='governance'
+                              AND at > now() - interval '10 minutes'
+                            ORDER BY at DESC LIMIT 1""", (ap["action_type"],))
+                    r = cur.fetchone()
+                    dispatched = bool(r and r[0] == "accepted")
+                    checks.append({"check": "dispatch_audit_row", "ok": dispatched,
+                                   "note": f"outcome={r[0] if r else 'none'}"})
+                    ok_all &= dispatched
+                except Exception as exc:                      # noqa: BLE001
+                    conn.rollback()
+                    checks.append({"check": "dispatch_audit_row", "ok": None,
+                                   "note": f"unverified: {str(exc)[:80]}"})
             data = (res.get("data") or {}) if isinstance(res.get("data"), dict) else {}
             at = ap["action_type"]
             try:
@@ -1877,6 +2181,22 @@ def _verify_execution(ap: Dict[str, Any], res: Dict[str, Any]) -> Dict[str, Any]
                                "note": f"unverified: {str(exc)[:80]}"})
     finally:
         conn.close()
+    # A VERIFICATION THAT CHECKED NOTHING DID NOT VERIFY ANYTHING.
+    #
+    # `ok_all` starts true and is only ever weakened, so a run in which every
+    # check came back 'unverified' returned ok=true having established nothing.
+    # That was already reachable before -- both the dispatch query and the
+    # entity branch can throw -- and it becomes ordinary once the check above
+    # reports 'unverified' for a whole class of executions. The weaker reading
+    # is the dangerous one: "verified" is what an operator acts on.
+    #
+    # This does NOT collapse 'unverified' into 'verified false'. The distinction
+    # the docstring draws survives where it is readable, in `checks` and in the
+    # note below; what changes is that neither one may be summarised as ok.
+    if not any(c.get("ok") is not None for c in checks):
+        return {"ok": False, "checks": checks, "verified_at": _now_iso(),
+                "note": "no check could be run; nothing about this execution "
+                        "was verified either way"}
     return {"ok": bool(ok_all), "checks": checks, "verified_at": _now_iso()}
 
 
