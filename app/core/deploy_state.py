@@ -602,6 +602,48 @@ _APPLIED_A3_INVOICE_ECONOMIC_INTEGRITY = (
     "that IS applied. A check that is permanently red teaches its reader to "
     "ignore it. The apply is evidenced by schema_attestations instead, which "
     "exists for exactly this path.")
+_APPLIED_LOCAL_FINANCIAL_APPROVAL_INSERT_BOUNDARY = (
+    "APPLIED TO LOCAL crmdb 2026-09-23 22:51:06 -04 "
+    "(schema_attestations id 1470); NOT YET ON RAILWAY. "
+    "Authored 2026-09-23. Re-binds two financial "
+    "approval controls from BEFORE UPDATE to BEFORE INSERT OR UPDATE, and "
+    "adds the TG_OP guard each one needs to survive an INSERT. "
+    "THE DEFECT IT CLOSES: a row INSERTed already at status='executed' passed "
+    "neither control. Measured on Railway 2026-09-23 -- five "
+    "email.send_payment_reminder rows, policy class 'financial', "
+    "created_at = decided_at = executed_at to the microsecond, every one with "
+    "a null proposition_hash, a null assigned_executive_id and a null amount, "
+    "the most recent dated that morning. Beside them, supervisor.emit_dunning "
+    "rows DO name an executive, because they travel pending -> executed by "
+    "UPDATE. One table, two populations, separated only by the verb. "
+    "ONLY TWO OF THE THREE TRIGGERS MOVE. "
+    "trgfn_approval_proposition_immutable stays UPDATE-only on purpose: it "
+    "compares thirteen NEW fields to their OLD counterparts and there is no "
+    "OLD on INSERT. It protects a decided row from being rewritten, which is "
+    "a statement about change, not about state. "
+    "IT CLOSES THE BYPASS AND NOT THE CONTROL. amount remains 0 on all 78 "
+    "approvals that carry it, approval_authority_limit remains NULL for all "
+    "five executives, and SAMPLED_REVIEW still has no completion record. "
+    "EXPECT IT TO STOP A DAILY JOB. email.send_payment_reminder will fail on "
+    "whichever database has this until it supplies a proposition and an "
+    "eligible executive, or is reclassified on the evidence of what it "
+    "actually does. That is the control working, and it is written down here "
+    "so the first failure is recognised rather than diagnosed. "
+    "VERIFIED ON LOCAL after apply: both triggers report BEFORE INSERT "
+    "OR UPDATE and trg_approval_proposition_immutable is unchanged at "
+    "BEFORE UPDATE; an INSERT-as-executed financial approval is refused "
+    "by ck_financial_approval_requires_proposition, and a pending "
+    "proposal naming an eligible owner is still accepted -- both probed "
+    "in transactions that were rolled back, leaving no row behind. "
+    "PRE-APPLY MEASUREMENT ON LOCAL: 1,523 email.send_payment_reminder "
+    "rows born executed, of which 480 were written AFTER "
+    "financial_proposition_binding.sql was applied on 2026-09-13. The "
+    "control was deployed and the bypass kept writing through it. "
+    "NOT PROMOTED TO REQUIRED_MIGRATIONS: apply_sql writes no "
+    "schema_migrations row, so a declared out-of-band apply would leave "
+    "ledger_health() permanently short by one. schema_attestations is the "
+    "evidence path for this file.")
+
 
 _APPLIED_FINANCIAL_PROPOSITION_BINDING = (
     "APPLIED OUT-OF-BAND TO BOTH DATABASES. Railway 2026-09-14 13:40:42 UTC "
@@ -633,6 +675,31 @@ _APPLIED_FINANCIAL_PROPOSITION_BINDING = (
     "Measured 2026-09-23: five email.send_payment_reminder rows, a financial "
     "action class, executed daily with a null proposition and no named "
     "executive. The remedy is a separate file, not an edit to this one.")
+_APPLIED_LOCAL_SOFT_DELETED_AR = (
+    "APPLIED TO LOCAL crmdb 2026-09-20; NOT YET ON RAILWAY. Adds the missing "
+    "invoice-level is_deleted predicate to vw_invoices_ar and "
+    "accounting_invoice_pipeline. "
+    "THE DEFECT. Neither view filtered soft-deleted invoices. vw_invoices_ar "
+    "ended FROM invoices i LEFT JOIN ... with no WHERE at all, while filtering "
+    "is_deleted = false on PAYMENTS inside its own CTE -- honouring the flag for "
+    "payments and ignoring it for invoices. Soft-deleting an invoice therefore "
+    "removed it from nothing: 260 marked deleted, and both the AR Aging chart "
+    "and the Accounting Summary continued to report $132,769.65, exactly "
+    "sum(balance_due) over the view. "
+    "LATENT UNTIL EXERCISED. No invoice had ever been soft-deleted before that "
+    "date, so the omission had never cost anything. v_invoice_balance_drift "
+    "already carried the predicate, which is why this is an omission rather "
+    "than a decision. "
+    "WHY THE VIEW AND NOT THE CONSUMERS: the reasoning in "
+    "cancelled_invoices_are_not_receivable.sql, which fixed the neighbouring "
+    "defect on the same view. Two consumer shapes exist and a consumer-side fix "
+    "must find every one of them. "
+    "PRODUCED BY READING THE LIVE VIEWS with pg_get_viewdef and re-emitting them "
+    "with one predicate added, then diffing against the originals to confirm the "
+    "predicate is the only change. Measured effect: outstanding $132,769.65 -> "
+    "$71,994.65, paid rate 82.5% -> 91.5%, affecting exactly the 260 "
+    "soft-deleted rows and nothing else.")
+
 
 _PENDING_ACCOUNTING_INVOICE_PIPELINE = (
     "PENDING DEPLOYMENT -- authored 2026-09-29. The sole authoritative "
@@ -1082,6 +1149,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "staff_email_ledger_owner_remind_kind.sql": _PENDING_OWNER_REMIND_KIND,
     "governance_policy_generate_invoice.sql": _PENDING_GENERATE_INVOICE_POLICY,
     "a3_financial_state.sql": _PENDING_A3_FINANCIAL_STATE,
+    "financial_approval_insert_boundary.sql": _APPLIED_LOCAL_FINANCIAL_APPROVAL_INSERT_BOUNDARY,
     "financial_proposition_binding.sql": _APPLIED_FINANCIAL_PROPOSITION_BINDING,
     "a3_invoice_economic_integrity.sql": _APPLIED_A3_INVOICE_ECONOMIC_INTEGRITY,
     "invoice_cancellation.sql": _PENDING_INVOICE_CANCELLATION,
@@ -1089,6 +1157,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "cancellation_enforcement.sql": _PENDING_CANCELLATION_ENFORCEMENT,
     "cancelled_not_invoiceable.sql": _PENDING_CANCELLED_NOT_INVOICEABLE,
     "cancellation_reversal.sql": _PENDING_CANCELLATION_REVERSAL,
+    "soft_deleted_invoices_are_not_receivable.sql": _APPLIED_LOCAL_SOFT_DELETED_AR,
     "settlement_authority.sql": _PENDING_SETTLEMENT_AUTHORITY,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
