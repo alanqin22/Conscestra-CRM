@@ -597,6 +597,47 @@ _SEED = (
 _DIAGNOSTIC = (
     "Diagnostic -- reads only and changes no state.")
 
+# Dispositions normalised 2026-09-29. These entries stated their disposition
+# in prose rather than naming one, which a structural check cannot read.
+# The wording is carried across unchanged; only the reference is new.
+#
+# _DUPLICATE_DECLARATION names a file whose objects are already created and
+# owned by another declared migration. It is not 'superseded': the owning
+# migration was ledgered before this file was authored, so this file was
+# never the source of those objects.
+_APPLIED_EMPLOYEE_WORK_EMAIL_ACTIVATION = (
+    "OUT OF BAND -- authorised activation applied to RAILWAY 2026-09-02. "
+        "A clean database must not replay it: it would confer email on grants "
+        "that environment does not have.")
+_APPLIED_OWNERS_NO_IDENTITY_REUSE = (
+    "APPLIED TO RAILWAY 2026-09-02. Promotable, not promoted -- see the "
+        "note on activities_owner_no_fabrication.sql.")
+_APPLIED_EMPLOYEES_PROVENANCE_ATTESTATION = (
+    "APPLIED TO RAILWAY 2026-09-02. Stays out-of-band permanently: it "
+        "records attestations about eight SPECIFIC identities, and a clean "
+        "database has no such employees to attest about.")
+_APPLIED_ACTIVITIES_OWNER_NO_FABRICATION = (
+    "APPLIED TO RAILWAY 2026-09-02. Promotable to REQUIRED_MIGRATIONS, but "
+        "NOT promoted here: apply_sql records no ledger row, so declaring "
+        "it would make migrate --check report a chain the ledger cannot "
+        "evidence. Answering that by writing a ledger row is exactly what "
+        "the ledger exists to prevent, so promotion waits.")
+_PENDING_LOCAL_20260902 = (
+    "PENDING DEPLOYMENT -- governed schema change applied locally "
+        "2026-09-02, awaiting Railway. Promote to REQUIRED_MIGRATIONS after "
+        "production has run it.")
+_PENDING_LOCAL_20260909 = (
+    "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.")
+_DUPLICATE_DECLARATION = (
+    "Redundant declaration retained for the record. The three triggers it "
+        "creates -- trg_contacts_touch, trg_leads_touch and trg_accounts_touch "
+        "-- are already created and owned by touch_updated_at_convergence.sql, "
+        "required at position 37 and ledgered on Railway 2026-08-28 16:13:52. "
+        "This is a corpus classification decision. It does not assert that the "
+        "triggers were applied outside the governed path, because they were "
+        "not: that migration created them through scripts.migrate.")
+
+
 # CORRECTED 2026-08-25 after re-examination. The earlier reason given here was
 # "an incremental chain cannot be adopted one link at a time". That mechanism is
 # WRONG: CREATE OR REPLACE FUNCTION is a TOTAL replacement, and
@@ -709,9 +750,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # replay it, because a fresh environment has no such grants and should not
     # acquire email-enabled recipients by being created.
     "employee_work_email_activation.sql": (
-        "OUT OF BAND -- authorised activation applied to RAILWAY 2026-09-02. "
-        "A clean database must not replay it: it would confer email on grants "
-        "that environment does not have."),
+        _APPLIED_EMPLOYEE_WORK_EMAIL_ACTIVATION),
     # An owner id may never equal the employee id it links to. Reusing one as
     # the other is exactly how the F1 collision was created, and it is the
     # shortest path to a working digest — so it is forbidden structurally
@@ -719,8 +758,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # 0 of 44 rows carry a link today, so nothing can violate it.
     #
     # PENDING DEPLOYMENT status is recorded at application time.
-    "owners_no_identity_reuse.sql": ("APPLIED TO RAILWAY 2026-09-02. Promotable, not promoted -- see the "
-        "note on activities_owner_no_fabrication.sql."),
+    "owners_no_identity_reuse.sql": (_APPLIED_OWNERS_NO_IDENTITY_REUSE),
     # P5 — the eight non-service employee identities attested SYNTHETIC by the
     # owner, 2026-09-02. corpus_provenance held ZERO rows for `employees`, so
     # they were unclassified; real-vs-synthetic cannot be reconstructed on this
@@ -733,9 +771,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     #
     # A DECLARATION, not a repair — it changes no employee, owner or activity.
     # Eight uuids named individually so a future real hire cannot inherit it.
-    "employees_provenance_attestation.sql": ("APPLIED TO RAILWAY 2026-09-02. Stays out-of-band permanently: it "
-        "records attestations about eight SPECIFIC identities, and a clean "
-        "database has no such employees to attest about."),
+    "employees_provenance_attestation.sql": (_APPLIED_EMPLOYEES_PROVENANCE_ATTESTATION),
     # Removes trg_fill_activity_owner, the BEFORE INSERT OR UPDATE trigger
     # whose entire body fabricates activity ownership (contact -> account ->
     # created_by -> sentinel). It made the ratified P3 transition impossible:
@@ -748,11 +784,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # one statement.
     #
     # PENDING DEPLOYMENT. Applied locally 2026-09-02, not yet on Railway.
-    "activities_owner_no_fabrication.sql": ("APPLIED TO RAILWAY 2026-09-02. Promotable to REQUIRED_MIGRATIONS, but "
-        "NOT promoted here: apply_sql records no ledger row, so declaring "
-        "it would make migrate --check report a chain the ledger cannot "
-        "evidence. Answering that by writing a ledger row is exactly what "
-        "the ledger exists to prevent, so promotion waits."),
+    "activities_owner_no_fabrication.sql": (_APPLIED_ACTIVITIES_OWNER_NO_FABRICATION),
     # E7 — the executive role-assignment link, under a truthful name.
     # Additive: adds owner_id, copies the four values across, constrains it to
     # owners. Does NOT drop employee_uuid (readers still on it) and does NOT
@@ -760,13 +792,9 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     #
     # PENDING DEPLOYMENT. Applied locally 2026-09-02, not yet on Railway.
     "executives_owner_id_column.sql": (
-        "PENDING DEPLOYMENT -- governed schema change applied locally "
-        "2026-09-02, awaiting Railway. Promote to REQUIRED_MIGRATIONS after "
-        "production has run it."),
+        _PENDING_LOCAL_20260902),
     "owner_eligibility_guards.sql": (
-        "PENDING DEPLOYMENT -- governed schema change applied locally "
-        "2026-09-02, awaiting Railway. Promote to REQUIRED_MIGRATIONS after "
-        "production has run it."),
+        _PENDING_LOCAL_20260902),
     "auth_sessions.sql": _SCHEMA_OOB,
     "autocomplete_communication_activities.sql": _SCHEMA_OOB,
     "backfill_account_addresses.sql": _BACKFILL,
@@ -964,7 +992,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # separate decision -- a capability migration must not quietly repair
     # history. PENDING DEPLOYMENT; applied locally 2026-09-09, not on Railway.
     "escalation_assigned_requires_claim_time.sql":
-        "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.",
+        _PENDING_LOCAL_20260909,
     # Escalation reminder allocation (docs/decision_escalation_reminder_state.md,
     # Option A). Two columns so that eligibility and ordinal allocation are ONE
     # atomic UPDATE -- the scheduling guarantee the ledger cannot provide,
@@ -976,7 +1004,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # exist and is not authorised. Promote only after Railway has run it AND
     # the columns have been read back there directly.
     "escalation_reminder_allocation.sql":
-        "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.",
+        _PENDING_LOCAL_20260909,
     # Defect A (docs/remediation_plan_2026-09-09_defects_A_B_C.md). Widens the
     # ledger's send vocabulary to the canonical set so the identity boundary in
     # staff_email.py has nothing legitimate left to refuse.
@@ -990,7 +1018,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # from the migration ledger, and promoting on an inference would repeat
     # exactly that gap.
     "staff_email_ledger_governance_kinds.sql":
-        "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.",
+        _PENDING_LOCAL_20260909,
     "settle_immaterial_overdue.sql": _CORRECTION,
     "telephony.sql": _CORRECTION,
     "tenants.sql": _SCHEMA_OOB,
@@ -1000,8 +1028,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # reduces drift rather than creating it. Not governed -- a clean database
     # built from the regenerated baseline never has them to drop.
     "drop_local_only_dead_functions.sql":
-        "One-time data correction -- targets rows that exist only in this "
-        "database's history.",
+        _CORRECTION,
     # OUT-OF-BAND for the same structural reason as the drop above, but it is
     # NOT the same kind of change and the classification should not be read as
     # saying so. A clean database built from the regenerated baseline never
@@ -1015,8 +1042,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # DEPLOYMENT entry on the first run afterwards, which is the independent
     # signal; that entry is now deleted.
     "drop_sp_cases.sql":
-        "One-time data correction -- targets rows that exist only in this "
-        "database's history.",
+        _CORRECTION,
     # BATCH A, same out-of-band reasoning: the regenerated baseline no longer
     # creates any of them, so a clean database has nothing to drop. Both DO
     # need a Railway apply, and each carries PENDING DEPLOYMENT entries in
@@ -1028,11 +1054,9 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # cases.summary. Merging them would put a live write-path removal behind a
     # title that says cleanup, and reverting one would revert the other.
     "drop_dead_seed_fossils.sql":
-        "One-time data correction -- targets rows that exist only in this "
-        "database's history.",
+        _CORRECTION,
     "drop_sp_ai_assist.sql":
-        "One-time data correction -- targets rows that exist only in this "
-        "database's history.",
+        _CORRECTION,
     # A DATA BACKFILL, so it stays out-of-band permanently rather than being
     # promoted into REQUIRED_MIGRATIONS. I had planned to promote it; the
     # repository's own vocabulary says otherwise, and it is right: a clean
