@@ -410,6 +410,159 @@ _PENDING_A3_FINANCIAL_STATE = (
     "Promote to REQUIRED_MIGRATIONS in the same change that records its "
     "Railway application, and not before.")
 
+_PENDING_INVOICE_CANCELLATION = (
+    "PENDING DEPLOYMENT -- authored 2026-09-17. The cancellation authority for "
+    "decision D1: a table beside invoices whose row existence is the cancelled "
+    "state, carrying an effective timestamp, the deciding actor and a reason, "
+    "and made terminal by the generic append-only trigger. "
+    "THE DEFECT IT CLOSES is that cancellation was carried by invoices.status, "
+    "which trgfn_invoice_before recomputes from balance_due on every write. A "
+    "fact that economics do not determine cannot survive in a column that "
+    "economics recompute. Measured: INV-000023 was voided on 2026-02-25, the "
+    "projector rewrote its status, and the immaterial-overdue sweep recorded a "
+    "confirmed payment against it on 2026-06-15 -- the settlement gate could "
+    "not fire because it read that same column. "
+    "IT IS A TABLE AND NOT A COLUMN so that ordinary updates and settlement "
+    "projections of the invoices row cannot erase it implicitly; changing "
+    "cancellation must target the authority itself. This follows the precedent "
+    "A3 set with order_invoiceability for a lifecycle fact economics cannot "
+    "derive. "
+    "APPROVAL IS DELIBERATELY NOT ENFORCED. The approval_uuid column is an "
+    "extension point for decision D2, which is recorded as NOT ESTABLISHED; "
+    "nothing requires it, and its presence must not be read as a requirement. "
+    "Deploy AFTER a3_invoice_economic_integrity.sql and BEFORE the settlement "
+    "authority, whose lifecycle precondition reads this table.")
+
+
+_PENDING_CANCELLATION_REVERSAL = (
+    "PENDING DEPLOYMENT -- authored 2026-09-20. Reversing a cancellation, "
+    "governed at the same boundary: fn_authorize_reversal, the reversal guard, "
+    "and the operation discriminator that keeps the two apart. "
+    "THE GAP IT CLOSES. The cancellation guard fires on a row ENTERING "
+    "cancelled, so it said nothing about leaving. Measured: as the application "
+    "role, a cancelled order could be moved to pending, processing, ready, "
+    "shipped, delivered, completed or active by bare DML, with no authority, "
+    "no principal, no reason and no record. "
+    "WHY IT IS A DISTINCT OPERATION. A customer cancels their own order having "
+    "proven possession; nobody self-serves an un-cancellation and no such flow "
+    "exists, so reversal is staff authority. The operation is bound into the "
+    "proposition hash, so a grant issued to cancel cannot be spent to "
+    "un-cancel. "
+    "A REVERSAL IS NOW AN EVENT. Nothing previously recorded un-cancelling: "
+    "audit_log holds 5,024 cancel_by_agent rows and no reversal action, so the "
+    "three reversals in the corpus are visible only as a contradiction between "
+    "an order's status and its cancellation evidence. "
+    "NO WINDOW IS DECIDED HERE. The 72 hours in undo() is an implementation "
+    "artifact, not a ratified policy; governing who may reverse does not "
+    "require deciding how long. Not applied to crmdb.")
+
+
+_PENDING_CANCELLED_NOT_INVOICEABLE = (
+    "PENDING DEPLOYMENT -- authored 2026-09-19. The invariant that a cancelled "
+    "order must not become invoiceable, enforced at invoice creation. "
+    "THE DEFECT IT CLOSES. An earlier guard refused the single transition "
+    "cancelled -> Invoiced. That is not where invoices come from: "
+    "trgfn_order_create_invoice fires when an order reaches 'shipped'. Reversal "
+    "out of cancelled is ungoverned, so cancelled -> shipped created an invoice "
+    "without meeting any guard, and cancelled -> pending -> Invoiced reached "
+    "the invoiced status the same way. Four orders in the current corpus are "
+    "cancelled and carry invoices totalling $2,594.21; those rows are "
+    "historical and are not modified. "
+    "WHY A STATUS PAIR CANNOT EXPRESS IT. OLD.status cannot say 'has ever been "
+    "cancelled', because every intermediate state resets what OLD reports. The "
+    "durable fact is a consumed cancellation authority record, which survives "
+    "reversal; the current status is checked as well, as transitional cover for "
+    "orders cancelled before this enforcement existed. "
+    "ENFORCED AT THE CONSEQUENCE. A BEFORE INSERT trigger on invoices and on "
+    "invoice_orders, so the order trigger that creates invoices on shipment, "
+    "sp_accounting, and direct DML by the application role all meet it without "
+    "any path being enumerated. "
+    "REVERSAL IS NOT DECIDED HERE. An order may still leave the cancelled "
+    "state exactly as before; only the invoice is refused. Not applied to crmdb.")
+
+
+_PENDING_CANCELLATION_ENFORCEMENT = (
+    "PENDING DEPLOYMENT -- authored 2026-09-19. The enforcement half of the "
+    "cancellation boundary: cancellation_authorization, "
+    "fn_authorize_cancellation, and the triggers that govern a row entering "
+    "cancelled. "
+    "THE DEFECT IT CLOSES. The application role holds arwd on orders on both "
+    "the local database and production, with no row-level security and no "
+    "SECURITY DEFINER routine in the cancellation surface. A bare UPDATE "
+    "setting status to cancelled therefore succeeded, and revoking EXECUTE on "
+    "any procedure did not change that, because the capability lives on the "
+    "table rather than on the procedure. "
+    "IT GOVERNS THE TRANSITION, NOT THE FUNCTION. The guard fires only when a "
+    "row enters cancelled, so it reaches bare DML, the generic status writer, "
+    "function indirection and any future caller, while leaving ordinary "
+    "lifecycle progression, invoicing and total recalculation untouched. Six of "
+    "the seven writers that touch order status never produce cancelled. "
+    "THE CALLER CANNOT WRITE ITS OWN PROOF. The authorization table grants the "
+    "application role SELECT only; the row is written by a SECURITY DEFINER "
+    "function that records what fn_cancellation_authority returned, and a CHECK "
+    "constraint independently refuses any verdict other than AUTHORIZED. "
+    "Authority is scoped to the transaction that obtained it and is spent once. "
+    "Installing this file changes cancellation behaviour: a caller that does "
+    "not obtain authority can no longer cancel. It is not applied to crmdb.")
+
+
+_PENDING_CANCELLATION_AUTHORITY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-19. The cancellation boundary: "
+    "fn_cancellation_authority, the verdict and cancellable-state vocabularies, "
+    "and the cancellation_path register. "
+    "THE FINDING IT ANSWERS. A reconciliation of 298 governed cancellations "
+    "established that verified_via is a field the action writes about itself "
+    "and is not a reference to any verification record. Of 298 cancellations "
+    "asserting OTP verification, 6 could be corroborated against "
+    "order_cancel_verifications. "
+    "EVIDENCE, NOT ASSERTION. Authority is established by a consumed, "
+    "unexpired verification record bound to the exact order, over the stated "
+    "channel, with the order still in a cancellable state at execution. "
+    "Absence of evidence returns a refusal, never a pass. "
+    "NO CALLER-SUPPLIED CLOCK. The evaluator takes no evaluation time, so a "
+    "caller cannot ask what the verdict would have been at some other moment; "
+    "execution-time revalidation is expressed as equality against current "
+    "state rather than as a tolerance, because no staleness window has been "
+    "decided. "
+    "THE REGISTER CARRIES THE CENSUS. Six paths can reach or overwrite "
+    "cancelled status; none binds a verification record, and three of them "
+    "carry no cancellation control at all. Installing this file changes no "
+    "cancellation behaviour -- nothing calls the function yet. Not applied to "
+    "crmdb.")
+
+
+_PENDING_SETTLEMENT_AUTHORITY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-14. Phase 1 of the ratified "
+    "write-off financial control: settlement_events, an append-only ledger of "
+    "named economic events, and the authority functions "
+    "fn_settlement_record_payment and fn_settlement_record_write_off. "
+    "THE DEFECT IT CLOSES is that receivable state is changed by writing a "
+    "row: a caller that can insert into payments reduces a receivable, and "
+    "trgfn_payment_before supplies 'credit card' and 'confirmed' when the row "
+    "does not say otherwise, so an underspecified row becomes a confirmed card "
+    "payment. Measured: on 2026-06-15 that mechanism recorded 57 relinquished "
+    "residuals, $1,446.10 across 29 accounts, as money received. "
+    "THE EVENT VOCABULARY IS CLOSED -- payment, write_off, recovery, reversal, "
+    "refund -- with no general-purpose 'adjustment' member, because a "
+    "general-purpose event reintroduces the ambiguity the vocabulary removes. "
+    "One function per event rather than settle(type, ...): a generic entry "
+    "point whose behaviour is chosen by a caller-supplied string is a "
+    "privileged DML proxy, and whoever picks the string picks the economics. "
+    "WRITE-OFF IS DEFINED BUT NOT EXECUTABLE. It fails closed, because the "
+    "approved-proposition path and the collection-state model that separates "
+    "the relinquished amount from the amount still collectible are later "
+    "phases, and writing the balance now would execute a partial write-off as "
+    "a full one. No threshold is consulted; the CFO has not set one and the "
+    "fifty dollars in settle_immaterial_overdue.sql is not policy. "
+    "PHASE 1 DOES NOT REVOKE DIRECT DML. Any role holding DML on payments can "
+    "still settle a receivable without the authority. That exposure is left "
+    "visible rather than partially closed, and closing it requires converting "
+    "the remaining invoker-rights writers first: only 4 of 27 sp_* procedures "
+    "are SECURITY DEFINER and sp_accounting is not, so a revoke that preceded "
+    "the migration would take the application down."
+)
+
+
 _APPLIED_A3_INVOICE_ECONOMIC_INTEGRITY = (
     "APPLIED OUT-OF-BAND TO BOTH DATABASES. Railway 2026-09-14 13:41:00 UTC "
     "(schema_attestations id 23); local crmdb 2026-09-14 00:15:53 -04. "
@@ -931,6 +1084,12 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "a3_financial_state.sql": _PENDING_A3_FINANCIAL_STATE,
     "financial_proposition_binding.sql": _APPLIED_FINANCIAL_PROPOSITION_BINDING,
     "a3_invoice_economic_integrity.sql": _APPLIED_A3_INVOICE_ECONOMIC_INTEGRITY,
+    "invoice_cancellation.sql": _PENDING_INVOICE_CANCELLATION,
+    "cancellation_authority.sql": _PENDING_CANCELLATION_AUTHORITY,
+    "cancellation_enforcement.sql": _PENDING_CANCELLATION_ENFORCEMENT,
+    "cancelled_not_invoiceable.sql": _PENDING_CANCELLED_NOT_INVOICEABLE,
+    "cancellation_reversal.sql": _PENDING_CANCELLATION_REVERSAL,
+    "settlement_authority.sql": _PENDING_SETTLEMENT_AUTHORITY,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
