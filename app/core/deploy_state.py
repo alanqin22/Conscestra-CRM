@@ -410,10 +410,18 @@ _PENDING_A3_FINANCIAL_STATE = (
     "Promote to REQUIRED_MIGRATIONS in the same change that records its "
     "Railway application, and not before.")
 
-_PENDING_A3_INVOICE_ECONOMIC_INTEGRITY = (
-    "PENDING DEPLOYMENT -- authored 2026-09-14. The A3 invoice economic "
+_APPLIED_A3_INVOICE_ECONOMIC_INTEGRITY = (
+    "APPLIED OUT-OF-BAND TO BOTH DATABASES. Railway 2026-09-14 13:41:00 UTC "
+    "(schema_attestations id 23); local crmdb 2026-09-14 00:15:53 -04. "
+    "Authored 2026-09-14. The A3 invoice economic "
     "integrity control: invoices.snapshot_sealed_at, an append-only "
     "invoice_economic_authorization table, and six triggers. "
+    "THIS DECLARATION WAS STALE UNTIL 2026-09-23 and said PENDING DEPLOYMENT "
+    "while the objects were live on both databases -- which is the precise "
+    "failure this file exists to prevent, since every downstream check reads "
+    "it as the truth about production. Corrected against a direct object "
+    "probe of both databases: the column, the table, fn_invoice_line_set_hash "
+    "and all five named triggers are present on each. "
     "THE INVARIANT is subtotal_amount = SUM(invoice_orders.line_total), "
     "evaluated at TRANSACTION COMMIT and not at INSERT -- measured, the "
     "invoice row is written first, a payment is created against it by "
@@ -433,11 +441,20 @@ _PENDING_A3_INVOICE_ECONOMIC_INTEGRITY = (
     "LIVE-PATH CHANGE: fn_recalc_order_totals, called by sp_orders, will be "
     "refused when it would rewrite a sealed invoice. Measured exposure is "
     "nil -- 0 of 4,310 invoice lines have drifted since May 2026. "
-    "Promote to REQUIRED_MIGRATIONS in the same change that records its "
-    "Railway application, and not before.")
+    "DELIBERATELY NOT PROMOTED to REQUIRED_MIGRATIONS, and the earlier "
+    "instruction to promote on Railway application is superseded. That list "
+    "is read by ledger_health(), which accounts a declared migration against "
+    "a schema_migrations row; apply_sql records nothing there by design, so "
+    "declaring this file would report a permanent shortfall for a migration "
+    "that IS applied. A check that is permanently red teaches its reader to "
+    "ignore it. The apply is evidenced by schema_attestations instead, which "
+    "exists for exactly this path.")
 
-_PENDING_FINANCIAL_PROPOSITION_BINDING = (
-    "PENDING DEPLOYMENT -- authored 2026-09-13. Widens "
+_APPLIED_FINANCIAL_PROPOSITION_BINDING = (
+    "APPLIED OUT-OF-BAND TO BOTH DATABASES. Railway 2026-09-14 13:40:42 UTC "
+    "(schema_attestations id 22); local crmdb first applied 2026-09-13 "
+    "17:32:44 -04 and replayed five times while it was being developed. "
+    "Authored 2026-09-13. Widens "
     "trgfn_approval_proposition_immutable from the five proposition* columns "
     "to the fields execution actually consumes -- params, amount, "
     "action_type, entity_type, entity_id -- and to the identity a decision is "
@@ -451,8 +468,18 @@ _PENDING_FINANCIAL_PROPOSITION_BINDING = (
     "NOT AN ACTIVATION. It constrains how an approval may change; it opens no "
     "execution path, and the financial-proposition requirement binds only "
     "actions a deployed policy already classifies 'financial'. "
-    "Promote to REQUIRED_MIGRATIONS in the same change that records its "
-    "Railway application, and not before.")
+    "THIS DECLARATION WAS STALE UNTIL 2026-09-23. Corrected against a direct "
+    "object probe: all five proposition* columns, all three named triggers "
+    "and governance_policy_changes are present on both databases. "
+    "DELIBERATELY NOT PROMOTED to REQUIRED_MIGRATIONS, for the reason given "
+    "on the A3 economic-integrity declaration above: apply_sql writes no "
+    "schema_migrations row, so promoting an out-of-band apply would make "
+    "ledger_health() permanently short by one. "
+    "KNOWN GAP IT DOES NOT CLOSE: its three triggers are BEFORE UPDATE only, "
+    "so a row INSERTed already at status='executed' passes none of them. "
+    "Measured 2026-09-23: five email.send_payment_reminder rows, a financial "
+    "action class, executed daily with a null proposition and no named "
+    "executive. The remedy is a separate file, not an edit to this one.")
 
 _PENDING_GENERATE_INVOICE_POLICY = (
     "PENDING DEPLOYMENT -- authored 2026-09-12. One governance_action_policies "
@@ -867,8 +894,8 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "staff_email_ledger_owner_remind_kind.sql": _PENDING_OWNER_REMIND_KIND,
     "governance_policy_generate_invoice.sql": _PENDING_GENERATE_INVOICE_POLICY,
     "a3_financial_state.sql": _PENDING_A3_FINANCIAL_STATE,
-    "financial_proposition_binding.sql": _PENDING_FINANCIAL_PROPOSITION_BINDING,
-    "a3_invoice_economic_integrity.sql": _PENDING_A3_INVOICE_ECONOMIC_INTEGRITY,
+    "financial_proposition_binding.sql": _APPLIED_FINANCIAL_PROPOSITION_BINDING,
+    "a3_invoice_economic_integrity.sql": _APPLIED_A3_INVOICE_ECONOMIC_INTEGRITY,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
