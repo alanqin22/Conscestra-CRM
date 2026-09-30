@@ -481,6 +481,39 @@ _APPLIED_FINANCIAL_PROPOSITION_BINDING = (
     "action class, executed daily with a null proposition and no named "
     "executive. The remedy is a separate file, not an edit to this one.")
 
+_PENDING_ACCOUNTING_INVOICE_PIPELINE = (
+    "PENDING DEPLOYMENT -- authored 2026-09-29. The sole authoritative "
+    "definition of the accounting_invoice_pipeline view, extracted from the "
+    "accounting SP pack and reconciled with the soft-delete predicate. "
+    "It exists as its own artifact because the statement is a CREATE OR REPLACE "
+    "VIEW, so the artifact that executes last defines the view, and any artifact "
+    "that restates all 145 lines to change one clause silently removes the "
+    "clauses other artifacts contributed. Three sources carried a full "
+    "definition and two of them were pending: the cancellation-authority "
+    "reconciliation in sp/sp_accounting_v5e.sql and the invoice-level "
+    "is_deleted predicate in soft_deleted_invoices_are_not_receivable.sql. "
+    "Neither carried the other's clause, so both apply orders lost a "
+    "correction and no order made both units correct. Ownership is now stated "
+    "in one artifact instead of decided by execution sequence. "
+    "The two historical artifacts are not amended. "
+    "cancelled_invoices_are_not_receivable.sql and "
+    "soft_deleted_invoices_are_not_receivable.sql remain byte-identical: each "
+    "records a definition it did apply, and editing a record to tidy an "
+    "architecture is the defect corrected here on 2026-09-29 for "
+    "trg_fn_contacts_leads_accounts_touch.sql. They are superseded by "
+    "application order, and neither is authoritative for future promotion. "
+    "Apply it after invoice_cancellation.sql, which creates the table the view "
+    "reads. The dependency is on that table alone; nothing in the cancellation "
+    "set reads this view. "
+    "It changes reported numbers. Cancelled invoices report a zero balance and "
+    "a cancelled status, soft-deleted invoices leave the receivable "
+    "population, and the GREATEST(1.00, one percent) settlement tolerance is "
+    "removed under the T1 decision of 2026-09-15, so a residual within it is "
+    "reported rather than rounded to settled. No column is removed. "
+    "Promote to REQUIRED_MIGRATIONS in the same change that records its "
+    "Railway application, and not before.")
+
+
 _PENDING_GENERATE_INVOICE_POLICY = (
     "PENDING DEPLOYMENT -- authored 2026-09-12. One governance_action_policies "
     "row for accounting.generate_invoice: financial class, HUMAN_APPROVAL, CFO "
@@ -745,6 +778,8 @@ _CATCHUP = (
 # open questions for a human, not settled answers.
 OUT_OF_BAND_SQL: Dict[str, str] = {
     "account_intelligence.sql": _SCHEMA_OOB,
+    "accounting_invoice_pipeline.sql": (
+        _PENDING_ACCOUNTING_INVOICE_PIPELINE),
     "accounts_enrichment_columns.sql": _SCHEMA_OOB,
     "accounts_firmographics_columns.sql": _SCHEMA_OOB,
     "activities_account_fk.sql": _SCHEMA_OOB,
