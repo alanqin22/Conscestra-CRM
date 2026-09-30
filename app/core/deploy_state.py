@@ -231,8 +231,15 @@ REQUIRED_MIGRATIONS: List[str] = [
     # no record that it had been. Declaring it re-applies it idempotently
     # (DROP TRIGGER IF EXISTS + CREATE) and writes the ledger row that was never
     # created. It depends on trgfn_touch_updated_at from
-    # executives_audit_and_touch.sql, already required at position 25.
-    "trg_fn_contacts_leads_accounts_touch.sql",
+    # 49 -> 48 on 2026-09-29. trg_fn_contacts_leads_accounts_touch.sql was
+    # removed from this manifest and classified out-of-band instead. The three
+    # triggers it declares are already created and owned by
+    # touch_updated_at_convergence.sql, required at position 37, which carries
+    # the Railway ledger entry dated 2026-08-28 16:13:52. The note previously
+    # recorded here described the file as applied out of band. The object
+    # history does not support that: the file was authored on 2026-09-13,
+    # sixteen days after the triggers were created, and it declares no object
+    # the convergence migration does not already own.
 ]
 
 
@@ -1070,6 +1077,8 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # opportunities are a deliberate exclusion, because assigning an owner to
     # finished business rewrites who is recorded as having won or lost it.
     "backfill_open_opportunity_owner.sql": _BACKFILL,
+    "trg_fn_contacts_leads_accounts_touch.sql": (
+        _DUPLICATE_DECLARATION),
     "unified_comms_conversations.sql": _SCHEMA_OOB,
     "unified_comms_identity.sql": _SCHEMA_OOB,
     "update_product_images.sql": _CORRECTION,
