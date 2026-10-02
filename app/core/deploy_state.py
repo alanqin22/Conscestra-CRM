@@ -222,6 +222,24 @@ REQUIRED_MIGRATIONS: List[str] = [
     #    may replay them safely.
     "governance_decision_link_identity.sql",
     "workflow_owner_resolution.sql",
+    # 48 -> 49 on 2026-09-13. Not a new deployment: the three triggers this
+    # wires -- trg_contacts_touch, trg_leads_touch, trg_accounts_touch -- were
+    # verified present on Railway read-only as crm_readonly, and locally, before
+    # the promotion. What changes is the DECLARATION. The file was applied out
+    # of band and filed in tri_fn/ among function definitions, so it sat outside
+    # the census with no disposition and no schema_migrations row: applied, with
+    # no record that it had been. Declaring it re-applies it idempotently
+    # (DROP TRIGGER IF EXISTS + CREATE) and writes the ledger row that was never
+    # created. It depends on trgfn_touch_updated_at from
+    # 49 -> 48 on 2026-09-29. trg_fn_contacts_leads_accounts_touch.sql was
+    # removed from this manifest and classified out-of-band instead. The three
+    # triggers it declares are already created and owned by
+    # touch_updated_at_convergence.sql, required at position 37, which carries
+    # the Railway ledger entry dated 2026-08-28 16:13:52. The note previously
+    # recorded here described the file as applied out of band. The object
+    # history does not support that: the file was authored on 2026-09-13,
+    # sixteen days after the triggers were created, and it declares no object
+    # the convergence migration does not already own.
 ]
 
 
@@ -349,6 +367,534 @@ _PENDING_READONLY_ROLE = (
     "scripts/verify_readonly_role.py proves the role by ATTEMPTING the writes "
     "and requiring each to be refused, and reports the rotation separately as "
     "an outstanding item rather than folding it into a pass.")
+
+_PENDING_A3_FINANCIAL_STATE = (
+    "PENDING DEPLOYMENT -- authored 2026-09-13. The A3 financial-state "
+    "implementation: order_invoiceability (mutable current decision), "
+    "order_invoiceability_transitions and order_financial_assertions (both "
+    "append-only via the existing trgfn_append_only), product_tax_treatment "
+    "(created EMPTY by design), five nullable proposition columns on "
+    "action_approvals, and seven guard functions. "
+    "THE AUDIT PATH IS ENFORCED, NOT ASSERTED. order_invoiceability is a "
+    "MUTABLE current decision, so three controls make it auditable rather "
+    "than merely documented: an AFTER trigger records every eligibility "
+    "change into order_invoiceability_transitions with the predecessor and "
+    "successor read from OLD and NEW; a BEFORE DELETE trigger refuses "
+    "deletion, because absence of a row means NO DECISION RECORDED and "
+    "deleting one would silently restate a decision as an unrecorded one; "
+    "and BEFORE TRUNCATE triggers close the same removal on all three A3 "
+    "tables. A BEFORE INSERT trigger on the transition table enforces the "
+    "CONVERSE, that every transition corresponds to a real eligibility "
+    "change: the successor must equal the current decision, the predecessor "
+    "must equal the end of the recorded chain, and the two must differ. "
+    "Those conditions cannot all hold for any row written outside the "
+    "recorder, so the table is recorder-owned by construction rather than by "
+    "permission -- which matters because ALTER DEFAULT PRIVILEGES grants "
+    "crm_app full DML on every new table, so a REVOKE here would neither be "
+    "durable nor bind the superuser the application connects as locally. "
+    "order_invoiceability_transitions also gains transition_seq "
+    "(bigserial), the ordering authority, for the reason assertion_seq "
+    "exists: `at` is transaction-scoped and the uuid primary key broke the "
+    "tie by chance, which read a five-step history back in the wrong order "
+    "in 12 of 12 runs. "
+    "ADDITIVE AND IDEMPOTENT. It creates tables, adds nullable columns and "
+    "attaches triggers; it reads no existing row, writes no existing row and "
+    "backfills nothing. "
+    "NO TABLE-WIDE CONSTRAINT IS ADDED, and that is the design rather than an "
+    "omission: 2,463 of 2,521 orders carry no currency, all 415 products are "
+    "unclassified for tax, and 2,032 orders have no fulfilment event, so a "
+    "blanket NOT NULL would force a value onto historical rows that do not "
+    "have one. Every invariant is enforced at the transition that requires it. "
+    "Applying it therefore changes no existing behaviour: nothing writes to "
+    "the new tables until the A3 application path does. "
+    "Promote to REQUIRED_MIGRATIONS in the same change that records its "
+    "Railway application, and not before.")
+
+_PENDING_INVOICE_CANCELLATION = (
+    "PENDING DEPLOYMENT -- authored 2026-09-17. The cancellation authority for "
+    "decision D1: a table beside invoices whose row existence is the cancelled "
+    "state, carrying an effective timestamp, the deciding actor and a reason, "
+    "and made terminal by the generic append-only trigger. "
+    "THE DEFECT IT CLOSES is that cancellation was carried by invoices.status, "
+    "which trgfn_invoice_before recomputes from balance_due on every write. A "
+    "fact that economics do not determine cannot survive in a column that "
+    "economics recompute. Measured: INV-000023 was voided on 2026-02-25, the "
+    "projector rewrote its status, and the immaterial-overdue sweep recorded a "
+    "confirmed payment against it on 2026-06-15 -- the settlement gate could "
+    "not fire because it read that same column. "
+    "IT IS A TABLE AND NOT A COLUMN so that ordinary updates and settlement "
+    "projections of the invoices row cannot erase it implicitly; changing "
+    "cancellation must target the authority itself. This follows the precedent "
+    "A3 set with order_invoiceability for a lifecycle fact economics cannot "
+    "derive. "
+    "APPROVAL IS DELIBERATELY NOT ENFORCED. The approval_uuid column is an "
+    "extension point for decision D2, which is recorded as NOT ESTABLISHED; "
+    "nothing requires it, and its presence must not be read as a requirement. "
+    "Deploy AFTER a3_invoice_economic_integrity.sql and BEFORE the settlement "
+    "authority, whose lifecycle precondition reads this table.")
+
+_PENDING_OWNER_PERSONHOOD = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. The owner personhood register: "
+    "owner_personhood, an effective-dated declaration of whether an identity is "
+    "a natural person or a service identity, with fn_personhood_of, "
+    "fn_personhood_certification_report, fn_personhood_roster_certified, "
+    "v_owner_principal and v_personhood_unclassified. "
+    "THE GAP IT CLOSES is that E2 names personhood as one of six eligibility "
+    "grounds, and it is the one ground SQL cannot evaluate: the rules live in "
+    "the Python constants SERVICE_IDENTITY_ROLES and "
+    "SERVICE_IDENTITY_EXCEPTIONS. dsar.staff_personhood's roster-level "
+    "fail-closed condition now has a SQL analogue over the owner-principal "
+    "population, but it is not a mirror of the staff roster: the certification "
+    "universe is deliberately narrower. Nine database routines "
+    "establish activity ownership inside trigger and procedure execution where "
+    "Python is unreachable, so a database-resident eligibility boundary built "
+    "before this register would execute a predicate missing one of E2's "
+    "grounds -- a second interpretation of the contract in the deepest "
+    "enforcement layer. "
+    "IT IS EFFECTIVE-DATED RATHER THAN MUTABLE because a classification can "
+    "legitimately change and the question 'what was this identity classified as "
+    "when that assignment was made' must stay answerable. A declaration may be "
+    "closed and succeeded; it may not be altered or deleted. "
+    "CERTIFICATION IS GLOBAL AND FAILS CLOSED. It is measured over the active "
+    "role-assignment principals represented by v_owner_principal -- the "
+    "distinct minted owner_id values holding an active membership -- and not "
+    "over employees, which is an upstream source of employee declarations "
+    "rather than the certification universe. Certification requires a "
+    "non-empty population, exactly one current declaration per principal, and "
+    "exactly one active membership per principal; "
+    "fn_personhood_certification_report exposes each condition separately and "
+    "v_personhood_unclassified names the principals that block it. See "
+    "docs/personhood_domain_contract_gate.md. "
+    "Deploy BEFORE owner_eligibility_authority.sql, and populate it before "
+    "deploying that file.")
+
+_PENDING_OWNER_ELIGIBILITY_AUTHORITY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. The E2 contract as one "
+    "authoritative executable definition: fn_owner_eligibility_state, seven "
+    "states in strict precedence, with fn_owner_eligible redefined to derive "
+    "from it rather than restate it. "
+    "THE DEFECT IT CLOSES is two executable meanings for one ratified "
+    "contract. Measured on 2026-09-17 the SQL predicate and the Python "
+    "classifier agreed exactly, 516 eligible and 11,509 ineligible, while "
+    "differing structurally in four places: the collision rule (Python refuses "
+    "an identifier present in both employees and owners; SQL refused it only "
+    "when the addresses also differed), membership multiplicity, personhood, "
+    "and the not-granted/not-active distinction that a report needs because the "
+    "two have different remedies. Agreement on one population is a property of "
+    "that data, not of the definitions. "
+    "CONDITION 3 IS DELIBERATELY ABSENT. Refusing a synthetic identity as the "
+    "owner of attested-real work is not an E2 ground: it is a property of the "
+    "pairing of an owner with particular work, and belongs with the selection "
+    "engine, which has the work in hand. "
+    "THIS FILE CHANGES THE BEHAVIOUR OF A DEPLOYED FUNCTION. Against an empty "
+    "or uncertified personhood register it returns INELIGIBLE_NOT_HUMAN for "
+    "every identity -- the correct reading of an uncertified roster, and one "
+    "that would refuse all twelve currently eligible owners. Apply "
+    "owner_personhood_register.sql first, populate it, confirm "
+    "fn_personhood_roster_certified() returns true, and only then apply this.")
+
+_PENDING_OWNERSHIP_POLICY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. The ownership selection "
+    "carrier: ownership_policy and ownership_policy_history, versioned by the "
+    "database and append-only, mirroring the deployed "
+    "governance_action_policies pattern. "
+    "WHY A SEPARATE CARRIER. governance_action_policies answers whether an "
+    "action class may execute without a human, in what mode, owned by which "
+    "authority -- and answers it well. It carries no conditions, no candidate "
+    "population, no ordering and no tie-break, because it was never about "
+    "selection. Its grain is one row per action type, which is the wrong grain "
+    "for policies that compete for the same activity, and putting selection "
+    "there would couple a routing-rule edit to an execution-authority row. "
+    "Authority is therefore referenced rather than restated. "
+    "PRECEDENCE IS A TOTAL ORDER over active policies, enforced by a unique "
+    "partial index rather than resolved at execution time: whether two "
+    "populations overlap is not decidable here, and a conflict settled by "
+    "whichever row the planner returned first is not a governed decision. "
+    "NO POLICY IS SEEDED. An empty carrier assigns nothing, which is the "
+    "correct state until a policy is authored and approved. The selection "
+    "engine that interprets these declarations is a later stage; this file "
+    "changes no assignment behaviour.")
+
+_PENDING_OWNERSHIP_SELECTION = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. Stage 4 of the C1 ownership "
+    "blueprint: the declared policy grammar and its validator, the decision "
+    "evidence carriers ownership_decision and ownership_decision_candidate, "
+    "deterministic sampling, and fn_select_activity_owner. "
+    "THE GRAMMAR IS VALIDATED ON WRITE, by a check constraint calling "
+    "fn_ownership_policy_defect, because a policy that failed only when the "
+    "engine ran would fail during an assignment -- where the correct behaviour "
+    "is to return NULL -- making a configuration error indistinguishable from "
+    "the legitimate answer 'no eligible candidate'. The validator returns the "
+    "reason rather than a boolean so the author is not left guessing which of "
+    "four structures was wrong. "
+    "EVERY CANDIDATE IS RECORDED, not only the winner. The existing router "
+    "computes exactly this set and discards it; the ordering values it read are "
+    "kept here because workload is counted live and is therefore not "
+    "reproducible later. A policy version alone answers which rule ran, not why "
+    "this person rather than that one. "
+    "SAMPLING IS DETERMINISTIC in the activity and policy version, using md5 "
+    "rather than hashtext: hashtext is an internal function with no "
+    "cross-version stability guarantee, and a sample whose membership changes "
+    "on an upgrade cannot be verified afterwards. "
+    "THE ENGINE NEVER RAISES AND WRITES NO activities.owner_id. P3 requires the "
+    "activity to survive a refused candidate, so a selection that could throw "
+    "would turn an ownership failure into a work failure; and separating the "
+    "decision from its application is what allows a shadow window to measure "
+    "the engine without it changing anything. "
+    "Deploy AFTER ownership_policy.sql. This file assigns nothing: it adds no "
+    "trigger to activities and changes no existing write path.")
+
+_PENDING_OWNERSHIP_SHADOW = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. Stage 5 of the C1 ownership "
+    "blueprint: an AFTER ROW observer on activities that records what the "
+    "governed mechanism would have decided, and changes nothing. "
+    "WHY A TRIGGER AND NOT AN APPLICATION CALL. The writer census found "
+    "nineteen establishment-capable paths, nine of them resident in the "
+    "database. An application-level observer cannot see any of those, so a "
+    "shadow window built there would measure the two paths that already call "
+    "the boundary and report the result as coverage. At the table, every "
+    "writer passes through, including direct SQL. "
+    "NON-MUTATION IS STRUCTURAL, NOT DISCIPLINARY. Postgres ignores what an "
+    "AFTER trigger returns and gives it no way to alter the row that fired it, "
+    "so the only way this could change ownership is by issuing its own UPDATE. "
+    "It issues none, and the mutation suite adds one to prove that would be "
+    "caught. An owner already recorded is preserved: an observer that "
+    "corrected it would be an enforcement mechanism wearing a shadow's name, "
+    "and reassignment is a separate authority. "
+    "IT SWALLOWS ITS OWN FAILURES because the observation must never break the "
+    "write it observes; a shadow that could abort an activity insert would "
+    "turn a measurement into an outage. "
+    "DEFAULT OFF. Deploying it changes nothing until app.ownership_shadow is "
+    "set, matching the posture OWNER_ELIGIBILITY_ENFORCE sets for P3. "
+    "Deploy AFTER ownership_selection.sql.")
+
+_PENDING_OWNERSHIP_ATTRIBUTION = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. Stage 6 of the C1 ownership "
+    "blueprint: trusted writer attribution on the decision record, and the "
+    "engine widened to capture it. "
+    "THE GAP IT CLOSES is that the stage 5 observer proved an ownership event "
+    "reached the governed boundary and could not say which writer caused it. "
+    "The only context available was a free-form session setting any caller can "
+    "write, and a decision attributed to crm_app names the role that executed "
+    "the statement, not the business path that caused it. "
+    "WRITER CLASS IS DERIVED, NOT DECLARED. pg_trigger_depth() distinguishes a "
+    "statement issued directly from one issued inside another trigger, which is "
+    "the distinction that matters: nine of the nineteen establishment paths are "
+    "database-resident and an application cannot declare on their behalf. "
+    "Neither value is settable by a caller. "
+    "A SELF-REPORTED PATH IS RECORDED AND NEVER PROMOTED. writer_declared "
+    "carries what the caller said; it never overrides writer_class, so a direct "
+    "statement claiming to be a trigger is recorded as a direct statement that "
+    "made the claim, and v_ownership_attribution_conflicts names it. The "
+    "forgery becomes visible rather than effective. "
+    "UNKNOWN IS A PERMITTED VALUE. Where attribution cannot be established it "
+    "is recorded as unknown: an unknown writer is an evidence gap, a fabricated "
+    "one is a false record that looks like evidence. "
+    "Execution role, policy authority, human actor and activity owner are kept "
+    "in separate columns because they are separate facts; one actor column is "
+    "how a database role comes to stand for a human decision. "
+    "Deploy AFTER ownership_shadow.sql.")
+
+
+_PENDING_CANCELLATION_REVERSAL = (
+    "PENDING DEPLOYMENT -- authored 2026-09-20. Reversing a cancellation, "
+    "governed at the same boundary: fn_authorize_reversal, the reversal guard, "
+    "and the operation discriminator that keeps the two apart. "
+    "THE GAP IT CLOSES. The cancellation guard fires on a row ENTERING "
+    "cancelled, so it said nothing about leaving. Measured: as the application "
+    "role, a cancelled order could be moved to pending, processing, ready, "
+    "shipped, delivered, completed or active by bare DML, with no authority, "
+    "no principal, no reason and no record. "
+    "WHY IT IS A DISTINCT OPERATION. A customer cancels their own order having "
+    "proven possession; nobody self-serves an un-cancellation and no such flow "
+    "exists, so reversal is staff authority. The operation is bound into the "
+    "proposition hash, so a grant issued to cancel cannot be spent to "
+    "un-cancel. "
+    "A REVERSAL IS NOW AN EVENT. Nothing previously recorded un-cancelling: "
+    "audit_log holds 5,024 cancel_by_agent rows and no reversal action, so the "
+    "three reversals in the corpus are visible only as a contradiction between "
+    "an order's status and its cancellation evidence. "
+    "NO WINDOW IS DECIDED HERE. The 72 hours in undo() is an implementation "
+    "artifact, not a ratified policy; governing who may reverse does not "
+    "require deciding how long. Not applied to crmdb.")
+
+
+_PENDING_CANCELLED_NOT_INVOICEABLE = (
+    "PENDING DEPLOYMENT -- authored 2026-09-19. The invariant that a cancelled "
+    "order must not become invoiceable, enforced at invoice creation. "
+    "THE DEFECT IT CLOSES. An earlier guard refused the single transition "
+    "cancelled -> Invoiced. That is not where invoices come from: "
+    "trgfn_order_create_invoice fires when an order reaches 'shipped'. Reversal "
+    "out of cancelled is ungoverned, so cancelled -> shipped created an invoice "
+    "without meeting any guard, and cancelled -> pending -> Invoiced reached "
+    "the invoiced status the same way. Four orders in the current corpus are "
+    "cancelled and carry invoices totalling $2,594.21; those rows are "
+    "historical and are not modified. "
+    "WHY A STATUS PAIR CANNOT EXPRESS IT. OLD.status cannot say 'has ever been "
+    "cancelled', because every intermediate state resets what OLD reports. The "
+    "durable fact is a consumed cancellation authority record, which survives "
+    "reversal; the current status is checked as well, as transitional cover for "
+    "orders cancelled before this enforcement existed. "
+    "ENFORCED AT THE CONSEQUENCE. A BEFORE INSERT trigger on invoices and on "
+    "invoice_orders, so the order trigger that creates invoices on shipment, "
+    "sp_accounting, and direct DML by the application role all meet it without "
+    "any path being enumerated. "
+    "REVERSAL IS NOT DECIDED HERE. An order may still leave the cancelled "
+    "state exactly as before; only the invoice is refused. Not applied to crmdb.")
+
+
+_PENDING_CANCELLATION_ENFORCEMENT = (
+    "PENDING DEPLOYMENT -- authored 2026-09-19. The enforcement half of the "
+    "cancellation boundary: cancellation_authorization, "
+    "fn_authorize_cancellation, and the triggers that govern a row entering "
+    "cancelled. "
+    "THE DEFECT IT CLOSES. The application role holds arwd on orders on both "
+    "the local database and production, with no row-level security and no "
+    "SECURITY DEFINER routine in the cancellation surface. A bare UPDATE "
+    "setting status to cancelled therefore succeeded, and revoking EXECUTE on "
+    "any procedure did not change that, because the capability lives on the "
+    "table rather than on the procedure. "
+    "IT GOVERNS THE TRANSITION, NOT THE FUNCTION. The guard fires only when a "
+    "row enters cancelled, so it reaches bare DML, the generic status writer, "
+    "function indirection and any future caller, while leaving ordinary "
+    "lifecycle progression, invoicing and total recalculation untouched. Six of "
+    "the seven writers that touch order status never produce cancelled. "
+    "THE CALLER CANNOT WRITE ITS OWN PROOF. The authorization table grants the "
+    "application role SELECT only; the row is written by a SECURITY DEFINER "
+    "function that records what fn_cancellation_authority returned, and a CHECK "
+    "constraint independently refuses any verdict other than AUTHORIZED. "
+    "Authority is scoped to the transaction that obtained it and is spent once. "
+    "Installing this file changes cancellation behaviour: a caller that does "
+    "not obtain authority can no longer cancel. It is not applied to crmdb.")
+
+
+_PENDING_CANCELLATION_AUTHORITY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-19. The cancellation boundary: "
+    "fn_cancellation_authority, the verdict and cancellable-state vocabularies, "
+    "and the cancellation_path register. "
+    "THE FINDING IT ANSWERS. A reconciliation of 298 governed cancellations "
+    "established that verified_via is a field the action writes about itself "
+    "and is not a reference to any verification record. Of 298 cancellations "
+    "asserting OTP verification, 6 could be corroborated against "
+    "order_cancel_verifications. "
+    "EVIDENCE, NOT ASSERTION. Authority is established by a consumed, "
+    "unexpired verification record bound to the exact order, over the stated "
+    "channel, with the order still in a cancellable state at execution. "
+    "Absence of evidence returns a refusal, never a pass. "
+    "NO CALLER-SUPPLIED CLOCK. The evaluator takes no evaluation time, so a "
+    "caller cannot ask what the verdict would have been at some other moment; "
+    "execution-time revalidation is expressed as equality against current "
+    "state rather than as a tolerance, because no staleness window has been "
+    "decided. "
+    "THE REGISTER CARRIES THE CENSUS. Six paths can reach or overwrite "
+    "cancelled status; none binds a verification record, and three of them "
+    "carry no cancellation control at all. Installing this file changes no "
+    "cancellation behaviour -- nothing calls the function yet. Not applied to "
+    "crmdb.")
+
+
+_PENDING_SETTLEMENT_AUTHORITY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-14. Phase 1 of the ratified "
+    "write-off financial control: settlement_events, an append-only ledger of "
+    "named economic events, and the authority functions "
+    "fn_settlement_record_payment and fn_settlement_record_write_off. "
+    "THE DEFECT IT CLOSES is that receivable state is changed by writing a "
+    "row: a caller that can insert into payments reduces a receivable, and "
+    "trgfn_payment_before supplies 'credit card' and 'confirmed' when the row "
+    "does not say otherwise, so an underspecified row becomes a confirmed card "
+    "payment. Measured: on 2026-06-15 that mechanism recorded 57 relinquished "
+    "residuals, $1,446.10 across 29 accounts, as money received. "
+    "THE EVENT VOCABULARY IS CLOSED -- payment, write_off, recovery, reversal, "
+    "refund -- with no general-purpose 'adjustment' member, because a "
+    "general-purpose event reintroduces the ambiguity the vocabulary removes. "
+    "One function per event rather than settle(type, ...): a generic entry "
+    "point whose behaviour is chosen by a caller-supplied string is a "
+    "privileged DML proxy, and whoever picks the string picks the economics. "
+    "WRITE-OFF IS DEFINED BUT NOT EXECUTABLE. It fails closed, because the "
+    "approved-proposition path and the collection-state model that separates "
+    "the relinquished amount from the amount still collectible are later "
+    "phases, and writing the balance now would execute a partial write-off as "
+    "a full one. No threshold is consulted; the CFO has not set one and the "
+    "fifty dollars in settle_immaterial_overdue.sql is not policy. "
+    "PHASE 1 DOES NOT REVOKE DIRECT DML. Any role holding DML on payments can "
+    "still settle a receivable without the authority. That exposure is left "
+    "visible rather than partially closed, and closing it requires converting "
+    "the remaining invoker-rights writers first: only 4 of 27 sp_* procedures "
+    "are SECURITY DEFINER and sp_accounting is not, so a revoke that preceded "
+    "the migration would take the application down."
+)
+
+
+_APPLIED_A3_INVOICE_ECONOMIC_INTEGRITY = (
+    "APPLIED OUT-OF-BAND TO BOTH DATABASES. Railway 2026-09-14 13:41:00 UTC "
+    "(schema_attestations id 23); local crmdb 2026-09-14 00:15:53 -04. "
+    "Authored 2026-09-14. The A3 invoice economic "
+    "integrity control: invoices.snapshot_sealed_at, an append-only "
+    "invoice_economic_authorization table, and six triggers. "
+    "THIS DECLARATION WAS STALE UNTIL 2026-09-23 and said PENDING DEPLOYMENT "
+    "while the objects were live on both databases -- which is the precise "
+    "failure this file exists to prevent, since every downstream check reads "
+    "it as the truth about production. Corrected against a direct object "
+    "probe of both databases: the column, the table, fn_invoice_line_set_hash "
+    "and all five named triggers are present on each. "
+    "THE INVARIANT is subtotal_amount = SUM(invoice_orders.line_total), "
+    "evaluated at TRANSACTION COMMIT and not at INSERT -- measured, the "
+    "invoice row is written first, a payment is created against it by "
+    "trigger, and only then are its lines written; 446 payments exist that "
+    "predate their invoice's lines, so an INSERT-time check would fail on "
+    "every invoice ever produced. "
+    "SEALING THE 2,102 EXISTING INVOICES IS DONE BY THE COLUMN DEFAULT, not "
+    "by an UPDATE: ADD COLUMN ... DEFAULT now() gives pre-existing rows that "
+    "value through the catalogue, and the default is dropped immediately so "
+    "future invoices are born unsealed. NO STATEMENT WRITES AN ECONOMIC "
+    "COLUMN OF ANY EXISTING RECORD. "
+    "SEALED IS NOT A CERTIFICATE OF CORRECTNESS: ~188 historical invoices "
+    "carry a generation defect corrected between May and June 2026 "
+    "($35,108 overstated, $2,577 understated), two were issued at $0.00 "
+    "against $398.75 of delivered goods, and one is a pytest artifact. Their "
+    "financial disposition is open finance work and is not settled here. "
+    "LIVE-PATH CHANGE: fn_recalc_order_totals, called by sp_orders, will be "
+    "refused when it would rewrite a sealed invoice. Measured exposure is "
+    "nil -- 0 of 4,310 invoice lines have drifted since May 2026. "
+    "DELIBERATELY NOT PROMOTED to REQUIRED_MIGRATIONS, and the earlier "
+    "instruction to promote on Railway application is superseded. That list "
+    "is read by ledger_health(), which accounts a declared migration against "
+    "a schema_migrations row; apply_sql records nothing there by design, so "
+    "declaring this file would report a permanent shortfall for a migration "
+    "that IS applied. A check that is permanently red teaches its reader to "
+    "ignore it. The apply is evidenced by schema_attestations instead, which "
+    "exists for exactly this path.")
+_APPLIED_LOCAL_FINANCIAL_APPROVAL_INSERT_BOUNDARY = (
+    "APPLIED TO LOCAL crmdb 2026-09-23 22:51:06 -04 "
+    "(schema_attestations id 1470); NOT YET ON RAILWAY. "
+    "Authored 2026-09-23. Re-binds two financial "
+    "approval controls from BEFORE UPDATE to BEFORE INSERT OR UPDATE, and "
+    "adds the TG_OP guard each one needs to survive an INSERT. "
+    "THE DEFECT IT CLOSES: a row INSERTed already at status='executed' passed "
+    "neither control. Measured on Railway 2026-09-23 -- five "
+    "email.send_payment_reminder rows, policy class 'financial', "
+    "created_at = decided_at = executed_at to the microsecond, every one with "
+    "a null proposition_hash, a null assigned_executive_id and a null amount, "
+    "the most recent dated that morning. Beside them, supervisor.emit_dunning "
+    "rows DO name an executive, because they travel pending -> executed by "
+    "UPDATE. One table, two populations, separated only by the verb. "
+    "ONLY TWO OF THE THREE TRIGGERS MOVE. "
+    "trgfn_approval_proposition_immutable stays UPDATE-only on purpose: it "
+    "compares thirteen NEW fields to their OLD counterparts and there is no "
+    "OLD on INSERT. It protects a decided row from being rewritten, which is "
+    "a statement about change, not about state. "
+    "IT CLOSES THE BYPASS AND NOT THE CONTROL. amount remains 0 on all 78 "
+    "approvals that carry it, approval_authority_limit remains NULL for all "
+    "five executives, and SAMPLED_REVIEW still has no completion record. "
+    "EXPECT IT TO STOP A DAILY JOB. email.send_payment_reminder will fail on "
+    "whichever database has this until it supplies a proposition and an "
+    "eligible executive, or is reclassified on the evidence of what it "
+    "actually does. That is the control working, and it is written down here "
+    "so the first failure is recognised rather than diagnosed. "
+    "VERIFIED ON LOCAL after apply: both triggers report BEFORE INSERT "
+    "OR UPDATE and trg_approval_proposition_immutable is unchanged at "
+    "BEFORE UPDATE; an INSERT-as-executed financial approval is refused "
+    "by ck_financial_approval_requires_proposition, and a pending "
+    "proposal naming an eligible owner is still accepted -- both probed "
+    "in transactions that were rolled back, leaving no row behind. "
+    "PRE-APPLY MEASUREMENT ON LOCAL: 1,523 email.send_payment_reminder "
+    "rows born executed, of which 480 were written AFTER "
+    "financial_proposition_binding.sql was applied on 2026-09-13. The "
+    "control was deployed and the bypass kept writing through it. "
+    "NOT PROMOTED TO REQUIRED_MIGRATIONS: apply_sql writes no "
+    "schema_migrations row, so a declared out-of-band apply would leave "
+    "ledger_health() permanently short by one. schema_attestations is the "
+    "evidence path for this file.")
+
+
+_APPLIED_FINANCIAL_PROPOSITION_BINDING = (
+    "APPLIED OUT-OF-BAND TO BOTH DATABASES. Railway 2026-09-14 13:40:42 UTC "
+    "(schema_attestations id 22); local crmdb first applied 2026-09-13 "
+    "17:32:44 -04 and replayed five times while it was being developed. "
+    "Authored 2026-09-13. Widens "
+    "trgfn_approval_proposition_immutable from the five proposition* columns "
+    "to the fields execution actually consumes -- params, amount, "
+    "action_type, entity_type, entity_id -- and to the identity a decision is "
+    "attributed to. Adds a delete guard for decided approvals, and requires a "
+    "canonical proposition before an action whose policy class is 'financial' "
+    "may be approved. "
+    "THE MEASUREMENT: all five guarded columns were empty in all 1446 rows "
+    "because nothing wrote them, while UPDATE of amount, params and "
+    "decided_by on genuine executed approvals was accepted by direct SQL. The "
+    "guarded set was narrower than the content it protected. "
+    "NOT AN ACTIVATION. It constrains how an approval may change; it opens no "
+    "execution path, and the financial-proposition requirement binds only "
+    "actions a deployed policy already classifies 'financial'. "
+    "THIS DECLARATION WAS STALE UNTIL 2026-09-23. Corrected against a direct "
+    "object probe: all five proposition* columns, all three named triggers "
+    "and governance_policy_changes are present on both databases. "
+    "DELIBERATELY NOT PROMOTED to REQUIRED_MIGRATIONS, for the reason given "
+    "on the A3 economic-integrity declaration above: apply_sql writes no "
+    "schema_migrations row, so promoting an out-of-band apply would make "
+    "ledger_health() permanently short by one. "
+    "KNOWN GAP IT DOES NOT CLOSE: its three triggers are BEFORE UPDATE only, "
+    "so a row INSERTed already at status='executed' passes none of them. "
+    "Measured 2026-09-23: five email.send_payment_reminder rows, a financial "
+    "action class, executed daily with a null proposition and no named "
+    "executive. The remedy is a separate file, not an edit to this one.")
+_APPLIED_LOCAL_SOFT_DELETED_AR = (
+    "APPLIED TO LOCAL crmdb 2026-09-20; NOT YET ON RAILWAY. Adds the missing "
+    "invoice-level is_deleted predicate to vw_invoices_ar and "
+    "accounting_invoice_pipeline. "
+    "THE DEFECT. Neither view filtered soft-deleted invoices. vw_invoices_ar "
+    "ended FROM invoices i LEFT JOIN ... with no WHERE at all, while filtering "
+    "is_deleted = false on PAYMENTS inside its own CTE -- honouring the flag for "
+    "payments and ignoring it for invoices. Soft-deleting an invoice therefore "
+    "removed it from nothing: 260 marked deleted, and both the AR Aging chart "
+    "and the Accounting Summary continued to report $132,769.65, exactly "
+    "sum(balance_due) over the view. "
+    "LATENT UNTIL EXERCISED. No invoice had ever been soft-deleted before that "
+    "date, so the omission had never cost anything. v_invoice_balance_drift "
+    "already carried the predicate, which is why this is an omission rather "
+    "than a decision. "
+    "WHY THE VIEW AND NOT THE CONSUMERS: the reasoning in "
+    "cancelled_invoices_are_not_receivable.sql, which fixed the neighbouring "
+    "defect on the same view. Two consumer shapes exist and a consumer-side fix "
+    "must find every one of them. "
+    "PRODUCED BY READING THE LIVE VIEWS with pg_get_viewdef and re-emitting them "
+    "with one predicate added, then diffing against the originals to confirm the "
+    "predicate is the only change. Measured effect: outstanding $132,769.65 -> "
+    "$71,994.65, paid rate 82.5% -> 91.5%, affecting exactly the 260 "
+    "soft-deleted rows and nothing else.")
+
+
+_PENDING_ACCOUNTING_INVOICE_PIPELINE = (
+    "PENDING DEPLOYMENT -- authored 2026-09-29. The sole authoritative "
+    "definition of the accounting_invoice_pipeline view, extracted from the "
+    "accounting SP pack and reconciled with the soft-delete predicate. "
+    "It exists as its own artifact because the statement is a CREATE OR REPLACE "
+    "VIEW, so the artifact that executes last defines the view, and any artifact "
+    "that restates all 145 lines to change one clause silently removes the "
+    "clauses other artifacts contributed. Three sources carried a full "
+    "definition and two of them were pending: the cancellation-authority "
+    "reconciliation in sp/sp_accounting_v5e.sql and the invoice-level "
+    "is_deleted predicate in soft_deleted_invoices_are_not_receivable.sql. "
+    "Neither carried the other's clause, so both apply orders lost a "
+    "correction and no order made both units correct. Ownership is now stated "
+    "in one artifact instead of decided by execution sequence. "
+    "The two historical artifacts are not amended. "
+    "cancelled_invoices_are_not_receivable.sql and "
+    "soft_deleted_invoices_are_not_receivable.sql remain byte-identical: each "
+    "records a definition it did apply, and editing a record to tidy an "
+    "architecture is the defect corrected here on 2026-09-29 for "
+    "trg_fn_contacts_leads_accounts_touch.sql. They are superseded by "
+    "application order, and neither is authoritative for future promotion. "
+    "Apply it after invoice_cancellation.sql, which creates the table the view "
+    "reads. The dependency is on that table alone; nothing in the cancellation "
+    "set reads this view. "
+    "It changes reported numbers. Cancelled invoices report a zero balance and "
+    "a cancelled status, soft-deleted invoices leave the receivable "
+    "population, and the GREATEST(1.00, one percent) settlement tolerance is "
+    "removed under the T1 decision of 2026-09-15, so a residual within it is "
+    "reported rather than rounded to settled. No column is removed. "
+    "Promote to REQUIRED_MIGRATIONS in the same change that records its "
+    "Railway application, and not before.")
+
 
 _PENDING_GENERATE_INVOICE_POLICY = (
     "PENDING DEPLOYMENT -- authored 2026-09-12. One governance_action_policies "
@@ -500,6 +1046,47 @@ _SEED = (
 _DIAGNOSTIC = (
     "Diagnostic -- reads only and changes no state.")
 
+# Dispositions normalised 2026-09-29. These entries stated their disposition
+# in prose rather than naming one, which a structural check cannot read.
+# The wording is carried across unchanged; only the reference is new.
+#
+# _DUPLICATE_DECLARATION names a file whose objects are already created and
+# owned by another declared migration. It is not 'superseded': the owning
+# migration was ledgered before this file was authored, so this file was
+# never the source of those objects.
+_APPLIED_EMPLOYEE_WORK_EMAIL_ACTIVATION = (
+    "OUT OF BAND -- authorised activation applied to RAILWAY 2026-09-02. "
+        "A clean database must not replay it: it would confer email on grants "
+        "that environment does not have.")
+_APPLIED_OWNERS_NO_IDENTITY_REUSE = (
+    "APPLIED TO RAILWAY 2026-09-02. Promotable, not promoted -- see the "
+        "note on activities_owner_no_fabrication.sql.")
+_APPLIED_EMPLOYEES_PROVENANCE_ATTESTATION = (
+    "APPLIED TO RAILWAY 2026-09-02. Stays out-of-band permanently: it "
+        "records attestations about eight SPECIFIC identities, and a clean "
+        "database has no such employees to attest about.")
+_APPLIED_ACTIVITIES_OWNER_NO_FABRICATION = (
+    "APPLIED TO RAILWAY 2026-09-02. Promotable to REQUIRED_MIGRATIONS, but "
+        "NOT promoted here: apply_sql records no ledger row, so declaring "
+        "it would make migrate --check report a chain the ledger cannot "
+        "evidence. Answering that by writing a ledger row is exactly what "
+        "the ledger exists to prevent, so promotion waits.")
+_PENDING_LOCAL_20260902 = (
+    "PENDING DEPLOYMENT -- governed schema change applied locally "
+        "2026-09-02, awaiting Railway. Promote to REQUIRED_MIGRATIONS after "
+        "production has run it.")
+_PENDING_LOCAL_20260909 = (
+    "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.")
+_DUPLICATE_DECLARATION = (
+    "Redundant declaration retained for the record. The three triggers it "
+        "creates -- trg_contacts_touch, trg_leads_touch and trg_accounts_touch "
+        "-- are already created and owned by touch_updated_at_convergence.sql, "
+        "required at position 37 and ledgered on Railway 2026-08-28 16:13:52. "
+        "This is a corpus classification decision. It does not assert that the "
+        "triggers were applied outside the governed path, because they were "
+        "not: that migration created them through scripts.migrate.")
+
+
 # CORRECTED 2026-08-25 after re-examination. The earlier reason given here was
 # "an incremental chain cannot be adopted one link at a time". That mechanism is
 # WRONG: CREATE OR REPLACE FUNCTION is a TOTAL replacement, and
@@ -573,6 +1160,8 @@ _CATCHUP = (
 # open questions for a human, not settled answers.
 OUT_OF_BAND_SQL: Dict[str, str] = {
     "account_intelligence.sql": _SCHEMA_OOB,
+    "accounting_invoice_pipeline.sql": (
+        _PENDING_ACCOUNTING_INVOICE_PIPELINE),
     "accounts_enrichment_columns.sql": _SCHEMA_OOB,
     "accounts_firmographics_columns.sql": _SCHEMA_OOB,
     "activities_account_fk.sql": _SCHEMA_OOB,
@@ -612,9 +1201,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # replay it, because a fresh environment has no such grants and should not
     # acquire email-enabled recipients by being created.
     "employee_work_email_activation.sql": (
-        "OUT OF BAND -- authorised activation applied to RAILWAY 2026-09-02. "
-        "A clean database must not replay it: it would confer email on grants "
-        "that environment does not have."),
+        _APPLIED_EMPLOYEE_WORK_EMAIL_ACTIVATION),
     # An owner id may never equal the employee id it links to. Reusing one as
     # the other is exactly how the F1 collision was created, and it is the
     # shortest path to a working digest — so it is forbidden structurally
@@ -622,8 +1209,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # 0 of 44 rows carry a link today, so nothing can violate it.
     #
     # PENDING DEPLOYMENT status is recorded at application time.
-    "owners_no_identity_reuse.sql": ("APPLIED TO RAILWAY 2026-09-02. Promotable, not promoted -- see the "
-        "note on activities_owner_no_fabrication.sql."),
+    "owners_no_identity_reuse.sql": (_APPLIED_OWNERS_NO_IDENTITY_REUSE),
     # P5 — the eight non-service employee identities attested SYNTHETIC by the
     # owner, 2026-09-02. corpus_provenance held ZERO rows for `employees`, so
     # they were unclassified; real-vs-synthetic cannot be reconstructed on this
@@ -636,9 +1222,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     #
     # A DECLARATION, not a repair — it changes no employee, owner or activity.
     # Eight uuids named individually so a future real hire cannot inherit it.
-    "employees_provenance_attestation.sql": ("APPLIED TO RAILWAY 2026-09-02. Stays out-of-band permanently: it "
-        "records attestations about eight SPECIFIC identities, and a clean "
-        "database has no such employees to attest about."),
+    "employees_provenance_attestation.sql": (_APPLIED_EMPLOYEES_PROVENANCE_ATTESTATION),
     # Removes trg_fill_activity_owner, the BEFORE INSERT OR UPDATE trigger
     # whose entire body fabricates activity ownership (contact -> account ->
     # created_by -> sentinel). It made the ratified P3 transition impossible:
@@ -651,11 +1235,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # one statement.
     #
     # PENDING DEPLOYMENT. Applied locally 2026-09-02, not yet on Railway.
-    "activities_owner_no_fabrication.sql": ("APPLIED TO RAILWAY 2026-09-02. Promotable to REQUIRED_MIGRATIONS, but "
-        "NOT promoted here: apply_sql records no ledger row, so declaring "
-        "it would make migrate --check report a chain the ledger cannot "
-        "evidence. Answering that by writing a ledger row is exactly what "
-        "the ledger exists to prevent, so promotion waits."),
+    "activities_owner_no_fabrication.sql": (_APPLIED_ACTIVITIES_OWNER_NO_FABRICATION),
     # E7 — the executive role-assignment link, under a truthful name.
     # Additive: adds owner_id, copies the four values across, constrains it to
     # owners. Does NOT drop employee_uuid (readers still on it) and does NOT
@@ -663,13 +1243,9 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     #
     # PENDING DEPLOYMENT. Applied locally 2026-09-02, not yet on Railway.
     "executives_owner_id_column.sql": (
-        "PENDING DEPLOYMENT -- governed schema change applied locally "
-        "2026-09-02, awaiting Railway. Promote to REQUIRED_MIGRATIONS after "
-        "production has run it."),
+        _PENDING_LOCAL_20260902),
     "owner_eligibility_guards.sql": (
-        "PENDING DEPLOYMENT -- governed schema change applied locally "
-        "2026-09-02, awaiting Railway. Promote to REQUIRED_MIGRATIONS after "
-        "production has run it."),
+        _PENDING_LOCAL_20260902),
     "auth_sessions.sql": _SCHEMA_OOB,
     "autocomplete_communication_activities.sql": _SCHEMA_OOB,
     "backfill_account_addresses.sql": _BACKFILL,
@@ -734,6 +1310,23 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "governance_alert_resolution_required.sql": _PENDING_ALERT_RESOLUTION_REQUIRED,
     "staff_email_ledger_owner_remind_kind.sql": _PENDING_OWNER_REMIND_KIND,
     "governance_policy_generate_invoice.sql": _PENDING_GENERATE_INVOICE_POLICY,
+    "a3_financial_state.sql": _PENDING_A3_FINANCIAL_STATE,
+    "financial_approval_insert_boundary.sql": _APPLIED_LOCAL_FINANCIAL_APPROVAL_INSERT_BOUNDARY,
+    "financial_proposition_binding.sql": _APPLIED_FINANCIAL_PROPOSITION_BINDING,
+    "a3_invoice_economic_integrity.sql": _APPLIED_A3_INVOICE_ECONOMIC_INTEGRITY,
+    "invoice_cancellation.sql": _PENDING_INVOICE_CANCELLATION,
+    "owner_personhood_register.sql": _PENDING_OWNER_PERSONHOOD,
+    "owner_eligibility_authority.sql": _PENDING_OWNER_ELIGIBILITY_AUTHORITY,
+    "ownership_policy.sql": _PENDING_OWNERSHIP_POLICY,
+    "ownership_selection.sql": _PENDING_OWNERSHIP_SELECTION,
+    "ownership_shadow.sql": _PENDING_OWNERSHIP_SHADOW,
+    "ownership_attribution.sql": _PENDING_OWNERSHIP_ATTRIBUTION,
+    "cancellation_authority.sql": _PENDING_CANCELLATION_AUTHORITY,
+    "cancellation_enforcement.sql": _PENDING_CANCELLATION_ENFORCEMENT,
+    "cancelled_not_invoiceable.sql": _PENDING_CANCELLED_NOT_INVOICEABLE,
+    "cancellation_reversal.sql": _PENDING_CANCELLATION_REVERSAL,
+    "soft_deleted_invoices_are_not_receivable.sql": _APPLIED_LOCAL_SOFT_DELETED_AR,
+    "settlement_authority.sql": _PENDING_SETTLEMENT_AUTHORITY,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
@@ -864,7 +1457,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # separate decision -- a capability migration must not quietly repair
     # history. PENDING DEPLOYMENT; applied locally 2026-09-09, not on Railway.
     "escalation_assigned_requires_claim_time.sql":
-        "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.",
+        _PENDING_LOCAL_20260909,
     # Escalation reminder allocation (docs/decision_escalation_reminder_state.md,
     # Option A). Two columns so that eligibility and ordinal allocation are ONE
     # atomic UPDATE -- the scheduling guarantee the ledger cannot provide,
@@ -876,7 +1469,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # exist and is not authorised. Promote only after Railway has run it AND
     # the columns have been read back there directly.
     "escalation_reminder_allocation.sql":
-        "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.",
+        _PENDING_LOCAL_20260909,
     # Defect A (docs/remediation_plan_2026-09-09_defects_A_B_C.md). Widens the
     # ledger's send vocabulary to the canonical set so the identity boundary in
     # staff_email.py has nothing legitimate left to refuse.
@@ -890,7 +1483,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # from the migration ledger, and promoting on an inference would repeat
     # exactly that gap.
     "staff_email_ledger_governance_kinds.sql":
-        "PENDING DEPLOYMENT -- applied locally 2026-09-09, not yet on Railway.",
+        _PENDING_LOCAL_20260909,
     "settle_immaterial_overdue.sql": _CORRECTION,
     "telephony.sql": _CORRECTION,
     "tenants.sql": _SCHEMA_OOB,
@@ -900,8 +1493,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # reduces drift rather than creating it. Not governed -- a clean database
     # built from the regenerated baseline never has them to drop.
     "drop_local_only_dead_functions.sql":
-        "One-time data correction -- targets rows that exist only in this "
-        "database's history.",
+        _CORRECTION,
     # OUT-OF-BAND for the same structural reason as the drop above, but it is
     # NOT the same kind of change and the classification should not be read as
     # saying so. A clean database built from the regenerated baseline never
@@ -915,8 +1507,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # DEPLOYMENT entry on the first run afterwards, which is the independent
     # signal; that entry is now deleted.
     "drop_sp_cases.sql":
-        "One-time data correction -- targets rows that exist only in this "
-        "database's history.",
+        _CORRECTION,
     # BATCH A, same out-of-band reasoning: the regenerated baseline no longer
     # creates any of them, so a clean database has nothing to drop. Both DO
     # need a Railway apply, and each carries PENDING DEPLOYMENT entries in
@@ -928,11 +1519,9 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # cases.summary. Merging them would put a live write-path removal behind a
     # title that says cleanup, and reverting one would revert the other.
     "drop_dead_seed_fossils.sql":
-        "One-time data correction -- targets rows that exist only in this "
-        "database's history.",
+        _CORRECTION,
     "drop_sp_ai_assist.sql":
-        "One-time data correction -- targets rows that exist only in this "
-        "database's history.",
+        _CORRECTION,
     # A DATA BACKFILL, so it stays out-of-band permanently rather than being
     # promoted into REQUIRED_MIGRATIONS. I had planned to promote it; the
     # repository's own vocabulary says otherwise, and it is right: a clean
@@ -946,6 +1535,8 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # opportunities are a deliberate exclusion, because assigning an owner to
     # finished business rewrites who is recorded as having won or lost it.
     "backfill_open_opportunity_owner.sql": _BACKFILL,
+    "trg_fn_contacts_leads_accounts_touch.sql": (
+        _DUPLICATE_DECLARATION),
     "unified_comms_conversations.sql": _SCHEMA_OOB,
     "unified_comms_identity.sql": _SCHEMA_OOB,
     "update_product_images.sql": _CORRECTION,

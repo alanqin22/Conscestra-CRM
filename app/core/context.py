@@ -159,9 +159,19 @@ def _hydrate_account(account_id: str) -> Optional[Dict[str, Any]]:
               {"id": account_id}, section="open_deals")
     if r and int(r[0].get("n") or 0):
         open_items["open_deals"] = r[0]
-    r = _rows("SELECT count(*) AS n, COALESCE(SUM(balance_due),0)::float AS value "
-              "FROM invoices WHERE account_id=%(id)s::uuid AND status='overdue' "
-              "AND deleted_at IS NULL", {"id": account_id}, section="overdue_invoices")
+    # Overdue is a temporal predicate evaluated at the moment it is asked, not a
+    # stored marker. invoices.status holds an overdue value only until the row is
+    # next written, so an invoice whose due date has since passed still reads as
+    # unpaid or partial and is missed. The amount continues to come from the
+    # stored balance_due, which is the authoritative accounts-receivable figure.
+    r = _rows("SELECT count(*) AS n, COALESCE(SUM(i.balance_due),0)::float AS value "
+              "FROM invoices i "
+              "JOIN accounting_invoice_pipeline v ON v.invoice_id = i.invoice_id "
+              "WHERE i.account_id=%(id)s::uuid "
+              "  AND v.payment_status IN ('unpaid','partial') "
+              "  AND v.due_date::date < CURRENT_DATE "
+              "  AND i.deleted_at IS NULL",
+              {"id": account_id}, section="overdue_invoices")
     if r and int(r[0].get("n") or 0):
         open_items["overdue_invoices"] = r[0]
     r = _rows("SELECT count(*) AS n FROM activities "

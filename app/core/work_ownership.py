@@ -71,6 +71,11 @@ from app.core.database import get_connection
 
 logger = logging.getLogger("work_ownership")
 
+# Recorded as the declaring actor when a personhood declaration is carried
+# across an identity mapping. Not a human: the act is mechanical, and naming
+# a person would claim a decision nobody made.
+_CARRY_ACTOR = "00000000-0000-4000-8000-000000000901"
+
 # The three states, and there is no fourth. `_TOTAL_IS_PARTITIONED` in the
 # tests asserts that every work item lands in exactly one of them.
 OWNED = "OWNED"
@@ -393,9 +398,57 @@ def _eligibility_facts(candidates: List[str]) -> Dict[str, Dict[str, Any]]:
     return {r["id"]: r for r in rows}
 
 
+def personhood_facts(candidates: List[str]) -> Dict[str, Optional[str]]:
+    """uuid -> current personhood classification, from the governed register.
+
+    Read separately from `_eligibility_facts` on purpose. Folding it into that
+    query would mean an absent register destroyed identity resolution as well,
+    and an identity present in `employees` would be reported as naming nobody --
+    fail-closed to a reason that is not true.
+    """
+    ids = [i for i in (candidates or []) if i]
+    if not ids:
+        return {}
+    rows = _rows("""SELECT c.id::text AS id, fn_personhood_of(c.id) AS classification
+                      FROM unnest(%s::uuid[]) AS c(id)""", (ids,))
+    return {r["id"]: r["classification"] for r in rows}
+
+
+def personhood_roster_certified() -> bool:
+    """Whether the personhood register describes the whole organisation.
+
+    Read from the governed register through the same function the SQL contract
+    calls, rather than recomputed here. Two implementations of one governance
+    fact is how they come to disagree, and this one would disagree in the
+    direction of treating an unknown identity as a person.
+
+    Fail-closed on absence: if the register is not present, personhood cannot be
+    established, and an identity that cannot be established as a person is not
+    one. Absence from a register never means human.
+    """
+    rows = _rows("SELECT fn_personhood_roster_certified() AS certified")
+    return bool(rows and rows[0].get("certified"))
+
+
+def personhood_register_available() -> bool:
+    """Whether the governed register exists to be read at all.
+
+    Distinct from certification. Both refuse, and they refuse for different
+    reasons: an absent register means the contract cannot be evaluated here,
+    while an incomplete one means the organisation is not yet described. A
+    single reason for both would send an operator to certify a register that
+    has not been deployed.
+    """
+    return bool(_rows("SELECT to_regclass('owner_personhood') IS NOT NULL AS ok")
+                and _rows("SELECT to_regclass('owner_personhood') IS NOT NULL AS ok"
+                          )[0].get("ok"))
+
+
 def eligibility(candidate: Optional[str],
                 facts: Optional[Dict[str, Dict[str, Any]]] = None,
-                svc: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+                svc: Optional[Dict[str, str]] = None,
+                personhood: Optional[Dict[str, Optional[str]]] = None
+                ) -> Dict[str, Any]:
     """The E2 predicate. Returns {candidate, state, reason} -- never raises,
     never returns None, and never answers ELIGIBLE by default.
 
@@ -443,12 +496,25 @@ def eligibility(candidate: Optional[str],
         return _s(IDENTITY_UNRESOLVED,
                   f"{f['active_grants']} active memberships name this owner")
 
-    # 3. Personhood -- declared, never inferred from a domain or a name.
-    if "*" in svc:
+    # 3. Personhood -- read from the governed register, never inferred from a
+    #    domain, a name, or an absence. The register is the same source the SQL
+    #    contract reads; this adapter interprets it rather than keeping its own
+    #    copy of the declarations.
+    if not personhood_roster_certified():
         return _s(INELIGIBLE_NOT_HUMAN,
-                  "personhood could not be certified for the roster")
-    if raw in svc:
-        return _s(INELIGIBLE_NOT_HUMAN, f"declared service identity: {svc[raw]}")
+                  "personhood could not be certified for the roster"
+                  if personhood_register_available()
+                  else "the personhood register is not present, so personhood "
+                       "cannot be established here")
+    if (personhood or personhood_facts([raw])).get(raw) != "person":
+        # An identity nobody has declared is an open question, and an open
+        # question is not a person. The superseded implementation tested only
+        # for DECLARED SERVICE identities, so an identity absent from the staff
+        # roster passed this ground by omission -- which is how an owner nobody
+        # had ever classified could be accountable for customer work.
+        return _s(INELIGIBLE_NOT_HUMAN,
+                  "no current personhood declaration names this identity as a "
+                  "natural person")
 
     # 4. Customer identity -- the shared primary key, never the email.
     if f.get("is_contact"):
@@ -1404,6 +1470,45 @@ def grant_employee_owner(employee_uuid: str, *, added_by: str,
                            now(), %s)
                    ON CONFLICT (entity_type, entity_id) DO NOTHING""",
                 (owner_id, prov[0]["state"], eid, added_by))
+
+            # Personhood is carried across the identity mapping exactly as
+            # provenance is, immediately above: the minted owner is a second
+            # identifier for the same declared person, and the evidence names
+            # the employee it came from.
+            #
+            # Carried, never invented. The SELECT yields no row unless the
+            # employee has a CURRENT declaration of 'person', so an identity
+            # nobody has vouched for does not acquire personhood by being
+            # issued a second identifier -- it stays undeclared and the
+            # eligibility contract refuses it.
+            # The optional write is wrapped in a savepoint, for the reason
+            # recorded at the same carry in assignable.provision_owner.
+            # Catching the exception in Python does not clear an aborted
+            # transaction, and the consequence here is worse than an error
+            # message: the next statement is conn.commit(), and PostgreSQL
+            # converts a COMMIT on an aborted transaction into a ROLLBACK and
+            # reports success. The owner row minted above would be discarded
+            # while the function returned its id and carried on, so a register
+            # that is not deployed produced a silent false success on a write
+            # path rather than a refusal.
+            cur.execute("SAVEPOINT carry_personhood")
+            try:
+                cur.execute(
+                    """INSERT INTO owner_personhood
+                         (subject_id, classification, rationale, declared_by)
+                       SELECT %s::uuid, 'person',
+                              'carried from the current declaration for '
+                              || %s || ' on grant issuance',
+                              %s::uuid
+                        WHERE fn_personhood_of(%s::uuid) = 'person'
+                       ON CONFLICT DO NOTHING""",
+                    (owner_id, eid, _CARRY_ACTOR, eid))
+            except Exception as exc:                           # noqa: BLE001
+                cur.execute("ROLLBACK TO SAVEPOINT carry_personhood")
+                logger.info(f"[work_ownership] personhood not carried to "
+                            f"{owner_id}: {exc}")
+            else:
+                cur.execute("RELEASE SAVEPOINT carry_personhood")
         conn.commit()
     except Exception as exc:
         conn.rollback()

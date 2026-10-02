@@ -60,6 +60,30 @@ BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(ROOT / "backups")))
 KEEP = int(os.getenv("BACKUP_KEEP", "14"))
 SCRATCH_DB = os.getenv("BACKUP_SCRATCH_DB", "restore_drill")
 
+# Schemas the dump deliberately skips, and the ceiling that keeps that decision
+# honest.
+#
+# This database carries Supabase scaffolding, `auth` and `storage`, left over
+# from an earlier platform. Both have row-level security enabled, and pg_dump
+# refuses to copy a table whose rows a policy could filter, because the result
+# would look like a backup while silently omitting rows. The alternative to
+# skipping them is granting the dump role BYPASSRLS, which is a standing
+# permission to see through every present and future policy.
+#
+# They are skipped instead, because on 2026-09-27 all 29 tables were empty:
+# 26 occupied zero bytes, and the remaining two held Supabase's own migration
+# bookkeeping. Nothing in `public` references either schema by foreign key,
+# function or view. The application authenticates against
+# `public.auth_credentials`.
+#
+# That measurement is the premise of the exclusion, so the backup re-checks it
+# every run rather than trusting a comment. If these schemas ever hold real
+# data, skipping them would be data loss, and the run stops instead.
+EXCLUDE_SCHEMAS = [x.strip() for x in
+                   os.getenv("BACKUP_EXCLUDE_SCHEMAS", "auth,storage").split(",")
+                   if x.strip()]
+MAX_EXCLUDED_BYTES = int(os.getenv("BACKUP_MAX_EXCLUDED_BYTES", str(1 << 20)))
+
 # EVERY table is verified, not a sample.
 #
 # The first version checked ten representative tables and printed only those,
@@ -130,6 +154,85 @@ def _tool(name: str) -> str:
                      f"them to PATH.")
 
 
+def _stderr_excerpt(text: str, head: int = 1200, tail: int = 400) -> str:
+    """Excerpt a tool's stderr, keeping the beginning.
+
+    PostgreSQL reports the reason first and the offending statement second, and
+    pg_dump's statement here is a LOCK TABLE naming every table in the
+    database. Keeping only the trailing 800 characters therefore preserved the
+    table list and discarded the reason on every failed run between 2026-09-12
+    and 2026-09-26. The cause, "permission denied for schema auth", was never
+    once recorded, and the outage ran for sixteen nights.
+    """
+    text = (text or "").strip()
+    if len(text) <= head + tail:
+        return text
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n  ... {omitted} characters omitted ...\n{text[-tail:]}"
+
+
+def _prunable(directory: Path) -> tuple:
+    """Split the dumps in a directory into (beyond retention, empty leftovers).
+
+    Retention previously sorted every railway-*.dump by filename and kept the
+    last KEEP names. A failed run leaves a dated zero-byte file behind, because
+    pg_dump creates its output file before it knows whether it can proceed, so
+    sixteen empty dumps sorted ahead of every real one. The first successful
+    run would have deleted all fourteen surviving backups and retained the
+    empty files.
+
+    Retention now applies only to dumps that contain data, ordered by
+    modification time, so an artifact that is not a backup can never displace
+    one that is. Empty files are reported separately and always removed.
+    """
+    dumps = list(directory.glob("railway-*.dump"))
+    empty = sorted(f for f in dumps if f.stat().st_size == 0)
+    usable = sorted((f for f in dumps if f.stat().st_size > 0),
+                    key=lambda f: f.stat().st_mtime)
+    beyond = usable[:-KEEP] if KEEP else []
+    return beyond, empty
+
+
+def _assert_excluded_are_empty(dsn: str) -> None:
+    """Confirm the schemas the dump skips still hold nothing worth keeping.
+
+    Size is read from the catalog rather than counted, because row-level
+    security is what makes these schemas unreadable in the first place: a
+    SELECT would return whatever the policies allow and report empty tables
+    that are not. pg_relation_size is not subject to policy.
+    """
+    if not EXCLUDE_SCHEMAS:
+        return
+    import psycopg2
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT n.nspname, c.relname, pg_relation_size(c.oid) AS bytes
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE c.relkind = 'r' AND n.nspname = ANY(%s)
+                 ORDER BY bytes DESC""", (EXCLUDE_SCHEMAS,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    total = sum(r[2] for r in rows)
+    print(f"  skipping {', '.join(EXCLUDE_SCHEMAS)} "
+          f"({len(rows)} tables, {total:,} bytes)")
+    if total > MAX_EXCLUDED_BYTES:
+        biggest = "; ".join(f"{n}.{t} {b:,} bytes" for n, t, b in rows[:5])
+        raise SystemExit(
+            f"the schemas this backup skips now hold {total:,} bytes, above "
+            f"the {MAX_EXCLUDED_BYTES:,} allowed.\n"
+            f"  largest: {biggest}\n"
+            f"  These were empty when they were excluded. Continuing would "
+            f"omit real data from every backup.\n"
+            f"  Either include them again -- which needs "
+            f"ALTER ROLE <dump role> BYPASSRLS, because they use row-level "
+            f"security -- or raise BACKUP_MAX_EXCLUDED_BYTES once the content "
+            f"is known to be disposable.")
+
+
 def _counts(dsn: str, tables=None) -> dict:
     """Exact row counts for every ordinary table in `public`, in one round trip.
 
@@ -195,15 +298,35 @@ def main() -> int:
     # absent; anything MISSING is data loss.
     major = _server_major(src)
     print(f"  production is PostgreSQL {major}; using {PG_IMAGE} client tools")
+    _assert_excluded_are_empty(src)
     before = _counts(src)
     print(f"  production before dump: {len(before)} tables, "
           f"{sum(v for v in before.values() if v):,} rows")
+    # Write under a name the retention glob cannot match, and rename only
+    # after pg_dump reports success.
+    #
+    # A failed dump is not always empty. On 2026-09-27 two runs stopped partway
+    # through COPY and left 2.3 MB archives that pg_restore reads without
+    # complaint, because the table of contents is written first. They were
+    # counted as backups and displaced three real ones. Neither file size nor
+    # archive readability separates a partial custom-format dump from a
+    # complete one, so neither can be the test. The exit code is the only
+    # signal that means anything, and a file that does not yet carry the final
+    # name cannot be mistaken for a backup by anything -- including a run
+    # killed partway, or a power loss.
+    partial = dump.with_suffix(".dump.partial")
+    for stale in BACKUP_DIR.glob("railway-*.dump.partial"):
+        stale.unlink()
     t0 = time.perf_counter()
     r = _docker("pg_dump", src, "-Fc", "--no-owner", "--no-acl",
-                "-f", f"/backup/{dump.name}", mount=BACKUP_DIR)
+                *[f"--exclude-schema={x}" for x in EXCLUDE_SCHEMAS],
+                "-f", f"/backup/{partial.name}", mount=BACKUP_DIR)
     dump_s = time.perf_counter() - t0
     if r.returncode != 0:
-        raise SystemExit(f"pg_dump failed:\n{r.stderr[-800:]}")
+        if partial.exists():
+            partial.unlink()
+        raise SystemExit(f"pg_dump failed:\n{_stderr_excerpt(r.stderr)}")
+    partial.rename(dump)
     size_mb = dump.stat().st_size / 1e6
     print(f"  dumped   {size_mb:7.1f} MB in {dump_s:6.1f}s -> {dump.name}")
 
@@ -298,11 +421,13 @@ def main() -> int:
     finally:
         subprocess.run(["docker", "rm", "-f", cname], capture_output=True)
 
-    old = sorted(BACKUP_DIR.glob("railway-*.dump"))[:-KEEP] if KEEP else []
-    for f in old:
+    old, empty = _prunable(BACKUP_DIR)
+    for f in old + empty:
         f.unlink()
     if old:
         print(f"\npruned {len(old)} dump(s) beyond the {KEEP} most recent")
+    if empty:
+        print(f"  removed {len(empty)} zero-byte file(s) left by a failed run")
 
     if bad:
         print(f"\nRESTORE VERIFICATION FAILED on: {', '.join(bad)}")
@@ -374,8 +499,9 @@ def _mirror(dump_path: Path) -> None:
         dest.mkdir(parents=True, exist_ok=True)
         shutil.copy2(dump_path, dest / dump_path.name)
         # Mirror the retention policy too, or the second copy grows forever.
-        old = sorted(dest.glob("railway-*.dump"))[:-KEEP] if KEEP else []
-        for f in old:
+        # The same rule applies: an empty file must never displace a backup.
+        old, empty = _prunable(dest)
+        for f in old + empty:
             f.unlink()
         copies = sorted(dest.glob("railway-*.dump"))
         newest = max((f.stat().st_mtime for f in copies), default=0)
