@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-4d3b3916ac89e9613bc256a28f6f1037c774e586
+1fe102b191f14be319e97124d95ea3628244ea65
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -267,3 +267,35 @@
 # kind. The fix uses the `ordinal` begin_send has always taken. Two tests are
 # needed rather than one: a bare ref with no ordinal would suppress reminder 2
 # as a duplicate of reminder 1.
+
+# 1fe102b -- the owner personhood register and the ownership chain it certifies.
+# The e802469 hazard in its usual direction, and six times over: deploy_state
+# declares SIX more out_of_band files -- owner_personhood_register,
+# owner_eligibility_authority, ownership_policy, ownership_selection,
+# ownership_shadow and ownership_attribution -- so a public commit pinned earlier
+# than this would fail with DECLARED BUT ABSENT FROM DISK on all six.
+#
+# NONE is promoted into REQUIRED_MIGRATIONS, and for this set the reason is
+# sharper than "Railway has not run it". The register must be POPULATED and
+# CERTIFIED before owner_eligibility_authority is applied anywhere: an
+# authoritative contract over an empty register would correctly refuse every
+# identity in the system. Deploy order is owner_personhood_register, then
+# owner_eligibility_authority, then ownership_policy, ownership_selection,
+# ownership_shadow, ownership_attribution.
+#
+# Certification is measured over the active role-assignment principals that
+# assignable_identity represents, and not over employees. employees is an
+# upstream source of employee declarations; a declaration is held against a
+# subject uuid while membership is keyed on an address with owner_id as optional
+# metadata, so certifying the staff roster would have established nothing about
+# the subject the eligibility contract asks about. The reasoning is recorded in
+# docs/personhood_domain_contract_gate.md, which arrives in the paired public
+# commit.
+#
+# Also carries two transactional corrections, because a swallowed exception does
+# not clear an aborted PostgreSQL transaction. In provision_owner the next
+# statement failed with "current transaction is aborted"; in
+# grant_employee_owner the next statement was conn.commit(), which PostgreSQL
+# converts to a ROLLBACK and reports as success, so a minted owner was discarded
+# silently while the caller reported the grant applied. Both are now behind
+# savepoints.

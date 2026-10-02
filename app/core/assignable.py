@@ -43,6 +43,11 @@ from app.core.database import get_connection
 
 logger = logging.getLogger("assignable")
 
+# The declaring actor recorded when a personhood declaration is carried
+# across an identity mapping. Not a human: the act is mechanical, and
+# attributing it to a person would claim a decision nobody made.
+_SYSTEM_ACTOR = "00000000-0000-4000-8000-000000000901"
+
 
 def _flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
@@ -518,6 +523,57 @@ def provision_owner(email: str, *, display_name: str = "",
                        VALUES (gen_random_uuid(), %s, %s, %s, 'Staff', true, false)
                        RETURNING owner_id::text""", (first, last, email))
                 owner_id, created = cur.fetchone()[0], True
+
+                # Minting an owner identity creates a SECOND identifier for a
+                # person who may already be declared under a first one. The
+                # personhood declaration is carried across that mapping,
+                # because the mapping is explicit -- same address, recorded
+                # here -- and because without it every newly provisioned owner
+                # would be refused on the personhood ground and nobody could
+                # ever be granted.
+                #
+                # Carried, never invented. If the staff identity has no current
+                # declaration, or is declared a service identity, nothing is
+                # written and the new owner stays undeclared: an identity
+                # nobody has vouched for does not acquire personhood by being
+                # given a second identifier.
+                #
+                # The optional write is wrapped in a savepoint. Catching the
+                # exception in Python does not clear an aborted transaction:
+                # once a statement fails, PostgreSQL refuses every later
+                # command on the connection until a rollback, so the UPDATE
+                # below failed with "current transaction is aborted" and the
+                # caller received that instead of the provisioning result. The
+                # absent register was reported as a transaction error, and the
+                # eligibility contract never got the chance to refuse the
+                # identity on its own ground.
+                cur.execute("SAVEPOINT carry_personhood")
+                try:
+                    cur.execute(
+                        """INSERT INTO owner_personhood
+                             (subject_id, classification, rationale, declared_by)
+                           SELECT %s::uuid, 'person',
+                                  'carried from the current declaration for '
+                                  || e.employee_uuid::text
+                                  || ' on provisioning an owner identity for '
+                                  || %s,
+                                  %s::uuid
+                             FROM employees e
+                            WHERE lower(e.email) = lower(%s)
+                              AND fn_personhood_of(e.employee_uuid) = 'person'
+                            LIMIT 1
+                           ON CONFLICT DO NOTHING""",
+                        (owner_id, email, _SYSTEM_ACTOR, email))
+                except Exception as exc:                       # noqa: BLE001
+                    # The register is not deployed here. Nothing is carried,
+                    # and the eligibility contract will refuse the identity for
+                    # that reason rather than this one.
+                    cur.execute("ROLLBACK TO SAVEPOINT carry_personhood")
+                    logger.info(f"[assignable] personhood not carried for "
+                                f"{email}: {exc}")
+                else:
+                    cur.execute("RELEASE SAVEPOINT carry_personhood")
+
             cur.execute(
                 """UPDATE assignable_identity
                    SET owner_id=%s::uuid, updated_at=now()

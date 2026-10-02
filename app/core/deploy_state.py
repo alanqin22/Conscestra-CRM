@@ -433,6 +433,168 @@ _PENDING_INVOICE_CANCELLATION = (
     "Deploy AFTER a3_invoice_economic_integrity.sql and BEFORE the settlement "
     "authority, whose lifecycle precondition reads this table.")
 
+_PENDING_OWNER_PERSONHOOD = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. The owner personhood register: "
+    "owner_personhood, an effective-dated declaration of whether an identity is "
+    "a natural person or a service identity, with fn_personhood_of, "
+    "fn_personhood_certification_report, fn_personhood_roster_certified, "
+    "v_owner_principal and v_personhood_unclassified. "
+    "THE GAP IT CLOSES is that E2 names personhood as one of six eligibility "
+    "grounds, and it is the one ground SQL cannot evaluate: the rules live in "
+    "the Python constants SERVICE_IDENTITY_ROLES and "
+    "SERVICE_IDENTITY_EXCEPTIONS. dsar.staff_personhood's roster-level "
+    "fail-closed condition now has a SQL analogue over the owner-principal "
+    "population, but it is not a mirror of the staff roster: the certification "
+    "universe is deliberately narrower. Nine database routines "
+    "establish activity ownership inside trigger and procedure execution where "
+    "Python is unreachable, so a database-resident eligibility boundary built "
+    "before this register would execute a predicate missing one of E2's "
+    "grounds -- a second interpretation of the contract in the deepest "
+    "enforcement layer. "
+    "IT IS EFFECTIVE-DATED RATHER THAN MUTABLE because a classification can "
+    "legitimately change and the question 'what was this identity classified as "
+    "when that assignment was made' must stay answerable. A declaration may be "
+    "closed and succeeded; it may not be altered or deleted. "
+    "CERTIFICATION IS GLOBAL AND FAILS CLOSED. It is measured over the active "
+    "role-assignment principals represented by v_owner_principal -- the "
+    "distinct minted owner_id values holding an active membership -- and not "
+    "over employees, which is an upstream source of employee declarations "
+    "rather than the certification universe. Certification requires a "
+    "non-empty population, exactly one current declaration per principal, and "
+    "exactly one active membership per principal; "
+    "fn_personhood_certification_report exposes each condition separately and "
+    "v_personhood_unclassified names the principals that block it. See "
+    "docs/personhood_domain_contract_gate.md. "
+    "Deploy BEFORE owner_eligibility_authority.sql, and populate it before "
+    "deploying that file.")
+
+_PENDING_OWNER_ELIGIBILITY_AUTHORITY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. The E2 contract as one "
+    "authoritative executable definition: fn_owner_eligibility_state, seven "
+    "states in strict precedence, with fn_owner_eligible redefined to derive "
+    "from it rather than restate it. "
+    "THE DEFECT IT CLOSES is two executable meanings for one ratified "
+    "contract. Measured on 2026-09-17 the SQL predicate and the Python "
+    "classifier agreed exactly, 516 eligible and 11,509 ineligible, while "
+    "differing structurally in four places: the collision rule (Python refuses "
+    "an identifier present in both employees and owners; SQL refused it only "
+    "when the addresses also differed), membership multiplicity, personhood, "
+    "and the not-granted/not-active distinction that a report needs because the "
+    "two have different remedies. Agreement on one population is a property of "
+    "that data, not of the definitions. "
+    "CONDITION 3 IS DELIBERATELY ABSENT. Refusing a synthetic identity as the "
+    "owner of attested-real work is not an E2 ground: it is a property of the "
+    "pairing of an owner with particular work, and belongs with the selection "
+    "engine, which has the work in hand. "
+    "THIS FILE CHANGES THE BEHAVIOUR OF A DEPLOYED FUNCTION. Against an empty "
+    "or uncertified personhood register it returns INELIGIBLE_NOT_HUMAN for "
+    "every identity -- the correct reading of an uncertified roster, and one "
+    "that would refuse all twelve currently eligible owners. Apply "
+    "owner_personhood_register.sql first, populate it, confirm "
+    "fn_personhood_roster_certified() returns true, and only then apply this.")
+
+_PENDING_OWNERSHIP_POLICY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. The ownership selection "
+    "carrier: ownership_policy and ownership_policy_history, versioned by the "
+    "database and append-only, mirroring the deployed "
+    "governance_action_policies pattern. "
+    "WHY A SEPARATE CARRIER. governance_action_policies answers whether an "
+    "action class may execute without a human, in what mode, owned by which "
+    "authority -- and answers it well. It carries no conditions, no candidate "
+    "population, no ordering and no tie-break, because it was never about "
+    "selection. Its grain is one row per action type, which is the wrong grain "
+    "for policies that compete for the same activity, and putting selection "
+    "there would couple a routing-rule edit to an execution-authority row. "
+    "Authority is therefore referenced rather than restated. "
+    "PRECEDENCE IS A TOTAL ORDER over active policies, enforced by a unique "
+    "partial index rather than resolved at execution time: whether two "
+    "populations overlap is not decidable here, and a conflict settled by "
+    "whichever row the planner returned first is not a governed decision. "
+    "NO POLICY IS SEEDED. An empty carrier assigns nothing, which is the "
+    "correct state until a policy is authored and approved. The selection "
+    "engine that interprets these declarations is a later stage; this file "
+    "changes no assignment behaviour.")
+
+_PENDING_OWNERSHIP_SELECTION = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. Stage 4 of the C1 ownership "
+    "blueprint: the declared policy grammar and its validator, the decision "
+    "evidence carriers ownership_decision and ownership_decision_candidate, "
+    "deterministic sampling, and fn_select_activity_owner. "
+    "THE GRAMMAR IS VALIDATED ON WRITE, by a check constraint calling "
+    "fn_ownership_policy_defect, because a policy that failed only when the "
+    "engine ran would fail during an assignment -- where the correct behaviour "
+    "is to return NULL -- making a configuration error indistinguishable from "
+    "the legitimate answer 'no eligible candidate'. The validator returns the "
+    "reason rather than a boolean so the author is not left guessing which of "
+    "four structures was wrong. "
+    "EVERY CANDIDATE IS RECORDED, not only the winner. The existing router "
+    "computes exactly this set and discards it; the ordering values it read are "
+    "kept here because workload is counted live and is therefore not "
+    "reproducible later. A policy version alone answers which rule ran, not why "
+    "this person rather than that one. "
+    "SAMPLING IS DETERMINISTIC in the activity and policy version, using md5 "
+    "rather than hashtext: hashtext is an internal function with no "
+    "cross-version stability guarantee, and a sample whose membership changes "
+    "on an upgrade cannot be verified afterwards. "
+    "THE ENGINE NEVER RAISES AND WRITES NO activities.owner_id. P3 requires the "
+    "activity to survive a refused candidate, so a selection that could throw "
+    "would turn an ownership failure into a work failure; and separating the "
+    "decision from its application is what allows a shadow window to measure "
+    "the engine without it changing anything. "
+    "Deploy AFTER ownership_policy.sql. This file assigns nothing: it adds no "
+    "trigger to activities and changes no existing write path.")
+
+_PENDING_OWNERSHIP_SHADOW = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. Stage 5 of the C1 ownership "
+    "blueprint: an AFTER ROW observer on activities that records what the "
+    "governed mechanism would have decided, and changes nothing. "
+    "WHY A TRIGGER AND NOT AN APPLICATION CALL. The writer census found "
+    "nineteen establishment-capable paths, nine of them resident in the "
+    "database. An application-level observer cannot see any of those, so a "
+    "shadow window built there would measure the two paths that already call "
+    "the boundary and report the result as coverage. At the table, every "
+    "writer passes through, including direct SQL. "
+    "NON-MUTATION IS STRUCTURAL, NOT DISCIPLINARY. Postgres ignores what an "
+    "AFTER trigger returns and gives it no way to alter the row that fired it, "
+    "so the only way this could change ownership is by issuing its own UPDATE. "
+    "It issues none, and the mutation suite adds one to prove that would be "
+    "caught. An owner already recorded is preserved: an observer that "
+    "corrected it would be an enforcement mechanism wearing a shadow's name, "
+    "and reassignment is a separate authority. "
+    "IT SWALLOWS ITS OWN FAILURES because the observation must never break the "
+    "write it observes; a shadow that could abort an activity insert would "
+    "turn a measurement into an outage. "
+    "DEFAULT OFF. Deploying it changes nothing until app.ownership_shadow is "
+    "set, matching the posture OWNER_ELIGIBILITY_ENFORCE sets for P3. "
+    "Deploy AFTER ownership_selection.sql.")
+
+_PENDING_OWNERSHIP_ATTRIBUTION = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. Stage 6 of the C1 ownership "
+    "blueprint: trusted writer attribution on the decision record, and the "
+    "engine widened to capture it. "
+    "THE GAP IT CLOSES is that the stage 5 observer proved an ownership event "
+    "reached the governed boundary and could not say which writer caused it. "
+    "The only context available was a free-form session setting any caller can "
+    "write, and a decision attributed to crm_app names the role that executed "
+    "the statement, not the business path that caused it. "
+    "WRITER CLASS IS DERIVED, NOT DECLARED. pg_trigger_depth() distinguishes a "
+    "statement issued directly from one issued inside another trigger, which is "
+    "the distinction that matters: nine of the nineteen establishment paths are "
+    "database-resident and an application cannot declare on their behalf. "
+    "Neither value is settable by a caller. "
+    "A SELF-REPORTED PATH IS RECORDED AND NEVER PROMOTED. writer_declared "
+    "carries what the caller said; it never overrides writer_class, so a direct "
+    "statement claiming to be a trigger is recorded as a direct statement that "
+    "made the claim, and v_ownership_attribution_conflicts names it. The "
+    "forgery becomes visible rather than effective. "
+    "UNKNOWN IS A PERMITTED VALUE. Where attribution cannot be established it "
+    "is recorded as unknown: an unknown writer is an evidence gap, a fabricated "
+    "one is a false record that looks like evidence. "
+    "Execution role, policy authority, human actor and activity owner are kept "
+    "in separate columns because they are separate facts; one actor column is "
+    "how a database role comes to stand for a human decision. "
+    "Deploy AFTER ownership_shadow.sql.")
+
 
 _PENDING_CANCELLATION_REVERSAL = (
     "PENDING DEPLOYMENT -- authored 2026-09-20. Reversing a cancellation, "
@@ -1153,6 +1315,12 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "financial_proposition_binding.sql": _APPLIED_FINANCIAL_PROPOSITION_BINDING,
     "a3_invoice_economic_integrity.sql": _APPLIED_A3_INVOICE_ECONOMIC_INTEGRITY,
     "invoice_cancellation.sql": _PENDING_INVOICE_CANCELLATION,
+    "owner_personhood_register.sql": _PENDING_OWNER_PERSONHOOD,
+    "owner_eligibility_authority.sql": _PENDING_OWNER_ELIGIBILITY_AUTHORITY,
+    "ownership_policy.sql": _PENDING_OWNERSHIP_POLICY,
+    "ownership_selection.sql": _PENDING_OWNERSHIP_SELECTION,
+    "ownership_shadow.sql": _PENDING_OWNERSHIP_SHADOW,
+    "ownership_attribution.sql": _PENDING_OWNERSHIP_ATTRIBUTION,
     "cancellation_authority.sql": _PENDING_CANCELLATION_AUTHORITY,
     "cancellation_enforcement.sql": _PENDING_CANCELLATION_ENFORCEMENT,
     "cancelled_not_invoiceable.sql": _PENDING_CANCELLED_NOT_INVOICEABLE,
