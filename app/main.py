@@ -1436,15 +1436,21 @@ async def lifespan(app: FastAPI):
         # be demoted and a follower promoted, and either may happen more than
         # once in a process's life.
         leader.on_demotion(_pause_scheduler_now)
+        # Unconditional, like the demotion registration above. This was once
+        # registered only on the follower branch, so a process that started as
+        # leader held no promotion callback for its whole life: demote it and
+        # promote it again and it reacquired the advisory lock with a
+        # permanently paused scheduler, blocking every other worker from taking
+        # over. `on_promotion` starts the scheduler immediately when leadership
+        # is already held, which is how the startup-leader path is served here.
+        leader.on_promotion(_start_scheduler_now)
 
         if not _run_bg:
             # Follower: the scheduler is BUILT and held, not started. If this
             # process is later promoted it starts the jobs itself.
             logger.info("[Scheduler] built but not started (HA follower) — "
                         "will start on promotion")
-            leader.on_promotion(_start_scheduler_now)
         else:
-            _start_scheduler_now()
             # A CURATED summary of 9 of the 36 jobs, not a manifest — it exists
             # so the nightly chain can be read in order at a glance. Every time
             # printed here is checked against the real trigger by

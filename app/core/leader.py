@@ -73,11 +73,19 @@ def on_promotion(fn: Callable[[], None]) -> None:
     """Run `fn` if this process is later promoted to leader.
 
     Registering after promotion has already happened runs it immediately, so a
-    caller never has to reason about ordering."""
+    caller never has to reason about ordering.
+
+    THE CALLBACK IS ALSO RETAINED IN THAT CASE. It previously returned before
+    appending, so a process that registered while already leader ran the
+    callback once and kept nothing. Leadership is not a single event: that
+    process could be demoted and promoted again, and the replay list was empty,
+    so it reacquired the advisory lock with its singletons still stopped.
+    FOUND IN PRODUCTION 2026-10-03 — one worker held lock 871123 with a paused
+    scheduler while the other fired every job without holding it. Retaining the
+    callback unconditionally matches `on_demotion`, which always appends."""
+    _promote_callbacks.append(fn)
     if _state.get("leader"):
         fn()
-        return
-    _promote_callbacks.append(fn)
 
 
 def _watch_for_promotion() -> None:
@@ -110,6 +118,16 @@ def _watch_for_promotion() -> None:
                 continue
             _hold_conn = conn
             _state["leader"] = True
+            # A leader created HERE needs the same supervision as one elected in
+            # begin(). The retention watcher was started only by begin(), so a
+            # promoted leader never re-verified its lock and could not detect
+            # losing it. That is the condition the watcher exists to prevent,
+            # reachable through the one path it did not cover. Armed before the
+            # callbacks run, so a failing callback cannot leave the process
+            # claiming leadership unsupervised.
+            _state["lock_verified_at"] = time.time()
+            threading.Thread(target=_watch_lock_retention, daemon=True,
+                             name="ha-lock-retention").start()
             logger.warning(
                 f"[HA] PROMOTED to leader ({_WHO}) — the previous holder is "
                 f"gone. Starting background singletons.")
