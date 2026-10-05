@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-1fe102b191f14be319e97124d95ea3628244ea65
+ded0dbb3e0e54bde075e437164adf0f477280f9d
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -299,3 +299,36 @@
 # converts to a ROLLBACK and reports as success, so a minted owner was discarded
 # silently while the caller reported the grant applied. Both are now behind
 # savepoints.
+
+# ded0dbb -- the scheduler promotion-supervision tests. Tests only; no SQL
+# arrives with this pin, so neither the e802469 hazard (declared-but-absent) nor
+# its mirror applies, and deploy_state is unchanged.
+#
+# THE USUAL INVERTED DEPENDENCY HOLDS, as at 0b6b491 and 28e6be6:
+# test_main_registers_promotion_unconditionally reads the source of
+# app.main.lifespan and requires the promotion callback to be registered
+# unconditionally. That arrived in 43df038 and is live on master at c77663d, so
+# this pin is safe at or after that commit and would fail exactly that one
+# assertion against an earlier public commit.
+#
+# THE PIN MOVES IN A FOLLOW-UP COMMIT rather than in the change that depends on
+# it, which is a deliberate departure from the instruction at the top of this
+# file. test_the_pin_names_a_commit_that_actually_exists requires the target to
+# be reachable, and its own message is "push the governance commit before the
+# change that pins it" -- so ded0dbb could not be named until it was pushed, and
+# it could not be pushed until the remediation it verifies was authorised. The
+# ordering forced the split; naming ded0dbb earlier would have passed the local
+# check, because the commit resolved in the local checkout, and failed the CI
+# clone.
+#
+# WHAT THE NINE TESTS PIN. The promotion path is now supervised: a leader
+# acquired by promotion records lock_verified_at and runs _watch_lock_retention,
+# exactly as one acquired in begin() always did, and a process demoted and later
+# promoted resumes its scheduler instead of holding advisory lock 871123 with it
+# paused. That last state is what production held for 32 hours from 2026-10-03
+# 14:47 UTC, after a PostgreSQL restart freed the lock: one worker held it with a
+# paused scheduler while the other fired all 36 jobs without holding it, and
+# /health reported healthy on both. Until this pin, CI resolved governance at
+# 1fe102b and ran none of these tests -- and nothing reported that, because the
+# pin control asserts only that the pinned commit RESOLVES, never that it is
+# current.
