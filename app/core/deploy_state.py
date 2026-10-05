@@ -1030,6 +1030,34 @@ _PENDING_LINK_IDENTITY = (
     "widening. Historical email-link rows are NOT rewritten: a decision the "
     "system could not attribute stays unattributed.")
 
+_PENDING_AUTH_OTP_TRUST_BOUNDARY = (
+    "PENDING DEPLOYMENT -- authored 2026-10-04 and applied NOWHERE, not even "
+    "locally. Operator-applied through apply_sql.py; promote to "
+    "REQUIRED_MIGRATIONS in the same change that records its Railway "
+    "application, and not before. "
+    "WHAT IT IS. The one-time-password trust boundary. It creates "
+    "auth_otp_challenges and auth_secrets and the two SECURITY DEFINER "
+    "functions that are the only way to reach them, fn_otp_issue and "
+    "fn_session_create_otp. crm_app is explicitly REVOKEd on both tables, "
+    "because the default ACL grants it arwd on anything new, so the "
+    "application holds no OTP state and can read neither a pending code nor "
+    "the pepper that hashes it. "
+    "THE PEPPER IS NOT IN THIS FILE and must never be. It is generated inside "
+    "the database after this artifact is applied, so no plaintext exists in "
+    "any repository file, .env, shell history or deployment configuration. "
+    "Both functions fail closed until it exists. "
+    "ORDER MATTERS AND IS NOT A PREFERENCE. This file must be applied BEFORE "
+    "the router change that calls it ships, because that router calls "
+    "fn_otp_issue and a deployment preceding this artifact breaks signup and "
+    "verification for every user until it lands. The reverse order is inert: "
+    "the objects exist and nothing calls them. "
+    "IDEMPOTENT, tested by applying it twice to one database -- CREATE TABLE "
+    "IF NOT EXISTS, CREATE UNIQUE INDEX IF NOT EXISTS, CREATE OR REPLACE "
+    "FUNCTION and idempotent grants. It carries no outer transaction, so "
+    "apply_sql.py owns the transaction and no statement can partially apply. "
+    "sha256 a576382b0791b0a76e796582bafc2e7908880341f0f9e1d8738bfd0ff55cfffc, "
+    "17444 bytes.")
+
 _SCHEMA_OOB = (
     "Historical schema operation applied out-of-band; it never entered the "
     "governed chain. This records what is true, not that the objects are "
@@ -1330,6 +1358,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
+    "auth_otp_trust_boundary.sql": _PENDING_AUTH_OTP_TRUST_BOUNDARY,
     "escalations.sql": _SCHEMA_OOB,
     "event_correlation_propagation.sql": _PENDING_CORRELATION,
     "event_types_voice_learning.sql": _CORRECTION,
