@@ -596,8 +596,10 @@ _PENDING_OWNERSHIP_ATTRIBUTION = (
     "Deploy AFTER ownership_shadow.sql.")
 
 
-_PENDING_CANCELLATION_REVERSAL = (
-    "PENDING DEPLOYMENT -- authored 2026-09-20. Reversing a cancellation, "
+_APPLIED_LOCAL_CANCELLATION_REVERSAL = (
+    "APPLIED TO LOCAL railwayl2 2026-10-05 22:28:16 -04 "
+    "(schema_attestations id 171); NOT YET ON RAILWAY. "
+    "Authored 2026-09-20. Reversing a cancellation, "
     "governed at the same boundary: fn_authorize_reversal, the reversal guard, "
     "and the operation discriminator that keeps the two apart. "
     "THE GAP IT CLOSES. The cancellation guard fires on a row ENTERING "
@@ -643,8 +645,10 @@ _PENDING_CANCELLED_NOT_INVOICEABLE = (
     "state exactly as before; only the invoice is refused. Not applied to crmdb.")
 
 
-_PENDING_CANCELLATION_ENFORCEMENT = (
-    "PENDING DEPLOYMENT -- authored 2026-09-19. The enforcement half of the "
+_APPLIED_LOCAL_CANCELLATION_ENFORCEMENT = (
+    "APPLIED TO LOCAL railwayl2 2026-10-05 22:28:15 -04 "
+    "(schema_attestations id 170); NOT YET ON RAILWAY. "
+    "Authored 2026-09-19. The enforcement half of the "
     "cancellation boundary: cancellation_authorization, "
     "fn_authorize_cancellation, and the triggers that govern a row entering "
     "cancelled. "
@@ -668,8 +672,10 @@ _PENDING_CANCELLATION_ENFORCEMENT = (
     "not obtain authority can no longer cancel. It is not applied to crmdb.")
 
 
-_PENDING_CANCELLATION_AUTHORITY = (
-    "PENDING DEPLOYMENT -- authored 2026-09-19. The cancellation boundary: "
+_APPLIED_LOCAL_CANCELLATION_AUTHORITY = (
+    "APPLIED TO LOCAL railwayl2 2026-10-06 11:15:15 -04 "
+    "(schema_attestations id 188); NOT YET ON RAILWAY. "
+    "Authored 2026-09-19. The cancellation boundary: "
     "fn_cancellation_authority, the verdict and cancellable-state vocabularies, "
     "and the cancellation_path register. "
     "THE FINDING IT ANSWERS. A reconciliation of 298 governed cancellations "
@@ -1349,10 +1355,10 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "ownership_selection.sql": _PENDING_OWNERSHIP_SELECTION,
     "ownership_shadow.sql": _PENDING_OWNERSHIP_SHADOW,
     "ownership_attribution.sql": _PENDING_OWNERSHIP_ATTRIBUTION,
-    "cancellation_authority.sql": _PENDING_CANCELLATION_AUTHORITY,
-    "cancellation_enforcement.sql": _PENDING_CANCELLATION_ENFORCEMENT,
+    "cancellation_authority.sql": _APPLIED_LOCAL_CANCELLATION_AUTHORITY,
+    "cancellation_enforcement.sql": _APPLIED_LOCAL_CANCELLATION_ENFORCEMENT,
     "cancelled_not_invoiceable.sql": _PENDING_CANCELLED_NOT_INVOICEABLE,
-    "cancellation_reversal.sql": _PENDING_CANCELLATION_REVERSAL,
+    "cancellation_reversal.sql": _APPLIED_LOCAL_CANCELLATION_REVERSAL,
     "soft_deleted_invoices_are_not_receivable.sql": _APPLIED_LOCAL_SOFT_DELETED_AR,
     "settlement_authority.sql": _PENDING_SETTLEMENT_AUTHORITY,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
