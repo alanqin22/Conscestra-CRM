@@ -564,6 +564,53 @@ def _report_connected_roles(dsn: str) -> None:
         conn.close()
 
 
+def _no_fixture_identity(target_dsn: str) -> str:
+    """No disposable-test identity may exist in a deployed database.
+
+    The governance identity plane is seeded in DISPOSABLE test databases so that
+    D4 can resolve a CEO and the governed capabilities are exercised rather than
+    refused. That seed is deliberately NOT marked test-only in `source`: the row
+    is genuinely executive-derived, and inventing a provenance value to label a
+    fixture would have widened a governed vocabulary to describe one.
+
+    The containment boundary is therefore the database LIFECYCLE -- a disposable
+    database is dropped -- and this check is what makes a breach of it visible.
+    The identity is `operator@disposable.test`; `.test` is IANA-reserved and
+    resolves nowhere, so an address ending in it can never belong to a real
+    person and must never appear in a deployed environment.
+
+    A hit here means a test seed reached production: an eligible authority
+    nobody appointed, able to own governance work.
+    """
+    import psycopg2
+    try:
+        conn = psycopg2.connect(target_dsn)
+    except Exception as exc:                                      # noqa: BLE001
+        return f"SKIPPED -- cannot connect: {str(exc).splitlines()[0][:80]}"
+    try:
+        found = []
+        with conn.cursor() as cur:
+            for table in ("assignable_identity", "executives"):
+                try:
+                    cur.execute(
+                        f"SELECT count(*), min(lower(email)) FROM {table} "
+                        f"WHERE lower(email) LIKE %s", ("%.test",))
+                    n, sample = cur.fetchone()
+                except Exception:                                 # noqa: BLE001
+                    conn.rollback()
+                    continue
+                if n:
+                    found.append(f"{table}: {n} row(s), e.g. {sample}")
+        if found:
+            return ("FIXTURE IDENTITY IN A DEPLOYED DATABASE -- "
+                    + "; ".join(found)
+                    + ". A disposable-test authority can own governance work "
+                      "here. Remove it and establish how it arrived.")
+        return "OK -- no .test identity in assignable_identity or executives"
+    finally:
+        conn.close()
+
+
 def main(argv: Optional[list] = None) -> int:
     # PARSE FIRST, CONNECT LATER. Everything below this line can touch a
     # production database; nothing above it may. argparse exits here for
@@ -683,6 +730,17 @@ def main(argv: Optional[list] = None) -> int:
     print(f"        {cancel}\n")
     if not _ok and not _skip:
         failures.append("no working cancellation path")
+
+    # Containment for the disposable governance identity seed. The seed lives in
+    # governance/tests/disposable_db.py and never ships; this asserts it did not.
+    fixture = _no_fixture_identity(dsn)
+    _fok = fixture.startswith("OK")
+    _fskip = fixture.startswith("SKIPPED")
+    print(f"  {'PASS' if _fok else 'SKIP' if _fskip else 'FAIL'}  "
+          f"no fixture identity")
+    print(f"        {fixture}\n")
+    if not _fok and not _fskip:
+        failures.append("fixture identity present in a deployed database")
 
     # A DIFFERENT QUESTION FROM THE CHECK ABOVE, and they are easy to confuse.
     #

@@ -55,6 +55,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
+import psycopg2.errors
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse
 
@@ -433,13 +434,32 @@ def issue_code(order_id: str, email: str,
         conn.commit()
     except Exception as exc:                              # noqa: BLE001
         conn.rollback()
-        missing = "order_cancel_verifications" in str(exc) and (
-            "does not exist" in str(exc)
-            or "UndefinedTable" in type(exc).__name__)
-        if missing:
+        # THE TYPE, NOT THE MESSAGE. This read "order_cancel_verifications" and
+        # "does not exist" out of str(exc), and PostgreSQL's MISSING COLUMN
+        # message contains both:
+        #
+        #   column "recipient_destination" of relation
+        #   "order_cancel_verifications" does not exist
+        #
+        # so a missing column was reported as a missing table, naming an
+        # artifact that was already applied. An operator following that message
+        # applies order_status_self_service.sql again and the failure persists;
+        # the file actually missing is cancellation_authority.sql. The
+        # exception's class is the error's identity, while its message is only a
+        # rendering of it, and here the two diverge exactly where it costs most.
+        if isinstance(exc, psycopg2.errors.UndefinedTable):
             logger.error("[order_status] order_cancel_verifications is MISSING "
-                         "(sql/order_status_self_service.sql is not applied "
-                         "here) -- refusing the cancellation.")
+                         "(governance/sql/order_status_self_service.sql is not "
+                         "applied here) -- refusing the cancellation.")
+        elif isinstance(exc, psycopg2.errors.UndefinedColumn):
+            # Named separately because the remedy is a different file. The
+            # column is reported verbatim so the reader does not have to guess
+            # which artifact introduces it.
+            logger.error("[order_status] order_cancel_verifications is present "
+                         "but a column it needs is not (%s) -- a cancellation "
+                         "artifact is unapplied; see app/core/deploy_state.py "
+                         "for which file carries it. Refusing the cancellation.",
+                         str(exc).splitlines()[0])
         else:
             logger.error("[order_status] could not record verification: %s", exc)
         return {"ok": False, "error": "verification_unavailable"}

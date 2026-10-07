@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-b75b34aa15bbf7d8d3515040b81da63f9d270f8e
+467d376d5d5ac82665832ab909c48ca6050869c1
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -332,3 +332,51 @@ b75b34aa15bbf7d8d3515040b81da63f9d270f8e
 # 1fe102b and ran none of these tests -- and nothing reported that, because the
 # pin control asserts only that the pinned commit RESOLVES, never that it is
 # current.
+
+# eb73be3 -- the cancellation chain made applicable, reachable and declared.
+# ELEVEN governance commits arrive with this pin, and it is the e802469 hazard
+# in a new direction: the hazard there was a file DECLARED but absent from
+# disk. Here the declaration NAMES A VOCABULARY that only exists from this
+# commit. deploy_state now points the three cancellation files at
+# _APPLIED_LOCAL_CANCELLATION_AUTHORITY, _..._ENFORCEMENT and _..._REVERSAL,
+# and DISPOSITIONS admits those three names only at eb73be3 -- so a public
+# commit pinned earlier fails test_sql_disposition_governance with
+# "disposition(s) outside the declared vocabulary", not with anything about
+# the SQL. The three _PENDING_CANCELLATION_* names are RETAINED in that set,
+# because it spans every state deploy_state is promotable through.
+#
+# THE BASELINE CHANGED AND CI BUILDS FROM IT. 00_base_schema now installs
+# pgcrypto and uuid-ossp into `extensions` rather than public, matching the
+# layout measured on both deployed databases. That is not cosmetic: it had been
+# installing pgcrypto into public, so every disposable database resolved an
+# unqualified digest() that no real database resolves, and the cancellation
+# artifacts passed the whole suite and then failed the first statement of a
+# real apply. All eleven functions in the three artifacts now pin
+# `pg_catalog, public, extensions, pg_temp`; a missing schema in search_path is
+# ignored rather than an error, so a pinned function works under either layout.
+# test_pgcrypto_search_path keys on unqualified AND unpinned, because
+# unqualified with a pin is the working production pattern.
+#
+# NOT PROMOTED INTO REQUIRED_MIGRATIONS, and the declarations say why in terms:
+# all three are APPLIED TO LOCAL railwayl2 with attestation ids 188, 170 and
+# 171, and NOT YET ON RAILWAY -- measured object by object, read-only, with
+# zero apply_sql attestations there. Promotion belongs in the change that
+# records the Railway application.
+#
+# ONE SECURITY CHANGE TRAVELS WITH IT. fn_cancellation_proposition is now
+# SECURITY DEFINER, because a search_path pin is INERT for a role without USAGE
+# on the pinned schema: crm_app holds EXECUTE on extensions.digest and not
+# USAGE on extensions, and PostgreSQL skips a schema the role cannot enter, so
+# the call failed as "function digest does not exist" and read as a missing
+# pin. Granting crm_app USAGE was the alternative and was rejected on
+# measurement -- 55 of the 56 functions in that schema already carry EXECUTE
+# for it, so schema USAGE is the only gate holding them shut. The keyword lives
+# in the artifact and not in a later ALTER because CREATE OR REPLACE resets
+# prosecdef to the default; the ACL is not reset that way, which is why the
+# grants could have lived elsewhere and the security mode could not.
+#
+# THE PIN MOVES IN A FOLLOW-UP COMMIT AGAIN, for the reason recorded at ded0dbb:
+# test_the_pin_names_a_commit_that_actually_exists requires the target to be
+# reachable, so eb73be3 could not be named until it was pushed. Its remote
+# resolution was verified with ls-remote before this line was written, rather
+# than inferred from a successful push.
