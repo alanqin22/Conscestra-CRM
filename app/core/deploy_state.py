@@ -1105,6 +1105,44 @@ _APPLIED_ACTIVITIES_OWNER_NO_FABRICATION = (
         "it would make migrate --check report a chain the ledger cannot "
         "evidence. Answering that by writing a ledger row is exactly what "
         "the ledger exists to prevent, so promotion waits.")
+_PENDING_POLICY_DELETION_LOG = (
+    "PENDING DEPLOYMENT -- authored 2026-10-08 and applied to LOCAL railwayl2 "
+    "only; NOT applied to Railway. Operator-applied; promote to "
+    "REQUIRED_MIGRATIONS in the same change that records its Railway "
+    "application and the read-back that proves it, and not before. "
+    "WHAT IT IS. It registers governance_action_policies with the generic "
+    "governed-deletion logger, so a deleted decision policy is archived into "
+    "governed_deletions with its full row, actor and txid, and can be put back "
+    "by restore_governed_deletion_row(). One trigger, no new function: "
+    "log_governed_deletion takes the primary key column as TG_ARGV[0], and this "
+    "table's key is the text column action_type. "
+    "WHY IT IS NEEDED. action_class decides whether financial enforcement "
+    "applies, and deleting the row removes it -- the proposition requirement, "
+    "both executive requirements, and three application effects that resolve "
+    "the class through _is_financial. Seven action types are classified "
+    "financial in production, so the path is live. And the deletion left "
+    "nothing behind: trg_gap_version_and_history fires BEFORE INSERT OR UPDATE "
+    "only, and governance_action_policy_history cannot carry a deletion because "
+    "after_state is NOT NULL. action_approvals has had a deletion log since "
+    "2026-08-08; the table that decides how those approvals are enforced had "
+    "none. "
+    "NO DEPLOY-ORDER CONSTRAINT, unlike the vocabulary and console files "
+    "elsewhere in this list. Nothing in the application reads this trigger, and "
+    "it only observes a deletion, so applying it before or after any "
+    "application change alters nothing the application does. "
+    "AFTER DELETE, matching the four existing attachments: logging must never "
+    "be able to block a write. trgfn_audit_row_history is the obvious-looking "
+    "wrong choice here, because it requires a uuid primary key and raises "
+    "otherwise. "
+    "IDEMPOTENT, and guarded: DROP TRIGGER IF EXISTS before CREATE, a "
+    "to_regclass check on the table, and an explicit check that "
+    "log_governed_deletion exists so a fresh environment fails with a readable "
+    "reason rather than inside CREATE TRIGGER. "
+    "WHAT IT DOES NOT DO. It does not prevent a deletion, does not govern an "
+    "UPDATE to action_class, and does not reduce the application principal's "
+    "rights: crm_app retains INSERT, UPDATE and DELETE on the table.")
+
+
 _PENDING_LOCAL_20260902 = (
     "PENDING DEPLOYMENT -- governed schema change applied locally "
         "2026-09-02, awaiting Railway. Promote to REQUIRED_MIGRATIONS after "
@@ -1393,6 +1431,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "fix_relative_image_urls.sql": _CORRECTION,
     "governance_critic.sql": _SCHEMA_OOB,
     "governance_history_audit.sql": _SCHEMA_OOB,
+    "governed_policy_deletion_log.sql": _PENDING_POLICY_DELETION_LOG,
     "governance_routing.sql": _SCHEMA_OOB,
     "guardrails_acl.sql": _SCHEMA_OOB,
     "identity_links.sql": _SCHEMA_OOB,

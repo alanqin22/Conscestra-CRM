@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-467d376d5d5ac82665832ab909c48ca6050869c1
+cba82764f7aa4e9c240885154facbd79617ed224
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -380,3 +380,50 @@
 # reachable, so eb73be3 could not be named until it was pushed. Its remote
 # resolution was verified with ls-remote before this line was written, rather
 # than inferred from a successful push.
+
+# cba8276 -- the policy deletion log. NOT tests only, but also NOT the e802469
+# hazard: the SQL file arriving with this pin is declared OUT OF BAND and PENDING
+# DEPLOYMENT in this same commit, so the corpus invariant is satisfied in both
+# directions. Pinned earlier, the file would be on disk with no classification
+# and test_every_sql_file_has_exactly_one_disposition would fail; declared
+# without the pin moving, the declaration would name a file absent from the
+# pinned governance commit. The two halves are coupled and belong together, which
+# is why they are one commit here rather than two.
+#
+# WHAT IT REGISTERS. governance_action_policies with log_governed_deletion, so a
+# deleted decision policy is archived into governed_deletions and recoverable by
+# restore_governed_deletion_row(). action_approvals has carried that log since
+# 2026-08-08 and the policy table that decides how those approvals are enforced
+# had none -- and the loss is not small: action_class gates the proposition
+# requirement, both executive requirements, and three application effects that
+# resolve the class through _is_financial. Seven action types are financial in
+# production, so the path is live.
+#
+# NOT PROMOTED INTO REQUIRED_MIGRATIONS, and the disposition says why in terms:
+# applied to LOCAL railwayl2 only, not to Railway. That list is a claim about
+# what production has executed, so promotion belongs in the change that records
+# the Railway application and the read-back proving it.
+#
+# NO DEPLOY-ORDER CONSTRAINT, unlike b0f47e9 and 0973596 in either direction.
+# Nothing in the application reads this trigger and it only observes a deletion,
+# so applying it before or after any application change alters nothing the
+# application does.
+#
+# A NEW DISPOSITION NAME TRAVELS WITH IT. _PENDING_POLICY_DELETION_LOG is
+# registered in the DISPOSITIONS vocabulary in the same governance commit,
+# because the contract refuses a disposition outside the declared set on the
+# grounds that adding one is a governance decision and not a naming choice. The
+# registration was falsified before being relied on: removing it fails
+# test_sql_disposition_governance on the name rather than on the SQL.
+#
+# WHAT DOES NOT TRAVEL WITH IT. The A1a tests are deliberately held back.
+# disposable_db layers an explicit list rather than REQUIRED_MIGRATIONS, and
+# 00_base_schema carries the four existing deletion-log triggers and not this
+# one, so a test asserting the live trigger would fail in CI against a database
+# that correctly does not have it. Those tests belong with the promotion commit
+# or behind a regenerated baseline.
+#
+# THE PIN MOVES IN A FOLLOW-UP COMMIT AGAIN, for the reason recorded at ded0dbb
+# and eb73be3. cba8276 was pushed first and its remote resolution verified with
+# ls-remote at 2026-10-08 08:33 UTC before this line was written, rather than
+# inferred from a successful push.
