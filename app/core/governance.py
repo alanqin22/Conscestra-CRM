@@ -1820,6 +1820,23 @@ def _with_approval_ref(ap: Dict[str, Any],
     return params
 
 
+def _classification_verifier(cur, stored, stored_hash):
+    """Imported lazily, as the economic verifier is, so importing governance
+    never pulls a proposition module in before it is needed."""
+    from app.core import classification_proposition as cp
+    return cp.rebuild_and_compare(cur, stored, stored_hash)
+
+
+# PROPOSITION KINDS THIS BUILD CAN VERIFY. A kind absent from this map is
+# REFUSED, so adding one is an explicit act and a rollback to an earlier build
+# cannot silently widen what passes -- it narrows it, which is the safe
+# direction. A module-level literal with no environment or database input, so
+# every worker builds an identical map.
+_PROPOSITION_KINDS = {
+    "classification.v1": _classification_verifier,
+}
+
+
 def _verify_proposition_unchanged(ap: Dict[str, Any]) -> Dict[str, Any]:
     """{ok, reason}. Is the approved proposition still true right now?
 
@@ -1830,6 +1847,16 @@ def _verify_proposition_unchanged(ap: Dict[str, Any]) -> Dict[str, Any]:
     waved through. That combination should be impossible -- the database
     refuses such an approval -- so reaching it means a control failed, and the
     permissive reading of a failed control is how this class of defect survives.
+
+    A financial action MAY carry a proposition of a declared non-economic KIND.
+    The marker lives inside that kind's own closed field set, so a proposition
+    cannot claim a kind without satisfying it, and cannot carry the marker
+    without being hashed under it. A proposition declaring NO kind takes the
+    economic path -- which is every proposition in existence today, because
+    `financial_proposition.canonical()` refuses undeclared fields and therefore
+    cannot carry the marker at all. An UNRECOGNISED kind is REFUSED rather than
+    passed, for the reason stated above: an unverifiable authorisation is not a
+    verified one.
     """
     from app.core import financial_proposition as fp
     action_type = ap.get("action_type") or ""
@@ -1842,6 +1869,24 @@ def _verify_proposition_unchanged(ap: Dict[str, Any]) -> Dict[str, Any]:
                 "reason": "this financial approval carries no economic "
                           "proposition; there is nothing to verify the "
                           "execution against"}
+    kind = stored.get("proposition_kind")
+    if kind is not None:
+        verifier = _PROPOSITION_KINDS.get(str(kind))
+        if verifier is None:
+            return {"ok": False,
+                    "reason": f"this approval declares proposition kind "
+                              f"{kind!r}, which this build cannot verify; an "
+                              f"unverifiable authorisation is refused"}
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                res = verifier(cur, stored, stored_hash)
+        finally:
+            # Read-only by construction, exactly as below: the kind verifiers
+            # only SELECT, and the rollback makes that structural.
+            conn.rollback()
+            conn.close()
+        return {"ok": bool(res.get("ok")), "reason": res.get("reason") or ""}
     conn = get_connection()
     try:
         with conn.cursor() as cur:
