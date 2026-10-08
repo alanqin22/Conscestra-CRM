@@ -563,6 +563,70 @@ def _sp_supervisor_emit_dunning(p: Dict[str, Any]) -> Any:
     return {"emitted_invoice_overdue_events": rows[0].get("r") if rows else 0}
 
 
+def _sp_classification_record_tax_evidence(p: Dict[str, Any]) -> Any:
+    """Governed auto-action (executed on approval): record the approved
+    evidentiary classification against the approved order set.
+
+    THE APPROVED PROPOSITION IS THE TARGET SET. This handler never queries for
+    targets. `_verify_proposition_unchanged` has already rebuilt the set
+    identity from the proposition and compared a live measurement to it, so by
+    the time this runs the approved artifact and current state agree.
+    Re-deriving the set here would discard that guarantee and reintroduce the
+    drift the control exists to catch.
+
+    ONE TRANSACTION, and the advisory lock is taken BEFORE the first guard is
+    evaluated. Measured: without it, two concurrent executions of the same
+    census both see NOT EXISTS as true under READ COMMITTED and both insert --
+    duplicate assertions in an append-only table, where they could never be
+    removed.
+
+    A REPEAT EXECUTION IS NOT A FAILURE AND IS NOT A SUCCESS WITH 195 WRITES.
+    It returns `already_classified` with the row count it actually wrote, which
+    is zero, plus the census id -- a non-empty string, so a correct no-op is
+    never mistaken for an action that had no effect.
+    """
+    from app.core import classification_proposition as cp
+    from app.core.database import get_connection
+    prop = (p or {}).get("proposition") or {}
+    asserter = (p or {}).get("asserter") or {}
+    if str(prop.get("proposition_kind")) != cp.KIND:
+        return {"ok": False, "error": f"proposition kind {prop.get('proposition_kind')!r} "
+                                      f"is not {cp.KIND!r}"}
+    if not asserter.get("assignable_id"):
+        return {"ok": False, "error": "no accountable asserter was supplied; "
+                                      "this capability never selects one"}
+    cid = str(prop["census_id"])
+    targets = ([(o, "zero_tax") for o in prop.get("zero_tax_order_ids") or []] +
+               [(o, "nonzero_unresolved")
+                for o in prop.get("nonzero_unresolved_order_ids") or []])
+    conn = get_connection()
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(cp.ADVISORY_LOCK_SQL, {"cid": cid})
+            detail = cp.measure_census(cur).get("detail") or {}
+            inserted = 0
+            for order_id, population in targets:
+                cur.execute(cp.ASSERT_INSERT_SQL, {
+                    "oid": str(order_id), "atype": cp.ASSERTION_TYPE,
+                    "state": cp.ASSERTION_STATE, "rule": cp.ASSERTION_RULE,
+                    "ev": cp.build_evidence(prop, str(order_id), population,
+                                            detail, asserter),
+                    "by": asserter["email"], "cid": cid})
+                inserted += cur.rowcount
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    if inserted == 0:
+        return {"ok": True, "already_classified": True, "inserted": 0,
+                "census_id": cid, "targets": len(targets)}
+    return {"ok": True, "inserted": inserted, "census_id": cid,
+            "targets": len(targets)}
+
+
 def _sp_supervisor_emit_hot_leads(p: Dict[str, Any]) -> Any:
     """Supervisor auto-action (executed on approval): kick the hot-lead loop."""
     from app.core.database import execute_sp
@@ -904,6 +968,15 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "kick the Accounting dunning loop (supervisor auto-action; "
                "queued for approval when governance tightens ACT_MIN)",
                sp=_sp_supervisor_emit_dunning),
+    Capability("classification.record_tax_evidence", "accounting", "", "write",
+               lambda p: ("record historically-unverifiable tax evidence "
+                          "against the approved order set"),
+               "record the approved evidentiary classification against the "
+               "EXACT approved order set; writes order_financial_assertions "
+               "only, is idempotent per census, and asserts nothing about "
+               "whether any tax amount was correct",
+               sp=_sp_classification_record_tax_evidence,
+               params_schema=(("proposition", "asserter"), ())),
     Capability("supervisor.emit_hot_leads", "supervisor", "", "write",
                lambda p: "emit hot-lead outreach events",
                "kick the hot-lead outreach loop (supervisor auto-action; "
