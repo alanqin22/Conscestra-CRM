@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-cba82764f7aa4e9c240885154facbd79617ed224
+99c8ac484f00ebe0f3bfbbe77c09a34b54771bf2
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -427,3 +427,32 @@ cba82764f7aa4e9c240885154facbd79617ed224
 # and eb73be3. cba8276 was pushed first and its remote resolution verified with
 # ls-remote at 2026-10-08 08:33 UTC before this line was written, rather than
 # inferred from a successful push.
+# 99c8ac4 -- THE OTHER HALF OF THE PROMOTION, and the reason the previous
+# commit's CI was red. The note at cba8276 above says it in advance:
+# 00_base_schema carried the four existing deletion-log triggers and not this
+# one, so anything asserting the live trigger would fail against a database
+# that correctly did not have it. deploy_state was then changed to DECLARE
+# governed_policy_deletion_log.sql without the baseline being carried forward,
+# and migrate --check reads a declaration as a claim about what has run. Run
+# 37831174224: the gate's migrations stage reported 'would apply', and
+# test_the_ledger_covers_every_declared_migration,
+# test_no_migration_is_declared_before_it_is_applied and
+# test_migrate_check_passes_when_the_corpus_is_classified fell with it.
+#
+# This pin carries the regenerated ledger and the one object it accounts for.
+# The baseline was DERIVED, not edited: built from its own previous version,
+# migrated by migrate.py, re-dumped and diffed -- one object added, none lost
+# -- and a database built from the result dumps identically to the migrated
+# one. The gate passes all five stages at this pin, 223 controls and 2
+# declared skips.
+#
+# 99c8ac4 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-09 13:46 UTC before this line was written, rather than inferred
+# from a successful push.
+#
+# STILL HELD BACK, and now unblocked rather than done: the A1a evidence tests
+# that cba8276 deferred 'with the promotion commit or behind a regenerated
+# baseline'. The baseline is regenerated here, so the reason they could not
+# run is gone; adding them is its own change, because disposable_db layers an
+# explicit migration list rather than REQUIRED_MIGRATIONS and would need the
+# same treatment.

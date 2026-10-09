@@ -222,6 +222,34 @@ REQUIRED_MIGRATIONS: List[str] = [
     #    may replay them safely.
     "governance_decision_link_identity.sql",
     "workflow_owner_resolution.sql",
+    # ── A1a, the policy deletion log. PROMOTED 2026-10-08, after Railway
+    #    executed it and the trigger was verified there directly from the
+    #    catalogs -- AFTER DELETE, row-level, enabled, bound to
+    #    log_governed_deletion('action_type') -- and not inferred from the apply
+    #    reporting success. Artifact sha256 390502a4...507e, 4855 bytes, at
+    #    governance commit cba8276. Railway attestation after the apply:
+    #    99b2b16a83763507.
+    #
+    #    IT WAS APPLIED OUT OF BAND, through apply_sql.py, so production's
+    #    ledger holds NO row for it and schema_migrations is still 49 at the
+    #    moment of this promotion. That is truthful and is left alone: the
+    #    ledger records what migrate.py executed, and migrate.py has not
+    #    executed this file.
+    #
+    #    SO migrate.py WILL REPLAY IT, once, on the next --target railway run,
+    #    and record the ledger row then -- 49 -> 50. That is the accepted
+    #    consequence of promotion rather than a defect, and it is safe because
+    #    the file is idempotent: DROP TRIGGER IF EXISTS then CREATE TRIGGER,
+    #    recreating the identical trigger and touching no row of any table.
+    #    Verified by applying it twice locally, and by a local dry run over an
+    #    EXISTING trigger, which printed the NOTICE without "does not exist,
+    #    skipping" -- so the DROP found the trigger and dropped it.
+    #
+    #    _PENDING_POLICY_DELETION_LOG is left defined and unused, as
+    #    _PENDING_LINK_IDENTITY and _PENDING_WORKFLOW_OWNER were: its
+    #    "NOT applied to Railway" sentence was true until 2026-10-08 and is kept
+    #    as the record of that, rather than rewritten to match today.
+    "governed_policy_deletion_log.sql",
     # 48 -> 49 on 2026-09-13. Not a new deployment: the three triggers this
     # wires -- trg_contacts_touch, trg_leads_touch, trg_accounts_touch -- were
     # verified present on Railway read-only as crm_readonly, and locally, before
@@ -1431,7 +1459,6 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "fix_relative_image_urls.sql": _CORRECTION,
     "governance_critic.sql": _SCHEMA_OOB,
     "governance_history_audit.sql": _SCHEMA_OOB,
-    "governed_policy_deletion_log.sql": _PENDING_POLICY_DELETION_LOG,
     "governance_routing.sql": _SCHEMA_OOB,
     "guardrails_acl.sql": _SCHEMA_OOB,
     "identity_links.sql": _SCHEMA_OOB,
