@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-f5085457839d8a663a42359dd27a0751639f6a8a
+330f64fee0fced9ff1c4d155f52333156c6eac62
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -509,3 +509,30 @@ f5085457839d8a663a42359dd27a0751639f6a8a
 # it authorized implementation and not publication. Until f508545 is pushed,
 # CI fails at 'governance commit is not reachable', which is the pin working.
 # Push the governance commit before this public commit.
+# 330f64f -- the RECONCILIATION of auth_otp_trust_boundary.sql's
+# declaration, which said 'applied NOWHERE, not even locally' and was false
+# on both databases. One line: the registration of
+# _APPLIED_AUTH_OTP_TRUST_BOUNDARY in DISPOSITIONS, which the public commit
+# that pins this references. The two cannot be split.
+#
+# ESTABLISHED BY DIRECT PROBE, not by the attestation row. That row carries
+# the bare filename and a fingerprint of the SCHEMA at that moment, not a
+# hash of the artifact. The substantive evidence is that every object the
+# file creates exists on Railway with the prescribed ACLs, and that both
+# function bodies are byte-identical to the artifact after CRLF
+# normalisation, on both databases.
+#
+# ONE APPLY, NOT TWO: Railway 2026-10-05 03:49:50 and local
+# 2026-10-04 23:49:50 are the same attestation row id=25 with the same
+# fingerprint, four hours apart in two session timezones. Reading
+# recorded_at::date nearly recorded two independent applications.
+#
+# NO ARTIFACT, INVENTORY, BACKLOG OR DATABASE CHANGED. The SQL is untouched
+# (sha256 a576382b...5cfffc, 17,444 bytes), REQUIRED_MIGRATIONS stays 49 and
+# OUT_OF_BAND_SQL stays 262. RECONCILIATION_BACKLOG is closed at its
+# 2026-09-23 contents and this file was NOT added to it.
+#
+# NOT YET PUSHED WHEN THIS LINE WAS WRITTEN: the gate that produced it
+# authorized implementation and local verification only. Until 330f64f is
+# pushed, CI fails at 'governance commit is not reachable', which is the pin
+# working. Push the governance commit before this public commit.

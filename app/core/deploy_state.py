@@ -1160,6 +1160,56 @@ _PENDING_AUTH_OTP_TRUST_BOUNDARY = (
     "sha256 a576382b0791b0a76e796582bafc2e7908880341f0f9e1d8738bfd0ff55cfffc, "
     "17444 bytes.")
 
+_APPLIED_AUTH_OTP_TRUST_BOUNDARY = (
+    "APPLIED TO BOTH DATABASES: Railway 2026-10-05 03:49:50 UTC and local "
+    "2026-10-04 23:49:50 America/Toronto -- ONE instant rendered in two "
+    "session timezones, attestation row id=25 on each, and NOT two "
+    "independent applications. Out-of-band; NOT promoted, and no "
+    "schema_migrations row exists on either database. "
+    "WHAT IT IS. The one-time-password trust boundary: auth_otp_challenges, "
+    "auth_secrets, and the two SECURITY DEFINER functions that are the only "
+    "declared way to reach them. The inspected table ACLs omit crm_app, and "
+    "crm_app has EXECUTE on both functions. This establishes the measured "
+    "table-access posture; it does not, by itself, prove every possible path "
+    "by which the application could access OTP state or secrets. THE PEPPER "
+    "IS NOT IN THIS FILE and never may be. "
+    "HOW APPLICATION WAS ESTABLISHED, and what each piece of evidence is "
+    "worth. The attestation row is SUPPORTING evidence only: its detail is "
+    "the bare filename, and its fingerprint 6740e72b936b89ca over 2,576 "
+    "objects hashes the SCHEMA at that moment, NOT this artifact bytes. The "
+    "substantive corroboration is a direct probe. On Railway every object "
+    "exists -- auth_secrets, auth_otp_challenges, uq_auth_otp_live, "
+    "fn_otp_issue(text,jsonb,interval,boolean,integer,integer) and "
+    "fn_session_create_otp(text,text,interval,integer), both prosecdef -- "
+    "with crm_app absent from both table ACLs, crm_readonly=r on "
+    "auth_otp_challenges only, and EXECUTE on both functions granted to "
+    "crm_app. Both function BODIES are byte-identical to this file after "
+    "CRLF normalisation, on both databases: md5 16e3d5ce (3,116 chars) and "
+    "f6453ee6 (5,265 chars). "
+    "WHAT THE BODY COMPARISON DOES NOT PROVE. It establishes those two "
+    "functions, not that every statement in this file executed "
+    "successfully. The object and ACL inventory is what carries the broader "
+    "claim. "
+    "public.auth_secrets is excluded by the configured backup policy; "
+    "restores made from dumps produced under that policy may legitimately "
+    "lack this table. scripts/backup_railway.py excludes it "
+    "(BACKUP_EXCLUDE_TABLES defaults to public.auth_secrets) because the "
+    "dump role cannot read it, and --exclude-table-data is not sufficient on "
+    "PostgreSQL 18.6. Such an absence is NOT evidence the artifact was never "
+    "applied. "
+    "Reapplying this artifact to a restore that lacks auth_secrets may "
+    "create an empty table without the required pepper, leaving the OTP "
+    "functions unable to complete their intended operation. Do not use "
+    "reapplication as a parity repair; assess the restore and "
+    "secret-provisioning requirements through a separate authorized "
+    "preflight. "
+    "_PENDING_AUTH_OTP_TRUST_BOUNDARY is left defined and unused, as "
+    "_PENDING_POLICY_DELETION_LOG and nine other superseded names are: its "
+    "sentence that it was applied nowhere, not even locally, was true when "
+    "written on 2026-10-04 and is kept as the record of that. "
+    "sha256 a576382b0791b0a76e796582bafc2e7908880341f0f9e1d8738bfd0ff55cfffc, "
+    "17444 bytes.")
+
 _SCHEMA_OOB = (
     "Historical schema operation applied out-of-band; it never entered the "
     "governed chain. This records what is true, not that the objects are "
@@ -1499,7 +1549,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
-    "auth_otp_trust_boundary.sql": _PENDING_AUTH_OTP_TRUST_BOUNDARY,
+    "auth_otp_trust_boundary.sql": _APPLIED_AUTH_OTP_TRUST_BOUNDARY,
     "escalations.sql": _SCHEMA_OOB,
     "event_correlation_propagation.sql": _PENDING_CORRELATION,
     "event_types_voice_learning.sql": _CORRECTION,
