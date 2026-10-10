@@ -1050,6 +1050,38 @@ _PENDING_APPEND_ONLY_ATTEST = (
     "Applied by scripts/apply_sql.py; NOT by deploy_sp.ps1, which is "
     "prohibited against Railway.")
 
+_APPLIED_APPEND_ONLY_ATTEST = (
+    "APPLIED TO RAILWAY 2026-10-10; out-of-band; NOT promoted. F-9.8 withdraws "
+    "UPDATE and DELETE from crm_app on schema_attestations, the table whose "
+    "rows are the evidence an apply is audited by. Artifact sha256 "
+    "4c7bbcd9...58fe1 at governance 77568b9. "
+    "WHAT WAS OBSERVED, and how. Read-only as crm_readonly after the apply: "
+    "the ACL is postgres=arwdDxtm/postgres, crm_app=ar/postgres, "
+    "crm_readonly=r/postgres -- crm_app lost exactly w and d while the other "
+    "two entries are untouched; no trigger exists; the 27 pre-existing rows "
+    "are byte-stable on two independent digests; and apply_sql recorded row "
+    "id=28 naming this file, carrying fingerprint 99b2b16a83763507 over 2,577 "
+    "objects -- the SAME value as the row before it, PREDICTED IN ADVANCE "
+    "because privileges sit outside what the fingerprint hashes. "
+    "WHAT THIS DOES NOT CLAIM. No production UPDATE or DELETE was executed "
+    "and refused. There is no authorized non-owner Railway connection, so the "
+    "production evidence is an independently read catalog configuration, not "
+    "an executed 42501 from aclcheck_error. That denial is demonstrated only "
+    "in a disposable fixture reproducing the measured Railway configuration. "
+    "NOT APPLIED LOCALLY, and local is NOT a safe place to establish parity. "
+    "railwayl2's table ACL is NULL -- owner-only, crm_app holds no privilege "
+    "there at all -- so on that database the REVOKE is a no-op and the GRANT "
+    "SELECT, INSERT would CREATE two privileges that do not exist. Applying "
+    "this file locally would ADD access rather than withdraw it. This records "
+    "that scope; it authorizes no local change. "
+    "NO LEDGER ROW, by design: apply_sql.py records none for an out-of-band "
+    "file and says so, the classification IS the provenance record, and "
+    "migrate --check --target railway reports the schema current. "
+    "_PENDING_APPEND_ONLY_ATTEST is left defined and unused, as "
+    "_PENDING_POLICY_DELETION_LOG and eight other superseded names are: its "
+    "sentence that no database had it was true until 2026-10-10 15:32 UTC and "
+    "is kept as the record of that rather than rewritten to match today.")
+
 _PENDING_ERASURE_E8 = (
     "PENDING DEPLOYMENT -- authored 2026-09-01 and applied to LOCAL only. "
     "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
@@ -1311,7 +1343,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "agent_tuning.sql": _SCHEMA_OOB,
     "append_only_revokes.sql": _SCHEMA_OOB,
     "append_only_revokes_fix.sql": _SCHEMA_OOB,
-    "append_only_schema_attestations.sql": _PENDING_APPEND_ONLY_ATTEST,
+    "append_only_schema_attestations.sql": _APPLIED_APPEND_ONLY_ATTEST,
     "ar_aging_realism.sql": _SCHEMA_OOB,
     "ar_collections_settle_88pct.sql": _CORRECTION,
     "assignable_identity.sql": _SCHEMA_OOB,
