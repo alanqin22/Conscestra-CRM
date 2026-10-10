@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-77568b9faa11d3e02acefd068b3b876f6cd0bd47
+f5085457839d8a663a42359dd27a0751639f6a8a
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -484,3 +484,28 @@
 # pushing was not authorized at the gate that produced it. Until 77568b9 is
 # pushed, CI will fail at 'governance commit is not reachable' -- which is the
 # pin doing its job. Push the governance commit before this public commit.
+# f508545 -- the RECONCILIATION of 77568b9's declaration, and nothing else.
+# append_only_schema_attestations.sql was applied to RAILWAY out-of-band on
+# 2026-10-10 15:32 UTC and verified read-only: ACL crm_app=ar/postgres with
+# the postgres and crm_readonly entries untouched, no trigger, the 27
+# pre-existing rows byte-stable on two digests, and apply_sql row id=28
+# naming the file with fingerprint 99b2b16a83763507 -- the same value as the
+# row before it, predicted in advance because privileges sit outside what the
+# fingerprint hashes. So the PENDING DEPLOYMENT marker became false that day.
+#
+# THIS PIN CARRIES ONE LINE: the registration of _APPLIED_APPEND_ONLY_ATTEST
+# in DISPOSITIONS. The public commit that pins it repoints the manifest entry
+# to that name, and test_every_named_disposition_is_declared reads the AST of
+# deploy_state.py and refuses a name outside the declared set -- so the two
+# cannot be split. Falsified: with the registration removed the test fails
+# naming the exact constant.
+#
+# NO ARTIFACT AND NO DATABASE CHANGED. The SQL is byte-identical to 77568b9
+# (sha256 4c7bbcd9...58fe1), REQUIRED_MIGRATIONS stays 49, and the Railway
+# control applied on 2026-10-10 is untouched. _PENDING_APPEND_ONLY_ATTEST is
+# retained defined-and-unused, as eight other superseded names are.
+#
+# NOT YET PUSHED WHEN THIS LINE WAS WRITTEN, because the gate that produced
+# it authorized implementation and not publication. Until f508545 is pushed,
+# CI fails at 'governance commit is not reachable', which is the pin working.
+# Push the governance commit before this public commit.
