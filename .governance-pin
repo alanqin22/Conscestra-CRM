@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-99c8ac484f00ebe0f3bfbbe77c09a34b54771bf2
+77568b9faa11d3e02acefd068b3b876f6cd0bd47
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -456,3 +456,31 @@
 # run is gone; adding them is its own change, because disposable_db layers an
 # explicit migration list rather than REQUIRED_MIGRATIONS and would need the
 # same treatment.
+# 77568b9 -- F-9.8, the append-only correction F-9.1 omitted. crm_app held
+# UPDATE and DELETE on schema_attestations, measured on Railway 2026-10-09:
+# the table was created after the ALTER DEFAULT PRIVILEGES rule in
+# app_role.sql, so it arrived fully mutable by the application role. Those
+# rows are the evidence an apply is audited by, and
+# test_pending_declaration_is_not_stale.py reads them, so the application
+# role could rewrite the record that audits it.
+#
+# THREE PATHS TRAVEL TOGETHER AND THE THIRD IS NOT OPTIONAL. The artifact,
+# its regression, and the registration of _PENDING_APPEND_ONLY_ATTEST in
+# DISPOSITIONS. The public commit that pins this references that disposition
+# name, and test_every_named_disposition_is_declared reads the AST of
+# deploy_state.py and refuses a name outside the declared vocabulary -- so a
+# public commit pinned to a governance commit without the registration fails
+# the gate on the NAME rather than on the SQL. Measured, not predicted: that
+# is exactly how the first attempt failed, 1 failed and 222 passed.
+#
+# THE ARTIFACT IS APPLIED TO NO DATABASE at this pin, and the regression is
+# deliberately absent from verify_gate.CONTROL_TESTS: it needs a
+# cluster-level crm_app role, which the gate's scratch database has no reason
+# to hold, and the gate already declares grants NOT GATED HERE. Its
+# precondition skips with a stated reason rather than failing.
+#
+# NOT YET PUSHED WHEN THIS LINE WAS WRITTEN. Every earlier note here records
+# ls-remote confirmation before the pin was advanced; this one cannot, because
+# pushing was not authorized at the gate that produced it. Until 77568b9 is
+# pushed, CI will fail at 'governance commit is not reachable' -- which is the
+# pin doing its job. Push the governance commit before this public commit.
