@@ -1014,6 +1014,42 @@ _PENDING_SCHEMA_ATTEST = (
     "that passed every check. Deliberately a MIGRATION rather than a runtime "
     "ensure_table: a detector for undeclared schema changes must not make one.")
 
+_PENDING_APPEND_ONLY_ATTEST = (
+    "PENDING DEPLOYMENT -- authored 2026-10-09 and applied to NO database. "
+    "F-9.8, the append-only correction F-9.1 omitted. schema_attestations was "
+    "created after the ALTER DEFAULT PRIVILEGES rule in app_role.sql, so it "
+    "arrived with UPDATE and DELETE granted to crm_app; measured on Railway "
+    "2026-10-09 as crm_readonly, and the table carries no trigger. Its rows "
+    "are the evidence that an apply changed nothing it should not have, and "
+    "test_pending_declaration_is_not_stale.py reads them, so the application "
+    "role could rewrite the record that audits it. "
+    "F-9.7 DOES NOT APPLY: that file restored UPDATE on replica_attestations "
+    "because its writer is INSERT ... ON CONFLICT DO UPDATE, which needs the "
+    "privilege whether or not a conflict occurs. This table's only writer is "
+    "a plain INSERT, so it is append-only by construction. "
+    "TRUNCATE IS DECLARATORY -- crm_app never held it, so its denial is "
+    "already true and is not evidence this control works. NO TRIGGER: one "
+    "would refuse UPDATE for every role including the migration principal, "
+    "and would break a future upsert writer silently, which is F-9.7's exact "
+    "failure. "
+    "RETENTION, recorded as policy rather than left as an accident: "
+    "attestation records are retained without automatic expiry or purge. "
+    "Retention will be reviewed if measured attestation storage reaches a "
+    "defined threshold, materially affects backup or restore performance, or "
+    "applicable governance requirements change. No deletion mechanism is "
+    "authorized by this decision, and this file creates none. "
+    "OUT-OF-BAND FOR A MEASURED REASON, not because privilege artifacts "
+    "cannot be declared -- three declared migrations carry them, two with "
+    "unguarded GRANT ... TO crm_app, which survive only because the "
+    "baseline's ledger records them so migrate.py skips them. A newly "
+    "declared migration is the ONLY file migrate.py executes in CI, and the "
+    "step that creates crm_app runs two steps later, so declaring this would "
+    "fail with 'role crm_app does not exist'. That ordering is liftable; the "
+    "classification is correct for this change and matches both F-9.1 "
+    "siblings. "
+    "Applied by scripts/apply_sql.py; NOT by deploy_sp.ps1, which is "
+    "prohibited against Railway.")
+
 _PENDING_ERASURE_E8 = (
     "PENDING DEPLOYMENT -- authored 2026-09-01 and applied to LOCAL only. "
     "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
@@ -1275,6 +1311,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "agent_tuning.sql": _SCHEMA_OOB,
     "append_only_revokes.sql": _SCHEMA_OOB,
     "append_only_revokes_fix.sql": _SCHEMA_OOB,
+    "append_only_schema_attestations.sql": _PENDING_APPEND_ONLY_ATTEST,
     "ar_aging_realism.sql": _SCHEMA_OOB,
     "ar_collections_settle_88pct.sql": _CORRECTION,
     "assignable_identity.sql": _SCHEMA_OOB,
