@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-330f64fee0fced9ff1c4d155f52333156c6eac62
+8758b652f5cfd85d71010b30fc3a01ca83e0fccb
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -536,3 +536,33 @@
 # authorized implementation and local verification only. Until 330f64f is
 # pushed, CI fails at 'governance commit is not reachable', which is the pin
 # working. Push the governance commit before this public commit.
+# 8758b65 -- the staleness detector can finally reach the database it audits.
+# Both existing tests take their connection from get_connection(), the LOCAL
+# database, so a file applied to Railway alone was invisible to them. Measured
+# 2026-10-10 in ONE run: they caught auth_otp_trust_boundary.sql because that
+# apply was local, and missed append_only_schema_attestations.sql because that
+# one was Railway only.
+#
+# ONE FILE, ADDITIVE, +74/-0: _railway_conn() and one test. attested_applied()
+# and declared_pending() are reused unchanged and the two existing tests are
+# untouched.
+#
+# THE SKIP AND FAIL CONTRACT IS THE CONTROL, not the query. An absent
+# RAILWAY_DB_URL is a declared skip. A CONFIGURED endpoint that cannot be
+# reached is a FAILURE, so the connect is deliberately unguarded -- the helper
+# has ZERO except handlers, which is the visible difference from the local
+# tests at lines 135 and 182 that skip on a connection error. Only a genuinely
+# missing table may skip, asked with to_regclass because it answers NULL
+# instead of raising. Exercised, not reasoned: absent DSN skipped with the
+# exact reason and get_connection was called zero times; 127.0.0.1:1 failed;
+# a table present with SELECT denied failed with 42501; and a declaration
+# flipped to PENDING in an in-memory copy was named by the detector.
+#
+# AVAILABILITY IS NOT ENFORCEMENT. This pin makes the test present in a
+# pin-driven checkout. verify_gate executes CONTROL_TESTS only, and this file
+# is deliberately NOT in it: adding it would give CI a dependency on
+# production connectivity and credentials, which needs its own security and
+# reliability review. Ruled 2026-10-10. Do not add it as a convenience.
+#
+# 8758b65 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-11 00:27 UTC before this line was written.
