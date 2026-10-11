@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-8758b652f5cfd85d71010b30fc3a01ca83e0fccb
+e13f163b9d1e9b8724c362977caa7db87e10cb9d
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -566,3 +566,31 @@
 #
 # 8758b65 was pushed first and its remote resolution verified with ls-remote
 # at 2026-10-11 00:27 UTC before this line was written.
+# e13f163 -- STAGE 1 of the scheduled production-governance audit, and only
+# stage 1. PENDING_MARKER, RECONCILIATION_BACKLOG and declared_pending() move
+# out of tests/test_pending_declaration_is_not_stale.py into
+# app/core/deploy_state.py, which this commit pairs with.
+#
+# WHY THE POLICY HAD TO MOVE. governance/ is gitignored and tracks zero files
+# in the public repository, so the deployed application cannot import the
+# detector. A scheduled audit could not reach the permitted-exception list
+# without a second copy of it, and two copies of a closed list is how the copy
+# nobody watches goes stale. In the shipped module, an audit and the detector
+# evaluate the same object: version skew between them is not possible.
+#
+# RELOCATED BYTE-FOR-BYTE, rationale included, rather than retyped. Six tests
+# were added because the three existing ones assert only that the DIFFERENCE
+# between pending and the backlog is empty -- a predicate returning a
+# different set would leave them green. They pin the marker and all 16 backlog
+# members verbatim, re-derive the pending set independently instead of
+# freezing today's 26 (a frozen count is a census pin that fails for the right
+# reason and gets deleted for the wrong one), prove the marker is positional
+# after normalising, and prove that withdrawing one backlog member surfaces
+# that artifact -- the test that shows the shared set is actually consulted.
+#
+# NO AUDIT BEHAVIOUR. No scheduler job, no notification classifier entry, no
+# audit module, no migration, no database write. Stage 2 is separately gated
+# and NOT authorized by this commit.
+#
+# e13f163 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-11 01:48 UTC before this line was written.
