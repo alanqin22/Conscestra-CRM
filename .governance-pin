@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-e13f163b9d1e9b8724c362977caa7db87e10cb9d
+01af7d86b32d424afeba82ab10ea1966a843c7fa
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -594,3 +594,30 @@ e13f163b9d1e9b8724c362977caa7db87e10cb9d
 #
 # e13f163 was pushed first and its remote resolution verified with ls-remote
 # at 2026-10-11 01:48 UTC before this line was written.
+
+# 01af7d8 -- the acceptance tests for the hourly production declaration
+# audit (app/core/governance_audit.py, added in the same commit as this
+# line). 893 lines, one new file, nothing else touched.
+#
+# WHY THE TWO CANNOT BE SPLIT. The tests import app.core.governance_audit
+# and read the CronTrigger registration out of the source of lifespan(), so
+# they describe exactly the application commit that carries this pin.
+#
+# WHAT THEY HOLD. Most of the file is about the cases where the audit CANNOT
+# run, because the answer is only worth having if "nothing to report" and
+# "could not tell" are never confused: a revoked SELECT is a source error
+# and not an absent table (asserted on SQLSTATE 42501 and
+# diag.source_function = aclcheck_error, from a real role holding no
+# privilege); a configured endpoint that cannot be reached fails rather than
+# skipping; total database unavailability raises and says the finding is NOT
+# in governance_alerts; an unconfigured audit is neither clean nor a skip;
+# and all three fail-closed policy guards are asserted on the guard that
+# refused rather than on the fact of a refusal.
+#
+# NOT A CONTROL_TESTS ENTRY. The gate is unchanged at 223 passed, 2 skipped.
+# Three of these tests build real databases and one needs a cluster role, so
+# admitting them to the gate needs its own review; that is a separate,
+# un-started changeset.
+#
+# 01af7d8 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-11 03:59 UTC before this line was written.
