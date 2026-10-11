@@ -1778,6 +1778,86 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "workflow_revival.sql": _SCHEMA_OOB,
 }
 
+
+# ── Shared with the governance declaration detector ────────────────────
+#
+# These three definitions lived in
+# governance/tests/test_pending_declaration_is_not_stale.py, which is NOT
+# shipped: `governance/` is gitignored, so the deployed application cannot
+# import it. A scheduled production-governance audit could therefore not reach
+# the permitted-exception list without a SECOND copy of it, and two copies of a
+# closed list is how the copy nobody watches goes stale.
+#
+# They live here because this module IS shipped, so an audit and the detector
+# evaluate the same policy object: the same values, from the same import, in
+# the same process. Version skew between them is not possible. The detector
+# imports them from here; this module imports nothing from governance; and the
+# move changed no value and no semantics.
+#
+# THE MARKER IS POSITIONAL, and that is load-bearing. A corrected declaration
+# is allowed to QUOTE its former status, so only the opening words state what
+# is true now. `lstrip().upper().startswith(...)` is the whole contract --
+# substring matching would classify a corrected declaration as pending again.
+PENDING_MARKER = "PENDING DEPLOYMENT"
+
+# ── The reconciliation backlog ──────────────────────────────────────────────
+#
+# Files whose declaration opened with PENDING DEPLOYMENT on 2026-09-23 while
+# this database held an apply_sql attestation for them. Enumerated rather than
+# excused: the same shape as `crmdb_write_register.LEGACY_CRMDB_WRITERS`, and
+# for the same reason. A permanently-red check is a switched-off check with
+# extra steps, and a silently-widened allowlist is how a real defect vanishes.
+#
+# THE LIST MAY SHRINK. It must never grow. An entry is removed by RECONCILING
+# the file -- confirming its objects against the live catalogue of each
+# database and rewriting its declaration to say which database has it and
+# when -- never by deleting the line.
+#
+# WHY IT IS NOT ALREADY EMPTY. Two entries were reconciled on the day this was
+# written, with attestation ids and a direct object probe of both databases
+# (`a3_invoice_economic_integrity.sql`, `financial_proposition_binding.sql`),
+# which is why neither appears below. The remainder need the same treatment
+# and had not had it. Correcting a declaration with less evidence than that
+# would reintroduce the defect in the other direction: a confident status
+# nobody checked.
+#
+# APPLIED IS PER-DATABASE, and this is the trap the first draft fell into.
+# Measured 2026-09-23: fourteen files are stale against local `crmdb`, ten
+# against Railway, and the two sets are not nested. A file applied locally and
+# genuinely not yet on Railway is CORRECTLY pending for Railway -- so a
+# reconciled declaration must name the database, as
+# `_APPLIED_LOCAL_SOFT_DELETED_AR` already does. This is the union of both,
+# so an entry may be legitimately stale on one database and accurate on the
+# other; only reconciliation can tell them apart.
+RECONCILIATION_BACKLOG = frozenset({
+    "a3_financial_state.sql",
+    "corpus_provenance.sql",
+    "escalation_assigned_requires_claim_time.sql",
+    "escalation_reminder_allocation.sql",
+    "event_correlation_propagation.sql",
+    "executives_owner_id_column.sql",
+    "governance_alert_ack_and_disposition.sql",
+    "governance_alert_resolution_required.sql",
+    "governance_policy_generate_invoice.sql",
+    "identity_confirm_evidence.sql",
+    "owner_eligibility_guards.sql",
+    "owner_personhood_register.sql",
+    "readonly_role.sql",
+    "schema_attestations.sql",
+    "staff_email_ledger_governance_kinds.sql",
+    "staff_email_ledger_owner_remind_kind.sql",
+})
+
+
+def declared_pending() -> set:
+    """Files whose disposition OPENS with the pending marker."""
+    return {
+        name for name, reason in OUT_OF_BAND_SQL.items()
+        if isinstance(reason, str)
+        and reason.lstrip().upper().startswith(PENDING_MARKER)
+    }
+
+
 from app.core.artifact_paths import SQL_DIR as _SQL_DIR
 
 
