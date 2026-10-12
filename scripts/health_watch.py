@@ -24,7 +24,8 @@ WHAT IT CHECKS
   db role        database.connected_as is the expected app role, not a superuser
   leader         ha.role is not 'unelected' (an election completed at all)
   coverage       the answering process is AUTHORITATIVE about the scheduled
-                 controls, and its evidence is complete and fresh
+                 controls: it holds the state, its evidence QUERY SUCCEEDED,
+                 and the resulting assessment is present and fresh
   scheduler      scheduler.last_tick is fresher than HEALTH_MAX_TICK_AGE_MIN
 
 It does NOT verify that exactly one process claims to run the singletons. One
@@ -47,6 +48,13 @@ So this checker separates "I looked and the controls are fine" from "I could not
 obtain evidence". The second is NOT healthy. It re-polls first, because 16% of
 follower runs are isolated and a second probe reaches the leader; if authority
 is still not obtained it says so as a problem.
+
+AND AN EMPTY RESULT IS NOT THE SAME AS A SUCCESSFUL ONE. `_last_success_map()`
+used to return {} when its query FAILED -- the same value a successful query
+over an empty table returns -- so a database failure was published as
+`overdue_jobs: []` with a fresh timestamp and satisfied every condition above.
+The backend now publishes `evidence_complete`, and this checker requires it to
+be exactly true.
 
 NOISE CONTROL
 -------------
@@ -218,9 +226,23 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
     # `unelected` fails the identity test as well as raising its own problem
     # above: a process that never won an election holds no state either.
     _audit_age = _age_minutes(sched.get("overdue_checked_at"))
+    _complete = sched.get("evidence_complete")
     coverage = {
         "identity": role in ("leader", "standalone"),
         "running": sched.get("running") is True,
+        # DID THE EVIDENCE QUERY ACTUALLY SUCCEED? This is not inferable from
+        # the shape of the result: an empty `overdue` list is produced both by a
+        # healthy system and by a read that failed, and before the backend
+        # published this field a failed read was reported as `overdue_jobs: []`
+        # with a fresh timestamp -- a database failure presented as proof that
+        # every scheduled job was fine.
+        #
+        # `is True` AND NOT `is not False`. A missing field means this backend
+        # cannot say whether its query succeeded, and an unanswerable question
+        # is not an affirmative answer. Backward compatibility does not get to
+        # weaken the invariant; version skew is reported below under its own
+        # name and remains non-authoritative until the contract is available.
+        "query_ok": _complete is True,
         "assessment_present": sched.get("overdue_jobs") is not None,
         "assessment_fresh": (_audit_age is not None
                              and _audit_age <= MAX_AUDIT_AGE_MIN),
@@ -231,6 +253,21 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
                                    + ", ".join(k for k, v in coverage.items()
                                                if not v))
     facts["scheduler_evidence_authoritative"] = authoritative
+    if _complete is None:
+        # NOT the same fact as a failed query, and not an excuse either. Named
+        # separately so the operator fixes the right thing: the backend is too
+        # old to say, rather than new enough to say it failed.
+        facts["evidence_contract"] = ("absent — this backend does not publish "
+                                      "evidence_complete")
+    elif _complete is False:
+        facts["evidence_contract"] = (
+            "the backend reports its evidence query did NOT succeed: "
+            + str(sched.get("evidence_error") or "no reason given"))
+        if sched.get("evidence_refresh_failed_at"):
+            facts["evidence_refresh_failed_at"] = \
+                sched["evidence_refresh_failed_at"]
+        if sched.get("evidence_never_succeeded"):
+            facts["evidence_contract"] += " (no assessment has ever succeeded)"
 
     # Gated on IDENTITY, not on full authority: a leader with a stale or absent
     # assessment must still reach the checks below, because that is where the
@@ -284,6 +321,29 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
                     f"the overdue-job audit last ran {audit_age:.0f} min ago "
                     f"(threshold {MAX_AUDIT_AGE_MIN:.0f}) — scheduler."
                     f"overdue_jobs is stale and cannot be trusted")
+
+        # A JOB WITH NO RECORDED RUN AT ALL. audit() has always computed this
+        # and /health used to discard it, which is part of how a failed evidence
+        # query read as a clean result: every job lands in `unknown` and
+        # `overdue` comes back empty.
+        #
+        # WORDED AS "CANNOT ESTABLISH", not "unhealthy". An unassessed job is
+        # not evidence that the job is failing; it is evidence that this check
+        # cannot say either way. Only `overdue_jobs` and `failed_jobs_24h`
+        # assert that something is actually wrong.
+        unknown = sched.get("unknown_jobs")
+        if unknown is None:
+            facts["unknown_jobs"] = "not reported by this backend"
+        else:
+            facts["unknown_jobs"] = len(unknown)
+            if unknown:
+                named = ", ".join(str(u) for u in unknown[:4])
+                more = f" (+{len(unknown) - 4} more)" if len(unknown) > 4 else ""
+                problems.append(
+                    f"{len(unknown)} scheduled job(s) have no recorded run at "
+                    f"all: {named}{more}. This does not say they are unhealthy "
+                    f"-- it says their health cannot be established from the "
+                    f"job ledger.")
 
         overdue = sched.get("overdue_jobs")
         if overdue is None:

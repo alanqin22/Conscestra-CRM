@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-8b8420eb43c5cab8869fe6affa031a2116a98d80
+b1edb93b0684a41aa6e17029f226080f38cf2a8f
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -730,3 +730,37 @@
 # 8b8420e was pushed to feat/p0-p1-governance-remediation as a fast-forward
 # from 5c103d8 and its remote resolution verified with ls-remote at
 # 2026-10-12 03:20 UTC before this line was written.
+
+# b1edb93 -- Gate A commit 2, the consumer side. Commit 1 taught /health to
+# publish evidence_complete; this requires the monitor to read it.
+#
+# ORDER MATTERS AND HAS BEEN OBSERVED. Commit 1 merged as 933a4b9 and was
+# DEPLOYED and verified on a leader before this was written:
+# evidence_complete true, unknown_jobs [], overdue_jobs [], fresh
+# overdue_checked_at. Shipping this first would have made the monitor
+# non-authoritative against a backend that could not yet answer.
+#
+# `is True`, NOT `is not False`. A backend that does not publish the field
+# cannot say whether its evidence query succeeded, and an unanswerable
+# question is not an affirmative answer. Version skew is reported under its
+# own name -- too old to say, versus new enough to say it failed -- and stays
+# non-authoritative either way.
+#
+# FIXTURES UPDATED DELIBERATELY. leader() now carries the contract fields;
+# seven Stage 1 tests failed against the new predicate until it did, which is
+# correct. pre_contract_leader() keeps the old shape as its own case.
+#
+# UNKNOWN JOBS ARE A FINDING, NOT A VERDICT. They are surfaced and named, but
+# worded as "health cannot be established" -- an unassessed job is not
+# evidence that the job is failing. Only overdue_jobs and failed_jobs_24h
+# assert that something is actually wrong.
+#
+# THREE MUTATIONS, ALL KILL TESTS. One revert failed silently mid-run because
+# its output was suppressed, leaving query_ok deleted; caught by comparing the
+# blob to the pre-mutation hash rather than by trusting the loop.
+#
+# ISSUE E IS STILL OPEN. Authority remains unobtainable on a follower, which
+# is Gate B.
+#
+# b1edb93 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-12 03:40 UTC before this line was written.
