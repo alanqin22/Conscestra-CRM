@@ -2538,8 +2538,30 @@ async def health():
         from app.core import job_ledger
         _audit = job_ledger.last_audit()
         if _audit:
-            _sched["overdue_jobs"] = _audit.get("overdue", [])
-            _sched["overdue_checked_at"] = _audit.get("checked_at")
+            # PUBLISHED ONLY WHEN AN ASSESSMENT EXISTS. The previous
+            # `.get("overdue", [])` supplied an empty list when there was no
+            # assessment at all, and an empty list is exactly what a clean
+            # system reports -- so "never assessed" was published as "nothing
+            # overdue". Absence is now absence.
+            if "overdue" in _audit:
+                _sched["overdue_jobs"] = _audit["overdue"]
+                # Was computed and then discarded here. A job with no recorded
+                # run at all is not overdue and is not healthy either; dropping
+                # it is what let a failed evidence query read as a clean result.
+                _sched["unknown_jobs"] = _audit["unknown"]
+                _sched["overdue_checked_at"] = _audit.get("checked_at")
+            # Whether the evidence QUERY SUCCEEDED, which is not inferable from
+            # the shape of its result: an empty overdue list is produced both by
+            # a healthy system and by a read that failed.
+            _sched["evidence_complete"] = _audit.get("evidence_complete")
+            if _audit.get("evidence_error"):
+                _sched["evidence_error"] = _audit["evidence_error"]
+            if _audit.get("refresh_failed_at"):
+                # Deliberately NOT `overdue_checked_at`: a failure timestamp
+                # must never be readable as a fresh successful assessment.
+                _sched["evidence_refresh_failed_at"] = _audit["refresh_failed_at"]
+            if _audit.get("evidence_never_succeeded"):
+                _sched["evidence_never_succeeded"] = True
             # A miss that was auto-repaired overnight leaves `overdue` empty by
             # morning. These two say it happened at all.
             if _audit.get("repairs"):

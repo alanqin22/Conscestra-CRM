@@ -83,7 +83,21 @@ _disabled_until = 0.0
 DISABLED_RETRY_S = float(os.getenv("JOB_LEDGER_RETRY_S", "900"))   # 15 min
 
 # Last audit result, published on /health.
-_last_audit: Dict[str, Any] = {}
+# TWO STORES, AND THE FAILURE PATH CANNOT REACH THE FIRST.
+#
+# A failed evidence query used to be written here with a fresh timestamp and an
+# empty `overdue` list, which is how an unsuccessful read came to look like
+# proof of health. Keeping the last SUCCESSFUL assessment and the latest FAILED
+# refresh in separate stores makes that impossible structurally rather than by
+# convention: nothing on the failure path has access to `_last_audit`, so no
+# later edit can advance a successful timestamp from a failure.
+#
+# One lock guards both, and `last_audit()` reads both inside it: the two facts
+# are interpreted together, so a reader must not be able to straddle a write and
+# see a success paired with a failure that the success already cleared.
+_last_audit: Dict[str, Any] = {}        # the last SUCCESSFUL assessment, only
+_last_refresh: Dict[str, Any] = {}      # {"failed_at", "error"} of the latest
+                                        # failed refresh, cleared by a success
 _audit_lock = threading.Lock()
 
 # The UNWRAPPED callables, kept by instrument(). Catch-up must invoke these
@@ -205,8 +219,22 @@ def record(job_id: str, status: str, started: _dt.datetime,
                            job_id, status, str(exc).splitlines()[0][:160])
 
 
-def _last_success_map() -> Dict[str, _dt.datetime]:
-    """One query for every job, rather than one query per job."""
+def _last_success_map() -> Optional[Dict[str, _dt.datetime]]:
+    """One query for every job, rather than one query per job.
+
+    NONE MEANS THE QUERY FAILED. An empty dict means it succeeded and found
+    nothing. Collapsing those two was the defect: with `{}` returned on
+    failure, `audit()` reported every job `unknown` and `overdue` empty -- and
+    the empty list is what /health published, with a fresh timestamp.
+
+    In catch-up it was worse. `seen is None` there means "first sighting", so a
+    failed read seeded a `baseline` row for EVERY job, and this function counts
+    `baseline` as a success. That is not a misleading report; it is false
+    evidence written permanently into the ledger, outliving the outage that
+    caused it.
+
+    Both callers are in this module and both handle None explicitly.
+    """
     if not available():
         return {}
     try:
@@ -228,7 +256,7 @@ def _last_success_map() -> Dict[str, _dt.datetime]:
         else:
             logger.warning("[JobLedger] last-success query failed: %s",
                            str(exc).splitlines()[0][:160])
-        return {}
+        return None
 
 
 def _recent_notable(hours: int = 24) -> Dict[str, List[Dict[str, Any]]]:
@@ -407,12 +435,33 @@ def audit(scheduler) -> Dict[str, Any]:
     """
     now = _dt.datetime.now(_dt.timezone.utc)
     out: Dict[str, Any] = {"checked_at": now.isoformat(timespec="seconds"),
-                           "overdue": [], "unknown": [], "ledger": "ok"}
+                           "overdue": [], "unknown": [], "ledger": "ok",
+                           "evidence_complete": True}
     if _disabled:
+        # The ledger is not readable at all, so this is not an assessment.
+        # Neither store is written: an unusable ledger must not replace the last
+        # assessment that was made when it worked.
         out["ledger"] = _disabled_reason or "disabled"
+        out["evidence_complete"] = False
         return out
 
     last = _last_success_map()
+    if last is None:
+        # THE FAILURE PATH. It records that a refresh failed and nothing else.
+        # It does not touch `_last_audit`, does not classify a single job, and
+        # does not invent a timestamp -- so the response below carries the last
+        # SUCCESSFUL assessment with its original `checked_at`, marked
+        # incomplete, or no assessment at all if there has never been one.
+        with _audit_lock:
+            _last_refresh.clear()
+            _last_refresh.update(
+                failed_at=now.isoformat(timespec="seconds"),
+                error="the last-success query failed, so no assessment was made")
+        logger.error("[JobLedger] assessment INCOMPLETE: the last-success query "
+                     "failed. The previous assessment is retained unchanged; "
+                     "this is not evidence that the jobs are healthy.")
+        return last_audit()
+
     for job in _cron_jobs(scheduler):
         prev = previous_fire_time(job.trigger, now)
         if prev is None:
@@ -433,12 +482,48 @@ def audit(scheduler) -> Dict[str, Any]:
     with _audit_lock:
         _last_audit.clear()
         _last_audit.update(out)
+        # A success CLEARS the failure record: the two stores are written
+        # together under one lock so no reader sees a stale failure beside a
+        # newer success.
+        _last_refresh.clear()
     return out
 
 
 def last_audit() -> Dict[str, Any]:
+    """The last SUCCESSFUL assessment, with the latest refresh failure beside it.
+
+    FOUR STATES, ALL DISTINGUISHABLE BY THE CALLER:
+
+      never assessed          no `checked_at`, no `overdue`, no `unknown`,
+                              evidence_complete False, evidence_never_succeeded
+      assessed, current       the assessment, evidence_complete True
+      assessed, refresh failed  the PREVIOUS assessment and its ORIGINAL
+                              `checked_at`, evidence_complete False, plus
+                              `refresh_failed_at` under its own key name
+      ledger unusable         handled in `audit()`; never written to a store
+
+    NOTHING IS FABRICATED when there has never been a successful assessment.
+    In particular no empty `overdue` list is supplied, because an empty list is
+    exactly what a clean system reports and a consumer must be able to tell the
+    two apart.
+
+    The failure timestamp lives under `refresh_failed_at`, never
+    `checked_at`, so a fresh failure cannot be read as a fresh success.
+    """
     with _audit_lock:
-        return dict(_last_audit)
+        out = dict(_last_audit)
+        failed = dict(_last_refresh)
+    had_success = "checked_at" in out
+    if failed:
+        out["evidence_complete"] = False
+        out["evidence_error"] = failed["error"]
+        out["refresh_failed_at"] = failed["failed_at"]
+        out["ledger"] = "last-success query failed"
+    else:
+        out["evidence_complete"] = had_success
+    if not had_success:
+        out["evidence_never_succeeded"] = True
+    return out
 
 
 # ── catch-up ─────────────────────────────────────────────────────────────────
@@ -451,6 +536,18 @@ def _catch_up_blocking(scheduler) -> Dict[str, Any]:
         return result
 
     last = _last_success_map()
+    if last is None:
+        # ABANDON, AND WRITE NOTHING. With no map, `seen is None` below is
+        # indistinguishable from a first sighting, so this loop would seed a
+        # `baseline` row for every registered job -- and `_last_success_map`
+        # counts `baseline` as a success, so every job would then look like it
+        # had run. A failed READ may never authorize a write that represents
+        # successful observation or execution.
+        logger.error("[JobLedger] catch-up ABANDONED: the last-success query "
+                     "failed, so a missed job cannot be told from a first "
+                     "sighting. No baseline was seeded and no job was re-run.")
+        result["error"] = "last-success query failed; no repair attempted"
+        return result
     candidates = []
     for job in _cron_jobs(scheduler):
         prev = previous_fire_time(job.trigger, now)

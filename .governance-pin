@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-c92c0c0745222d198b8ff4ed553d03a859912786
+4511cbf33b2a0147ba3d93ea2b62edffcfe9741c
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -657,3 +657,38 @@ c92c0c0745222d198b8ff4ed553d03a859912786
 #
 # c92c0c0 was pushed first and its remote resolution verified with ls-remote
 # at 2026-10-11 23:42 UTC before this line was written.
+
+# 4511cbf -- the tests for Gate A: a failed read of the evidence may not look
+# like proof of health. One new file, 14 tests.
+#
+# BASED ON c92c0c0, NOT on 5c103d8. 5c103d8 carries the Issue E Stage 1 tests,
+# which assert on a scripts/health_watch.py that this changeset does not
+# contain, so pinning to it would make CI fail on an unrelated gate. Gate A
+# and Stage 1 are independent: Gate A touches job_ledger.py and /health,
+# Stage 1 touches health_watch.py. If PR #112 merges first, rebase 4511cbf
+# onto 5c103d8 and update this line before merging Gate A.
+#
+# THE DEFECT. _last_success_map() returned {} on a query FAILURE, which is
+# also what a successful query over an empty table returns. audit() then
+# reported `overdue: []` with a fresh timestamp and `ledger: ok`, and /health
+# published the empty list while discarding `unknown` -- so a database failure
+# was published as evidence that every scheduled job was fine.
+#
+# WORSE IN CATCH-UP. There `seen is None` means "first sighting, seed a
+# baseline instead of running", so a failed read wrote a baseline row for
+# EVERY job -- and that function counts baseline as a success. Measured before
+# the fix: 3 of 3 jobs seeded. A failed READ may never authorize a write that
+# represents successful observation.
+#
+# FIVE MUTATIONS, ALL KILL TESTS. The first killed NOTHING at first, because
+# every test replaced _last_success_map wholesale and none exercised its own
+# except branch; two tests were added that drive the real function with a real
+# psycopg2 error injected at the cursor.
+#
+# NOT INCLUDED: the monitor side. Requiring evidence_complete is True in
+# health_watch.py is Gate A commit 2 and must not ship before this contract is
+# DEPLOYED, or the monitor goes non-authoritative against a backend that
+# cannot yet answer. Issue E remains open.
+#
+# 4511cbf was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-12 03:00 UTC before this line was written.
