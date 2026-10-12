@@ -85,10 +85,24 @@ SOURCE = "governance-audit"
 #
 #   clean              the audit ran against production and found nothing
 #   finding            drift found, recorded as a governed obligation
-#   not_configured     no audit DSN; the audit did NOT run. Not a clean result
-#   source_absent      connected, but production has no attestation table
 #
-# Everything else raises: see `run`.
+# THE OTHER TWO ARE NOT RETURN VALUES. `not_configured` and `source_absent`
+# name states in which NO attestation evidence was examined, and both raise.
+# They are kept as constants because each is embedded in its exception message
+# as a stable token that a log or ledger reader can match on.
+#
+#   not_configured     no audit DSN           -> AuditNotConfigured
+#   source_absent      no attestation ledger  -> AuditSourceAbsent
+#
+# WHY THEY RAISE. Every return, whatever it says, is recorded by
+# `job_ledger._wrap` as an `ok` row with no detail -- indistinguishable from a
+# completed clean audit. An audit that examined none of its required evidence
+# must not be representable as a successful one. `_last_success_map` counts
+# only ok/caught_up/baseline, so an `error` row leaves the job with no recent
+# success, `job_ledger.audit()` reports it overdue, `/health` publishes that,
+# and the external monitor already alerts on it.
+#
+# Everything else raises too: see `run`.
 OUTCOME_CLEAN = "clean"
 OUTCOME_FINDING = "finding"
 OUTCOME_NOT_CONFIGURED = "not_configured"
@@ -120,6 +134,29 @@ class AuditSourceError(AuditError):
     """Production evidence could not be read: connection, permission, query or
     parsing. Distinct from `source_absent`, which is an answer about the
     database rather than a failure to ask it."""
+
+
+class AuditNotConfigured(AuditError):
+    """No audit DSN is configured, so no production evidence was examined.
+
+    A CONFIGURATION STATE THAT IS STILL A FAILURE. This began life as a return
+    value, on the reasoning that an unset variable is not one of the four I/O
+    faults an audit must raise on. That was wrong on assurance grounds: a
+    return is recorded as `ok`, and an audit that read nothing must never be
+    representable as a clean one. A missing variable is exactly when coverage
+    is lost, and exactly when nobody is looking for it.
+    """
+
+
+class AuditSourceAbsent(AuditError):
+    """The audited database holds no attestation ledger to compare against.
+
+    Distinct from `AuditSourceError`, which means the read was ATTEMPTED and
+    failed. Here the question was answered -- by `to_regclass`, which returns
+    NULL rather than raising -- and the answer is that production has no
+    evidence to audit. The assurance consequence is the same as a missing DSN:
+    nothing was checked, so this is not a clean result.
+    """
 
 
 class FindingWriteError(AuditError):
@@ -383,21 +420,26 @@ def run() -> Dict[str, Any]:
     """One audit pass. Returns its outcome; raises when it could not run.
 
     THE RETURN/RAISE SPLIT IS THE CONTRACT. A return value is an answer about
-    production. A raise means no answer was obtained -- and because
-    `job_ledger.instrument` wraps this job, a raise is recorded as an `error`
-    row and re-raised into APScheduler's error listener, so the failure reaches
-    `/health` and the external monitor instead of being averaged into silence.
+    production, and there are exactly TWO of them -- `clean` and `finding`.
+    Everything else raises, including the two states in which no attestation
+    evidence was examined at all, because `job_ledger._wrap` records any return
+    as an `ok` row and a loss of audit coverage must not be recorded as a
+    successful audit.
+
+    A raise is recorded as an `error` row carrying the exception class name,
+    and re-raised into APScheduler's error listener -- so the failure reaches
+    the ledger, `/health` and the external monitor instead of being averaged
+    into silence.
     """
     counts = assert_policy_usable()          # raises AuditPolicyError
 
     dsn = _dsn()
     if not dsn:
-        # NOT a skip and NOT clean. The audit did not run, and says so.
-        logger.warning(
-            "[governance_audit] NOT CONFIGURED: neither GOV_AUDIT_DB_URL nor "
-            "RAILWAY_DB_URL is set, so no production declaration audit ran. "
-            "This is not a clean result.")
-        return {"outcome": OUTCOME_NOT_CONFIGURED, "ran": False, **counts}
+        raise AuditNotConfigured(
+            f"outcome={OUTCOME_NOT_CONFIGURED}: neither GOV_AUDIT_DB_URL nor "
+            f"RAILWAY_DB_URL is set, so no production declaration audit ran "
+            f"and {counts['pending']} pending declarations went unchecked. "
+            f"This is a loss of audit coverage, not a clean audit.")
 
     try:
         conn = source_connection(dsn)
@@ -409,11 +451,20 @@ def run() -> Dict[str, Any]:
     try:
         try:
             if not source_has_attestations(conn):
-                logger.warning("[governance_audit] the audited database has no "
-                               "schema_attestations table, so there is nothing "
-                               "to compare against. Not a clean result.")
-                return {"outcome": OUTCOME_SOURCE_ABSENT, "ran": False, **counts}
+                raise AuditSourceAbsent(
+                    f"outcome={OUTCOME_SOURCE_ABSENT}: the audited database has "
+                    f"no public.schema_attestations table, so there was nothing "
+                    f"to compare against and {counts['pending']} pending "
+                    f"declarations went unchecked. This is a loss of audit "
+                    f"coverage, not a clean audit.")
             attested = attested_applied(conn)
+        except AuditError:
+            # ALREADY CLASSIFIED, so it passes through untouched. Without this
+            # the handler below would re-wrap AuditSourceAbsent as an
+            # AuditSourceError and erase the distinction between "there is no
+            # ledger to read" and "reading the ledger failed" -- the two that
+            # the `to_regclass` probe exists to keep apart.
+            raise
         except Exception as exc:                               # noqa: BLE001
             # Permission, query or parsing. Explicitly NOT folded into
             # `source_absent`: a revoked SELECT must not read as an absent

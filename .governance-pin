@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-01af7d86b32d424afeba82ab10ea1966a843c7fa
+c92c0c0745222d198b8ff4ed553d03a859912786
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -621,3 +621,39 @@
 #
 # 01af7d8 was pushed first and its remote resolution verified with ls-remote
 # at 2026-10-11 03:59 UTC before this line was written.
+
+# c92c0c0 -- the tests for the fail-closed outcome correction, two updated
+# and two added. One file, +195/-15.
+#
+# WHY THE TWO CANNOT BE SPLIT. The updated tests expect
+# AuditNotConfigured and AuditSourceAbsent, which only exist in the
+# application commit that carries this pin. Against the previous tree they
+# fail; against the previous tests the new application code fails.
+#
+# WHAT CHANGED AND WHY. Two of the audit exits RETURNED where they should
+# have raised: a missing GOV_AUDIT_DB_URL and an absent
+# public.schema_attestations. job_ledger._wrap records ANY return as an `ok`
+# row with no detail, so an audit that examined none of its required
+# evidence was recorded exactly like one that examined all of it and found
+# nothing. Measured in production: five consecutive runs at 1-6 ms, status
+# ok, examining nothing.
+#
+# THE DISCRIMINATOR IS THE EXCEPTION CLASS NAME.
+# scheduled_job_runs.status is CHECK-constrained to five values, so a sixth
+# outcome-specific status would need a migration. _wrap already writes
+# "<ClassName>: <message>" into `detail`, and the test asserts the token
+# survives the exact transformation record() applies, scrub(detail[:500]).
+#
+# THE ALERT PATH ALREADY EXISTED. _last_success_map counts only
+# ok/caught_up/baseline, so an error row leaves the job with no recent
+# success, job_ledger.audit() reports it overdue, /health publishes that and
+# health_watch.py already alerts on it. The new test proves this through the
+# real audit() against a disposable ledger, in two arms, and is falsified by
+# adding "error" to that status list.
+#
+# STILL OPEN, and not addressed here: health_watch skips the whole overdue
+# block when /health answers from a FOLLOWER, so the signal is durable and
+# observable but not yet guaranteed to be delivered. That is Issue E.
+#
+# c92c0c0 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-11 23:42 UTC before this line was written.
