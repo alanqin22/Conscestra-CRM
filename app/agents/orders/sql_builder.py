@@ -71,13 +71,27 @@ VALID_ACTIONS = {
     'soft_delete', 'restore', 'hard_delete', 'batch_update',
 }
 
-VALID_STATUSES = {
+# Statuses an order may be SET to. pre_router keeps the same two sets and states
+# the rule: a value valid for filtering a list is not thereby valid as a write.
+# This module had collapsed them into one, so 'active' and 'open' were accepted
+# as write statuses here and refused by sp_orders afterwards with code -43. The
+# builder exists to refuse a malformed request at the boundary and name the
+# reason; a value it admits and the procedure rejects is the boundary reporting
+# a server error for a request that was never valid.
+WRITE_STATUSES = {
     'pending', 'processing', 'ready', 'invoiced',
-    'shipped', 'delivered', 'completed', 'cancelled', 'refunded',
-    # list-only pseudo-statuses → expand to the active fulfilment queue
-    # (pending+processing+ready) in sp_orders. Matches the home KPI count.
-    'active', 'open',
+    'shipped', 'delivered', 'completed', 'refunded',
 }
+
+# Additionally valid when filtering a list: 'cancelled', which is a real status
+# that may be read but not written here, and the pseudo-statuses, which expand
+# to the active fulfilment queue (pending+processing+ready) in sp_orders and
+# match the home KPI count.
+#
+# Cancelling an order is a governed operation, not a status assignment;
+# sp_orders refuses it with code -44 and names the order.cancel capability.
+# pre_router keeps the same split for the same reason.
+LIST_STATUSES = WRITE_STATUSES | {'cancelled', 'active', 'open'}
 
 VALID_PRICE_TYPES = {'Retail', 'Promo', 'Wholesale'}
 
@@ -251,9 +265,19 @@ def _validate(params: dict) -> List[str]:
         # Normalize to lowercase (DB stores order status in lowercase).
         # Accept any case from upstream callers (HTML/AI/pre_router) and
         # canonicalize before validation + downstream SQL build.
+        #
+        # Which set applies depends on what the status is FOR. A change_status or
+        # header update is a write and takes WRITE_STATUSES; everything else is
+        # reading or filtering and may use the pseudo-statuses as well.
         status_norm = str(status).strip().lower()
-        if status_norm not in VALID_STATUSES:
-            errors.append(f"Invalid status: '{status}'. Allowed: {', '.join(sorted(VALID_STATUSES))}")
+        _writing = (mode == 'update'
+                    and params.get('action') in ('change_status', 'update_header'))
+        _allowed = WRITE_STATUSES if _writing else LIST_STATUSES
+        if status_norm not in _allowed:
+            errors.append(
+                f"Invalid status: '{status}'. Allowed"
+                + (" for a status write" if _writing else "")
+                + f": {', '.join(sorted(_allowed))}")
         else:
             params['status'] = status_norm
 

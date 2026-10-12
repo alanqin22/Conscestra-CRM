@@ -74,14 +74,26 @@ ORDER_NO_RE = re.compile(r'SO-\d{4}-\d{6}', re.IGNORECASE)
 
 VALID_STATUSES = [
     'pending', 'processing', 'ready', 'invoiced',
-    'shipped', 'delivered', 'completed', 'cancelled', 'refunded',
+    'shipped', 'delivered', 'completed', 'refunded',
 ]
 
-# List-filter pseudo-statuses: 'active'/'open' expand to the fulfilment queue
-# (pending+processing+ready) in sp_orders — matches the home KPI count. These
-# are valid for LIST filtering only, NOT for change_status writes, so they are
-# kept out of VALID_STATUSES above.
-LIST_STATUS_FILTERS = VALID_STATUSES + ['active', 'open']
+# 'cancelled' is a valid order status and is deliberately absent from the set
+# above, which is the set a status WRITE may use. Cancelling an order is a
+# governed operation with a requesting party, a durable authorization and
+# consequences for the customer and the invoice; sp_orders refuses it with code
+# -44 and names the order.cancel capability instead. Keeping it out here means
+# the refusal arrives before a dispatch rather than after one.
+#
+# This matters most for the path that reaches change_status from natural
+# language: "mark order SO-123 as cancelled" routed straight through, which is
+# how an unverified request could cancel a customer's order.
+
+# List-filter statuses: everything above, plus 'cancelled', plus the
+# pseudo-statuses 'active'/'open' which expand to the fulfilment queue
+# (pending+processing+ready) in sp_orders — matches the home KPI count. Valid
+# for LIST filtering only and not for writes, which is why they are kept out of
+# VALID_STATUSES.
+LIST_STATUS_FILTERS = VALID_STATUSES + ['cancelled', 'active', 'open']
 
 UUID_PARAMS = [
     'orderId', 'accountId', 'contactId', 'productId',

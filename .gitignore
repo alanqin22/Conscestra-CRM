@@ -192,3 +192,9 @@ backups/
 
 # Private governance repo (schema/sql/sp/tests) — see .governance-pin
 /governance/
+
+# A pre-apply measurement of one machine's order population, written by
+# scripts/verify_cancellation_authority.py --snapshot. It describes a
+# specific database at a specific moment, so committing it would invite a
+# later verify to compare one machine against another's fingerprint.
+scripts/.cancellation_preflight.json

@@ -38,6 +38,7 @@ v1.0.0 — initial implementation
 """
 
 import hashlib
+import json
 import logging
 import os
 import random
@@ -111,9 +112,76 @@ def _token_hash(token: str) -> str:
 
 # ---------------------------------------------------------------------------
 # OTP (email verification) store
-# { identifier: { code, expires_at, attempts, last_resend, resend_count, session_data } }
+# The challenge now lives in auth_otp_challenges; this process holds no OTP state.
 # ---------------------------------------------------------------------------
-_OTP_STORE: Dict[str, Dict[str, Any]] = {}
+# RETIRED 2026-10-03. The one-time code used to live here, in a process-local
+# dict. Two consequences, one of each kind:
+#
+#   SECURITY. /auth/verify-code minted a full session, including its role, from
+#   a check the database could neither see nor verify. The session rested on the
+#   application's own assertion that verification had happened.
+#
+#   CORRECTNESS. The dict is per-process and production runs two workers, so a
+#   code issued by one worker was invisible to the other.
+#
+# The challenge now lives in auth_otp_challenges and is reachable only through
+# two SECURITY DEFINER functions; this process holds no OTP state at all.
+# See governance/sql/auth_otp_trust_boundary.sql.
+
+
+def _otp_issue(identifier: str, session_data: Optional[Dict[str, Any]] = None,
+               resend: bool = False) -> tuple:
+    """(status, code, first_name). The code is returned for delivery only.
+
+    session_data may be None on a resend: the function then carries forward the
+    trusted identity already bound to the live challenge. This process must not
+    read that identity itself — `crm_app` holds no privilege on the challenge
+    table, deliberately."""
+    row = _db_fetchone(
+        "SELECT status, code, first_name FROM public.fn_otp_issue("
+        "  %s::text, %s::jsonb, make_interval(mins => %s), %s::boolean, %s::int, %s::int)",
+        (identifier, json.dumps(session_data) if session_data is not None else None,
+         _OTP_TTL_MINUTES, resend, _OTP_RESEND_COOLDOWN_SECONDS, _OTP_MAX_RESENDS),
+    )
+    return (row[0], row[1], row[2]) if row else ("error", None, "")
+
+
+def _otp_verify_and_session(identifier: str, code: str) -> tuple:
+    """(status, token). Verification, consumption, signup-lead conversion and
+    session creation happen in ONE transaction inside the function.
+
+    An authentication failure comes back as a status, not an exception. That is
+    deliberate and must be preserved: the function records the failed attempt
+    before returning, and PostgreSQL would roll that increment back if it raised
+    instead — a six-digit code would then admit unlimited guesses. The commit
+    below is what persists the attempt."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status, token FROM public.fn_session_create_otp("
+                "  %s::text, %s::text, make_interval(hours => %s), %s::int)",
+                (identifier, code, _SESSION_TTL_HOURS, _OTP_MAX_ATTEMPTS),
+            )
+            row = cur.fetchone()
+        conn.commit()          # persists the attempt increment on failure
+        return (row[0], row[1]) if row else ("error", None)
+    except psycopg2.Error as exc:
+        # An INTERNAL failure — a failed signup-lead conversion, a database
+        # fault, a violated invariant. The function raised, so the transaction
+        # has already rolled back: no session, and the challenge is still usable.
+        #
+        # The exception is absorbed here rather than allowed to escape. A raw
+        # psycopg2 error reaching the endpoint would surface database internals
+        # to the client, and it would be an accidental 500 rather than an
+        # intended one. It must NOT become a 401: this is not an authentication
+        # outcome, and reporting it as one would tell the caller their code was
+        # wrong when it was correct.
+        conn.rollback()
+        logger.error(f"OTP session creation failed for {identifier!r}: {exc}")
+        return ("internal_error", None)
+    finally:
+        conn.close()
 _OTP_TTL_MINUTES = 15
 _OTP_MAX_ATTEMPTS = 5
 _OTP_RESEND_COOLDOWN_SECONDS = 60
@@ -521,24 +589,22 @@ async def signup(req: SignUpRequest):
         except Exception as exc:
             logger.warning(f"Could not persist signup firmographics for lead {lead_id}: {exc}")
 
-    # Generate OTP and store pending verification
-    code = _generate_otp()
-    _OTP_STORE[identifier] = {
-        "code":        code,
-        "expires_at":  datetime.now(timezone.utc) + timedelta(minutes=_OTP_TTL_MINUTES),
-        "attempts":    0,
-        "last_resend": datetime.now(timezone.utc),
-        "resend_count": 0,
-        "session_data": {
-            "credential_id": credential_id,
-            "lead_id":       lead_id,
-            "account_id":    account_id,
-            "contact_id":    contact_id,
-            "first_name":    first_name,
-            "last_name":     last_name,
-            "source_table":  source_table,
-        },
-    }
+    # Issue the OTP through the governed function. The identity is bound to the
+    # challenge here, at issuance, and verification never accepts one from the
+    # caller.
+    _st, code, _fn = _otp_issue(identifier, {
+        "credential_id": credential_id,
+        "lead_id":       lead_id,
+        "account_id":    account_id,
+        "contact_id":    contact_id,
+        "first_name":    first_name,
+        "last_name":     last_name,
+        "source_table":  source_table,
+    })
+    if _st != "ok" or not code:
+        logger.error(f"Could not issue verification code for {identifier!r}: {_st}")
+        raise HTTPException(status_code=500,
+                            detail="Could not issue a verification code. Please try again.")
 
     try:
         _send_otp_email(identifier, code, first_name)
@@ -936,87 +1002,66 @@ async def password_reset_confirm(req: PasswordResetConfirmRequest):
 async def verify_code(req: VerifyCodeRequest):
     """Verify 6-digit OTP sent after signup. Issues session on success."""
     identifier = req.identifier.strip().lower()
-    entry = _OTP_STORE.get(identifier)
+    # One governed call. Verification, consumption, signup-lead conversion and
+    # session creation happen in a single transaction inside
+    # fn_session_create_otp, so the three can no longer disagree: previously the
+    # conversion could succeed while the session failed, converting a lead for a
+    # user who never received a session.
+    #
+    # Authentication outcomes arrive as a status rather than an exception, and
+    # the helper commits before returning so the recorded attempt survives.
+    status, session_token = _otp_verify_and_session(identifier, req.code)
 
-    if not entry:
+    if status == "no_challenge":
         raise HTTPException(status_code=404, detail="No pending verification for this email")
+    if status == "expired":
+        raise HTTPException(status_code=410,
+                            detail="Verification code has expired. Request a new one.")
+    if status == "too_many_attempts":
+        raise HTTPException(status_code=429,
+                            detail="Too many failed attempts. Request a new code.")
+    if status == "bad_code":
+        # The remaining count is no longer computable here: the attempt counter
+        # lives in the challenge row, which this process cannot read. The message
+        # is correspondingly less specific, which is also the safer disclosure.
+        raise HTTPException(status_code=401, detail="Incorrect code.")
+    if status == "internal_error" or status != "ok" or not session_token:
+        # Deliberate, authorized compatibility change. Before the trust boundary
+        # existed, a failed signup-lead conversion was swallowed and a session
+        # was created with NULL account_id/contact_id — HTTP 200 carrying a
+        # broken authenticated identity. That session is now never created, and
+        # the caller is told the request failed. The detail is generic: the
+        # diagnostic stays in the log.
+        logger.error(f"Verification failed for {identifier!r}: {status}")
+        raise HTTPException(status_code=500,
+                            detail="Verification failed. Please try again.")
 
-    if datetime.now(timezone.utc) > entry["expires_at"]:
-        _OTP_STORE.pop(identifier, None)
-        raise HTTPException(status_code=410, detail="Verification code has expired. Request a new one.")
-
-    if entry["attempts"] >= _OTP_MAX_ATTEMPTS:
-        raise HTTPException(status_code=429, detail="Too many failed attempts. Request a new code.")
-
-    if req.code != entry["code"]:
-        entry["attempts"] += 1
-        remaining = _OTP_MAX_ATTEMPTS - entry["attempts"]
-        raise HTTPException(
-            status_code=401,
-            detail=f"Incorrect code. {remaining} attempt{'s' if remaining != 1 else ''} remaining.",
-        )
-
-    # Code correct — the email is now proven. CONVERT the signup lead into a real
-    # customer (account + contact, email-verified) and link the credential, so the
-    # session carries account_id/contact_id and store checkout works with no error.
-    # Signup only created a lead (account_id/contact_id NULL); conversion happens
-    # here, on verification — see sp_convert_signup_lead.
-    sd = entry["session_data"]
-    account_id = sd.get("account_id")
-    contact_id = sd.get("contact_id")
-    if sd.get("lead_id"):
-        try:
-            row = _db_fetchone(
-                "SELECT public.sp_convert_signup_lead(%s::uuid, %s::uuid) AS payload",
-                (sd["lead_id"], sd.get("credential_id")),
-            )
-            conv = (row[0] if row else None) or {}
-            if conv.get("success"):
-                account_id = conv.get("account_id") or account_id
-                contact_id = conv.get("contact_id") or contact_id
-                logger.info(f"Signup lead converted on verify — account={account_id} contact={contact_id}")
-            else:
-                logger.warning(f"Lead conversion returned no success for {identifier!r}: {conv}")
-        except Exception as exc:
-            logger.warning(f"Could not convert signup lead for {identifier!r}: {exc}")
-    elif contact_id:
-        # Edge case: a contact already existed (no lead to convert) — just verify it.
-        try:
-            _db_execute(
-                "UPDATE public.contacts SET is_email_verified = true, updated_at = now() "
-                "WHERE contact_id = %s::uuid",
-                (contact_id,),
-            )
-        except Exception as exc:
-            logger.warning(f"Could not mark email verified for contact {contact_id}: {exc}")
-
-    _OTP_STORE.pop(identifier, None)
-
-    session_token = _new_session(
-        account_id=account_id or "",
-        credential_id=sd["credential_id"],
-        identifier=identifier,
-        lead_id=sd.get("lead_id"),
-        contact_id=contact_id,
-        first_name=sd.get("first_name", ""),
-        last_name=sd.get("last_name", ""),
-        source_table="contacts" if account_id else sd.get("source_table", "leads"),
+    # The identity the session actually carries, read back from the session the
+    # function created. It is the post-conversion identity for a signup lead,
+    # and it is not reconstructed here from anything the caller supplied.
+    row = _db_fetchone(
+        "SELECT credential_id::text, lead_id::text, account_id::text, contact_id::text, "
+        "       coalesce(first_name,''), coalesce(last_name,'') "
+        "FROM public.auth_sessions WHERE token_hash = %s",
+        (_token_hash(session_token),),
     )
+    (credential_id, lead_id, account_id, contact_id,
+     first_name, last_name) = row if row else (None, None, None, None, "", "")
 
     logger.info(f"Email verified and session issued for {identifier!r}")
     return AuthResponse(
         success=True,
         message="Email verified. Welcome to Conscestra CRM.",
         session_token=session_token,
-        credential_id=sd["credential_id"],
-        lead_id=sd.get("lead_id"),
+        credential_id=credential_id,
+        lead_id=lead_id,
         account_id=account_id,
         contact_id=contact_id,
         identifier=identifier,
         email=identifier,
-        first_name=sd.get("first_name", ""),
-        last_name=sd.get("last_name", ""),
-        source_table="contacts" if account_id else sd.get("source_table", "leads"),
+        first_name=first_name,
+        last_name=last_name,
+        source_table="contacts" if account_id else "leads",
     )
 
 
@@ -1024,77 +1069,93 @@ async def verify_code(req: VerifyCodeRequest):
 async def resend_verification(req: ResendVerificationRequest):
     """Resend OTP to the given email. Rate-limited."""
     identifier = req.identifier.strip().lower()
-    entry = _OTP_STORE.get(identifier)
+    # ASK, DO NOT READ. The challenge is authority-bearing state and this
+    # process holds no privilege on it. fn_otp_issue carries the trusted
+    # session_data forward itself when none is supplied, enforces the cooldown
+    # and the cap against the stored row, and returns only what delivery needs.
+    # Step 5G found an earlier version of this endpoint SELECTing the table
+    # directly; that query must not come back.
+    status, code, first_name = _otp_issue(identifier, None, resend=True)
 
-    if entry:
-        now = datetime.now(timezone.utc)
-        elapsed = (now - entry["last_resend"]).total_seconds()
-        if elapsed < _OTP_RESEND_COOLDOWN_SECONDS:
-            wait = int(_OTP_RESEND_COOLDOWN_SECONDS - elapsed)
-            raise HTTPException(
-                status_code=429,
-                detail=f"Please wait {wait} second{'s' if wait != 1 else ''} before requesting a new code.",
-            )
-        if entry["resend_count"] >= _OTP_MAX_RESENDS:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many resend requests. Please try again later or contact support.",
-            )
-        first_name = entry["session_data"].get("first_name", "")
-        resend_count = entry["resend_count"] + 1
-        sd = entry["session_data"]
-    else:
-        # Allow resend for existing unverified contacts (e.g. from signin 403 flow)
+    if status == "cooldown":
+        raise HTTPException(status_code=429,
+                            detail="Please wait before requesting a new code.")
+    if status == "resend_cap":
+        raise HTTPException(
+            status_code=429,
+            detail="Too many resend requests. Please try again later or contact support.")
+
+    if status == "ok":
         try:
-            row = _db_fetchone(
-                """
-                SELECT c.contact_id, c.first_name, c.last_name, c.is_email_verified,
-                       ac.credential_id,
-                       l.lead_id, c.account_id
-                FROM   public.contacts c
-                LEFT   JOIN public.auth_credentials ac
-                       ON  ac.identifier = lower(c.email)
-                       AND ac.credential_type = 'password' AND ac.is_active = true
-                LEFT   JOIN public.leads l ON l.converted_contact_id = c.contact_id
-                WHERE  c.email = lower(%s) AND c.is_deleted = false
-                LIMIT  1
-                """,
-                (identifier,),
-            )
+            _send_otp_email(identifier, code, first_name or "")
+            logger.info(f"OTP resent to {identifier!r}")
         except Exception as exc:
-            logger.error(f"resend_verification DB lookup error: {exc}")
-            raise HTTPException(status_code=500, detail="Lookup failed")
+            logger.error(f"Failed to resend OTP to {identifier!r}: {exc}")
+            raise HTTPException(status_code=500,
+                                detail="Failed to send verification email. Please try again.")
+        return AuthResponse(success=True,
+                            message="Verification code sent. Check your email.",
+                            identifier=identifier, email=identifier)
 
-        if not row:
-            # Respond vaguely to avoid account enumeration
-            return AuthResponse(
-                success=True,
-                message="If that account exists, a new verification code has been sent.",
-            )
-        contact_id, first_name, last_name, is_verified, credential_id, lead_id, account_id = row
-        if is_verified:
-            return AuthResponse(success=True, message="Email is already verified. Please sign in.")
+    # status == 'no_challenge': recover the identity from an unverified contact,
+    # which is the pre-existing signin-403 recovery path.
+    # Allow resend for existing unverified contacts (e.g. from signin 403 flow)
+    try:
+        row = _db_fetchone(
+            """
+            SELECT c.contact_id, c.first_name, c.last_name, c.is_email_verified,
+                   ac.credential_id,
+                   l.lead_id, c.account_id
+            FROM   public.contacts c
+            LEFT   JOIN public.auth_credentials ac
+                   ON  ac.identifier = lower(c.email)
+                   AND ac.credential_type = 'password' AND ac.is_active = true
+            LEFT   JOIN public.leads l ON l.converted_contact_id = c.contact_id
+            WHERE  c.email = lower(%s) AND c.is_deleted = false
+            LIMIT  1
+            """,
+            (identifier,),
+        )
+    except Exception as exc:
+        logger.error(f"resend_verification DB lookup error: {exc}")
+        raise HTTPException(status_code=500, detail="Lookup failed")
 
-        sd = {
-            "credential_id": str(credential_id) if credential_id else "",
-            "lead_id":       str(lead_id)       if lead_id       else None,
-            "account_id":    str(account_id)    if account_id    else None,
-            "contact_id":    str(contact_id),
-            "first_name":    first_name or "",
-            "last_name":     last_name  or "",
-            "source_table":  "contacts",
-        }
-        resend_count = 1
+    if not row:
+        # Respond vaguely to avoid account enumeration
+        return AuthResponse(
+            success=True,
+            message="If that account exists, a new verification code has been sent.",
+        )
+    contact_id, first_name, last_name, is_verified, credential_id, lead_id, account_id = row
+    if is_verified:
+        return AuthResponse(success=True, message="Email is already verified. Please sign in.")
 
-    code = _generate_otp()
-    _OTP_STORE[identifier] = {
-        "code":        code,
-        "expires_at":  datetime.now(timezone.utc) + timedelta(minutes=_OTP_TTL_MINUTES),
-        "attempts":    0,
-        "last_resend": datetime.now(timezone.utc),
-        "resend_count": resend_count,
-        "session_data": sd,
+    sd = {
+        "credential_id": str(credential_id) if credential_id else "",
+        "lead_id":       str(lead_id)       if lead_id       else None,
+        "account_id":    str(account_id)    if account_id    else None,
+        "contact_id":    str(contact_id),
+        "first_name":    first_name or "",
+        "last_name":     last_name  or "",
+        "source_table":  "contacts",
     }
+
+    # fn_otp_issue enforces the cooldown and the resend cap against the stored
+    # challenge, closes the superseded one, and resets attempts — which is the
+    # existing semantics, preserved deliberately rather than tightened here.
+    status, code, first_name = _otp_issue(identifier, sd, resend=True)
+    if status == "cooldown":
+        raise HTTPException(
+            status_code=429,
+            detail="Please wait before requesting a new code.")
+    if status == "resend_cap":
+        raise HTTPException(
+            status_code=429,
+            detail="Too many resend requests. Please try again later or contact support.")
+    if status != "ok" or not code:
+        logger.error(f"Could not reissue verification code for {identifier!r}: {status}")
+        raise HTTPException(status_code=500,
+                            detail="Failed to send verification email. Please try again.")
 
     try:
         _send_otp_email(identifier, code, first_name or "")

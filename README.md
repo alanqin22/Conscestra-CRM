@@ -62,6 +62,99 @@ site, so a section here and its page there are the same argument.
 
 ---
 
+## Recent Platform Enhancements
+
+The capabilities below are in production, and each was verified against the
+published artifact after deployment rather than inferred from a successful
+release. Work that is written and published but not yet running in production is
+listed separately beneath them, so the two are never read as the same thing.
+
+**Order economics are complete before an invoice is issued.** When an order
+reaches a shipping status, the invoice it produces is created from the order's
+final economics rather than from the order as it stood a moment earlier.
+Commercial rules that are evaluated once at issue — a free-shipping threshold, a
+tax base — therefore see the amounts the order actually carries. Settlement
+remains a separate authority: recalculating what an order is worth does not
+alter what has been paid against it, and an invoice whose economics have been
+sealed is not revised by a later change to the order behind it.
+
+**Cancelling an order is a governed operation, not a field update.** A
+cancellation carries a requesting party, a durable authorization, and
+consequences for the customer and the invoice. Generic order-update paths refuse
+to write a cancelled status and return an actionable message naming the
+capability that owns the operation, so the refusal reads as a wrong-operation
+answer rather than a permissions error. Both routes by which a status can reach
+the order procedure are covered, and the refusal is tested by deliberately
+removing each guard to confirm the test fails when the control is absent.
+
+**Scheduled work runs once across a multi-process deployment.** Background
+processing elects a single leader through a database lock, and the verification
+confirms that the elected instance performed the work rather than merely
+acquiring the lock.
+
+**Database operations run inside explicit privilege boundaries.** The
+application connects as a non-superuser role, and independent verification uses
+a separate read-only role, in a session the server confirms is read-only before
+any state is read.
+
+**A deployed procedure can be checked against the artifact it claims to be.** An
+operator control resolves the expected version from the repository's governance
+pin, confirms that version is published, and compares the deployed procedure
+body, its security context, and its published description against it. The
+structural expectations are derived from the published artifact rather than
+written into the control, so a later authorized change moves the expectation
+with it instead of turning the check into an assertion about an older release.
+The control states what it does not prove, including execution grants, which
+are not a property of the artifact. It is a verification tool for operators
+rather than a runtime feature.
+
+**Classification of historical financial evidence is a governed capability.**
+The platform can record an evidentiary classification against a defined
+population of historical financial records — for example, invoices whose tax
+jurisdiction resolves no configured rate — without altering the amounts those
+records carry. The capability is registered and enabled in production, which
+makes it dispatchable. Registration and enablement are not authorization: the
+capability becomes usable only once a decision policy governs it, an approval is
+granted, and an accountable identity is named.
+
+What the capability writes is bound to what was approved. The approval carries a
+proposition built from a closed set of declared fields and hashed over a
+canonical projection of those fields, so the authorization refers to one exact
+statement rather than to a description of one. The proposition also carries a
+census identity and fingerprints over the specific records in scope. At
+execution the population is measured again, and the capability refuses if the
+census no longer matches — a population that has grown since approval is not
+silently included, and a stale authorization is refused rather than repaired.
+
+Execution is accountable, concurrent-safe, and repeatable. The accountable party
+is supplied by the caller as an assignable identity and is never chosen by the
+capability; a request that names no identity is refused outright. A transactional
+advisory lock is taken before the duplicate guard is evaluated, because the guard
+alone is not sufficient under the database's default isolation. Running the same
+approved classification twice records nothing the second time, and an interrupted
+run leaves no partial result. Verification is independent of execution: a
+read-only tool compares what was recorded against the approved manifest without
+reusing the code that produced it, so the check does not inherit the assumptions
+of the thing it is checking.
+
+### Published, not yet in production
+
+The following is written, reviewed, and published, and is deliberately not
+described above as current platform behaviour:
+
+- **Durable cancellation authority** — the records and enforcement that bind a
+  cancellation to a verified request, and that govern its reversal separately,
+  are applied in the development environment and declared pending for
+  production.
+- **Owner and personhood classification** — the record that distinguishes a
+  person from a service identity for accountable attribution is deployed and
+  holds no declarations yet, so the distinction is not yet in effect.
+- **One-time-code portal authentication** — the database-side trust boundary is
+  in place; the application route that would make it a customer-facing feature
+  is not yet released.
+
+---
+
 ## Specialized AI Agents Working Together
 
 Conscestra operates as a symphony of specialized AI Agents, each responsible
@@ -1018,6 +1111,74 @@ human review is required, and continuous health monitoring ensures every
 automation remains transparent and reliable.
 
 Even the supervisors are supervised.
+
+## Capability, Authority, and Execution Are Separate Stages
+
+A consequential operation in Conscestra passes through five distinct stages, and
+each is granted separately. Code being present does not mean an action is
+permitted, and permission does not mean it has happened.
+
+1. **Capability registration.** The operation exists, is declared, and can be
+   dispatched. Nothing about the business state changes.
+2. **Policy authorization.** A decision policy states how the operation is
+   governed: whether a human decides, which authority approves, and whether it
+   may ever run without a decision.
+3. **Approval.** A specific request is decided, by a named authority, against
+   the evidence presented with it.
+4. **Execution.** The approved operation runs, bound to what was approved rather
+   than to the state of the world at the moment it runs.
+5. **Independent verification.** The resulting business state is checked by a
+   reader that did not perform the work.
+
+The stages are visible in the platform's own current state. The classification
+capability described above is registered and enabled in production, and at the
+time of writing no decision policy governs it, no approval exists, and no
+classification record has been written. That is the architecture behaving as
+intended rather than an incomplete release: a capability that is present and
+ungoverned is a capability that cannot act.
+
+**Absent governance is a refusal, not a default.** When an operation of this
+class has no decision policy, the platform does not fall back to permissive
+behaviour. The resolved policy requires a human decision, records that no policy
+was declared, and reports that the action may not run automatically. The reason
+accompanies the refusal, so an operator sees why an action is waiting rather than
+discovering only that nothing happened.
+
+### Accountability is an identity, not a job title
+
+Accountability is carried by an assignable identity — a durable record of the
+party answerable for an action. The identity model is independent of any
+particular organizational structure: it does not assume a specific set of
+executive titles, and it does not require that an accountable party be an
+employee. Where the governance model calls for human approval, approval
+authorities are the humans holding those roles in a given organization, and the
+roles themselves are configuration rather than architecture.
+
+An accountable identity is always supplied to a governed operation by its
+caller. The platform does not select one on a caller's behalf, because an
+operation that chooses who will be answerable for it has not established
+accountability at all.
+
+### Four principals, deliberately not the same
+
+Consequential work separates concerns that are often collapsed into a single
+account:
+
+- the **application principal** that connects to the database, which holds no
+  administrative rights;
+- the **accountable identity** recorded against the action, which is an
+  organizational fact rather than a database credential;
+- the **approval authority** that decided the action, which the governance
+  record binds to the authenticated person who decided it;
+- the **independent verifier**, which reads production through a separate
+  read-only role in a session the server confirms is read-only before any state
+  is examined.
+
+Because these are distinct, the record of who was answerable for an action does
+not depend on which process performed it, and verification does not depend on
+the goodwill of the component being verified.
+
+---
 
 ## Four Layers of Control Around Every AI Action
 

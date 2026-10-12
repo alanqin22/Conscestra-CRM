@@ -20,6 +20,7 @@ These are measured, not estimated. Re-measure if the database grows materially.
 | Volume headroom during that restore | peak 235 MB of 1024 MB | measured; production untouched, 131 accounts intact after |
 | Dump size / duration | 19.2 MB, ~208 s | 2026-08-05 run |
 | Dumps retained | 14 (`BACKUP_KEEP`) | `backups\railway-*.dump` |
+| **Omitted from every dump** | `public.auth_secrets` (`BACKUP_EXCLUDE_TABLES`) | the dump role may not read it by design; see §4b |
 
 > **Use the 65 s figure, not the 3.5 s one.** The local numbers measure a dump
 > being read off a local disk into a container on the same machine. A real
@@ -183,7 +184,71 @@ SET ROLE crm_app; SELECT count(*) FROM accounts; RESET ROLE;       -- must work
 migration creates tables `crm_app` cannot read, and that failure appears days
 later with no connection to the restore.
 
-### 4b. Then bring the app back
+### 4b. MANDATORY — recreate `auth_secrets` and re-provision the OTP pepper
+
+**The dump does not contain this table. Not its rows, and not its definition.**
+
+The backup connects as `crm_readonly`, and on 2026-10-05 the OTP trust boundary
+revoked `pg_read_all_data` from that role precisely so the audit credential
+could not read the pepper. A table the dump role cannot read cannot be dumped:
+`pg_dump` issues a single `LOCK TABLE` covering its whole dump set before it
+reads anything, so `--exclude-table-data` fails exactly as a plain dump does
+(measured on PostgreSQL 18.6). Only `--exclude-table` removes the table from
+that set, and it removes the definition along with the rows.
+
+The two OTP functions restore without complaint, because PL/pgSQL bodies are
+not resolved when the function is created. The failure appears at the first
+call: `fn_otp_issue` raises on a missing relation, and every OTP-gated path —
+order cancellation, support-line identity verification — is down with an error
+that does not mention the restore.
+
+Run this as `postgres`, before scaling the app back up:
+
+```sql
+CREATE TABLE IF NOT EXISTS auth_secrets (
+    secret_key    text PRIMARY KEY,
+    secret_value  text NOT NULL CHECK (btrim(secret_value) <> ''),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    rotated_at    timestamptz
+);
+
+-- The default ACL carries crm_app=arwd/postgres for new relations, so a table
+-- created here is granted to the application automatically. All three REVOKEs
+-- are load-bearing.
+REVOKE ALL ON auth_secrets FROM PUBLIC;
+REVOKE ALL ON auth_secrets FROM crm_app;
+REVOKE ALL ON auth_secrets FROM crm_readonly;
+
+INSERT INTO auth_secrets (secret_key, secret_value)
+VALUES ('otp_pepper', encode(extensions.gen_random_bytes(32), 'hex'))
+ON CONFLICT (secret_key) DO NOTHING;
+```
+
+`extensions.gen_random_bytes` must be schema-qualified. pgcrypto is installed in
+the `extensions` schema, and an ad-hoc session's `search_path` is `"$user",
+public`, so the unqualified call fails with 42883. The OTP functions work only
+because the artifact pins `search_path` on each of them — that pin is a security
+control, and ad-hoc statements qualify rather than lean on the ambient path.
+
+The statement carries no secret: the value is generated inside PostgreSQL, so it
+is safe in a terminal, a ticket or a shell history.
+
+**This provisions a NEW pepper, which invalidates every challenge issued before
+the incident.** That is correct, not a side effect to work around — the codes
+live minutes, and the table comment records the property deliberately. Do not
+try to recover the old pepper from a dump; no dump has it.
+
+The full artifact is `governance/sql/auth_otp_trust_boundary.sql` if the
+functions themselves also need rebuilding. Verify before moving on:
+
+```sql
+SELECT has_table_privilege('crm_app','public.auth_secrets','SELECT');       -- false
+SELECT has_table_privilege('crm_readonly','public.auth_secrets','SELECT');  -- false
+SELECT count(*) FROM auth_secrets WHERE secret_key = 'otp_pepper';          -- 1
+BEGIN; SELECT fn_otp_issue(...); ROLLBACK;   -- must return status 'ok'
+```
+
+### 4c. Then bring the app back
 
 Scale the app back up and confirm `/health` returns 200 with
 `database.connected_as` = `crm_app`. **If it reports `postgres`, the separation
