@@ -253,21 +253,43 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
                                    + ", ".join(k for k, v in coverage.items()
                                                if not v))
     facts["scheduler_evidence_authoritative"] = authoritative
+    # WHY THE EVIDENCE IS INCOMPLETE -- reported WITHOUT inferring a cause the
+    # payload does not establish.
+    #
+    # The authority decision is unchanged: every state below is non-authoritative
+    # and `query_ok` already said so. This only fixes the explanation, because an
+    # explanation that names the wrong cause sends an operator to the wrong fix.
+    #
+    # THE CASE THAT FORCED THIS. A FOLLOWER publishes evidence_complete false
+    # with evidence_never_succeeded true and NO evidence_error -- it never ran an
+    # assessment, because it is not the leader. Calling that "the query did not
+    # succeed" invents a database fault out of ordinary HA routing. Observed live
+    # on 2026-10-12, five consecutive follower probes before a leader answered.
+    #
+    # AND THE CONVERSE: an absent evidence_error does NOT imply a query failed.
+    # A payload that claims incomplete evidence without saying why gets a neutral
+    # diagnostic rather than a guess.
+    _err = sched.get("evidence_error")
+    _never = bool(sched.get("evidence_never_succeeded"))
     if _complete is None:
-        # NOT the same fact as a failed query, and not an excuse either. Named
-        # separately so the operator fixes the right thing: the backend is too
-        # old to say, rather than new enough to say it failed.
-        facts["evidence_contract"] = ("absent — this backend does not publish "
-                                      "evidence_complete")
+        # Too old to say, rather than new enough to say it failed.
+        facts["evidence_contract"] = (
+            "unavailable — this backend does not publish evidence_complete")
+    elif _complete is False and _err:
+        facts["evidence_contract"] = (
+            "incomplete — the backend reports the assessment failed: "
+            + str(_err)
+            + (" (and none has ever succeeded here)" if _never else ""))
+    elif _complete is False and _never:
+        facts["evidence_contract"] = (
+            "no assessment has been made in this process — expected on an HA "
+            "follower, which holds no scheduler state")
     elif _complete is False:
         facts["evidence_contract"] = (
-            "the backend reports its evidence query did NOT succeed: "
-            + str(sched.get("evidence_error") or "no reason given"))
-        if sched.get("evidence_refresh_failed_at"):
-            facts["evidence_refresh_failed_at"] = \
-                sched["evidence_refresh_failed_at"]
-        if sched.get("evidence_never_succeeded"):
-            facts["evidence_contract"] += " (no assessment has ever succeeded)"
+            "incomplete — the backend reports its evidence is not complete and "
+            "does not say why")
+    if sched.get("evidence_refresh_failed_at"):
+        facts["evidence_refresh_failed_at"] = sched["evidence_refresh_failed_at"]
 
     # Gated on IDENTITY, not on full authority: a leader with a stale or absent
     # assessment must still reach the checks below, because that is where the
