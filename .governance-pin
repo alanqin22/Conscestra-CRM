@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-4511cbf33b2a0147ba3d93ea2b62edffcfe9741c
+8b8420eb43c5cab8869fe6affa031a2116a98d80
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -658,26 +658,63 @@
 # c92c0c0 was pushed first and its remote resolution verified with ls-remote
 # at 2026-10-11 23:42 UTC before this line was written.
 
-# 4511cbf -- the tests for Gate A: a failed read of the evidence may not look
+# 5c103d8 -- the tests for Issue E Stage 1: the health monitor may not report
+# healthy on a response that carried no scheduler evidence. One new file, 391
+# lines, 20 tests.
+#
+# WHY THE TWO CANNOT BE SPLIT. The tests import scripts.health_watch and
+# assert on facts["scheduler_evidence_authoritative"] and on
+# first_attempt_problems, neither of which exists before the application
+# commit that carries this pin.
+#
+# THE DEFECT, MEASURED from the monitor's own log: of 2,989 checks, 899 (30%)
+# reached an HA follower holding no scheduler state, and 829 of those were
+# recorded HEALTHY. The longest follower-only run was 12 consecutive checks,
+# 3h23m, every one healthy, with a leader answering before and after.
+#
+# FOUR CONDITIONS, NOT ONE. identity / running / assessment_present /
+# assessment_fresh, each asserted by a case that fails only that one, so
+# collapsing them is killed by exactly those cases. Falsified: four source
+# mutations each kill tests, and the file was restored byte-identically.
+#
+# NOT A NEW FALSE ALARM. A routing re-poll is deliberately not counted as a
+# service flap; three flaps in 24h raise the repeated-restart alert, and 30%
+# of checks now re-poll for routing.
+#
+# STAGE 2 IS NOT IMPLEMENTED. Authority is still unobtainable on a follower;
+# this makes its absence impossible to mistake for health. Issue E is NOT
+# resolved until the evidence can be obtained despite routing.
+#
+# 5c103d8 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-12 01:40 UTC before this line was written.
+
+# 8b8420e -- the tests for Gate A: a failed read of the evidence may not look
 # like proof of health. One new file, 14 tests.
 #
-# BASED ON c92c0c0, NOT on 5c103d8. 5c103d8 carries the Issue E Stage 1 tests,
-# which assert on a scripts/health_watch.py that this changeset does not
-# contain, so pinning to it would make CI fail on an unrelated gate. Gate A
-# and Stage 1 are independent: Gate A touches job_ledger.py and /health,
-# Stage 1 touches health_watch.py. If PR #112 merges first, rebase 4511cbf
-# onto 5c103d8 and update this line before merging Gate A.
+# REBASED ONTO 5c103d8, which is what this line originally anticipated. Gate A
+# was first published as 4511cbf on top of c92c0c0, deliberately NOT on the
+# Issue E Stage 1 commit: 5c103d8 carries test_health_watch_authority.py, whose
+# assertions need a scripts/health_watch.py that Gate A does not contain, so a
+# Gate A PR pinned there would have failed CI on an unrelated gate.
 #
-# THE DEFECT. _last_success_map() returned {} on a query FAILURE, which is
-# also what a successful query over an empty table returns. audit() then
-# reported `overdue: []` with a fresh timestamp and `ledger: ok`, and /health
-# published the empty list while discarding `unknown` -- so a database failure
-# was published as evidence that every scheduled job was fine.
+# PR #112 then merged, which moved master's pin to 5c103d8 and put the two
+# lines in conflict. Resolved by rebasing rather than by choosing a side: the
+# pinned tree now carries BOTH test files. Choosing either side would have
+# silently dropped a suite from CI, and "accept both" would have left two SHA
+# lines, of which the parser (grep -v comments | tail -1) takes only the last.
+# Blobs verified unchanged by the rebase: Gate A 11068fbc, Stage 1 17f7611b.
+#
+# THE DEFECT. _last_success_map() returned {} on a query FAILURE, which is also
+# what a successful query over an empty table returns. audit() then reported
+# `overdue: []` with a fresh timestamp and `ledger: ok`, and /health published
+# the empty list while discarding `unknown` -- so a database failure was
+# published as evidence that every scheduled job was fine. Stage 1 does not
+# catch this: it covers ABSENT evidence, not FALSE evidence.
 #
 # WORSE IN CATCH-UP. There `seen is None` means "first sighting, seed a
-# baseline instead of running", so a failed read wrote a baseline row for
-# EVERY job -- and that function counts baseline as a success. Measured before
-# the fix: 3 of 3 jobs seeded. A failed READ may never authorize a write that
+# baseline instead of running", so a failed read wrote a baseline row for EVERY
+# job -- and that function counts baseline as a success. Measured before the
+# fix: 3 of 3 jobs seeded. A failed READ may never authorize a write that
 # represents successful observation.
 #
 # FIVE MUTATIONS, ALL KILL TESTS. The first killed NOTHING at first, because
@@ -687,8 +724,9 @@
 #
 # NOT INCLUDED: the monitor side. Requiring evidence_complete is True in
 # health_watch.py is Gate A commit 2 and must not ship before this contract is
-# DEPLOYED, or the monitor goes non-authoritative against a backend that
-# cannot yet answer. Issue E remains open.
+# DEPLOYED, or the monitor goes non-authoritative against a backend that cannot
+# yet answer. Issue E remains open.
 #
-# 4511cbf was pushed first and its remote resolution verified with ls-remote
-# at 2026-10-12 03:00 UTC before this line was written.
+# 8b8420e was pushed to feat/p0-p1-governance-remediation as a fast-forward
+# from 5c103d8 and its remote resolution verified with ls-remote at
+# 2026-10-12 03:20 UTC before this line was written.
