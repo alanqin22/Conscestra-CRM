@@ -22,12 +22,39 @@ WHAT IT CHECKS
   http status    200 (the endpoint returns 503 when the database is unreachable)
   database       database.ok is true
   db role        database.connected_as is the expected app role, not a superuser
-  leader         exactly one process claims to run the singletons
+  leader         ha.role is not 'unelected' (an election completed at all)
+  coverage       the answering process is AUTHORITATIVE about the scheduled
+                 controls: it holds the state, its evidence QUERY SUCCEEDED,
+                 and the resulting assessment is present and fresh
   scheduler      scheduler.last_tick is fresher than HEALTH_MAX_TICK_AGE_MIN
+
+It does NOT verify that exactly one process claims to run the singletons. One
+probe reaches one worker and cannot see the others; the earlier wording here
+described a check that was never implemented.
 
 The scheduler tick is the one that matters most and the one a generic uptime
 service cannot see. `running: true` only means the object exists; a scheduler
 that is running and never firing looks identical in every other field.
+
+COVERAGE IS NOT THE SAME AS HEALTH
+----------------------------------
+Scheduler state lives in the LEADER's memory, so a follower answers 200 with
+`scheduler: {running: null, jobs: 0, last_tick: null}` and nothing to assess.
+Measured over 2,989 checks: 899 (30%) reached a follower, and 829 of those were
+recorded HEALTHY on no scheduler evidence at all. One follower-only run lasted
+3h23m and reported healthy throughout.
+
+So this checker separates "I looked and the controls are fine" from "I could not
+obtain evidence". The second is NOT healthy. It re-polls first, because 16% of
+follower runs are isolated and a second probe reaches the leader; if authority
+is still not obtained it says so as a problem.
+
+AND AN EMPTY RESULT IS NOT THE SAME AS A SUCCESSFUL ONE. `_last_success_map()`
+used to return {} when its query FAILED -- the same value a successful query
+over an empty table returns -- so a database failure was published as
+`overdue_jobs: []` with a fresh timestamp and satisfied every condition above.
+The backend now publishes `evidence_complete`, and this checker requires it to
+be exactly true.
 
 NOISE CONTROL
 -------------
@@ -166,8 +193,9 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
                         f"'{EXPECT_ROLE}' — privilege separation may be off")
 
     ha = h.get("ha") or {}
-    facts["ha_role"] = ha.get("role")
-    if ha.get("role") == "unelected":
+    role = ha.get("role")
+    facts["ha_role"] = role
+    if role == "unelected":
         problems.append("leader election never completed (ha.role=unelected)")
 
     sched = h.get("scheduler") or {}
@@ -180,7 +208,95 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
     started_age = _age_minutes(sched.get("started_at"))
     facts["started_min_ago"] = round(started_age, 1) if started_age is not None else None
 
-    if ha.get("role") in ("leader", "standalone", None):
+    # IS THIS RESPONSE AUTHORITATIVE ABOUT THE SCHEDULED CONTROLS?
+    #
+    # FOUR SEPARATE CONDITIONS, deliberately not collapsed into one. An identity
+    # test alone would accept a leader whose audit cache is empty or three hours
+    # stale, and `running: true` says the scheduler OBJECT exists -- not that its
+    # assessment of the work is present, let alone current.
+    #
+    #   identity    only a leader or a standalone process holds scheduler state
+    #   running     the scheduler object exists in that process
+    #   present     it has an overdue assessment at all (absent on a freshly
+    #               started process, and on any backend predating the ledger)
+    #   fresh       that assessment is newer than MAX_AUDIT_AGE_MIN. A frozen
+    #               cache reports `[]` forever, and an absence of bad news that
+    #               cannot go stale is not evidence.
+    #
+    # `unelected` fails the identity test as well as raising its own problem
+    # above: a process that never won an election holds no state either.
+    _audit_age = _age_minutes(sched.get("overdue_checked_at"))
+    _complete = sched.get("evidence_complete")
+    coverage = {
+        "identity": role in ("leader", "standalone"),
+        "running": sched.get("running") is True,
+        # DID THE EVIDENCE QUERY ACTUALLY SUCCEED? This is not inferable from
+        # the shape of the result: an empty `overdue` list is produced both by a
+        # healthy system and by a read that failed, and before the backend
+        # published this field a failed read was reported as `overdue_jobs: []`
+        # with a fresh timestamp -- a database failure presented as proof that
+        # every scheduled job was fine.
+        #
+        # `is True` AND NOT `is not False`. A missing field means this backend
+        # cannot say whether its query succeeded, and an unanswerable question
+        # is not an affirmative answer. Backward compatibility does not get to
+        # weaken the invariant; version skew is reported below under its own
+        # name and remains non-authoritative until the contract is available.
+        "query_ok": _complete is True,
+        "assessment_present": sched.get("overdue_jobs") is not None,
+        "assessment_fresh": (_audit_age is not None
+                             and _audit_age <= MAX_AUDIT_AGE_MIN),
+    }
+    authoritative = all(coverage.values())
+    facts["scheduler_evidence"] = ("authoritative" if authoritative else
+                                   "INCOMPLETE: missing "
+                                   + ", ".join(k for k, v in coverage.items()
+                                               if not v))
+    facts["scheduler_evidence_authoritative"] = authoritative
+    # WHY THE EVIDENCE IS INCOMPLETE -- reported WITHOUT inferring a cause the
+    # payload does not establish.
+    #
+    # The authority decision is unchanged: every state below is non-authoritative
+    # and `query_ok` already said so. This only fixes the explanation, because an
+    # explanation that names the wrong cause sends an operator to the wrong fix.
+    #
+    # THE CASE THAT FORCED THIS. A FOLLOWER publishes evidence_complete false
+    # with evidence_never_succeeded true and NO evidence_error -- it never ran an
+    # assessment, because it is not the leader. Calling that "the query did not
+    # succeed" invents a database fault out of ordinary HA routing. Observed live
+    # on 2026-10-12, five consecutive follower probes before a leader answered.
+    #
+    # AND THE CONVERSE: an absent evidence_error does NOT imply a query failed.
+    # A payload that claims incomplete evidence without saying why gets a neutral
+    # diagnostic rather than a guess.
+    _err = sched.get("evidence_error")
+    _never = bool(sched.get("evidence_never_succeeded"))
+    if _complete is None:
+        # Too old to say, rather than new enough to say it failed.
+        facts["evidence_contract"] = (
+            "unavailable — this backend does not publish evidence_complete")
+    elif _complete is False and _err:
+        facts["evidence_contract"] = (
+            "incomplete — the backend reports the assessment failed: "
+            + str(_err)
+            + (" (and none has ever succeeded here)" if _never else ""))
+    elif _complete is False and _never:
+        facts["evidence_contract"] = (
+            "no assessment has been made in this process — expected on an HA "
+            "follower, which holds no scheduler state")
+    elif _complete is False:
+        facts["evidence_contract"] = (
+            "incomplete — the backend reports its evidence is not complete and "
+            "does not say why")
+    if sched.get("evidence_refresh_failed_at"):
+        facts["evidence_refresh_failed_at"] = sched["evidence_refresh_failed_at"]
+
+    # Gated on IDENTITY, not on full authority: a leader with a stale or absent
+    # assessment must still reach the checks below, because that is where the
+    # staleness is reported. `None` is no longer admitted here -- it used to be,
+    # and every check then no-opped silently on the missing fields, which is a
+    # bypass wearing the costume of a check.
+    if coverage["identity"]:
         if sched.get("running") is False:
             problems.append("scheduler is not running on the leader")
 
@@ -228,6 +344,29 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
                     f"(threshold {MAX_AUDIT_AGE_MIN:.0f}) — scheduler."
                     f"overdue_jobs is stale and cannot be trusted")
 
+        # A JOB WITH NO RECORDED RUN AT ALL. audit() has always computed this
+        # and /health used to discard it, which is part of how a failed evidence
+        # query read as a clean result: every job lands in `unknown` and
+        # `overdue` comes back empty.
+        #
+        # WORDED AS "CANNOT ESTABLISH", not "unhealthy". An unassessed job is
+        # not evidence that the job is failing; it is evidence that this check
+        # cannot say either way. Only `overdue_jobs` and `failed_jobs_24h`
+        # assert that something is actually wrong.
+        unknown = sched.get("unknown_jobs")
+        if unknown is None:
+            facts["unknown_jobs"] = "not reported by this backend"
+        else:
+            facts["unknown_jobs"] = len(unknown)
+            if unknown:
+                named = ", ".join(str(u) for u in unknown[:4])
+                more = f" (+{len(unknown) - 4} more)" if len(unknown) > 4 else ""
+                problems.append(
+                    f"{len(unknown)} scheduled job(s) have no recorded run at "
+                    f"all: {named}{more}. This does not say they are unhealthy "
+                    f"-- it says their health cannot be established from the "
+                    f"job ledger.")
+
         overdue = sched.get("overdue_jobs")
         if overdue is None:
             # Version skew, not health: a backend that predates the ledger has
@@ -268,11 +407,20 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
             # installed. Nothing is broken yet, and nothing will report it
             # when something is.
             problems.append(f"job-run ledger {sched['ledger']}")
-    elif ha.get("role") == "follower":
-        # A follower not running the scheduler is correct. But if EVERY process
-        # is a follower nobody runs it, and one probe cannot see the others.
+    elif role == "follower":
+        # A follower not running the scheduler is correct, and this branch used
+        # to end here as a NOTE -- which is how 829 checks were recorded healthy
+        # on no evidence. The note stays for the reader; `authoritative` above is
+        # what stops it being read as a clean assessment, and check_confirmed
+        # escalates it once re-polling is exhausted.
         facts["note"] = ("this process is a follower; scheduler state not "
                          "assessed. Confirm some process reports leader.")
+    else:
+        # `unknown` means leader.status() raised inside /health -- a fault, not a
+        # quiet state -- and an absent `ha` means a backend predating HA
+        # reporting. Both used to skip the scheduler checks without comment.
+        facts["note"] = ("ha.role=%r: this process does not hold scheduler "
+                         "state, so none was assessed." % (role,))
     return problems, facts
 
 
@@ -384,21 +532,50 @@ def _last_error(log: Path, window: int = 8000) -> str:
 
 
 def check_confirmed(url: str) -> Tuple[List[str], Dict[str, Any], int]:
-    """check(), but a failure has to survive a re-check to count.
+    """check(), but a failure has to survive a re-check -- and MISSING EVIDENCE
+    is re-polled too.
 
     Returns (problems, facts, attempts). The LAST attempt wins: if the retry
     comes back clean the service is treated as healthy and the flap is recorded
     by the caller instead of mailed.
+
+    TWO REASONS TO RE-POLL, and they are not the same thing. A problem may be a
+    flap. Missing authority is a ROUTING outcome: scheduler state lives in the
+    leader and 30% of probes reach a follower holding none, so a second probe
+    reaches the leader for the 16% of follower runs that are isolated.
+
+    AND THEN IT FAILS CLOSED. If authority is still not obtained, the absence is
+    recorded as a problem, because "I could not check" is not "nothing is wrong"
+    -- the substitution this function exists to prevent.
+
+    `first_attempt_problems` is carried so the caller can tell a recovered
+    SERVICE flap from a re-poll that only ever chased routing. Counting the
+    second as a blip would make ~30% of checks look like restarts and trip the
+    repeated-restart alert on a healthy service.
     """
     problems, facts = check(url)
+    first_problems = len(problems)
     attempts = 1
-    while problems and attempts <= CONFIRM_RETRIES:
-        print(f"  {len(problems)} problem(s) on attempt {attempts} — "
-              f"re-checking in {CONFIRM_DELAY_S:.0f}s before alerting")
+    while attempts <= CONFIRM_RETRIES and (
+            problems or not facts.get("scheduler_evidence_authoritative")):
+        why = ("%d problem(s)" % len(problems) if problems else
+               "no authoritative scheduler evidence (ha.role=%r)"
+               % (facts.get("ha_role"),))
+        print(f"  {why} on attempt {attempts} — re-checking in "
+              f"{CONFIRM_DELAY_S:.0f}s before alerting")
         time.sleep(CONFIRM_DELAY_S)
         problems, facts = check(url)
         attempts += 1
     facts["attempts"] = attempts
+    facts["first_attempt_problems"] = first_problems
+    if not facts.get("scheduler_evidence_authoritative"):
+        problems.append(
+            f"NO AUTHORITATIVE SCHEDULER EVIDENCE after {attempts} attempt(s) "
+            f"(ha.role={facts.get('ha_role')!r}; "
+            f"{facts.get('scheduler_evidence')}). Scheduled-control coverage is "
+            f"NOT established by this check: a governance audit or a nightly job "
+            f"could be failing and this check could not have seen it. That is "
+            f"not a healthy result.")
     return problems, facts, attempts
 
 
@@ -532,7 +709,11 @@ def main() -> int:
     # ── transient failures: suppressed, counted, and eventually reported ─────
     blips = [b for b in state.get("blips", [])
              if (_age_minutes(b) or 1e9) <= BLIP_WINDOW_HOURS * 60]
-    if attempts > 1 and not problems:
+    # ONLY A SERVICE FLAP COUNTS. A re-poll driven purely by missing authority
+    # is a routing outcome, not a restart, and ~30% of checks now re-poll for
+    # that reason -- counting those would trip the repeated-restart alert on a
+    # perfectly healthy service.
+    if attempts > 1 and not problems and facts.get("first_attempt_problems"):
         blips.append(now.isoformat())
         print(f"  transient: recovered by attempt {attempts} — not alerting")
     facts["blips_24h"] = len(blips)
@@ -591,6 +772,12 @@ def main() -> int:
     state["checked_at"] = now.isoformat()
     state["problems"] = problems
     state["blips"] = blips[-50:]
+    # Additive to the EXISTING store, not a second one. Without these the
+    # monitor's own history can say "healthy" without saying whether it ever had
+    # the evidence to justify it -- which is how this blind spot stayed
+    # invisible across 2,989 checks.
+    state["ha_role"] = facts.get("ha_role")
+    state["scheduler_evidence"] = facts.get("scheduler_evidence")
     _save_state(state)
     return 0 if healthy else 1
 

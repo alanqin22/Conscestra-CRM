@@ -222,6 +222,43 @@ REQUIRED_MIGRATIONS: List[str] = [
     #    may replay them safely.
     "governance_decision_link_identity.sql",
     "workflow_owner_resolution.sql",
+    # ── A1a, the policy deletion log. PROMOTED 2026-10-08, after Railway
+    #    executed it and the trigger was verified there directly from the
+    #    catalogs -- AFTER DELETE, row-level, enabled, bound to
+    #    log_governed_deletion('action_type') -- and not inferred from the apply
+    #    reporting success. Artifact sha256 390502a4...507e, 4855 bytes, at
+    #    governance commit cba8276. Railway attestation after the apply:
+    #    99b2b16a83763507.
+    #
+    #    IT WAS APPLIED OUT OF BAND, through apply_sql.py, so production's
+    #    ledger holds NO row for it and schema_migrations is still 49 at the
+    #    moment of this promotion. That is truthful and is left alone: the
+    #    ledger records what migrate.py executed, and migrate.py has not
+    #    executed this file.
+    #
+    #    SO migrate.py WILL REPLAY IT, once, on the next --target railway run,
+    #    and record the ledger row then -- 49 -> 50. That is the accepted
+    #    consequence of promotion rather than a defect, and it is safe because
+    #    the file is idempotent: DROP TRIGGER IF EXISTS then CREATE TRIGGER,
+    #    recreating the identical trigger and touching no row of any table.
+    #    Verified by applying it twice locally, and by a local dry run over an
+    #    EXISTING trigger, which printed the NOTICE without "does not exist,
+    #    skipping" -- so the DROP found the trigger and dropped it.
+    #
+    #    _PENDING_POLICY_DELETION_LOG is left defined and unused, as
+    #    _PENDING_LINK_IDENTITY and _PENDING_WORKFLOW_OWNER were: its
+    #    "NOT applied to Railway" sentence was true until 2026-10-08 and is kept
+    #    as the record of that, rather than rewritten to match today.
+    "governed_policy_deletion_log.sql",
+    # 48 -> 49 on 2026-09-13. Not a new deployment: the three triggers this
+    # wires -- trg_contacts_touch, trg_leads_touch, trg_accounts_touch -- were
+    # verified present on Railway read-only as crm_readonly, and locally, before
+    # the promotion. What changes is the DECLARATION. The file was applied out
+    # of band and filed in tri_fn/ among function definitions, so it sat outside
+    # the census with no disposition and no schema_migrations row: applied, with
+    # no record that it had been. Declaring it re-applies it idempotently
+    # (DROP TRIGGER IF EXISTS + CREATE) and writes the ledger row that was never
+    # created. It depends on trgfn_touch_updated_at from
     # 49 -> 48 on 2026-09-29. trg_fn_contacts_leads_accounts_touch.sql was
     # removed from this manifest and classified out-of-band instead. The three
     # triggers it declares are already created and owned by
@@ -1112,6 +1149,74 @@ _PENDING_SCHEMA_ATTEST = (
     "that passed every check. Deliberately a MIGRATION rather than a runtime "
     "ensure_table: a detector for undeclared schema changes must not make one.")
 
+_PENDING_APPEND_ONLY_ATTEST = (
+    "PENDING DEPLOYMENT -- authored 2026-10-09 and applied to NO database. "
+    "F-9.8, the append-only correction F-9.1 omitted. schema_attestations was "
+    "created after the ALTER DEFAULT PRIVILEGES rule in app_role.sql, so it "
+    "arrived with UPDATE and DELETE granted to crm_app; measured on Railway "
+    "2026-10-09 as crm_readonly, and the table carries no trigger. Its rows "
+    "are the evidence that an apply changed nothing it should not have, and "
+    "test_pending_declaration_is_not_stale.py reads them, so the application "
+    "role could rewrite the record that audits it. "
+    "F-9.7 DOES NOT APPLY: that file restored UPDATE on replica_attestations "
+    "because its writer is INSERT ... ON CONFLICT DO UPDATE, which needs the "
+    "privilege whether or not a conflict occurs. This table's only writer is "
+    "a plain INSERT, so it is append-only by construction. "
+    "TRUNCATE IS DECLARATORY -- crm_app never held it, so its denial is "
+    "already true and is not evidence this control works. NO TRIGGER: one "
+    "would refuse UPDATE for every role including the migration principal, "
+    "and would break a future upsert writer silently, which is F-9.7's exact "
+    "failure. "
+    "RETENTION, recorded as policy rather than left as an accident: "
+    "attestation records are retained without automatic expiry or purge. "
+    "Retention will be reviewed if measured attestation storage reaches a "
+    "defined threshold, materially affects backup or restore performance, or "
+    "applicable governance requirements change. No deletion mechanism is "
+    "authorized by this decision, and this file creates none. "
+    "OUT-OF-BAND FOR A MEASURED REASON, not because privilege artifacts "
+    "cannot be declared -- three declared migrations carry them, two with "
+    "unguarded GRANT ... TO crm_app, which survive only because the "
+    "baseline's ledger records them so migrate.py skips them. A newly "
+    "declared migration is the ONLY file migrate.py executes in CI, and the "
+    "step that creates crm_app runs two steps later, so declaring this would "
+    "fail with 'role crm_app does not exist'. That ordering is liftable; the "
+    "classification is correct for this change and matches both F-9.1 "
+    "siblings. "
+    "Applied by scripts/apply_sql.py; NOT by deploy_sp.ps1, which is "
+    "prohibited against Railway.")
+
+_APPLIED_APPEND_ONLY_ATTEST = (
+    "APPLIED TO RAILWAY 2026-10-10; out-of-band; NOT promoted. F-9.8 withdraws "
+    "UPDATE and DELETE from crm_app on schema_attestations, the table whose "
+    "rows are the evidence an apply is audited by. Artifact sha256 "
+    "4c7bbcd9...58fe1 at governance 77568b9. "
+    "WHAT WAS OBSERVED, and how. Read-only as crm_readonly after the apply: "
+    "the ACL is postgres=arwdDxtm/postgres, crm_app=ar/postgres, "
+    "crm_readonly=r/postgres -- crm_app lost exactly w and d while the other "
+    "two entries are untouched; no trigger exists; the 27 pre-existing rows "
+    "are byte-stable on two independent digests; and apply_sql recorded row "
+    "id=28 naming this file, carrying fingerprint 99b2b16a83763507 over 2,577 "
+    "objects -- the SAME value as the row before it, PREDICTED IN ADVANCE "
+    "because privileges sit outside what the fingerprint hashes. "
+    "WHAT THIS DOES NOT CLAIM. No production UPDATE or DELETE was executed "
+    "and refused. There is no authorized non-owner Railway connection, so the "
+    "production evidence is an independently read catalog configuration, not "
+    "an executed 42501 from aclcheck_error. That denial is demonstrated only "
+    "in a disposable fixture reproducing the measured Railway configuration. "
+    "NOT APPLIED LOCALLY, and local is NOT a safe place to establish parity. "
+    "railwayl2's table ACL is NULL -- owner-only, crm_app holds no privilege "
+    "there at all -- so on that database the REVOKE is a no-op and the GRANT "
+    "SELECT, INSERT would CREATE two privileges that do not exist. Applying "
+    "this file locally would ADD access rather than withdraw it. This records "
+    "that scope; it authorizes no local change. "
+    "NO LEDGER ROW, by design: apply_sql.py records none for an out-of-band "
+    "file and says so, the classification IS the provenance record, and "
+    "migrate --check --target railway reports the schema current. "
+    "_PENDING_APPEND_ONLY_ATTEST is left defined and unused, as "
+    "_PENDING_POLICY_DELETION_LOG and eight other superseded names are: its "
+    "sentence that no database had it was true until 2026-10-10 15:32 UTC and "
+    "is kept as the record of that rather than rewritten to match today.")
+
 _PENDING_ERASURE_E8 = (
     "PENDING DEPLOYMENT -- authored 2026-09-01 and applied to LOCAL only. "
     "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
@@ -1187,6 +1292,56 @@ _PENDING_AUTH_OTP_TRUST_BOUNDARY = (
     "IF NOT EXISTS, CREATE UNIQUE INDEX IF NOT EXISTS, CREATE OR REPLACE "
     "FUNCTION and idempotent grants. It carries no outer transaction, so "
     "apply_sql.py owns the transaction and no statement can partially apply. "
+    "sha256 a576382b0791b0a76e796582bafc2e7908880341f0f9e1d8738bfd0ff55cfffc, "
+    "17444 bytes.")
+
+_APPLIED_AUTH_OTP_TRUST_BOUNDARY = (
+    "APPLIED TO BOTH DATABASES: Railway 2026-10-05 03:49:50 UTC and local "
+    "2026-10-04 23:49:50 America/Toronto -- ONE instant rendered in two "
+    "session timezones, attestation row id=25 on each, and NOT two "
+    "independent applications. Out-of-band; NOT promoted, and no "
+    "schema_migrations row exists on either database. "
+    "WHAT IT IS. The one-time-password trust boundary: auth_otp_challenges, "
+    "auth_secrets, and the two SECURITY DEFINER functions that are the only "
+    "declared way to reach them. The inspected table ACLs omit crm_app, and "
+    "crm_app has EXECUTE on both functions. This establishes the measured "
+    "table-access posture; it does not, by itself, prove every possible path "
+    "by which the application could access OTP state or secrets. THE PEPPER "
+    "IS NOT IN THIS FILE and never may be. "
+    "HOW APPLICATION WAS ESTABLISHED, and what each piece of evidence is "
+    "worth. The attestation row is SUPPORTING evidence only: its detail is "
+    "the bare filename, and its fingerprint 6740e72b936b89ca over 2,576 "
+    "objects hashes the SCHEMA at that moment, NOT this artifact bytes. The "
+    "substantive corroboration is a direct probe. On Railway every object "
+    "exists -- auth_secrets, auth_otp_challenges, uq_auth_otp_live, "
+    "fn_otp_issue(text,jsonb,interval,boolean,integer,integer) and "
+    "fn_session_create_otp(text,text,interval,integer), both prosecdef -- "
+    "with crm_app absent from both table ACLs, crm_readonly=r on "
+    "auth_otp_challenges only, and EXECUTE on both functions granted to "
+    "crm_app. Both function BODIES are byte-identical to this file after "
+    "CRLF normalisation, on both databases: md5 16e3d5ce (3,116 chars) and "
+    "f6453ee6 (5,265 chars). "
+    "WHAT THE BODY COMPARISON DOES NOT PROVE. It establishes those two "
+    "functions, not that every statement in this file executed "
+    "successfully. The object and ACL inventory is what carries the broader "
+    "claim. "
+    "public.auth_secrets is excluded by the configured backup policy; "
+    "restores made from dumps produced under that policy may legitimately "
+    "lack this table. scripts/backup_railway.py excludes it "
+    "(BACKUP_EXCLUDE_TABLES defaults to public.auth_secrets) because the "
+    "dump role cannot read it, and --exclude-table-data is not sufficient on "
+    "PostgreSQL 18.6. Such an absence is NOT evidence the artifact was never "
+    "applied. "
+    "Reapplying this artifact to a restore that lacks auth_secrets may "
+    "create an empty table without the required pepper, leaving the OTP "
+    "functions unable to complete their intended operation. Do not use "
+    "reapplication as a parity repair; assess the restore and "
+    "secret-provisioning requirements through a separate authorized "
+    "preflight. "
+    "_PENDING_AUTH_OTP_TRUST_BOUNDARY is left defined and unused, as "
+    "_PENDING_POLICY_DELETION_LOG and nine other superseded names are: its "
+    "sentence that it was applied nowhere, not even locally, was true when "
+    "written on 2026-10-04 and is kept as the record of that. "
     "sha256 a576382b0791b0a76e796582bafc2e7908880341f0f9e1d8738bfd0ff55cfffc, "
     "17444 bytes.")
 
@@ -1372,6 +1527,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "agent_tuning.sql": _SCHEMA_OOB,
     "append_only_revokes.sql": _SCHEMA_OOB,
     "append_only_revokes_fix.sql": _SCHEMA_OOB,
+    "append_only_schema_attestations.sql": _APPLIED_APPEND_ONLY_ATTEST,
     "ar_aging_realism.sql": _SCHEMA_OOB,
     "ar_collections_settle_88pct.sql": _CORRECTION,
     "assignable_identity.sql": _SCHEMA_OOB,
@@ -1519,7 +1675,6 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "ownership_shadow.sql": _PENDING_OWNERSHIP_SHADOW,
     "ownership_attribution.sql": _PENDING_OWNERSHIP_ATTRIBUTION,
     "mutation_governance.sql": _PENDING_MUTATION_GOVERNANCE,
-    "governed_policy_deletion_log.sql": _PENDING_POLICY_DELETION_LOG,
     "canonical_identity.sql": _PENDING_CANONICAL_IDENTITY,
     "authority_envelope.sql": _PENDING_AUTHORITY_ENVELOPE,
     "cancellation_authority.sql": _APPLIED_LOCAL_CANCELLATION_AUTHORITY,
@@ -1533,7 +1688,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "readonly_role.sql": _PENDING_READONLY_ROLE,
     "schema_attestations.sql": _PENDING_SCHEMA_ATTEST,
     "identity_confirm_evidence.sql": _PENDING_IDENTITY_CONFIRM,
-    "auth_otp_trust_boundary.sql": _PENDING_AUTH_OTP_TRUST_BOUNDARY,
+    "auth_otp_trust_boundary.sql": _APPLIED_AUTH_OTP_TRUST_BOUNDARY,
     "escalations.sql": _SCHEMA_OOB,
     "event_correlation_propagation.sql": _PENDING_CORRELATION,
     "event_types_voice_learning.sql": _CORRECTION,
@@ -1765,6 +1920,86 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "workflow_placeholders.sql": _SCHEMA_OOB,
     "workflow_revival.sql": _SCHEMA_OOB,
 }
+
+
+# ── Shared with the governance declaration detector ────────────────────
+#
+# These three definitions lived in
+# governance/tests/test_pending_declaration_is_not_stale.py, which is NOT
+# shipped: `governance/` is gitignored, so the deployed application cannot
+# import it. A scheduled production-governance audit could therefore not reach
+# the permitted-exception list without a SECOND copy of it, and two copies of a
+# closed list is how the copy nobody watches goes stale.
+#
+# They live here because this module IS shipped, so an audit and the detector
+# evaluate the same policy object: the same values, from the same import, in
+# the same process. Version skew between them is not possible. The detector
+# imports them from here; this module imports nothing from governance; and the
+# move changed no value and no semantics.
+#
+# THE MARKER IS POSITIONAL, and that is load-bearing. A corrected declaration
+# is allowed to QUOTE its former status, so only the opening words state what
+# is true now. `lstrip().upper().startswith(...)` is the whole contract --
+# substring matching would classify a corrected declaration as pending again.
+PENDING_MARKER = "PENDING DEPLOYMENT"
+
+# ── The reconciliation backlog ──────────────────────────────────────────────
+#
+# Files whose declaration opened with PENDING DEPLOYMENT on 2026-09-23 while
+# this database held an apply_sql attestation for them. Enumerated rather than
+# excused: the same shape as `crmdb_write_register.LEGACY_CRMDB_WRITERS`, and
+# for the same reason. A permanently-red check is a switched-off check with
+# extra steps, and a silently-widened allowlist is how a real defect vanishes.
+#
+# THE LIST MAY SHRINK. It must never grow. An entry is removed by RECONCILING
+# the file -- confirming its objects against the live catalogue of each
+# database and rewriting its declaration to say which database has it and
+# when -- never by deleting the line.
+#
+# WHY IT IS NOT ALREADY EMPTY. Two entries were reconciled on the day this was
+# written, with attestation ids and a direct object probe of both databases
+# (`a3_invoice_economic_integrity.sql`, `financial_proposition_binding.sql`),
+# which is why neither appears below. The remainder need the same treatment
+# and had not had it. Correcting a declaration with less evidence than that
+# would reintroduce the defect in the other direction: a confident status
+# nobody checked.
+#
+# APPLIED IS PER-DATABASE, and this is the trap the first draft fell into.
+# Measured 2026-09-23: fourteen files are stale against local `crmdb`, ten
+# against Railway, and the two sets are not nested. A file applied locally and
+# genuinely not yet on Railway is CORRECTLY pending for Railway -- so a
+# reconciled declaration must name the database, as
+# `_APPLIED_LOCAL_SOFT_DELETED_AR` already does. This is the union of both,
+# so an entry may be legitimately stale on one database and accurate on the
+# other; only reconciliation can tell them apart.
+RECONCILIATION_BACKLOG = frozenset({
+    "a3_financial_state.sql",
+    "corpus_provenance.sql",
+    "escalation_assigned_requires_claim_time.sql",
+    "escalation_reminder_allocation.sql",
+    "event_correlation_propagation.sql",
+    "executives_owner_id_column.sql",
+    "governance_alert_ack_and_disposition.sql",
+    "governance_alert_resolution_required.sql",
+    "governance_policy_generate_invoice.sql",
+    "identity_confirm_evidence.sql",
+    "owner_eligibility_guards.sql",
+    "owner_personhood_register.sql",
+    "readonly_role.sql",
+    "schema_attestations.sql",
+    "staff_email_ledger_governance_kinds.sql",
+    "staff_email_ledger_owner_remind_kind.sql",
+})
+
+
+def declared_pending() -> set:
+    """Files whose disposition OPENS with the pending marker."""
+    return {
+        name for name, reason in OUT_OF_BAND_SQL.items()
+        if isinstance(reason, str)
+        and reason.lstrip().upper().startswith(PENDING_MARKER)
+    }
+
 
 from app.core.artifact_paths import SQL_DIR as _SQL_DIR
 

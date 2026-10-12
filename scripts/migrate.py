@@ -101,6 +101,14 @@ def main() -> int:
             return 2
 
     conn = psycopg2.connect(dsn)
+    # AN INSPECTION RUN IS PINNED READ-ONLY AT THE SERVER, not merely intended
+    # to be. The comment above declares --check and --dry-run read-only by
+    # design; that was a statement of intent which the ledger DDL below
+    # falsified for as long as it stood. Pinning the session makes the claim
+    # enforced, so a write added to this path in future fails loudly here
+    # instead of quietly changing a database somebody asked only to look at.
+    if args.check or args.dry_run:
+        conn.set_session(readonly=True)
     # AUTOCOMMIT OFF. It used to be on, which meant the migration DDL committed
     # and the ledger INSERT committed separately -- a crash between them left a
     # migration applied and unrecorded, the one state `migrate --check` cannot
@@ -110,14 +118,48 @@ def main() -> int:
     applied, changed, unverifiable, missing_files = [], [], [], []
     try:
         with conn.cursor() as cur:
-            cur.execute(_LEDGER)
+            # THE LEDGER IS CREATED ONLY BY A RUN THAT MAY WRITE.
+            #
+            # This statement was unconditional, and it made --check the one
+            # thing it is documented not to be. CREATE TABLE is refused
+            # outright in a read-only transaction, so
+            # `python -m scripts.migrate --check --target railway` -- the
+            # pre-merge step this repository's own pull-request checklist
+            # mandates -- died with "cannot execute CREATE TABLE in a read-only
+            # transaction" against the sanctioned crm_readonly DSN. The check
+            # that detects a declared-but-unledgered migration on production
+            # could not be run against production, which is how exactly that
+            # state reached master in #103.
+            #
+            # Where it COULD write, the effect was worse than an error.
+            # Measured 2026-10-09: --check against an empty database left
+            # public.schema_migrations behind. A command that reports on a
+            # database must not change it.
+            #
+            # AN ABSENT LEDGER IS AN ANSWER, not a condition to repair from
+            # here. It means nothing has been migrated, so every declared file
+            # is pending -- which is what an empty `have` reports, and the
+            # printed note keeps that distinguishable from an empty ledger that
+            # does exist.
+            if args.check or args.dry_run:
+                cur.execute("SELECT to_regclass('public.schema_migrations')")
+                ledger_exists = cur.fetchone()[0] is not None
+                if not ledger_exists:
+                    print("note: public.schema_migrations does not exist here "
+                          "-- nothing has been migrated, so the whole declared "
+                          "chain is reported as pending")
+            else:
+                cur.execute(_LEDGER)
+                ledger_exists = True
             # Always qualified. This database has THREE tables named
             # schema_migrations (public, auth, realtime -- the last two are
             # Supabase's). Unqualified resolution happens to be correct today
             # only because neither of the others is on the search_path.
-            cur.execute("SELECT filename, checksum "
-                        "FROM public.schema_migrations")
-            have = dict(cur.fetchall())
+            have = {}
+            if ledger_exists:
+                cur.execute("SELECT filename, checksum "
+                            "FROM public.schema_migrations")
+                have = dict(cur.fetchall())
         conn.commit()
 
         # ---- THE COMPLETENESS INVARIANT, before anything is applied -------

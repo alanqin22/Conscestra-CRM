@@ -109,6 +109,20 @@ MATERIAL_BALANCE = 50.0
 # `*.updated` chatter without enumerating every type.
 CRITICAL_TYPES = {
     "supervisor.alert",
+    # The hourly production declaration audit (app.core.governance_audit).
+    #
+    # CRITICAL rather than actionable because what it reports is that a
+    # declaration ABOUT PRODUCTION is wrong, and every integrity check
+    # downstream reads those declarations as true. Tier 3 (informational)
+    # never emails at all and Tier 2 only reaches the daily digest; a day is
+    # longer than the window in which a wrong declaration gets acted on.
+    #
+    # Membership here is what grants the type email AT ALL --
+    # staff_email.sync_tier_rules derives notification_tier_rules from this
+    # set and expresses informational as absence. The literal is pinned to
+    # governance_audit.EVENT_TYPE by test_governance_audit, so the two cannot
+    # drift apart silently.
+    "governance.declaration_drift",
 }
 ACTIONABLE_TYPES = {
     "activity.overdue_flagged",

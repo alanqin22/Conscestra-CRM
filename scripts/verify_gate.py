@@ -348,7 +348,18 @@ def main() -> int:
         # not run. CI skipped five that pass locally, including
         # test_anonymous_cannot_execute_a_write_the_blocklist_misses, the
         # regression test for the anonymous-write defect. The gate was green.
-        rc, out = _run([sys.executable, "-m", "pytest", "-q", "-rs",
+        #
+        # -rsfE, not -rs. `-r` REPLACES pytest's default of `fE` rather than
+        # adding to it, so asking for skip reasons alone SUPPRESSED the
+        # `FAILED <nodeid>` summary lines -- and those lines are the only thing
+        # the `startswith("FAILED")` loop below can print. Measured on CI run
+        # 37831174224: the stage reported "3 failed, 220 passed" and named none
+        # of the three, so the log said a verification had failed without
+        # saying which, and the failing tests had to be re-derived by rebuilding
+        # the gate database by hand. A gate that cannot say what broke still
+        # fails closed, which is why this survived; it just costs an
+        # investigation every time it fires.
+        rc, out = _run([sys.executable, "-m", "pytest", "-q", "-rsfE",
                         "-p", "no:cacheprovider", *CONTROL_TESTS], env)
         by["controls"].secs = time.time() - t
         tail = [l for l in out.splitlines() if "passed" in l or "failed" in l]
@@ -373,7 +384,14 @@ def main() -> int:
             print("  controls: FAILED")
             for l in out.splitlines():
                 if l.startswith("FAILED"):
-                    print(f"    {l[:110]}")
+                    # 110 characters cut these lines mid-NODE-ID -- the test
+                    # names here reach 145 with their class path, so the width
+                    # truncated the only part that says what failed. The reason
+                    # text after the node id is still bounded, because an
+                    # assertion message can run to several hundred characters
+                    # and the full one belongs in a local run, not in a summary.
+                    nodeid, _, why = l.partition(" - ")
+                    print(f"    {nodeid}" + (f" - {why[:80]}" if why else ""))
         else:
             print(f"  controls: {by['controls'].detail}")
 

@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-467d376d5d5ac82665832ab909c48ca6050869c1
+c6a20fb5207492d5a972e68d06cf131ff0434793
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -380,3 +380,418 @@
 # reachable, so eb73be3 could not be named until it was pushed. Its remote
 # resolution was verified with ls-remote before this line was written, rather
 # than inferred from a successful push.
+
+# cba8276 -- the policy deletion log. NOT tests only, but also NOT the e802469
+# hazard: the SQL file arriving with this pin is declared OUT OF BAND and PENDING
+# DEPLOYMENT in this same commit, so the corpus invariant is satisfied in both
+# directions. Pinned earlier, the file would be on disk with no classification
+# and test_every_sql_file_has_exactly_one_disposition would fail; declared
+# without the pin moving, the declaration would name a file absent from the
+# pinned governance commit. The two halves are coupled and belong together, which
+# is why they are one commit here rather than two.
+#
+# WHAT IT REGISTERS. governance_action_policies with log_governed_deletion, so a
+# deleted decision policy is archived into governed_deletions and recoverable by
+# restore_governed_deletion_row(). action_approvals has carried that log since
+# 2026-08-08 and the policy table that decides how those approvals are enforced
+# had none -- and the loss is not small: action_class gates the proposition
+# requirement, both executive requirements, and three application effects that
+# resolve the class through _is_financial. Seven action types are financial in
+# production, so the path is live.
+#
+# NOT PROMOTED INTO REQUIRED_MIGRATIONS, and the disposition says why in terms:
+# applied to LOCAL railwayl2 only, not to Railway. That list is a claim about
+# what production has executed, so promotion belongs in the change that records
+# the Railway application and the read-back proving it.
+#
+# NO DEPLOY-ORDER CONSTRAINT, unlike b0f47e9 and 0973596 in either direction.
+# Nothing in the application reads this trigger and it only observes a deletion,
+# so applying it before or after any application change alters nothing the
+# application does.
+#
+# A NEW DISPOSITION NAME TRAVELS WITH IT. _PENDING_POLICY_DELETION_LOG is
+# registered in the DISPOSITIONS vocabulary in the same governance commit,
+# because the contract refuses a disposition outside the declared set on the
+# grounds that adding one is a governance decision and not a naming choice. The
+# registration was falsified before being relied on: removing it fails
+# test_sql_disposition_governance on the name rather than on the SQL.
+#
+# WHAT DOES NOT TRAVEL WITH IT. The A1a tests are deliberately held back.
+# disposable_db layers an explicit list rather than REQUIRED_MIGRATIONS, and
+# 00_base_schema carries the four existing deletion-log triggers and not this
+# one, so a test asserting the live trigger would fail in CI against a database
+# that correctly does not have it. Those tests belong with the promotion commit
+# or behind a regenerated baseline.
+#
+# THE PIN MOVES IN A FOLLOW-UP COMMIT AGAIN, for the reason recorded at ded0dbb
+# and eb73be3. cba8276 was pushed first and its remote resolution verified with
+# ls-remote at 2026-10-08 08:33 UTC before this line was written, rather than
+# inferred from a successful push.
+# 99c8ac4 -- THE OTHER HALF OF THE PROMOTION, and the reason the previous
+# commit's CI was red. The note at cba8276 above says it in advance:
+# 00_base_schema carried the four existing deletion-log triggers and not this
+# one, so anything asserting the live trigger would fail against a database
+# that correctly did not have it. deploy_state was then changed to DECLARE
+# governed_policy_deletion_log.sql without the baseline being carried forward,
+# and migrate --check reads a declaration as a claim about what has run. Run
+# 37831174224: the gate's migrations stage reported 'would apply', and
+# test_the_ledger_covers_every_declared_migration,
+# test_no_migration_is_declared_before_it_is_applied and
+# test_migrate_check_passes_when_the_corpus_is_classified fell with it.
+#
+# This pin carries the regenerated ledger and the one object it accounts for.
+# The baseline was DERIVED, not edited: built from its own previous version,
+# migrated by migrate.py, re-dumped and diffed -- one object added, none lost
+# -- and a database built from the result dumps identically to the migrated
+# one. The gate passes all five stages at this pin, 223 controls and 2
+# declared skips.
+#
+# 99c8ac4 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-09 13:46 UTC before this line was written, rather than inferred
+# from a successful push.
+#
+# STILL HELD BACK, and now unblocked rather than done: the A1a evidence tests
+# that cba8276 deferred 'with the promotion commit or behind a regenerated
+# baseline'. The baseline is regenerated here, so the reason they could not
+# run is gone; adding them is its own change, because disposable_db layers an
+# explicit migration list rather than REQUIRED_MIGRATIONS and would need the
+# same treatment.
+# 77568b9 -- F-9.8, the append-only correction F-9.1 omitted. crm_app held
+# UPDATE and DELETE on schema_attestations, measured on Railway 2026-10-09:
+# the table was created after the ALTER DEFAULT PRIVILEGES rule in
+# app_role.sql, so it arrived fully mutable by the application role. Those
+# rows are the evidence an apply is audited by, and
+# test_pending_declaration_is_not_stale.py reads them, so the application
+# role could rewrite the record that audits it.
+#
+# THREE PATHS TRAVEL TOGETHER AND THE THIRD IS NOT OPTIONAL. The artifact,
+# its regression, and the registration of _PENDING_APPEND_ONLY_ATTEST in
+# DISPOSITIONS. The public commit that pins this references that disposition
+# name, and test_every_named_disposition_is_declared reads the AST of
+# deploy_state.py and refuses a name outside the declared vocabulary -- so a
+# public commit pinned to a governance commit without the registration fails
+# the gate on the NAME rather than on the SQL. Measured, not predicted: that
+# is exactly how the first attempt failed, 1 failed and 222 passed.
+#
+# THE ARTIFACT IS APPLIED TO NO DATABASE at this pin, and the regression is
+# deliberately absent from verify_gate.CONTROL_TESTS: it needs a
+# cluster-level crm_app role, which the gate's scratch database has no reason
+# to hold, and the gate already declares grants NOT GATED HERE. Its
+# precondition skips with a stated reason rather than failing.
+#
+# NOT YET PUSHED WHEN THIS LINE WAS WRITTEN. Every earlier note here records
+# ls-remote confirmation before the pin was advanced; this one cannot, because
+# pushing was not authorized at the gate that produced it. Until 77568b9 is
+# pushed, CI will fail at 'governance commit is not reachable' -- which is the
+# pin doing its job. Push the governance commit before this public commit.
+# f508545 -- the RECONCILIATION of 77568b9's declaration, and nothing else.
+# append_only_schema_attestations.sql was applied to RAILWAY out-of-band on
+# 2026-10-10 15:32 UTC and verified read-only: ACL crm_app=ar/postgres with
+# the postgres and crm_readonly entries untouched, no trigger, the 27
+# pre-existing rows byte-stable on two digests, and apply_sql row id=28
+# naming the file with fingerprint 99b2b16a83763507 -- the same value as the
+# row before it, predicted in advance because privileges sit outside what the
+# fingerprint hashes. So the PENDING DEPLOYMENT marker became false that day.
+#
+# THIS PIN CARRIES ONE LINE: the registration of _APPLIED_APPEND_ONLY_ATTEST
+# in DISPOSITIONS. The public commit that pins it repoints the manifest entry
+# to that name, and test_every_named_disposition_is_declared reads the AST of
+# deploy_state.py and refuses a name outside the declared set -- so the two
+# cannot be split. Falsified: with the registration removed the test fails
+# naming the exact constant.
+#
+# NO ARTIFACT AND NO DATABASE CHANGED. The SQL is byte-identical to 77568b9
+# (sha256 4c7bbcd9...58fe1), REQUIRED_MIGRATIONS stays 49, and the Railway
+# control applied on 2026-10-10 is untouched. _PENDING_APPEND_ONLY_ATTEST is
+# retained defined-and-unused, as eight other superseded names are.
+#
+# NOT YET PUSHED WHEN THIS LINE WAS WRITTEN, because the gate that produced
+# it authorized implementation and not publication. Until f508545 is pushed,
+# CI fails at 'governance commit is not reachable', which is the pin working.
+# Push the governance commit before this public commit.
+# 330f64f -- the RECONCILIATION of auth_otp_trust_boundary.sql's
+# declaration, which said 'applied NOWHERE, not even locally' and was false
+# on both databases. One line: the registration of
+# _APPLIED_AUTH_OTP_TRUST_BOUNDARY in DISPOSITIONS, which the public commit
+# that pins this references. The two cannot be split.
+#
+# ESTABLISHED BY DIRECT PROBE, not by the attestation row. That row carries
+# the bare filename and a fingerprint of the SCHEMA at that moment, not a
+# hash of the artifact. The substantive evidence is that every object the
+# file creates exists on Railway with the prescribed ACLs, and that both
+# function bodies are byte-identical to the artifact after CRLF
+# normalisation, on both databases.
+#
+# ONE APPLY, NOT TWO: Railway 2026-10-05 03:49:50 and local
+# 2026-10-04 23:49:50 are the same attestation row id=25 with the same
+# fingerprint, four hours apart in two session timezones. Reading
+# recorded_at::date nearly recorded two independent applications.
+#
+# NO ARTIFACT, INVENTORY, BACKLOG OR DATABASE CHANGED. The SQL is untouched
+# (sha256 a576382b...5cfffc, 17,444 bytes), REQUIRED_MIGRATIONS stays 49 and
+# OUT_OF_BAND_SQL stays 262. RECONCILIATION_BACKLOG is closed at its
+# 2026-09-23 contents and this file was NOT added to it.
+#
+# NOT YET PUSHED WHEN THIS LINE WAS WRITTEN: the gate that produced it
+# authorized implementation and local verification only. Until 330f64f is
+# pushed, CI fails at 'governance commit is not reachable', which is the pin
+# working. Push the governance commit before this public commit.
+# 8758b65 -- the staleness detector can finally reach the database it audits.
+# Both existing tests take their connection from get_connection(), the LOCAL
+# database, so a file applied to Railway alone was invisible to them. Measured
+# 2026-10-10 in ONE run: they caught auth_otp_trust_boundary.sql because that
+# apply was local, and missed append_only_schema_attestations.sql because that
+# one was Railway only.
+#
+# ONE FILE, ADDITIVE, +74/-0: _railway_conn() and one test. attested_applied()
+# and declared_pending() are reused unchanged and the two existing tests are
+# untouched.
+#
+# THE SKIP AND FAIL CONTRACT IS THE CONTROL, not the query. An absent
+# RAILWAY_DB_URL is a declared skip. A CONFIGURED endpoint that cannot be
+# reached is a FAILURE, so the connect is deliberately unguarded -- the helper
+# has ZERO except handlers, which is the visible difference from the local
+# tests at lines 135 and 182 that skip on a connection error. Only a genuinely
+# missing table may skip, asked with to_regclass because it answers NULL
+# instead of raising. Exercised, not reasoned: absent DSN skipped with the
+# exact reason and get_connection was called zero times; 127.0.0.1:1 failed;
+# a table present with SELECT denied failed with 42501; and a declaration
+# flipped to PENDING in an in-memory copy was named by the detector.
+#
+# AVAILABILITY IS NOT ENFORCEMENT. This pin makes the test present in a
+# pin-driven checkout. verify_gate executes CONTROL_TESTS only, and this file
+# is deliberately NOT in it: adding it would give CI a dependency on
+# production connectivity and credentials, which needs its own security and
+# reliability review. Ruled 2026-10-10. Do not add it as a convenience.
+#
+# 8758b65 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-11 00:27 UTC before this line was written.
+# e13f163 -- STAGE 1 of the scheduled production-governance audit, and only
+# stage 1. PENDING_MARKER, RECONCILIATION_BACKLOG and declared_pending() move
+# out of tests/test_pending_declaration_is_not_stale.py into
+# app/core/deploy_state.py, which this commit pairs with.
+#
+# WHY THE POLICY HAD TO MOVE. governance/ is gitignored and tracks zero files
+# in the public repository, so the deployed application cannot import the
+# detector. A scheduled audit could not reach the permitted-exception list
+# without a second copy of it, and two copies of a closed list is how the copy
+# nobody watches goes stale. In the shipped module, an audit and the detector
+# evaluate the same object: version skew between them is not possible.
+#
+# RELOCATED BYTE-FOR-BYTE, rationale included, rather than retyped. Six tests
+# were added because the three existing ones assert only that the DIFFERENCE
+# between pending and the backlog is empty -- a predicate returning a
+# different set would leave them green. They pin the marker and all 16 backlog
+# members verbatim, re-derive the pending set independently instead of
+# freezing today's 26 (a frozen count is a census pin that fails for the right
+# reason and gets deleted for the wrong one), prove the marker is positional
+# after normalising, and prove that withdrawing one backlog member surfaces
+# that artifact -- the test that shows the shared set is actually consulted.
+#
+# NO AUDIT BEHAVIOUR. No scheduler job, no notification classifier entry, no
+# audit module, no migration, no database write. Stage 2 is separately gated
+# and NOT authorized by this commit.
+#
+# e13f163 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-11 01:48 UTC before this line was written.
+
+# 01af7d8 -- the acceptance tests for the hourly production declaration
+# audit (app/core/governance_audit.py, added in the same commit as this
+# line). 893 lines, one new file, nothing else touched.
+#
+# WHY THE TWO CANNOT BE SPLIT. The tests import app.core.governance_audit
+# and read the CronTrigger registration out of the source of lifespan(), so
+# they describe exactly the application commit that carries this pin.
+#
+# WHAT THEY HOLD. Most of the file is about the cases where the audit CANNOT
+# run, because the answer is only worth having if "nothing to report" and
+# "could not tell" are never confused: a revoked SELECT is a source error
+# and not an absent table (asserted on SQLSTATE 42501 and
+# diag.source_function = aclcheck_error, from a real role holding no
+# privilege); a configured endpoint that cannot be reached fails rather than
+# skipping; total database unavailability raises and says the finding is NOT
+# in governance_alerts; an unconfigured audit is neither clean nor a skip;
+# and all three fail-closed policy guards are asserted on the guard that
+# refused rather than on the fact of a refusal.
+#
+# NOT A CONTROL_TESTS ENTRY. The gate is unchanged at 223 passed, 2 skipped.
+# Three of these tests build real databases and one needs a cluster role, so
+# admitting them to the gate needs its own review; that is a separate,
+# un-started changeset.
+#
+# 01af7d8 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-11 03:59 UTC before this line was written.
+
+# c92c0c0 -- the tests for the fail-closed outcome correction, two updated
+# and two added. One file, +195/-15.
+#
+# WHY THE TWO CANNOT BE SPLIT. The updated tests expect
+# AuditNotConfigured and AuditSourceAbsent, which only exist in the
+# application commit that carries this pin. Against the previous tree they
+# fail; against the previous tests the new application code fails.
+#
+# WHAT CHANGED AND WHY. Two of the audit exits RETURNED where they should
+# have raised: a missing GOV_AUDIT_DB_URL and an absent
+# public.schema_attestations. job_ledger._wrap records ANY return as an `ok`
+# row with no detail, so an audit that examined none of its required
+# evidence was recorded exactly like one that examined all of it and found
+# nothing. Measured in production: five consecutive runs at 1-6 ms, status
+# ok, examining nothing.
+#
+# THE DISCRIMINATOR IS THE EXCEPTION CLASS NAME.
+# scheduled_job_runs.status is CHECK-constrained to five values, so a sixth
+# outcome-specific status would need a migration. _wrap already writes
+# "<ClassName>: <message>" into `detail`, and the test asserts the token
+# survives the exact transformation record() applies, scrub(detail[:500]).
+#
+# THE ALERT PATH ALREADY EXISTED. _last_success_map counts only
+# ok/caught_up/baseline, so an error row leaves the job with no recent
+# success, job_ledger.audit() reports it overdue, /health publishes that and
+# health_watch.py already alerts on it. The new test proves this through the
+# real audit() against a disposable ledger, in two arms, and is falsified by
+# adding "error" to that status list.
+#
+# STILL OPEN, and not addressed here: health_watch skips the whole overdue
+# block when /health answers from a FOLLOWER, so the signal is durable and
+# observable but not yet guaranteed to be delivered. That is Issue E.
+#
+# c92c0c0 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-11 23:42 UTC before this line was written.
+
+# 5c103d8 -- the tests for Issue E Stage 1: the health monitor may not report
+# healthy on a response that carried no scheduler evidence. One new file, 391
+# lines, 20 tests.
+#
+# WHY THE TWO CANNOT BE SPLIT. The tests import scripts.health_watch and
+# assert on facts["scheduler_evidence_authoritative"] and on
+# first_attempt_problems, neither of which exists before the application
+# commit that carries this pin.
+#
+# THE DEFECT, MEASURED from the monitor's own log: of 2,989 checks, 899 (30%)
+# reached an HA follower holding no scheduler state, and 829 of those were
+# recorded HEALTHY. The longest follower-only run was 12 consecutive checks,
+# 3h23m, every one healthy, with a leader answering before and after.
+#
+# FOUR CONDITIONS, NOT ONE. identity / running / assessment_present /
+# assessment_fresh, each asserted by a case that fails only that one, so
+# collapsing them is killed by exactly those cases. Falsified: four source
+# mutations each kill tests, and the file was restored byte-identically.
+#
+# NOT A NEW FALSE ALARM. A routing re-poll is deliberately not counted as a
+# service flap; three flaps in 24h raise the repeated-restart alert, and 30%
+# of checks now re-poll for routing.
+#
+# STAGE 2 IS NOT IMPLEMENTED. Authority is still unobtainable on a follower;
+# this makes its absence impossible to mistake for health. Issue E is NOT
+# resolved until the evidence can be obtained despite routing.
+#
+# 5c103d8 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-12 01:40 UTC before this line was written.
+
+# 8b8420e -- the tests for Gate A: a failed read of the evidence may not look
+# like proof of health. One new file, 14 tests.
+#
+# REBASED ONTO 5c103d8, which is what this line originally anticipated. Gate A
+# was first published as 4511cbf on top of c92c0c0, deliberately NOT on the
+# Issue E Stage 1 commit: 5c103d8 carries test_health_watch_authority.py, whose
+# assertions need a scripts/health_watch.py that Gate A does not contain, so a
+# Gate A PR pinned there would have failed CI on an unrelated gate.
+#
+# PR #112 then merged, which moved master's pin to 5c103d8 and put the two
+# lines in conflict. Resolved by rebasing rather than by choosing a side: the
+# pinned tree now carries BOTH test files. Choosing either side would have
+# silently dropped a suite from CI, and "accept both" would have left two SHA
+# lines, of which the parser (grep -v comments | tail -1) takes only the last.
+# Blobs verified unchanged by the rebase: Gate A 11068fbc, Stage 1 17f7611b.
+#
+# THE DEFECT. _last_success_map() returned {} on a query FAILURE, which is also
+# what a successful query over an empty table returns. audit() then reported
+# `overdue: []` with a fresh timestamp and `ledger: ok`, and /health published
+# the empty list while discarding `unknown` -- so a database failure was
+# published as evidence that every scheduled job was fine. Stage 1 does not
+# catch this: it covers ABSENT evidence, not FALSE evidence.
+#
+# WORSE IN CATCH-UP. There `seen is None` means "first sighting, seed a
+# baseline instead of running", so a failed read wrote a baseline row for EVERY
+# job -- and that function counts baseline as a success. Measured before the
+# fix: 3 of 3 jobs seeded. A failed READ may never authorize a write that
+# represents successful observation.
+#
+# FIVE MUTATIONS, ALL KILL TESTS. The first killed NOTHING at first, because
+# every test replaced _last_success_map wholesale and none exercised its own
+# except branch; two tests were added that drive the real function with a real
+# psycopg2 error injected at the cursor.
+#
+# NOT INCLUDED: the monitor side. Requiring evidence_complete is True in
+# health_watch.py is Gate A commit 2 and must not ship before this contract is
+# DEPLOYED, or the monitor goes non-authoritative against a backend that cannot
+# yet answer. Issue E remains open.
+#
+# 8b8420e was pushed to feat/p0-p1-governance-remediation as a fast-forward
+# from 5c103d8 and its remote resolution verified with ls-remote at
+# 2026-10-12 03:20 UTC before this line was written.
+
+# b1edb93 -- Gate A commit 2, the consumer side. Commit 1 taught /health to
+# publish evidence_complete; this requires the monitor to read it.
+#
+# ORDER MATTERS AND HAS BEEN OBSERVED. Commit 1 merged as 933a4b9 and was
+# DEPLOYED and verified on a leader before this was written:
+# evidence_complete true, unknown_jobs [], overdue_jobs [], fresh
+# overdue_checked_at. Shipping this first would have made the monitor
+# non-authoritative against a backend that could not yet answer.
+#
+# `is True`, NOT `is not False`. A backend that does not publish the field
+# cannot say whether its evidence query succeeded, and an unanswerable
+# question is not an affirmative answer. Version skew is reported under its
+# own name -- too old to say, versus new enough to say it failed -- and stays
+# non-authoritative either way.
+#
+# FIXTURES UPDATED DELIBERATELY. leader() now carries the contract fields;
+# seven Stage 1 tests failed against the new predicate until it did, which is
+# correct. pre_contract_leader() keeps the old shape as its own case.
+#
+# UNKNOWN JOBS ARE A FINDING, NOT A VERDICT. They are surfaced and named, but
+# worded as "health cannot be established" -- an unassessed job is not
+# evidence that the job is failing. Only overdue_jobs and failed_jobs_24h
+# assert that something is actually wrong.
+#
+# THREE MUTATIONS, ALL KILL TESTS. One revert failed silently mid-run because
+# its output was suppressed, leaving query_ok deleted; caught by comparing the
+# blob to the pre-mutation hash rather than by trusting the loop.
+#
+# ISSUE E IS STILL OPEN. Authority remains unobtainable on a follower, which
+# is Gate B.
+#
+# b1edb93 was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-12 03:40 UTC before this line was written.
+
+# c6a20fb -- the diagnostic precision correction. Found by replaying REAL
+# production payloads through the merged monitor rather than fixtures: a
+# FOLLOWER publishes evidence_complete false with evidence_never_succeeded
+# true and NO evidence_error, and the monitor called that "the backend reports
+# its evidence query did NOT succeed". The follower never ran an assessment;
+# describing that as a query failure invents a database fault out of ordinary
+# HA routing.
+#
+# FOUR STATES, each named for what the payload establishes: contract
+# unavailable; no assessment made here; the assessment failed, with its
+# reason; incomplete without a stated reason. The last is the converse guard --
+# an ABSENT evidence_error must not be read as a failure.
+#
+# THE AUTHORITY DECISION IS UNCHANGED and that is asserted, not assumed: all
+# four states were non-authoritative before and still are, and identity,
+# running, retry behaviour and transient-routing classification are exercised
+# again unchanged.
+#
+# TWO EARLIER ASSERTIONS LOOSENED on purpose. test_15 and test_17 pinned the
+# literal phrase "did NOT succeed"; a test pinned to a sentence blocks the
+# correction of that sentence. They now assert the meaning instead.
+#
+# LIVE_FOLLOWER is the exact payload /health returned on 2026-10-12 after Gate
+# A deployed, replayed through check()/check_confirmed() only -- main() is
+# never called, so no mail is sent and no state file is written.
+#
+# ISSUE E IS STILL OPEN: evidence remains unobtainable on a follower (Gate B).
+#
+# c6a20fb was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-12 04:25 UTC before this line was written.
