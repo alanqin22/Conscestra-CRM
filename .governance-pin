@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-b1edb93b0684a41aa6e17029f226080f38cf2a8f
+c6a20fb5207492d5a972e68d06cf131ff0434793
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -764,3 +764,34 @@ b1edb93b0684a41aa6e17029f226080f38cf2a8f
 #
 # b1edb93 was pushed first and its remote resolution verified with ls-remote
 # at 2026-10-12 03:40 UTC before this line was written.
+
+# c6a20fb -- the diagnostic precision correction. Found by replaying REAL
+# production payloads through the merged monitor rather than fixtures: a
+# FOLLOWER publishes evidence_complete false with evidence_never_succeeded
+# true and NO evidence_error, and the monitor called that "the backend reports
+# its evidence query did NOT succeed". The follower never ran an assessment;
+# describing that as a query failure invents a database fault out of ordinary
+# HA routing.
+#
+# FOUR STATES, each named for what the payload establishes: contract
+# unavailable; no assessment made here; the assessment failed, with its
+# reason; incomplete without a stated reason. The last is the converse guard --
+# an ABSENT evidence_error must not be read as a failure.
+#
+# THE AUTHORITY DECISION IS UNCHANGED and that is asserted, not assumed: all
+# four states were non-authoritative before and still are, and identity,
+# running, retry behaviour and transient-routing classification are exercised
+# again unchanged.
+#
+# TWO EARLIER ASSERTIONS LOOSENED on purpose. test_15 and test_17 pinned the
+# literal phrase "did NOT succeed"; a test pinned to a sentence blocks the
+# correction of that sentence. They now assert the meaning instead.
+#
+# LIVE_FOLLOWER is the exact payload /health returned on 2026-10-12 after Gate
+# A deployed, replayed through check()/check_confirmed() only -- main() is
+# never called, so no mail is sent and no state file is written.
+#
+# ISSUE E IS STILL OPEN: evidence remains unobtainable on a follower (Gate B).
+#
+# c6a20fb was pushed first and its remote resolution verified with ls-remote
+# at 2026-10-12 04:25 UTC before this line was written.
