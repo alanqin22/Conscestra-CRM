@@ -248,6 +248,44 @@ SELECT count(*) FROM auth_secrets WHERE secret_key = 'otp_pepper';          -- 1
 BEGIN; SELECT fn_otp_issue(...); ROLLBACK;   -- must return status 'ok'
 ```
 
+### 4b-2. MANDATORY — close the SECURITY DEFINER boundary before serving
+
+**The dump is taken `--no-owner --no-acl`, so a restored database has no
+function privileges at all and every SECURITY DEFINER function is born
+executable by PUBLIC.** Measured on a database restored from the 2026-10-16
+dump: 22 of 22 open, including credential functions reachable by any role that
+can connect.
+
+A SECURITY DEFINER function runs with its OWNER's privileges, so this is not a
+cosmetic difference — it hands every principal whatever those functions can do
+until it is corrected.
+
+**The database event trigger does not save you here.** It closes functions at
+`CREATE`/`ALTER` time, but it is itself just an object in the restore stream:
+anything restored before it is never seen by it. Measured directly. That is why
+this step exists and why it is before §4c.
+
+```powershell
+python -m scripts.check_definer_boundary
+```
+
+It reads `DEFINER_CHECK_DSN`, then `DATABASE_URL`, then `DB_DSN`, and prints
+which one it used — so there is no doubt which database was checked.
+
+| Exit | Meaning | Action |
+|---|---|---|
+| **0** | no SECURITY DEFINER function is executable by PUBLIC | proceed to §4c |
+| **1** | at least one is, and each is named | **do not scale the app up.** Run `python -m scripts.migrate`: the chain carries `app_definer_function_grants.sql` and `definer_public_execute_boundary.sql`, which re-establish the named application grants and then close PUBLIC. Measured on a restored database: both apply cleanly with no operator step first, and the check then returns 0. For a function named here that those two do not cover, re-apply the artifact that owns it -- never a blanket grant |
+| **2** | the check could not run | **do not proceed.** A check that could not run is not a check that passed |
+
+**Exit 0 is required before §4c.** Do not issue a blanket grant to clear a
+failure: grant to the one named role that needs the function, or re-apply the
+artifact that owns it.
+
+**Scope.** `SECURITY INVOKER` functions are deliberately out of scope — they
+run with the caller's own privileges and hundreds are PUBLIC-executable by
+design. This step is about `prosecdef` functions only.
+
 ### 4c. Then bring the app back
 
 Scale the app back up and confirm `/health` returns 200 with

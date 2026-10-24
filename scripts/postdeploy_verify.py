@@ -697,7 +697,23 @@ def main(argv: Optional[list] = None) -> int:
               # own role any more. They exist today only because they predate
               # the privilege separation; the next one added will be inert in
               # production and silent about it.
-              ("runtime ddl", "scripts.verify_runtime_ddl", ())]
+              ("runtime ddl", "scripts.verify_runtime_ddl", ()),
+              # The SECURITY DEFINER PUBLIC-EXECUTE boundary, against the
+              # DEPLOYED database. CI asserts the same invariant, but only
+              # over a database built from the declared chain: it cannot see
+              # a GRANT issued directly against production, a function in a
+              # schema the chain does not create, or anything a restore left
+              # open. Those are exactly the paths an event trigger cannot
+              # intercept either, so this is the only place they are caught.
+              #
+              # A FAILURE HERE FAILS THE DEPLOY VERIFICATION. The stage loop
+              # below appends to `failures`, and main() returns 1 if any
+              # failure is present -- so this blocks completion rather than
+              # merely reporting. Exit 2 (the check could not run) is also
+              # non-zero and is likewise a failure, by design: a check that
+              # could not run is not a check that passed.
+              ("security definer public-execute boundary",
+               "scripts.check_definer_boundary", ())]
 
     failures = list(early_fail)
     for name, module, args in stages:
