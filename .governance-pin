@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-c6a20fb5207492d5a972e68d06cf131ff0434793
+58b1699023873986682c2b2335e9115913fd672d
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -795,3 +795,26 @@ c6a20fb5207492d5a972e68d06cf131ff0434793
 #
 # c6a20fb was pushed first and its remote resolution verified with ls-remote
 # at 2026-10-12 04:25 UTC before this line was written.
+
+# 58b1699 -- the five SQL artifacts deploy_state already DECLARED but that
+# no pin could reach. They existed only as untracked files in a local
+# governance working copy, so CI's clone at c6a20fb contained no such files
+# and scripts.migrate refused with CLASSIFIED BUT ABSENT FROM DISK. A
+# declaration and its artifact are two halves of one statement; this moves
+# the half that was missing.
+#
+# EXACTLY FIVE were committed: authority_envelope, canonical_identity,
+# invoice_issued_followup, mutation_governance, synthetic_order_provenance.
+# Two further untracked SQL files in that directory --
+# app_definer_function_grants and definer_public_execute_boundary -- are
+# declared only in an UNCOMMITTED revision of deploy_state.py. Committing
+# them would place undeclared files in the corpus and fail the same
+# invariant in the opposite direction, as UNCLASSIFIED. The manifest and
+# the pin have to move together or they fail one way or the other.
+#
+# The local checkout was 6 commits BEHIND this pin before the
+# fast-forward. Those 6 commits touched 3 test files and none of the
+# staged paths, and the 12 locally modified files did not overlap them.
+#
+# 58b1699 was pushed first and its remote resolution verified with
+# ls-remote at 2026-10-24 01:04 UTC before this line was written.
