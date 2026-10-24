@@ -735,8 +735,24 @@ _PENDING_INVOICE_ISSUED_FOLLOWUP = (
     "about invoice.status semantics. Not applied to crmdb.")
 
 _APPLIED_LOCAL_CANCELLATION_REVERSAL = (
-    "APPLIED TO LOCAL railwayl2 2026-10-05 22:28:16 -04 "
-    "(schema_attestations id 171); NOT YET ON RAILWAY. "
+    "PENDING DEPLOYMENT on both databases. CURRENT OBSERVED STATE, 2026-10-16: "
+    "all three objects this file creates -- fn_authorize_reversal, "
+    "trgfn_orders_reversal_guard and the trigger trg_orders_reversal_guard -- "
+    "are ABSENT from railwayl2, probed exhaustively. On Railway the artifact is "
+    "NOT DEPLOYED: fn_authorize_reversal is recorded absent there. The other "
+    "two objects were NOT individually re-observed on Railway in the gate that "
+    "wrote this sentence, which did not authorize a production query, so their "
+    "absence there is inferred from the artifact's rather than observed. "
+    "HISTORICAL RECORD, NOT WITHDRAWN. This declaration previously opened "
+    "'APPLIED TO LOCAL railwayl2 2026-10-05 22:28:16 -04 (schema_attestations "
+    "id 171); NOT YET ON RAILWAY'. That apply is not retracted: what changed is "
+    "that its objects did not survive. railwayl2 has since been rebuilt from a "
+    "Railway dump -- its 173 tables occupy one contiguous OID band and all 26 "
+    "of its schema_attestations rows carry database='railway' -- so the ledger "
+    "that held id 171 is gone with it. Attestation id 171 is therefore "
+    "HISTORICALLY UNVERIFIABLE, not disproven; it is kept here as the record of "
+    "that apply and has NOT been recreated. An attestation records that an "
+    "apply ran, not that its objects survived. "
     "Authored 2026-09-20. Reversing a cancellation, "
     "governed at the same boundary: fn_authorize_reversal, the reversal guard, "
     "and the operation discriminator that keeps the two apart. "
@@ -837,8 +853,21 @@ _PENDING_SYNTHETIC_ORDER_PROVENANCE = (
     "it intact.")
 
 _APPLIED_LOCAL_CANCELLATION_ENFORCEMENT = (
-    "APPLIED TO LOCAL railwayl2 2026-10-05 22:28:15 -04 "
-    "(schema_attestations id 170); NOT YET ON RAILWAY. "
+    "PENDING DEPLOYMENT on both databases. Reconciled against the live "
+    "catalogue of each database on 2026-10-16: cancellation_authorization, "
+    "fn_authorize_cancellation and fn_cancellation_proposition are ABSENT "
+    "from railwayl2 and ABSENT from Railway. "
+    "THIS DECLARATION PREVIOUSLY OPENED 'APPLIED TO LOCAL railwayl2 "
+    "2026-10-05 22:28:15 -04 (schema_attestations id 170); NOT YET ON "
+    "RAILWAY'. The local apply is not withdrawn as history -- what changed is "
+    "that its objects did not survive. railwayl2 has since been rebuilt from "
+    "a Railway dump: its 173 tables occupy one contiguous OID band "
+    "(14803248..14806167), and its schema_attestations holds 26 rows whose "
+    "`database` column reads 'railway' in every one, so the ledger that "
+    "carried id 170 is gone with it. Attestation id 170 is therefore "
+    "UNVERIFIABLE rather than false, it is recorded here as history only, and "
+    "it has NOT been recreated. An attestation records that an apply ran, not "
+    "that its objects survived. "
     "Authored 2026-09-19. The enforcement half of the "
     "cancellation boundary: cancellation_authorization, "
     "fn_authorize_cancellation, and the triggers that govern a row entering "
@@ -863,8 +892,25 @@ _APPLIED_LOCAL_CANCELLATION_ENFORCEMENT = (
     "not obtain authority can no longer cancel. It is not applied to crmdb.")
 
 _APPLIED_LOCAL_CANCELLATION_AUTHORITY = (
-    "APPLIED TO LOCAL railwayl2 2026-10-06 11:15:15 -04 "
-    "(schema_attestations id 188); NOT YET ON RAILWAY. "
+    "PENDING DEPLOYMENT on both databases. CURRENT OBSERVED STATE, 2026-10-16: "
+    "all ten objects this file creates -- the tables cancellation_path and "
+    "order_cancel_staff_authority, the functions fn_cancellation_authority, "
+    "fn_cancellation_proposition, fn_cancellable_states, "
+    "fn_cancellation_operations, fn_cancellation_verdicts and "
+    "trgfn_cancellation_path_append_only, the trigger "
+    "trg_cancellation_path_append_only and the view v_cancellation_boundary -- "
+    "are ABSENT from railwayl2, probed exhaustively. On Railway the artifact is "
+    "NOT DEPLOYED: both tables and fn_cancellation_authority and "
+    "fn_cancellation_proposition are recorded absent there. The remaining six "
+    "objects were NOT individually re-observed on Railway in the gate that "
+    "wrote this sentence, which did not authorize a production query. "
+    "HISTORICAL RECORD, NOT WITHDRAWN. This declaration previously opened "
+    "'APPLIED TO LOCAL railwayl2 2026-10-06 11:15:15 -04 (schema_attestations "
+    "id 188); NOT YET ON RAILWAY'. That apply is not retracted: what changed is "
+    "that its objects did not survive the rebuild of railwayl2 from a Railway "
+    "dump, which also replaced the attestation ledger that held id 188. "
+    "Attestation id 188 is therefore HISTORICALLY UNVERIFIABLE, not disproven; "
+    "it is kept as the record of that apply and has NOT been recreated. "
     "Authored 2026-09-19. The cancellation boundary: "
     "fn_cancellation_authority, the verdict and cancellable-state vocabularies, "
     "and the cancellation_path register. "
@@ -1338,6 +1384,19 @@ _APPLIED_AUTH_OTP_TRUST_BOUNDARY = (
     "reapplication as a parity repair; assess the restore and "
     "secret-provisioning requirements through a separate authorized "
     "preflight. "
+    "THAT CONDITION IS THE MEASURED STATE OF railwayl2, stated in the "
+    "indicative because the sentences above state it only conditionally. "
+    "Reconciled against the live catalogue of each database on 2026-10-16: "
+    "Railway holds all four objects -- auth_secrets, auth_otp_challenges, "
+    "fn_otp_issue and fn_session_create_otp. railwayl2 holds three of the "
+    "four and auth_secrets is ABSENT, which is what the backup policy above "
+    "produces and is not evidence against the apply. The consequence is "
+    "recorded rather than left to be derived: on railwayl2 the two SECURITY "
+    "DEFINER functions reference a table that is not there, so local OTP has "
+    "an unresolved dependency until docs/runbook_restore.md section 4b -- "
+    "recreate auth_secrets and re-provision the pepper -- is performed and "
+    "verified. That step has NOT been performed on railwayl2, and nothing in "
+    "this declaration should be read as saying the dependency is restored. "
     "_PENDING_AUTH_OTP_TRUST_BOUNDARY is left defined and unused, as "
     "_PENDING_POLICY_DELETION_LOG and nine other superseded names are: its "
     "sentence that it was applied nowhere, not even locally, was true when "
@@ -1510,6 +1569,48 @@ _CATCHUP = (
 
 # filename -> why it is NOT a governed migration. Reasons beginning REVIEW are
 # open questions for a human, not settled answers.
+_APPLIED_APP_DEFINER_FUNCTION_GRANTS = (
+    "APPLIED TO PRODUCTION (`railway`) on 2026-10-20 01:12:55 UTC, with a "
+    "schema_migrations row, because it was applied through migrate.py while "
+    "it was briefly declared governed. It is out-of-band now and migrate "
+    "will refuse it; the row stays as the historical record of the apply. "
+    "NOT applied to the local `railwayl2` restore. "
+    "WHAT IT IS. A named EXECUTE grant to crm_app on the twenty in-scope "
+    "SECURITY DEFINER functions in public. The boundary migration revokes "
+    "PUBLIC from those functions, and on a freshly built database the "
+    "application reaches them ONLY through PUBLIC -- their proacl is NULL -- "
+    "so revoking without this first takes crm_app from 20/20 to 0/20. "
+    "WHY OUT OF BAND. REQUIRED_MIGRATIONS obliges the baseline to carry the "
+    "entry, and the baseline is dumped --no-privileges because CI has no "
+    "crm_app role to grant to. A grant-based migration therefore cannot be "
+    "governed under the present baseline and gate design. Enforcement is "
+    "scripts/check_definer_boundary.py, run against the DEPLOYED database by "
+    "scripts/postdeploy_verify.py, where a failure fails the deploy."
+)
+
+_APPLIED_DEFINER_PUBLIC_EXECUTE_BOUNDARY = (
+    "APPLIED TO PRODUCTION (`railway`) on 2026-10-20 01:12:55 UTC, with a "
+    "schema_migrations row, for the same reason as its grant pair. "
+    "VERIFIED ON THE OBJECTS, not on the row, on 2026-10-24: of the "
+    "twenty-two SECURITY DEFINER functions in public, zero are executable by "
+    "PUBLIC, twenty-two carry a named EXECUTE grant to crm_app, and none has "
+    "a NULL proacl. A ledger row records that an apply ran, not that its "
+    "objects survived. "
+    "NOT applied to the local `railwayl2` restore, where all twenty-two are "
+    "still open: the dump is taken --no-owner --no-acl, so a restored "
+    "database carries no function privileges at all. "
+    "ON A RESTORED DATABASE THIS IS A TRIPLE, NOT A PAIR. "
+    "auth_otp_trust_boundary.sql must run first, or this refuses on "
+    "fn_otp_issue and fn_session_create_otp, which are in its "
+    "v_known_external set. Measured on a restored copy in a rolled-back "
+    "transaction: the pair alone refuses; with the OTP boundary first, "
+    "PUBLIC reach goes 22 -> 20 -> 20 -> 0 while crm_app reach stays 22. "
+    "THE BYTES ARE IMMUTABLE. Both files hash to the checksums recorded in "
+    "production's schema_migrations, 472adc85a3756281 and 8af55780fd082040. "
+    "The ledger stores sha256(bytes)[:16], so editing even a comment would "
+    "make `migrate --check` report drift on every database carrying them."
+)
+
 OUT_OF_BAND_SQL: Dict[str, str] = {
     "account_intelligence.sql": _SCHEMA_OOB,
     "accounting_invoice_pipeline.sql": (
@@ -1525,6 +1626,8 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "agent_playbooks.sql": _SCHEMA_OOB,
     "agent_sequences.sql": _SCHEMA_OOB,
     "agent_tuning.sql": _SCHEMA_OOB,
+    "app_definer_function_grants.sql": (
+        _APPLIED_APP_DEFINER_FUNCTION_GRANTS),
     "append_only_revokes.sql": _SCHEMA_OOB,
     "append_only_revokes_fix.sql": _SCHEMA_OOB,
     "append_only_schema_attestations.sql": _APPLIED_APPEND_ONLY_ATTEST,
@@ -1553,6 +1656,8 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # Out-of-band is the correct disposition — a clean database must NOT
     # replay it, because a fresh environment has no such grants and should not
     # acquire email-enabled recipients by being created.
+    "definer_public_execute_boundary.sql": (
+        _APPLIED_DEFINER_PUBLIC_EXECUTE_BOUNDARY),
     "employee_work_email_activation.sql": (
         _APPLIED_EMPLOYEE_WORK_EMAIL_ACTIVATION),
     # An owner id may never equal the employee id it links to. Reusing one as
