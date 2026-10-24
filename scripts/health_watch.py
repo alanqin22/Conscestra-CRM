@@ -137,6 +137,62 @@ ALERT_ON_GAP = os.getenv("HEALTH_ALERT_ON_GAP", "0").strip().lower() in (
     "1", "true", "yes", "on")
 
 
+# ── incident classification ──────────────────────────────────────────────────
+#
+# WHY A TAXONOMY AND NOT JUST A PROBLEM LIST. On 2026-10-12 at 19:16:32Z this
+# monitor exhausted its retries against an HA follower, correctly refused the
+# incomplete evidence, failed closed, and mailed "2 problem(s)". The service was
+# healthy throughout; the probe simply never reached the leader. The refusal was
+# right and the LABEL was wrong, and a reader cannot act on a label that does
+# not say which system failed.
+#
+# THE CENTRAL RULE, which this does not relax: missing authoritative evidence
+# must never become proof of service health -- and it must not become proof of
+# service failure either. Every class below except OK is unhealthy.
+#
+#   SERVICE              the service answered and its answer establishes a
+#                        failure, or a directly observed operational failure
+#                        (a stale backup, repeated restarts)
+#   EVIDENCE_UNAVAILABLE the service answered, but no authoritative scheduler
+#                        assessment could be obtained. Coverage is unknown.
+#   UNDETERMINED         the service made no usable statement at all -- no HTTP
+#                        response, or a response that is not JSON. The condition
+#                        cannot be determined, which is NOT the same as either
+#                        of the two above.
+#   MONITORING           this monitor did not run when it should have. It cannot
+#                        witness its own absence in real time, but it can see a
+#                        gap behind it.
+#
+# A confirmed application failure and an inconclusive probe are deliberately
+# different classes: one sends you to the application, the other to the network
+# or to this monitor.
+CLS_SERVICE = "SERVICE"
+CLS_EVIDENCE = "EVIDENCE_UNAVAILABLE"
+CLS_UNDETERMINED = "UNDETERMINED"
+CLS_MONITORING = "MONITORING"
+CLS_OK = "OK"
+
+# Most urgent first. A confirmed failure outranks an inability to determine one,
+# which outranks missing coverage evidence, which outranks a gap behind us.
+CLASS_PRECEDENCE = (CLS_SERVICE, CLS_UNDETERMINED, CLS_EVIDENCE, CLS_MONITORING)
+
+# One line per class, carried into the alert so the reader is told which system
+# to go to before reading any problem text.
+_MEANING = {
+    CLS_SERVICE: ("A failed condition was ESTABLISHED by evidence. Go to the "
+                  "application."),
+    CLS_EVIDENCE: ("The service answered, but no authoritative scheduler "
+                   "assessment could be obtained, so scheduled-control "
+                   "coverage is UNKNOWN for this check. This is not an "
+                   "established outage, and not a clean result either."),
+    CLS_UNDETERMINED: ("The service made no usable statement, so its condition "
+                       "could not be determined. Check connectivity and this "
+                       "monitor before assuming an outage."),
+    CLS_MONITORING: ("This monitor did not run when it should have. The gap is "
+                     "unobserved, not quiet."),
+}
+
+
 # ── the checks ───────────────────────────────────────────────────────────────
 
 def _age_minutes(ts: Any) -> Optional[float]:
@@ -155,8 +211,19 @@ def _age_minutes(ts: Any) -> Optional[float]:
 def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
     """Return (problems, facts). Empty problems means healthy."""
     problems: List[str] = []
+    # THE CLASS IS RECORDED WHERE THE PROBLEM IS RAISED. It used to be inferred
+    # afterwards from which return path ran, which defaulted every parsed-payload
+    # problem to SERVICE -- and three problems below are evidence-availability
+    # failures, not established service failures. A healthy leader whose audit
+    # cache had gone stale was therefore reported as a confirmed outage.
+    classes: List[str] = []
     facts: Dict[str, Any] = {"url": url,
                              "checked_at": datetime.now(timezone.utc).isoformat()}
+
+    def _add(cls: str, text: str) -> None:
+        problems.append(text)
+        classes.append(cls)
+
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "health_watch"})
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
@@ -166,37 +233,42 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
         code, body = exc.code, exc.read().decode("utf-8", "replace")
     except Exception as exc:                                    # noqa: BLE001
         # Unreachable is the loudest possible result and must never be silent.
-        problems.append(f"UNREACHABLE: {type(exc).__name__}: {exc}")
+        _add(CLS_UNDETERMINED, f"UNREACHABLE: {type(exc).__name__}: {exc}")
         facts["reachable"] = False
+        facts["problem_classes"] = list(classes)
         return problems, facts
 
     facts["reachable"] = True
     facts["http_status"] = code
     if code != 200:
-        problems.append(f"HTTP {code} (503 means the database query failed)")
+        _add(CLS_SERVICE, f"HTTP {code} (503 means the database query failed)")
 
     try:
         h = json.loads(body)
     except Exception:                                           # noqa: BLE001
-        problems.append("response was not JSON — is this the right URL?")
+        _add(CLS_UNDETERMINED, "response was not JSON — is this the right URL?")
+        facts["problem_classes"] = list(classes)
         return problems, facts
+    # Recorded so classification can tell "the service said something bad" from
+    # "the service said nothing usable" WITHOUT matching on problem text.
+    facts["payload_parsed"] = True
 
     db = h.get("database") or {}
     facts["db_ok"] = db.get("ok")
     facts["connected_as"] = db.get("connected_as")
     if db.get("ok") is False:
-        problems.append(f"database not answering: {str(db.get('error'))[:120]}")
+        _add(CLS_SERVICE, f"database not answering: {str(db.get('error'))[:120]}")
     if EXPECT_ROLE and db.get("connected_as") and db["connected_as"] != EXPECT_ROLE:
         # Not a crash — a silently weaker security posture, which is worse
         # because nothing else will report it.
-        problems.append(f"app connected as '{db['connected_as']}', expected "
+        _add(CLS_SERVICE, f"app connected as '{db['connected_as']}', expected "
                         f"'{EXPECT_ROLE}' — privilege separation may be off")
 
     ha = h.get("ha") or {}
     role = ha.get("role")
     facts["ha_role"] = role
     if role == "unelected":
-        problems.append("leader election never completed (ha.role=unelected)")
+        _add(CLS_SERVICE, "leader election never completed (ha.role=unelected)")
 
     sched = h.get("scheduler") or {}
     facts["scheduler_running"] = sched.get("running")
@@ -298,7 +370,7 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
     # bypass wearing the costume of a check.
     if coverage["identity"]:
         if sched.get("running") is False:
-            problems.append("scheduler is not running on the leader")
+            _add(CLS_SERVICE, "scheduler is not running on the leader")
 
         # `running` is a flag set once at startup; `alive` is the scheduler
         # object answering for itself. If APScheduler's thread dies, the flag
@@ -308,7 +380,7 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
         if alive is not None:
             facts["scheduler_alive"] = alive
             if alive is False:
-                problems.append(
+                _add(CLS_SERVICE, 
                     "scheduler.alive=false — APScheduler has stopped inside a "
                     "process that still reports running=true; no job will fire "
                     "until this process is restarted")
@@ -318,12 +390,12 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
             # Alerting on that pages after every deploy and teaches the reader
             # to ignore this check, which is worse than not having it.
             if started_age is None or started_age > MAX_TICK_AGE_MIN:
-                problems.append(
+                _add(CLS_SERVICE, 
                     f"scheduler has not ticked since it started "
                     f"{'?' if started_age is None else f'{started_age:.0f} min'} "
                     f"ago (threshold {MAX_TICK_AGE_MIN:.0f} min)")
         elif age is not None and age > MAX_TICK_AGE_MIN:
-            problems.append(f"scheduler last ticked {age:.0f} min ago "
+            _add(CLS_SERVICE, f"scheduler last ticked {age:.0f} min ago "
                             f"(threshold {MAX_TICK_AGE_MIN:.0f}) — background "
                             f"jobs are not running")
         # last_tick says a job fired. It does not say WHICH jobs did not.
@@ -339,7 +411,7 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
         if audit_age is not None:
             facts["overdue_checked_min_ago"] = round(audit_age, 1)
             if audit_age > MAX_AUDIT_AGE_MIN:
-                problems.append(
+                _add(CLS_EVIDENCE, 
                     f"the overdue-job audit last ran {audit_age:.0f} min ago "
                     f"(threshold {MAX_AUDIT_AGE_MIN:.0f}) — scheduler."
                     f"overdue_jobs is stale and cannot be trusted")
@@ -361,7 +433,7 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
             if unknown:
                 named = ", ".join(str(u) for u in unknown[:4])
                 more = f" (+{len(unknown) - 4} more)" if len(unknown) > 4 else ""
-                problems.append(
+                _add(CLS_EVIDENCE, 
                     f"{len(unknown)} scheduled job(s) have no recorded run at "
                     f"all: {named}{more}. This does not say they are unhealthy "
                     f"-- it says their health cannot be established from the "
@@ -382,7 +454,7 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
                 f"{o.get('job')} ({o.get('late_min')} min late)"
                 for o in overdue[:4])
             more = f" (+{len(overdue) - 4} more)" if len(overdue) > 4 else ""
-            problems.append(
+            _add(CLS_SERVICE, 
                 f"{len(overdue)} scheduled job(s) missed their last due time: "
                 f"{named}{more}")
         # Repairs are reported, not alerted on: the work did happen. A job that
@@ -399,14 +471,14 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
         if failed:
             named = ", ".join(f"{f.get('job')} ({f.get('status')})"
                               for f in failed[:4])
-            problems.append(
+            _add(CLS_SERVICE, 
                 f"{len(failed)} scheduled job(s) raised in the last 24h: {named}")
 
         if sched.get("ledger"):
             # The safety net that re-runs jobs a restart skipped is not
             # installed. Nothing is broken yet, and nothing will report it
             # when something is.
-            problems.append(f"job-run ledger {sched['ledger']}")
+            _add(CLS_EVIDENCE, f"job-run ledger {sched['ledger']}")
     elif role == "follower":
         # A follower not running the scheduler is correct, and this branch used
         # to end here as a NOTE -- which is how 829 checks were recorded healthy
@@ -421,6 +493,7 @@ def check(url: str) -> Tuple[List[str], Dict[str, Any]]:
         # reporting. Both used to skip the scheduler checks without comment.
         facts["note"] = ("ha.role=%r: this process does not hold scheduler "
                          "state, so none was assessed." % (role,))
+    facts["problem_classes"] = list(classes)
     return problems, facts
 
 
@@ -531,6 +604,33 @@ def _last_error(log: Path, window: int = 8000) -> str:
     return lines[-1][:300]
 
 
+def recorded_classes(problems: List[str],
+                     facts: Dict[str, Any]) -> List[str]:
+    """The classes check() recorded, one per problem, in the same order.
+
+    THIS REPLACED A HEURISTIC that inferred the class from which return path ran
+    and defaulted everything else to SERVICE. Three problems in check() are
+    evidence-availability failures, so that default reported a healthy leader
+    with a stale audit cache as a confirmed service outage -- precisely the
+    substitution the taxonomy exists to prevent.
+
+    A length disagreement means a producer forgot to record its class. That
+    returns UNCLASSIFIED rather than guessing, because quietly labelling the
+    remainder SERVICE is how the original defect arose.
+    """
+    recorded = list(facts.get("problem_classes") or [])
+    if len(recorded) == len(problems):
+        return recorded
+    return ["UNCLASSIFIED"] * len(problems)
+
+
+def summarise(classes: List[str]) -> Dict[str, Any]:
+    """The incident set, and the one class that names the alert."""
+    present = [c for c in CLASS_PRECEDENCE if c in classes]
+    return {"incident_classes": present,
+            "incident_class": present[0] if present else CLS_OK}
+
+
 def check_confirmed(url: str) -> Tuple[List[str], Dict[str, Any], int]:
     """check(), but a failure has to survive a re-check -- and MISSING EVIDENCE
     is re-polled too.
@@ -568,7 +668,17 @@ def check_confirmed(url: str) -> Tuple[List[str], Dict[str, Any], int]:
         attempts += 1
     facts["attempts"] = attempts
     facts["first_attempt_problems"] = first_problems
-    if not facts.get("scheduler_evidence_authoritative"):
+    classes = recorded_classes(problems, facts)
+    # GATED ON A USABLE RESPONSE, which is the distinction the taxonomy exists
+    # to draw. An unreachable service or an unparseable body has already said
+    # that the condition cannot be determined; appending "no authoritative
+    # evidence" there would classify every failed request as evidence
+    # unavailability and bury the cause that is actually actionable. The
+    # evidence requirement itself is unchanged: when the service DOES answer,
+    # missing authority is still a problem and still unhealthy.
+    if (facts.get("payload_parsed") is True
+            and not facts.get("scheduler_evidence_authoritative")):
+        classes.append(CLS_EVIDENCE)
         problems.append(
             f"NO AUTHORITATIVE SCHEDULER EVIDENCE after {attempts} attempt(s) "
             f"(ha.role={facts.get('ha_role')!r}; "
@@ -576,6 +686,7 @@ def check_confirmed(url: str) -> Tuple[List[str], Dict[str, Any], int]:
             f"NOT established by this check: a governance audit or a nightly job "
             f"could be failing and this check could not have seen it. That is "
             f"not a healthy result.")
+    facts["problem_classes"] = list(classes)
     return problems, facts, attempts
 
 
@@ -692,6 +803,9 @@ def main() -> int:
     problems, facts, attempts = check_confirmed(url)
     now = datetime.now(timezone.utc)
     state = _load_state()
+    # Classes are collected FROM EACH PRODUCER, in the same order the problems
+    # are appended, so no stage has to re-identify another stage's output.
+    classes: List[str] = list(facts.get("problem_classes") or [])
 
     # ── how long was nobody watching? ────────────────────────────────────────
     gap = _age_minutes(state.get("checked_at"))
@@ -703,8 +817,16 @@ def main() -> int:
                         f"before this one (threshold {MAX_GAP_MIN:.0f}). "
                         f"Nothing is known about that window.")
             print(f"  {gap_note}")
+            # RECORDED AS A FINDING EVEN WHEN IT DOES NOT ALERT. Whether a gap
+            # raises an alert is governed by ALERT_ON_GAP and is left exactly as
+            # configured; whether it is CLASSIFIED is not the same question, and
+            # the 105-minute gap on 2026-10-12 went unnamed because the two were
+            # conflated. A monitor cannot witness its own absence in real time,
+            # but it can name the silence behind it.
+            facts["monitoring_gap_min"] = round(gap, 1)
             if ALERT_ON_GAP:
                 problems.append(gap_note)
+                classes.append(CLS_MONITORING)
 
     # ── transient failures: suppressed, counted, and eventually reported ─────
     blips = [b for b in state.get("blips", [])
@@ -718,6 +840,7 @@ def main() -> int:
         print(f"  transient: recovered by attempt {attempts} — not alerting")
     facts["blips_24h"] = len(blips)
     if len(blips) >= BLIP_ALERT_COUNT:
+        classes.append(CLS_SERVICE)
         problems.append(
             f"{len(blips)} transient failures in the last "
             f"{BLIP_WINDOW_HOURS:.0f}h — each recovered within "
@@ -728,8 +851,16 @@ def main() -> int:
     backup_problems, backup_facts = check_backups()
     facts.update(backup_facts)
     problems.extend(backup_problems)
+    classes.extend([CLS_SERVICE] * len(backup_problems))
 
+    # UNCHANGED, and deliberately so. Classification does not touch the
+    # fail-closed rule: any problem at all, in any class, is unhealthy. An
+    # EVIDENCE_UNAVAILABLE result must never report healthy true.
     healthy = not problems
+    summary = summarise(classes)
+    facts["incident_class"] = summary["incident_class"]
+    facts["incident_classes"] = ", ".join(summary["incident_classes"]) or "-"
+    facts["problem_classes"] = ", ".join(classes) or "-"
 
     print(f"health check {url}")
     for k, v in facts.items():
@@ -749,17 +880,52 @@ def main() -> int:
     should = a.force or (not healthy and (transition or stale_alert)) or \
              (healthy and transition)
     if should:
+        # CLASSIFICATION AND DELIVERY ARE SEPARATE. Everything above decided
+        # WHETHER to mail -- transition, repeat window, --force -- on exactly
+        # the rules it used before. Only the wording below depends on the class.
+        prior = [c for c in (state.get("incident_classes") or "").split(", ") if c]
         if healthy:
-            subj = "Conscestra: RECOVERED"
-            body = f"{url} is healthy again at {now.isoformat()}.\n\n"
+            if CLS_SERVICE in prior:
+                subj = "Conscestra: RECOVERED (service)"
+                body = f"{url} is healthy again at {now.isoformat()}.\n\n"
+            elif prior:
+                # The incident being resolved was never established as an
+                # outage, so this must not read as one having been repaired.
+                subj = "Conscestra: RECOVERED (evidence)"
+                body = (f"Authoritative evidence was obtained again at "
+                        f"{now.isoformat()}.\n\n"
+                        f"This resolves an incident classified "
+                        f"{' + '.join(prior)}. No service outage was "
+                        f"established while it was open, and none is claimed "
+                        f"to have been repaired.\n\n")
+            else:
+                subj = "Conscestra: RECOVERED"
+                body = (f"{url} reports healthy at {now.isoformat()}.\n\n"
+                        f"The preceding incident carried no recorded "
+                        f"classification, so what it was is not stated.\n\n")
         else:
-            subj = f"Conscestra: {len(problems)} problem(s)"
-            body = ("Problems detected:\n\n"
-                    + "\n".join(f"  - {p}" for p in problems)
-                    + "\n\nRunbooks:\n"
-                      "  docs/runbook_leader_failure.md      (scheduler / leader)\n"
-                      "  docs/runbook_incident_escalation.md (triage, 72h clock)\n"
-                      "  docs/runbook_restore.md             (data loss)\n\n")
+            cls = summary["incident_class"]
+            extra = summary["incident_classes"][1:]
+            subj = f"Conscestra: {cls}"
+            if extra:
+                subj += " + " + " + ".join(extra)
+            subj += f" — {len(problems)} problem(s)"
+            body = _MEANING.get(cls, "") + "\n"
+            # GROUPED BY CLASS so the reader is not left inferring which system
+            # each line accuses. Pairing is positional because every producer
+            # appends its class alongside its problem.
+            pairs = list(zip(classes, problems))
+            if len(classes) != len(problems):     # not expected; never fatal
+                pairs = [("UNCLASSIFIED", p) for p in problems]
+            for c in summary["incident_classes"] + ["UNCLASSIFIED"]:
+                lines = [p for k, p in pairs if k == c]
+                if lines:
+                    body += (f"\n{c}:\n"
+                             + "\n".join(f"  - {p}" for p in lines) + "\n")
+            body += ("\nRunbooks:\n"
+                     "  docs/runbook_leader_failure.md      (scheduler / leader)\n"
+                     "  docs/runbook_incident_escalation.md (triage, 72h clock)\n"
+                     "  docs/runbook_restore.md             (data loss)\n\n")
         if gap_note:
             # Carried on every email, not only gap alerts: the reader needs to
             # know the preceding silence was unobserved rather than quiet.
@@ -778,6 +944,10 @@ def main() -> int:
     # invisible across 2,989 checks.
     state["ha_role"] = facts.get("ha_role")
     state["scheduler_evidence"] = facts.get("scheduler_evidence")
+    # Carried so the NEXT run's recovery message can say what it resolves.
+    # Without it, recovery from an evidence incident claims a repaired outage.
+    state["incident_class"] = summary["incident_class"]
+    state["incident_classes"] = ", ".join(summary["incident_classes"])
     _save_state(state)
     return 0 if healthy else 1
 
