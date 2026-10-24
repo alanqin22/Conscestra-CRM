@@ -79,10 +79,51 @@ SCRATCH_DB = os.getenv("BACKUP_SCRATCH_DB", "restore_drill")
 # That measurement is the premise of the exclusion, so the backup re-checks it
 # every run rather than trusting a comment. If these schemas ever hold real
 # data, skipping them would be data loss, and the run stops instead.
+#
+# `n8n_legacy` and `realtime` joined them on 2026-10-08, for a different reason
+# with the same conclusion. The 2026-10-05 revoke of pg_read_all_data left the
+# dump role unable to read all 62 of their tables, because neither schema ever
+# carried a direct grant -- the role reached them only through the membership.
+#
+# Restoring that reach would have meant granting the audit credential standing
+# SELECT on two vendor schemas to preserve a copy of nothing. Measured from the
+# last good dump (railway-20261005): n8n_legacy holds 751 rows across 59 tables,
+# and every one of them is n8n's own installation bookkeeping -- 415 role_scope,
+# 174 scope, 143 migrations, 13 role, 3 settings, and one row each in project,
+# project_relation and "user". There are no workflows, no executions and no
+# credentials; the backend moved off n8n and nothing in `public` references
+# either schema. Together the two schemas occupy 131,072 bytes, which the
+# ceiling below already covers, so the same re-measurement keeps this honest.
 EXCLUDE_SCHEMAS = [x.strip() for x in
-                   os.getenv("BACKUP_EXCLUDE_SCHEMAS", "auth,storage").split(",")
+                   os.getenv("BACKUP_EXCLUDE_SCHEMAS",
+                             "auth,storage,n8n_legacy,realtime").split(",")
                    if x.strip()]
 MAX_EXCLUDED_BYTES = int(os.getenv("BACKUP_MAX_EXCLUDED_BYTES", str(1 << 20)))
+
+# Individual tables the dump deliberately omits, because the dump role is not
+# permitted to read them.
+#
+# On 2026-10-05 the OTP trust boundary revoked pg_read_all_data from
+# crm_readonly so that the audit credential could not read the OTP pepper in
+# public.auth_secrets. That is the intended posture. It also stopped this
+# backup for three nights: the row census selects from every table in public,
+# and pg_dump takes an ACCESS SHARE lock on every table it dumps, so both died
+# on `permission denied for table auth_secrets`.
+#
+# --exclude-table-data is NOT a way out. Measured on PostgreSQL 18.6: pg_dump
+# issues one LOCK TABLE covering the whole dump set before it reads anything,
+# and that set still includes a table whose data was excluded, so the run fails
+# identically. Only --exclude-table removes the table from the set, and it
+# removes the table DEFINITION along with the rows.
+#
+# So a restore from these dumps has no auth_secrets table at all. That is a
+# recovery obligation, not a silent gap: see docs/runbook_restore.md, which
+# carries the statement that recreates it and re-provisions a fresh pepper. The
+# pepper is a credential, and keeping a credential out of fourteen dump files
+# on a laptop and an external drive is the better trade.
+EXCLUDE_TABLES = [x.strip() for x in
+                  os.getenv("BACKUP_EXCLUDE_TABLES", "public.auth_secrets").split(",")
+                  if x.strip()]
 
 # EVERY table is verified, not a sample.
 #
@@ -233,6 +274,138 @@ def _assert_excluded_are_empty(dsn: str) -> None:
             f"is known to be disposable.")
 
 
+def _excluded_tables_in(schema: str) -> list:
+    """Bare names of the excluded tables that live in `schema`."""
+    out = []
+    for qualified in EXCLUDE_TABLES:
+        s, _, t = qualified.rpartition(".")
+        if (s or "public") == schema:
+            out.append(t)
+    return out
+
+
+def _assert_unreadable_are_excluded(dsn: str) -> None:
+    """Confirm the dump role can read every table this backup claims to carry.
+
+    A table the dump role cannot read cannot be backed up by this path. Each
+    one must therefore be named in BACKUP_EXCLUDE_TABLES and accounted for in
+    the restore runbook. An unreadable table that is NOT named is a privilege
+    change nobody decided here, and the run stops rather than producing a
+    backup whose coverage quietly shrank -- which is the same failure the
+    schema exclusion above is written to prevent.
+
+    has_table_privilege is used rather than a trial SELECT: it answers the
+    question for every table in a single round trip, it reflects role
+    membership as well as direct grants -- the distinction that hid this exact
+    defect from four earlier gates -- and it costs nothing on a large table.
+    """
+    import psycopg2
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT n.nspname, c.relname,
+                       has_table_privilege(current_user, c.oid, 'SELECT')
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE c.relkind IN ('r', 'p')
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                   AND NOT (n.nspname = ANY(%s))
+                 ORDER BY 1, 2""", (EXCLUDE_SCHEMAS,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    declared = {q if "." in q else f"public.{q}" for q in EXCLUDE_TABLES}
+    unreadable = {f"{n}.{t}" for n, t, ok in rows if not ok}
+
+    if EXCLUDE_TABLES:
+        present = {f"{n}.{t}" for n, t, _ in rows}
+        gone = sorted(declared - present)
+        print(f"  omitting {', '.join(sorted(declared))} from the dump -- "
+              f"a restore will NOT contain {'it' if len(declared) == 1 else 'them'}")
+        if gone:
+            print(f"  NOTE: {', '.join(gone)} no longer exist(s); the "
+                  f"exclusion is stale and can be dropped from "
+                  f"BACKUP_EXCLUDE_TABLES")
+        readable_but_excluded = sorted(declared & present - unreadable)
+        if readable_but_excluded:
+            print(f"  NOTE: {', '.join(readable_but_excluded)} "
+                  f"{'is' if len(readable_but_excluded) == 1 else 'are'} "
+                  f"readable again; still omitted by configuration")
+
+    undeclared = sorted(unreadable - declared)
+    if undeclared:
+        raise SystemExit(
+            f"the dump role cannot read {len(undeclared)} table(s) that this "
+            f"backup is supposed to carry:\n"
+            f"  {', '.join(undeclared)}\n"
+            f"  pg_dump locks every table it dumps, so the run would fail; the "
+            f"row census fails first. Privileges changed since the last "
+            f"successful backup.\n"
+            f"  Either restore the dump role's SELECT on these tables, or -- if "
+            f"the revoke was deliberate -- add them to BACKUP_EXCLUDE_TABLES "
+            f"and record in docs/runbook_restore.md how a restore recovers "
+            f"what they held.")
+
+
+def _assert_sequences_readable(dsn: str) -> None:
+    """Confirm the dump role can read the sequences, which cannot be excluded.
+
+    pg_dump reads every sequence it dumps to capture `last_value`, and a
+    sequence has no equivalent of --exclude-table that is safe to use: the
+    sequence behind a serial column is created as part of that column, so
+    dropping it from the dump would restore a table whose default refers to
+    nothing. There is therefore no configuration answer here. Either the role
+    can read them or no backup can be taken.
+
+    Worth checking separately for that reason, and worth checking BEFORE the
+    dump: pg_dump discovers this about sixty seconds in, after the archive is
+    already being written, and reports it as one sequence name rather than as a
+    privilege gap with a shape.
+
+    This gap is how the 2026-10-05 revoke of pg_read_all_data stayed invisible.
+    The blast radius was measured against tables and views, found 173 of 174
+    tables still readable through their own grants, and recorded the sequences
+    as "42 objects nothing in the repo reads" -- true of the repo's queries,
+    and false of pg_dump, which is the one consumer that reads all of them.
+    """
+    import psycopg2
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT n.nspname, c.relname,
+                       has_sequence_privilege(current_user, c.oid, 'SELECT')
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE c.relkind = 'S'
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                   AND NOT (n.nspname = ANY(%s))
+                 ORDER BY 1, 2""", (EXCLUDE_SCHEMAS,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    blocked = [f"{n}.{s}" for n, s, ok in rows if not ok]
+    if not blocked:
+        print(f"  all {len(rows)} sequences readable")
+        return
+    shown = ", ".join(blocked[:6]) + (f", +{len(blocked) - 6} more"
+                                      if len(blocked) > 6 else "")
+    raise SystemExit(
+        f"the dump role cannot read {len(blocked)} of {len(rows)} sequences:\n"
+        f"  {shown}\n"
+        f"  pg_dump reads last_value from every sequence it dumps, and a "
+        f"sequence cannot be excluded without breaking the column that owns "
+        f"it. No backup can be taken until this is granted:\n"
+        f"    GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO <dump role>;\n"
+        f"    ALTER DEFAULT PRIVILEGES IN SCHEMA public\n"
+        f"        GRANT SELECT ON SEQUENCES TO <dump role>;\n"
+        f"  The second statement is what stops the next migration from "
+        f"reopening this. A sequence's current value is not a secret; this is "
+        f"far narrower than pg_read_all_data and leaves auth_secrets unreadable.")
+
+
 def _counts(dsn: str, tables=None) -> dict:
     """Exact row counts for every ordinary table in `public`, in one round trip.
 
@@ -244,10 +417,17 @@ def _counts(dsn: str, tables=None) -> dict:
     try:
         with conn.cursor() as cur:
             if tables is None:
+                # The excluded tables are left out here as well as from the
+                # dump. Counting a table the dump does not carry would compare
+                # production against a restore that was never meant to hold it,
+                # and selecting from one the role may not read raises before
+                # any of that matters.
                 cur.execute("""SELECT c.relname FROM pg_class c
                                  JOIN pg_namespace n ON n.oid = c.relnamespace
                                 WHERE n.nspname = 'public' AND c.relkind = 'r'
-                                ORDER BY 1""")
+                                  AND c.relname <> ALL(%s)
+                                ORDER BY 1""",
+                            (_excluded_tables_in("public"),))
                 tables = [r[0] for r in cur.fetchall()]
             if not tables:
                 return {}
@@ -299,6 +479,8 @@ def main() -> int:
     major = _server_major(src)
     print(f"  production is PostgreSQL {major}; using {PG_IMAGE} client tools")
     _assert_excluded_are_empty(src)
+    _assert_unreadable_are_excluded(src)
+    _assert_sequences_readable(src)
     before = _counts(src)
     print(f"  production before dump: {len(before)} tables, "
           f"{sum(v for v in before.values() if v):,} rows")
@@ -320,6 +502,7 @@ def main() -> int:
     t0 = time.perf_counter()
     r = _docker("pg_dump", src, "-Fc", "--no-owner", "--no-acl",
                 *[f"--exclude-schema={x}" for x in EXCLUDE_SCHEMAS],
+                *[f"--exclude-table={x}" for x in EXCLUDE_TABLES],
                 "-f", f"/backup/{partial.name}", mount=BACKUP_DIR)
     dump_s = time.perf_counter() - t0
     if r.returncode != 0:
@@ -436,6 +619,9 @@ def main() -> int:
         _ping(False, f"restore verification failed on: {', '.join(bad)}")
         return 1
     print(f"\nverified: every checked table matches production")
+    if EXCLUDE_TABLES:
+        print(f"  NOT in this backup: {', '.join(sorted(EXCLUDE_TABLES))}"
+              f" -- see docs/runbook_restore.md")
     print(f"  RPO = time since this ran.  RTO = {restore_s:.0f}s + provisioning.")
 
     _mirror(dump)

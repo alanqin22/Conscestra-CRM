@@ -623,6 +623,116 @@ _PENDING_OWNERSHIP_ATTRIBUTION = (
     "how a database role comes to stand for a human decision. "
     "Deploy AFTER ownership_shadow.sql.")
 
+_PENDING_MUTATION_GOVERNANCE = (
+    "PENDING DEPLOYMENT -- authored 2026-09-18. The durable carrier for the "
+    "governed mutation capability, deployed to a dedicated database rather than "
+    "to crmdb. "
+    "WHY IT IS NOT IN crmdb. Mutation-testing lifecycle state is not customer "
+    "data. The contract requires a durable carrier in the same cluster that "
+    "holds the ownership lease, and advisory locks are cluster-wide rather than "
+    "per-database, so a separate database satisfies the requirement without the "
+    "production schema acquiring tables that exist to serve the test apparatus. "
+    "THE GAP IT CLOSES is that the superseded mutation harness reported a catch "
+    "rate that nothing could check. Its accounting lived in the memory of the "
+    "process doing the work, so a run that was killed reported whatever it had "
+    "printed before it died, and a mutation that silently failed to apply "
+    "counted as a skip that nobody saw. "
+    "STATE IS DERIVED, NOT STORED. There is no status column. Every question "
+    "about a run is answered by reading its events, so no second place exists "
+    "for the answer to disagree with. "
+    "APPEND-ONLY IS ENFORCED IN THE DATABASE, because a convention that history "
+    "may not be rewritten is a promise made by the same code that would benefit "
+    "from breaking it. "
+    "A BLOCKED ENVIRONMENT IS CLEARED BY A RECORDED FINDING, never by deleting "
+    "the run that blocked it: the unresolved history stays readable beside the "
+    "decision that accounted for it. "
+    "Deployed to crm_mutation_governance by the capability itself; it is not "
+    "applied to crmdb by migrate.py or apply_sql.py.")
+
+_PENDING_CANONICAL_IDENTITY = (
+    "PENDING DEPLOYMENT -- authored 2026-09-19. The canonical human identity "
+    "carrier: governance_actor, human_identity, workforce_class, "
+    "workforce_classification, certification_scope and identity_binding. "
+    "WHY IT EXISTS. Identity was keyed off mutable attributes in several "
+    "places, so a person's record could be re-labelled by an email change. "
+    "human_identity carries an identifier and an organization only; every "
+    "mutable attribute stays in the source system that owns it. "
+    "IDENTITY IS BOUND, NOT REPAIRED. identity_binding records a disposition "
+    "for every legacy identifier, including the ones that resolve to nobody, "
+    "so an unresolvable subject stays visible as unresolved rather than being "
+    "inferred into a person. "
+    "Rehearsed on a disposable database against a read-only copy of the "
+    "identity population. Not applied to crmdb.")
+
+_PENDING_AUTHORITY_ENVELOPE = (
+    "PENDING DEPLOYMENT -- authored 2026-09-19. The authority envelope: "
+    "authority_capability, agent_identity, authority_contract, "
+    "authority_constraint and fn_authority_evaluate. "
+    "WHAT IT DECIDES. Whether a given source holds a given capability for a "
+    "given action at a given time, against constraints whose state is one of "
+    "NOT_APPLICABLE, NOT_DEFINED, BOUNDED or UNLIMITED_BY_POLICY. "
+    "NOT_DEFINED REFUSES. A dimension that applies and has not been decided "
+    "returns UNRESOLVED rather than permitting, which is the difference a "
+    "nullable numeric cannot express: an absent limit and an unlimited one are "
+    "not the same statement. "
+    "NO THRESHOLD IS SET HERE. Every monetary, percentage and risk dimension "
+    "is recorded as undecided, because deciding one is a business call that "
+    "this file must not make on the business's behalf. "
+    "No authority is granted to any agent by its installation. Not applied to "
+    "crmdb.")
+
+_APPLIED_LOCAL_SOFT_DELETED_AR = (
+    "APPLIED TO LOCAL crmdb 2026-09-20; NOT YET ON RAILWAY. Adds the missing "
+    "invoice-level is_deleted predicate to vw_invoices_ar and "
+    "accounting_invoice_pipeline. "
+    "THE DEFECT. Neither view filtered soft-deleted invoices. vw_invoices_ar "
+    "ended FROM invoices i LEFT JOIN ... with no WHERE at all, while filtering "
+    "is_deleted = false on PAYMENTS inside its own CTE -- honouring the flag for "
+    "payments and ignoring it for invoices. Soft-deleting an invoice therefore "
+    "removed it from nothing: 260 marked deleted, and both the AR Aging chart "
+    "and the Accounting Summary continued to report $132,769.65, exactly "
+    "sum(balance_due) over the view. "
+    "LATENT UNTIL EXERCISED. No invoice had ever been soft-deleted before that "
+    "date, so the omission had never cost anything. v_invoice_balance_drift "
+    "already carried the predicate, which is why this is an omission rather "
+    "than a decision. "
+    "WHY THE VIEW AND NOT THE CONSUMERS: the reasoning in "
+    "cancelled_invoices_are_not_receivable.sql, which fixed the neighbouring "
+    "defect on the same view. Two consumer shapes exist and a consumer-side fix "
+    "must find every one of them. "
+    "PRODUCED BY READING THE LIVE VIEWS with pg_get_viewdef and re-emitting them "
+    "with one predicate added, then diffing against the originals to confirm the "
+    "predicate is the only change. Measured effect: outstanding $132,769.65 -> "
+    "$71,994.65, paid rate 82.5% -> 91.5%, affecting exactly the 260 "
+    "soft-deleted rows and nothing else.")
+
+_PENDING_INVOICE_ISSUED_FOLLOWUP = (
+    "PENDING DEPLOYMENT -- authored 2026-09-20. The replacement for "
+    "trgfn_invoice_create_payment, and its retirement, in one file. "
+    "WHAT SS.1 RATIFIED. The demonstration-payment trigger must not remain a "
+    "producer of real payment rows; app.ar_unpaid_pct and app.ar_partial_pct "
+    "must not cause a synthetic payment to enter the governed payment ledger; "
+    "historical payments it produced are not to be altered; and if "
+    "demonstration realism is still required it must be implemented separately "
+    "through a mechanism that creates no payment or settlement consequence. "
+    "WHY A REPLACEMENT AND NOT A DELETION. The trigger does two unrelated "
+    "things. It fabricates a payment, which is the defect, and it raises a "
+    "follow-up task on an issued invoice, which is ordinary workflow that "
+    "nothing else provides. Retiring it alone would have removed a real "
+    "behaviour on the way to removing a defect. "
+    "MEASURED, on a disposable database built from the committed baseline: 200 "
+    "invoices under the old trigger produced 184 payments totalling $17,730.00, "
+    "every one with no provenance at all, and 167 invoices reached 'paid'. The "
+    "same 200 under the replacement produce 0 payments, 0 paid, and exactly one "
+    "follow-up each. "
+    "ORDERING IS THE WHOLE TRANSITION. The replacement is created before the "
+    "DROP runs, so there is no window in which an invoice is issued with "
+    "neither mechanism attached. The function is dropped as well as the "
+    "trigger, because ar_aging_realism.sql defines its body and would otherwise "
+    "revive it on a re-apply. "
+    "NOT DECIDED HERE: whether demonstration realism is still required, the "
+    "disposition of the 2,286 unattributed historical payments, or anything "
+    "about invoice.status semantics. Not applied to crmdb.")
 
 _APPLIED_LOCAL_CANCELLATION_REVERSAL = (
     "APPLIED TO LOCAL railwayl2 2026-10-05 22:28:16 -04 "
@@ -648,7 +758,6 @@ _APPLIED_LOCAL_CANCELLATION_REVERSAL = (
     "artifact, not a ratified policy; governing who may reverse does not "
     "require deciding how long. Not applied to crmdb.")
 
-
 _PENDING_CANCELLED_NOT_INVOICEABLE = (
     "PENDING DEPLOYMENT -- authored 2026-09-19. The invariant that a cancelled "
     "order must not become invoiceable, enforced at invoice creation. "
@@ -672,6 +781,60 @@ _PENDING_CANCELLED_NOT_INVOICEABLE = (
     "REVERSAL IS NOT DECIDED HERE. An order may still leave the cancelled "
     "state exactly as before; only the invoice is refused. Not applied to crmdb.")
 
+_PENDING_SYNTHETIC_ORDER_PROVENANCE = (
+    "PENDING DEPLOYMENT -- authored 2026-09-25. Adds orders.is_synthetic as a "
+    "three-valued provenance column (true generated, false customer, null not "
+    "established) and a trigger making an established value immutable. "
+    "THE GAP IT CLOSES. Every customer metric counts orders and nothing lets a "
+    "consumer exclude generated ones. Measured on Railway 2026-09-25: "
+    "orders.source and orders.channel are null on 2,784 rows, null on all 155 "
+    "generated orders born cancelled, and null on all three genuine "
+    "cancellations taken through cancel_order_sp; the generator's insert names "
+    "neither. No expression over the current schema separates the populations. "
+    "ITS WRITER is generate_random_orders, which establishes is_synthetic=true "
+    "in the statement that creates the row. It is the only writer, "
+    "deliberately: every other creation path serves a request from outside the "
+    "system and cannot establish that an order is not a customer's, so those "
+    "paths leave the column null rather than assert false. The value is an "
+    "assertion by the row's creator and NOT an authority -- the generator runs "
+    "as the application role, which holds UPDATE on orders, so the column must "
+    "never be read as permission for anything. "
+    "IT EXTENDS AN EXISTING CONVENTION rather than adding one. is_synthetic is "
+    "already on accounts, contacts, opportunities, opportunity_products, "
+    "owners, products and product_pricing, is named in corpus_provenance.py's "
+    "subject registry, and is read by six deployed routines. Orders were the "
+    "gap. A CLAIM WITHDRAWN 2026-09-25: an earlier version of this declaration "
+    "said trgfn_order_create_invoice already carried the value into the "
+    "opportunity it creates. It does not -- that INSERT passes the literal "
+    "true, reads no order provenance, and marks every opportunity it creates as "
+    "generated regardless of the order. "
+    "A side table was rejected: it would be a new subject-linked table "
+    "suspending DSAR certification, it would put a join in every customer "
+    "metric, and the invoice-cancellation precedent that justifies a table "
+    "does not apply to a fact no projector recomputes. "
+    "THERE IS DELIBERATELY NO DEFAULT, unlike the seven sibling tables, which "
+    "declare DEFAULT false and thereby assert customer provenance for every "
+    "unmarked row. On a corpus where corpus_provenance.py states that "
+    "real-versus-synthetic cannot be reconstructed, that default manufactures "
+    "the distinction it appears to record. The 2,784 existing "
+    "orders take null. The inconsistency with the siblings is intended. "
+    "DEPLOY THIS BEFORE fn_generate_orders.sql. The generator now names "
+    "is_synthetic in its INSERT, so applying that stored procedure to a "
+    "database without this column breaks the nightly order batch. "
+    "IT ESTABLISHES NO PROVENANCE FOR ANY EXISTING ROW and must not: the 155 "
+    "generated orders already in cancelled status cannot be distinguished from "
+    "customer orders by surviving evidence, and marking them from their status "
+    "would infer the answer from the question. "
+    "IT ENFORCES NOTHING ABOUT CANCELLATION, and the column must never be read "
+    "as permission. The generator runs as the application role, which holds "
+    "UPDATE on orders, so a guard keyed on is_synthetic would be satisfied by "
+    "self-assertion. Cancellation authority stays in "
+    "cancellation_authorization, where a caller cannot write its own record. "
+    "VERIFIED on a disposable database: the column arrives nullable with no "
+    "default, a pre-existing order reads null rather than false, re-applying "
+    "the file is idempotent, null may still be established, an established "
+    "value cannot be changed or cleared, and an unrelated order update leaves "
+    "it intact.")
 
 _APPLIED_LOCAL_CANCELLATION_ENFORCEMENT = (
     "APPLIED TO LOCAL railwayl2 2026-10-05 22:28:15 -04 "
@@ -699,7 +862,6 @@ _APPLIED_LOCAL_CANCELLATION_ENFORCEMENT = (
     "Installing this file changes cancellation behaviour: a caller that does "
     "not obtain authority can no longer cancel. It is not applied to crmdb.")
 
-
 _APPLIED_LOCAL_CANCELLATION_AUTHORITY = (
     "APPLIED TO LOCAL railwayl2 2026-10-06 11:15:15 -04 "
     "(schema_attestations id 188); NOT YET ON RAILWAY. "
@@ -725,7 +887,6 @@ _APPLIED_LOCAL_CANCELLATION_AUTHORITY = (
     "carry no cancellation control at all. Installing this file changes no "
     "cancellation behaviour -- nothing calls the function yet. Not applied to "
     "crmdb.")
-
 
 _PENDING_SETTLEMENT_AUTHORITY = (
     "PENDING DEPLOYMENT -- authored 2026-09-14. Phase 1 of the ratified "
@@ -757,7 +918,6 @@ _PENDING_SETTLEMENT_AUTHORITY = (
     "are SECURITY DEFINER and sp_accounting is not, so a revoke that preceded "
     "the migration would take the application down."
 )
-
 
 _APPLIED_A3_INVOICE_ECONOMIC_INTEGRITY = (
     "APPLIED OUT-OF-BAND TO BOTH DATABASES. Railway 2026-09-14 13:41:00 UTC "
@@ -798,6 +958,7 @@ _APPLIED_A3_INVOICE_ECONOMIC_INTEGRITY = (
     "that IS applied. A check that is permanently red teaches its reader to "
     "ignore it. The apply is evidenced by schema_attestations instead, which "
     "exists for exactly this path.")
+
 _APPLIED_LOCAL_FINANCIAL_APPROVAL_INSERT_BOUNDARY = (
     "APPLIED TO LOCAL crmdb 2026-09-23 22:51:06 -04 "
     "(schema_attestations id 1470); NOT YET ON RAILWAY. "
@@ -840,7 +1001,6 @@ _APPLIED_LOCAL_FINANCIAL_APPROVAL_INSERT_BOUNDARY = (
     "ledger_health() permanently short by one. schema_attestations is the "
     "evidence path for this file.")
 
-
 _APPLIED_FINANCIAL_PROPOSITION_BINDING = (
     "APPLIED OUT-OF-BAND TO BOTH DATABASES. Railway 2026-09-14 13:40:42 UTC "
     "(schema_attestations id 22); local crmdb first applied 2026-09-13 "
@@ -871,31 +1031,6 @@ _APPLIED_FINANCIAL_PROPOSITION_BINDING = (
     "Measured 2026-09-23: five email.send_payment_reminder rows, a financial "
     "action class, executed daily with a null proposition and no named "
     "executive. The remedy is a separate file, not an edit to this one.")
-_APPLIED_LOCAL_SOFT_DELETED_AR = (
-    "APPLIED TO LOCAL crmdb 2026-09-20; NOT YET ON RAILWAY. Adds the missing "
-    "invoice-level is_deleted predicate to vw_invoices_ar and "
-    "accounting_invoice_pipeline. "
-    "THE DEFECT. Neither view filtered soft-deleted invoices. vw_invoices_ar "
-    "ended FROM invoices i LEFT JOIN ... with no WHERE at all, while filtering "
-    "is_deleted = false on PAYMENTS inside its own CTE -- honouring the flag for "
-    "payments and ignoring it for invoices. Soft-deleting an invoice therefore "
-    "removed it from nothing: 260 marked deleted, and both the AR Aging chart "
-    "and the Accounting Summary continued to report $132,769.65, exactly "
-    "sum(balance_due) over the view. "
-    "LATENT UNTIL EXERCISED. No invoice had ever been soft-deleted before that "
-    "date, so the omission had never cost anything. v_invoice_balance_drift "
-    "already carried the predicate, which is why this is an omission rather "
-    "than a decision. "
-    "WHY THE VIEW AND NOT THE CONSUMERS: the reasoning in "
-    "cancelled_invoices_are_not_receivable.sql, which fixed the neighbouring "
-    "defect on the same view. Two consumer shapes exist and a consumer-side fix "
-    "must find every one of them. "
-    "PRODUCED BY READING THE LIVE VIEWS with pg_get_viewdef and re-emitting them "
-    "with one predicate added, then diffing against the originals to confirm the "
-    "predicate is the only change. Measured effect: outstanding $132,769.65 -> "
-    "$71,994.65, paid rate 82.5% -> 91.5%, affecting exactly the 260 "
-    "soft-deleted rows and nothing else.")
-
 
 _PENDING_ACCOUNTING_INVOICE_PIPELINE = (
     "PENDING DEPLOYMENT -- authored 2026-09-29. The sole authoritative "
@@ -1304,7 +1439,6 @@ _DUPLICATE_DECLARATION = (
         "triggers were applied outside the governed path, because they were "
         "not: that migration created them through scripts.migrate.")
 
-
 # CORRECTED 2026-08-25 after re-examination. The earlier reason given here was
 # "an incremental chain cannot be adopted one link at a time". That mechanism is
 # WRONG: CREATE OR REPLACE FUNCTION is a TOTAL replacement, and
@@ -1540,10 +1674,15 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "ownership_selection.sql": _PENDING_OWNERSHIP_SELECTION,
     "ownership_shadow.sql": _PENDING_OWNERSHIP_SHADOW,
     "ownership_attribution.sql": _PENDING_OWNERSHIP_ATTRIBUTION,
+    "mutation_governance.sql": _PENDING_MUTATION_GOVERNANCE,
+    "canonical_identity.sql": _PENDING_CANONICAL_IDENTITY,
+    "authority_envelope.sql": _PENDING_AUTHORITY_ENVELOPE,
     "cancellation_authority.sql": _APPLIED_LOCAL_CANCELLATION_AUTHORITY,
     "cancellation_enforcement.sql": _APPLIED_LOCAL_CANCELLATION_ENFORCEMENT,
+    "synthetic_order_provenance.sql": _PENDING_SYNTHETIC_ORDER_PROVENANCE,
     "cancelled_not_invoiceable.sql": _PENDING_CANCELLED_NOT_INVOICEABLE,
     "cancellation_reversal.sql": _APPLIED_LOCAL_CANCELLATION_REVERSAL,
+    "invoice_issued_followup.sql": _PENDING_INVOICE_ISSUED_FOLLOWUP,
     "soft_deleted_invoices_are_not_receivable.sql": _APPLIED_LOCAL_SOFT_DELETED_AR,
     "settlement_authority.sql": _PENDING_SETTLEMENT_AUTHORITY,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
@@ -1755,6 +1894,10 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # opportunities are a deliberate exclusion, because assigning an owner to
     # finished business rewrites who is recorded as having won or lost it.
     "backfill_open_opportunity_owner.sql": _BACKFILL,
+    # Retained rather than deleted: the file is real repository history,
+    # authored 2026-09-13 to describe triggers that already existed. It is
+    # classified here rather than in REQUIRED_MIGRATIONS because it declares no
+    # object of its own.
     "trg_fn_contacts_leads_accounts_touch.sql": (
         _DUPLICATE_DECLARATION),
     "unified_comms_conversations.sql": _SCHEMA_OOB,

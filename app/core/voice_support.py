@@ -75,6 +75,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Request, Response
+import psycopg2
 from psycopg2.extras import RealDictCursor
 
 from app.core.database import get_connection
@@ -2915,6 +2916,87 @@ def _verify_identity(spoken: Dict[str, str],
 
 # ── The write ───────────────────────────────────────────────────────────────
 
+def grant_staff_cancellation_authority(order_id, staff_identity, reason,
+                                       reason_detail=None, ttl_seconds=900,
+                                       operation="cancel"):
+    """Record a named human's decision to cancel an order, durably.
+
+    Staff cancellation is a legitimate business operation and is NOT customer
+    authorisation. It is modelled here explicitly rather than permitted by
+    exemption: the grant is order-bound, proposition-bound, time-limited,
+    single-use, and passes the same database transition guard every other
+    channel passes. "Internal" does not mean the authority boundary stops
+    applying.
+
+    Both the identity and the reason are required by a database constraint
+    rather than by convention, because a cancellation with no named human and
+    no stated reason is not accountable to anyone afterwards.
+
+    Note on placement: this sits beside cancel_order_sp because that is where
+    the guarded write lives. That the shared cancellation write lives in the
+    voice module at all is a pre-existing architectural wart, recorded rather
+    than compounded silently.
+    """
+    if not (staff_identity or "").strip():
+        return {"ok": False, "error": "an authenticated staff identity is required"}
+    if not (reason or "").strip():
+        return {"ok": False, "error": "a cancellation reason is required"}
+
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "INSERT INTO order_cancel_staff_authority "
+                "  (order_id, staff_identity, reason, reason_detail, "
+                "   proposition_hash, expires_at, operation) "
+                "VALUES (%(id)s::uuid, %(who)s, %(why)s, %(detail)s, "
+                "        fn_cancellation_proposition(%(id)s::uuid, 'staff', "
+                "                                    %(why)s, %(detail)s, "
+                "                                    %(op)s), "
+                "        now() + make_interval(secs => %(ttl)s), %(op)s) "
+                "RETURNING staff_authority_id::text",
+                {"id": str(order_id), "who": staff_identity.strip(),
+                 "why": reason.strip(), "detail": reason_detail,
+                 "ttl": ttl_seconds, "op": operation})
+            row = cur.fetchone()
+        conn.commit()
+        return {"ok": True, "staff_authority_id": row["staff_authority_id"]}
+    except psycopg2.errors.UndefinedTable:
+        conn.rollback()
+        return {"ok": False, "error": "cancellation authority is not installed "
+                                      "on this database"}
+    except Exception as exc:                                       # noqa: BLE001
+        conn.rollback()
+        logger.error("[staff-cancel] could not record authority: %s", exc)
+        return {"ok": False, "error": "could not record cancellation authority"}
+    finally:
+        conn.close()
+
+
+def staff_cancel_order(order_id, staff_identity, reason, reason_detail=None):
+    """The governed staff cancellation: record authority, then cancel.
+
+    This is the only staff route to a cancellation. A staff member reaching
+    sp_orders in update mode, or issuing direct DML, does not acquire authority
+    by doing so -- the database refuses the transition either way.
+    """
+    granted = grant_staff_cancellation_authority(
+        order_id, staff_identity, reason, reason_detail)
+    if not granted.get("ok"):
+        return granted
+
+    return cancel_order_sp({
+        "order_id": order_id,
+        "verified_via": "staff",
+        "verification_id": granted["staff_authority_id"],
+        "verification_channel": "staff",
+        "authority_source": "staff",
+        "reason": reason.strip(),
+        "reason_detail": reason_detail,
+        "channel": "staff",
+        "updated_by": None})
+
+
 def cancel_order_sp(p: Dict[str, Any]) -> Dict[str, Any]:
     """THE guarded cancellation. Exactly one UPDATE, against exactly one table.
 
@@ -2945,6 +3027,46 @@ def cancel_order_sp(p: Dict[str, Any]) -> Dict[str, Any]:
                 {"id": order_id})
             before = cur.fetchone()
             prior = (before or {}).get("status")
+
+            # AUTHORITY IS OBTAINED FROM THE DATABASE, NOT ASSERTED HERE.
+            # fn_authorize_cancellation re-reads the verification record, checks
+            # it is bound to this order, consumed, verified, unexpired and from
+            # the stated channel, and confirms the status read under the lock
+            # above is still the one the proposition was built against. It
+            # writes an authorization the caller has no privilege to write, and
+            # the trigger on orders spends it. Without that row the UPDATE below
+            # is refused by the database, whatever this function believes.
+            #
+            # `prior` is passed as the asserted status so that revalidation is
+            # against the row this transaction has locked, not against whatever
+            # the caller last saw.
+            try:
+                cur.execute(
+                    "SELECT fn_authorize_cancellation("
+                    "  %(id)s::uuid, %(vid)s::uuid, %(chan)s, NULL, %(prior)s,"
+                    "  %(reason)s, %(detail)s, %(source)s)",
+                    {"id": order_id, "vid": p.get("verification_id"),
+                     "chan": p.get("verification_channel"), "prior": prior,
+                     # The proposition travels WITH the request, so the database
+                     # can check that what is being executed is what the
+                     # principal authorised -- not merely that they authorised
+                     # something.
+                     "reason": p.get("reason"),
+                     "detail": p.get("reason_detail"),
+                     "source": p.get("authority_source") or "customer"})
+                verdict = (cur.fetchone() or {}).get("fn_authorize_cancellation")
+            except psycopg2.errors.UndefinedFunction:
+                conn.rollback()
+                return {"ok": False, "error": "cancellation authority is not "
+                        "installed on this database",
+                        "reason": "governance/sql/cancellation_enforcement.sql "
+                                  "has not been applied"}
+            if verdict != "AUTHORIZED":
+                conn.rollback()
+                return {"ok": False, "error": "not authorized",
+                        "prior_status": prior, "verdict": verdict,
+                        "reason": "no corroborated ORDER.CANCEL verification "
+                                  "for this cancellation (%s)" % verdict}
 
             cur.execute(
                 """UPDATE orders
@@ -3021,9 +3143,35 @@ def undo_order_cancel(ap: Dict[str, Any]) -> Dict[str, Any]:
     if not order_id or prior not in CANCELLABLE_STATUSES:
         return {"ok": False,
                 "error": "no restorable prior status recorded on the approval"}
+    # REVERSING A CANCELLATION IS ITS OWN OPERATION, and it needs its own
+    # authority. Undo is a legitimate reversal, so it obtains a grant rather
+    # than being exempted from the guard: an exemption for the one path that is
+    # supposed to be legitimate would leave the guard protecting nothing it
+    # could not already reach.
+    #
+    # The decider is the human who approved the original action. Undo is
+    # reachable only through POST /governance/undo/{approval_uuid}, so there is
+    # always an approval and always a decider.
+    who = (ap.get("decided_by") or "").strip() or "governance:undo"
+    granted = grant_staff_cancellation_authority(
+        order_id, staff_identity=who,
+        reason="undo of an approved cancellation",
+        reason_detail=None, operation="reverse")
+    if not granted.get("ok"):
+        return granted
+
     conn = get_connection()
     try:
         with conn.cursor() as cur:
+            cur.execute(
+                "SELECT fn_authorize_reversal(%(id)s::uuid, %(ev)s::uuid,"
+                "  'undo of an approved cancellation', NULL)",
+                {"id": str(order_id), "ev": granted["staff_authority_id"]})
+            verdict = cur.fetchone()[0]
+            if verdict != "AUTHORIZED":
+                conn.rollback()
+                return {"ok": False, "error": "reversal not authorized",
+                        "verdict": verdict}
             cur.execute(
                 """UPDATE orders
                       SET status = %(s)s, updated_at = now()
@@ -3273,14 +3421,88 @@ def _cancel_authorize(sess: Dict[str, Any]) -> Tuple[str, str]:
     """
     if not require_phone():
         order = (sess.get("cancel") or {}).get("order") or {}
+        # NO POSSESSION MEANS NO AUTHORITY. This records what happened and
+        # deliberately carries no verification identity, so the cancellation is
+        # refused at the database rather than permitted by a label that admits
+        # nothing was proven. Knowledge of a customer's details is reproducible
+        # by anyone who holds them and is the standard social-engineering
+        # target; it is not evidence of possession.
         sess["cancel_auth"] = {"order_id": order.get("order_id"),
                                "verified_via": VERIFIED_VIA_DEMO,
+                               "verification_id": None,
+                               "verification_channel": None,
                                "at": time.time(), "scope": "order.cancel"}
         logger.warning(
             "[voice] DEMO MODE cancellation for %s — no possession was proven "
             "(VOICE_CANCEL_REQUIRE_PHONE=0)", order.get("order_number"))
         return "", "decide"
     return _cancel_send_otp(sess)
+
+
+def _record_cancel_verification(order_id, code, reason=None,
+                                reason_detail=None, destination=None,
+                                contact_id=None):
+    """Write the durable verification row a voice cancellation is authorised by.
+
+    The same table the web channel uses, so there is one authoritative record
+    type for customer cancellation authority rather than one per channel.
+    `channel` is 'voice', which the authority function checks against the
+    channel the cancellation is executed through.
+
+    The destination is recorded in `recipient_destination`, not in
+    `recipient_email`: for this channel it is a phone number, and a column whose
+    name says email must not hold one. `recipient_contact_id` records the
+    canonical contact the destination was taken from, so an auditor can
+    establish that the challenge went to the authoritative number for the order
+    rather than to anything the caller supplied.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO order_cancel_verifications "
+                "  (order_id, code_hash, channel, expires_at, attempts, "
+                "   reason, reason_detail, recipient_destination, "
+                "   recipient_contact_id) "
+                "VALUES (%s::uuid, %s, 'voice', now() + make_interval(secs => %s), "
+                "        0, %s, %s, %s, %s::uuid) "
+                "RETURNING verification_id::text",
+                (str(order_id), _hash_code(code), OTP_TTL, reason, reason_detail,
+                 destination, contact_id))
+            vid = cur.fetchone()[0]
+        conn.commit()
+        return vid
+    except Exception as exc:                                       # noqa: BLE001
+        conn.rollback()
+        logger.error("[voice] could not record cancellation verification: %s", exc)
+        return None
+    finally:
+        conn.close()
+
+
+def _consume_cancel_verification(verification_id, result):
+    """Close the verification exactly once.
+
+    `consumed_at IS NULL` is in the predicate rather than checked beforehand, so
+    two keypad submissions racing cannot both consume the same code.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE order_cancel_verifications "
+                "   SET consumed_at = now(), consumed_result = %s "
+                " WHERE verification_id = %s::uuid AND consumed_at IS NULL",
+                (result, str(verification_id)))
+            took = cur.rowcount
+        conn.commit()
+        return took == 1
+    except Exception as exc:                                       # noqa: BLE001
+        conn.rollback()
+        logger.error("[voice] could not close cancellation verification: %s", exc)
+        return False
+    finally:
+        conn.close()
 
 
 def _cancel_send_otp(sess: Dict[str, Any]) -> Tuple[str, str]:
@@ -3321,8 +3543,28 @@ def _cancel_send_otp(sess: Dict[str, Any]) -> Tuple[str, str]:
                             order.get("order_number"),
                             reason="order_cancel_unverifiable")
 
+    # DURABLE EVIDENCE, NOT SESSION MEMORY. The session survives one call in
+    # one worker process; it is not readable afterwards, is not shared across
+    # workers and does not survive a restart. A cancellation authorised against
+    # it therefore cannot be corroborated later, which is why nine voice
+    # cancellations exist in the corpus and none can be evidenced. The row
+    # below is the authority; the session entry that follows is conversational
+    # state only.
+    verification_id = _record_cancel_verification(
+        order_id=order.get("order_id"), code=code,
+        reason=c.get("reason"), reason_detail=c.get("reason_detail"),
+        # `phone` is the number ON THE ORDER'S CONTACT, resolved above -- never
+        # the number the caller is speaking from and never one they supply.
+        destination=phone, contact_id=order.get("contact_id"))
+    if not verification_id:
+        return _cancel_fail(sess, "the cancellation verification record could "
+                                  "not be written, so no authority can be "
+                                  "established for this cancellation",
+                            order.get("order_number"),
+                            reason="order_cancel_unverifiable")
+
     c["verify"] = {"hash": _hash_code(code), "expires": time.time() + OTP_TTL,
-                   "attempts": 0}
+                   "attempts": 0, "verification_id": verification_id}
     c["state"] = "awaiting_otp"
     logger.info(f"[voice] cancellation OTP sent for order "
                 f"{order.get('order_number')}")
@@ -3505,9 +3747,21 @@ async def _cancel_check_code(sess: Dict[str, Any],
                                 reason="order_cancel_lockout")
         return _line("cx_bad_code", _lang_of(sess)), "digits"
 
-    # Verified by possession AND by all three record factors.
+    # Verified by possession AND by all three record factors. The durable row
+    # is closed here, under a predicate, and its identity is what authorises the
+    # write -- not the fact that this function believes the code was right.
+    vid = v.get("verification_id")
+    if not vid or not _consume_cancel_verification(vid, "verified"):
+        return _cancel_fail(sess, "the verification record could not be closed, "
+                                  "so this cancellation has no corroborated "
+                                  "authority",
+                            order.get("order_number"),
+                            reason="order_cancel_unverifiable")
+
     sess["cancel_auth"] = {"order_id": order.get("order_id"),
                            "verified_via": "voice-otp",
+                           "verification_id": vid,
+                           "verification_channel": "voice",
                            "at": time.time(), "scope": "order.cancel"}
     return await _execute_cancellation(sess)
 
@@ -3544,6 +3798,13 @@ async def _execute_cancellation(sess: Dict[str, Any]) -> Tuple[str, str]:
     result = await asyncio.to_thread(cancel_order_sp, {
         "order_id": order.get("order_id"),
         "verified_via": auth.get("verified_via"),
+        # The record, not the label. A demo-mode authorisation carries neither,
+        # so it cannot reach the cancellation: that is the intended outcome, not
+        # an oversight.
+        "verification_id": auth.get("verification_id"),
+        "verification_channel": auth.get("verification_channel"),
+        "reason": (c.get("reason") if isinstance(c, dict) else None),
+        "reason_detail": (c.get("reason_detail") if isinstance(c, dict) else None),
         "call_sid": sess.get("call_sid")})
 
     if not result.get("ok"):

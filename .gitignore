@@ -192,3 +192,17 @@ backups/
 
 # Private governance repo (schema/sql/sp/tests) — see .governance-pin
 /governance/
+
+# A pre-apply measurement of one machine's order population, written by
+# scripts/verify_cancellation_authority.py --snapshot. It describes a
+# specific database at a specific moment, so committing it would invite a
+# later verify to compare one machine against another's fingerprint.
+scripts/.cancellation_preflight.json
+
+# Governance audit working directory. The evidence files record production
+# privilege inventories: the roles holding CREATE on public, every
+# PUBLIC-executable SECURITY DEFINER function, and the gaps not yet closed.
+# This repository is public, so publishing that material would describe
+# where production is weak while it is still weak. The directory is
+# retained locally and referenced by the governance records.
+docs/audit/

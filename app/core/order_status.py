@@ -425,11 +425,14 @@ def issue_code(order_id: str, email: str,
             cur.execute(
                 "INSERT INTO order_cancel_verifications "
                 "  (order_id, code_hash, recipient_email, channel, expires_at, "
-                "   reason, reason_detail) "
-                "VALUES (%s::uuid, %s, %s, 'web', %s, %s, %s) "
+                "   reason, reason_detail, recipient_destination) "
+                # recipient_destination is the canonical field the authority
+                # check reads, on every channel. recipient_email keeps its
+                # existing value for anything already reading it.
+                "VALUES (%s::uuid, %s, %s, 'web', %s, %s, %s, %s) "
                 "RETURNING verification_id::text",
                 (str(order_id), _hash_code(code), email.strip(), expires,
-                 reason, reason_detail))
+                 reason, reason_detail, email.strip()))
             verification_id = cur.fetchone()[0]
         conn.commit()
     except Exception as exc:                              # noqa: BLE001
@@ -589,7 +592,9 @@ def sweep_verifications(days: int = 30) -> int:
 def perform_cancellation(order_id: str, *, verified_via: str,
                          actor: str = "customer-web",
                          reason: Optional[str] = None,
-                         reason_detail: Optional[str] = None) -> Dict[str, Any]:
+                         reason_detail: Optional[str] = None,
+                         verification_id: Optional[str] = None,
+                         verification_channel: str = "web") -> Dict[str, Any]:
     """Cancel, ledger, email, tell a human. In that order, for that reason.
 
     Every step after the first is reached ONLY because the guarded UPDATE
@@ -612,6 +617,22 @@ def perform_cancellation(order_id: str, *, verified_via: str,
     result = voice_support.cancel_order_sp({
         "order_id": order_id,
         "verified_via": verified_via,
+        # THE VERIFICATION RECORD, NOT A CLAIM ABOUT IT. `verified_via` is a
+        # label this function writes about itself; it corroborates nothing. The
+        # identity of the row that actually proved possession travels with the
+        # request so the database can check it against the order being
+        # cancelled. A reconciliation of 298 cancellations found 6 that could be
+        # corroborated, because this identity stopped here.
+        "verification_id": verification_id,
+        # The verification row records 'web'; `actor` records 'customer-web' for
+        # the audit trail. They are different vocabularies and must not be
+        # conflated -- passing the audit actor here would fail every check.
+        "verification_channel": verification_channel,
+        # The proposition the customer actually agreed to. The reason already
+        # comes from the verification row rather than the request body; sending
+        # it into the authority check makes that a database guarantee instead of
+        # a convention this function happens to follow.
+        "authority_source": "customer",
         # The audit row records the channel from here. Without it cancel_order_sp
         # falls back to its historical default and a website cancellation is
         # filed as a phone call.
@@ -1120,7 +1141,9 @@ async def order_cancel_confirm(body: Dict[str, Any] = Body(...)):
     # and the audit record must say what the customer chose on the page.
     res = perform_cancellation(order_id, verified_via="email-otp",
                                reason=checked.get("reason"),
-                               reason_detail=checked.get("reason_detail"))
+                               reason_detail=checked.get("reason_detail"),
+                               verification_id=checked.get("verification_id"),
+                               verification_channel="web")
     if not res.get("ok"):
         return {"ok": False, "error": res.get("error"),
                 "message": ("We could not cancel this order -- its status "

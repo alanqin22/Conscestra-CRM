@@ -459,16 +459,76 @@ def check_backups(directory: Path = None,
     facts["newest_backup"] = (f"{newest.name} "
                               f"({newest.stat().st_size / 1e6:.0f} MB, "
                               f"{age_h:.0f}h old)")
+    log = directory / "backup.log"
+    ran_after = False
+    try:
+        ran_after = log.stat().st_mtime > newest.stat().st_mtime
+        facts["backup_log"] = (
+            f"{log.name} last written "
+            f"{(time.time() - log.stat().st_mtime) / 3600:.0f}h ago")
+    except OSError:
+        facts["backup_log"] = "absent"
     if age_h > max_age_h:
         problems.append(
             f"newest usable backup is {age_h / 24:.1f} days old "
             f"({newest.name}), threshold {max_age_h / 24:.1f} days. Recovery "
             f"would lose everything written since. "
-            + (f"{empty} zero-byte dump file(s) are present, so the nightly "
-               f"job is running and failing."
-               if empty else
-               "Check that the nightly backup task still exists."))
+            + _diagnose_missing_backup(log, ran_after, empty))
     return problems, facts
+
+
+def _diagnose_missing_backup(log: Path, ran_after: bool, empty: int) -> str:
+    """Say whether the nightly job is failing or not running at all.
+
+    This sentence used to offer one diagnosis — "check that the nightly backup
+    task still exists" — unless zero-byte dump files were present. That proxy
+    was already dead when it was written: since 2026-09-27 a failed run writes
+    to a `.dump.partial` name and deletes it, so a failing job leaves no file
+    behind and every outage reads as a deleted task. On 2026-10-05 the task was
+    running nightly and failing on a privilege change, and the alert sent the
+    operator to the scheduler, which was the one thing working.
+
+    The scheduled task appends its own output (`>> backup.log 2>&1`), so the
+    log's timestamp is evidence the job RAN — independent of whether it
+    produced a dump, and independent of anything the job itself decided to
+    report.
+    """
+    if ran_after:
+        return (f"The nightly job IS running and failing: {log.name} was "
+                f"written after the newest dump. Last error: "
+                f"{_last_error(log) or 'not identifiable in the log tail'}")
+    if empty:
+        return (f"{empty} zero-byte dump file(s) are present, so the nightly "
+                f"job is running and failing.")
+    return (f"{log.name} has not been written since that dump, so the job is "
+            f"not running at all. Check the 'CRM Railway Backup' scheduled "
+            f"task, and that Docker Desktop is running -- the dump and the "
+            f"restore drill both run in containers.")
+
+
+def _last_error(log: Path, window: int = 8000) -> str:
+    """The exception line from the end of the backup log, if there is one.
+
+    A traceback's final line is the first unindented line after the last
+    `Traceback (most recent call last):`. Picking it by position rather than by
+    matching error-looking text means the reason survives whatever the failure
+    happens to be called. With no traceback the last line is reported instead,
+    which is what a `SystemExit` message looks like.
+    """
+    try:
+        tail = log.read_bytes()[-window:].decode("utf-8", "replace")
+    except OSError:
+        return ""
+    lines = [ln.rstrip() for ln in tail.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    starts = [i for i, ln in enumerate(lines)
+              if ln.startswith("Traceback (most recent call last):")]
+    if starts:
+        for ln in lines[starts[-1] + 1:]:
+            if not ln.startswith((" ", "\t")):
+                return ln[:300]
+    return lines[-1][:300]
 
 
 def check_confirmed(url: str) -> Tuple[List[str], Dict[str, Any], int]:

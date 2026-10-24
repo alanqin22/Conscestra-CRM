@@ -733,9 +733,81 @@ def _sp_order_cancel(p: Dict[str, Any]) -> Any:
     visible in the registry, and so governance.undo has a named action type.
     The status guard lives inside the UPDATE, so it applies to every caller of
     this function equally.
+
+    AGENT ENTITLEMENT IS NOT CUSTOMER AUTHORIZATION. Three separate things must
+    hold for a cancellation, and this capability establishes only the first:
+
+        actor entitlement    -- the agent may initiate this class of operation,
+                                which the registry and allowed_callers decide;
+        customer authority   -- the customer authorised THIS cancellation of
+                                THIS order, which only a verification record
+                                can evidence;
+        execution authority  -- the database has checked both and permits the
+                                state transition.
+
+    A capability grant that stood in for the second would let an agent cancel a
+    customer's order because it was permitted to call a function. So the
+    proposition must carry a verification identity; without one the database
+    refuses, and the refusal below names why rather than surfacing as an opaque
+    write failure.
     """
     from app.core import voice_support
-    return voice_support.cancel_order_sp(p or {})
+    params = dict(p or {})
+
+    # A cancellation approved by a named executive is STAFF authority, and the
+    # approval row already holds both things that authority requires: who
+    # decided, and why. Minting the grant here is what makes the approval queue
+    # -- the staff surface that already exists -- actually able to cancel.
+    #
+    # A policy-executed action is deliberately NOT staff authority. `decided_by`
+    # reads 'policy:<owner>' when a standing policy ran the action with no human
+    # in the loop, and treating that as a human decision would hand an automated
+    # path the accountability of a person who never saw it.
+    if not params.get("verification_id") and params.get("approval_uuid"):
+        decided_by, reason = _approval_decider(params["approval_uuid"])
+        if decided_by and not str(decided_by).startswith("policy:"):
+            granted = voice_support.grant_staff_cancellation_authority(
+                params.get("order_id"), staff_identity=str(decided_by),
+                reason=(reason or params.get("reason")
+                        or "cancellation approved without a stated reason"))
+            if not granted.get("ok"):
+                return granted
+            params.update({
+                "verification_id": granted["staff_authority_id"],
+                "verification_channel": "staff",
+                "authority_source": "staff",
+                "reason": (reason or params.get("reason")
+                           or "cancellation approved without a stated reason"),
+                "reason_detail": None})
+
+    if not params.get("verification_id"):
+        return {"ok": False, "error": "no customer authorization",
+                "reason": "an agent capability permits initiating a "
+                          "cancellation; it is not evidence that the customer "
+                          "authorised this one. A verification record, or an "
+                          "approval decided by a named human, is required."}
+    return voice_support.cancel_order_sp(params)
+
+
+def _approval_decider(approval_uuid):
+    """(decided_by, decision_reason) for one approval, or (None, None).
+
+    Read here rather than passed in, because the caller must not be able to
+    name its own approver.
+    """
+    from app.core.database import get_connection
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT decided_by, decision_reason FROM action_approvals"
+                        " WHERE approval_uuid = %s::uuid", (str(approval_uuid),))
+            row = cur.fetchone()
+        return (row[0], row[1]) if row else (None, None)
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[a2a] could not read approval {approval_uuid}: {exc}")
+        return (None, None)
+    finally:
+        conn.close()
 
 
 def _sp_scoring_activate(p: Dict[str, Any]) -> Any:
@@ -1086,7 +1158,8 @@ CAPABILITIES: Dict[str, Capability] = _reg(
                "cannot be cancelled through this capability by anyone; "
                "undo restores the prior status",
                sp=_sp_order_cancel,
-               params_schema=(('order_id',), ('reason', 'reason_detail', 'channel', 'verified_via', 'call_sid', 'updated_by', 'order_number'))),
+               params_schema=(('order_id',), ('reason', 'reason_detail', 'channel', 'verified_via', 'call_sid', 'updated_by', 'order_number',
+                                             'verification_id', 'verification_channel', 'authority_source', 'approval_uuid'))),
     Capability("scoring.activate", "leads", "", "write",
                lambda p: f"activate lead-scoring model v{p.get('version', '?')}",
                "make a trained predictive lead-scoring candidate the active "
@@ -1723,12 +1796,47 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
                                        "sla_hours": pol.get("sla_hours")})
             # d == "act" → fall through and execute under the declared policy
 
+    # ── CLAIM BEFORE ACTING (G-2a) ──────────────────────────────────────────
+    #
+    # One claim site, covering BOTH the structured and the endpoint path below.
+    # It sits here rather than beside each ledger call because the thing being
+    # established is the right to execute, and both paths execute after this
+    # line.
+    #
+    # FAIL-CLOSED, and that is the entire change. The old order was
+    # execute → try to record → continue regardless, so a refused record left
+    # the side effect done and reported ok=True. A claim that cannot be
+    # committed now stops the dispatch instead.
+    _policy_claim = None
+    if _policy_exec is not None:
+        _policy_claim = governance.claim_policy_execution(
+            req.intent, req.from_agent,
+            (_policy_exec.get("policy_owner")
+             or _policy_exec.get("approver_role") or "unowned") + f":{req.intent}",
+            {**{k: v for k, v in dict(req.params).items()
+                if not k.startswith("_")},
+             "_correlation_id": cid,
+             "principal": str(req.principal) if req.principal else None},
+            entity_type=req.entity.type if req.entity else None,
+            entity_id=req.entity.id if req.entity else None)
+        if _policy_claim is None:
+            logger.error(f"[a2a] {req.intent} NOT executed — the execution "
+                         f"could not be recorded before acting cid={cid[:8]}")
+            return A2AResult(
+                False, req.intent, cap.agent, cid, outcome=REJECTED,
+                error="refused: this action executes under a standing policy, "
+                      "and the execution could not be durably recorded before "
+                      "acting. Nothing was dispatched.")
+
     # Structured input contract: deterministic params → SP → structured data.
     # No NL parsing, no AI, no HTTP — the default for agent-to-agent calls.
     if structured:
         try:
             data = await asyncio.to_thread(cap.sp, req.params)
         except Exception as exc:
+            if _policy_claim is not None:
+                governance.finish_policy_execution(
+                    _policy_claim, req.intent, {"error": str(exc)}, ok=False)
             return A2AResult(False, req.intent, cap.agent, cid,
                              outcome=FAILED,
                              error=f"sp failed for '{req.intent}': {exc}")
@@ -1743,14 +1851,23 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
             logger.warning(f"[a2a] {req.from_agent} → {cap.agent}.{req.intent} "
                            f"(structured) → {outcome} cid={cid[:8]}"
                            + (f": {detail}" if detail else ""))
+            if _policy_claim is not None:
+                # A claim that is never finished strands and is recovered as
+                # 'unknown'. This outcome is KNOWN — the SP said no — so it is
+                # recorded as failed rather than left to the sweep.
+                governance.finish_policy_execution(
+                    _policy_claim, req.intent,
+                    data if isinstance(data, dict) else {"result": data},
+                    ok=False)
             return A2AResult(False, req.intent, cap.agent, cid, data=data,
                              outcome=outcome,
                              error=str(detail) if detail else
                              f"'{req.intent}' returned {outcome}")
         logger.info(f"[a2a] {req.from_agent} → {cap.agent}.{req.intent} "
                     f"(structured) cid={cid[:8]}")
-        if _policy_exec is not None:
-            _ledger_policy_execution(req, cid, _policy_exec, data)
+        if _policy_claim is not None:
+            _close_policy_execution(req, cid, _policy_exec, _policy_claim, data,
+                                    ok=True)
         return A2AResult(True, req.intent, cap.agent, cid, data=data,
                          outcome=ACCEPTED,
                          output=_summarize(req.intent, data))
@@ -1788,12 +1905,22 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
                          error=f"transport failure: {exc}", outcome=UNKNOWN)
 
     outcome = classify_outcome(status, resp, parsed)
+    _endpoint_data = resp.get("result") if isinstance(resp, dict) else None
     if outcome != ACCEPTED:
         logger.warning(f"[a2a] {cap.agent}.{req.intent} → {outcome} "
                        f"(HTTP {status}) cid={cid[:8]}")
-    elif _policy_exec is not None:
-        _ledger_policy_execution(req, cid, _policy_exec,
-                                 resp.get("result") if isinstance(resp, dict) else None)
+        if _policy_claim is not None:
+            # UNKNOWN is deliberately finished as failed here rather than left
+            # to strand: the transport outcome is recorded in `result`, and a
+            # row that says "we permitted this, the call did not come back
+            # accepted" is more use than one the sweep closes 15 minutes later
+            # with no detail.
+            _close_policy_execution(req, cid, _policy_exec, _policy_claim,
+                                    {"outcome": outcome, "http_status": status,
+                                     "result": _endpoint_data}, ok=False)
+    elif _policy_claim is not None:
+        _close_policy_execution(req, cid, _policy_exec, _policy_claim,
+                                _endpoint_data, ok=True)
     return A2AResult(
         ok=(outcome == ACCEPTED),
         intent=req.intent, agent=cap.agent, correlation_id=cid,
@@ -1805,41 +1932,54 @@ async def _dispatch_inner(req: A2ARequest, cid: str,
     )
 
 
-def _ledger_policy_execution(req: "A2ARequest", cid: str, pol: Dict[str, Any],
-                             data: Any) -> None:
-    """A write that executed under a declared AUTO_EXECUTE / SAMPLED_REVIEW
-    policy is ledgered in action_approvals with decided_by='policy:<owner>' —
-    the technical decider is the policy, the accountable human is its owner
-    (activation §10, §16). SAMPLED_REVIEW additionally raises a review work
-    item for a `sample_rate` share of executions, owned by the approver role.
-    Best-effort: the customer-visible action already happened."""
+def _close_policy_execution(req: "A2ARequest", cid: str, pol: Dict[str, Any],
+                            claim: Dict[str, Any], data: Any, ok: bool) -> None:
+    """Close the claim taken before this action ran (G-2a).
+
+    REPLACES `_ledger_policy_execution`, which wrote the whole ledger row AFTER
+    the side effect and swallowed the failure. The row now already exists, in
+    'executing', committed before the action; this moves it to its terminal
+    state and attaches the verification.
+
+    Still best-effort, and now that is defensible rather than resigned: the
+    action has happened by the time this runs, so raising would change nothing
+    about the world and would only lose the caller its result. What has changed
+    is the consequence of losing this call. Before, the outcome was no record
+    at all. Now the committed 'executing' row survives, and `sla_sweep` closes
+    it as stranded with an alert saying the side effect is unknown -- which is
+    the truth, and is what the old path could never say.
+    """
     try:
-        from app.core import governance
-        owner = pol.get("policy_owner") or pol.get("approver_role") or "unowned"
-        result = data if isinstance(data, dict) else {"data": data}
-        aid = governance.record_preauthorized(
-            req.intent, req.from_agent, f"{owner}:{req.intent}",
-            {**{k: v for k, v in dict(req.params).items() if not k.startswith("_")},
-             "_correlation_id": cid,
-             "principal": str(req.principal) if req.principal else None},
-            {"ok": True, **{k: v for k, v in result.items() if k != "ok"}} if isinstance(result, dict) else {"ok": True},
-            entity_type=req.entity.type if req.entity else None,
-            entity_id=req.entity.id if req.entity else None)
-        if pol.get("decision_mode") == "SAMPLED_REVIEW":
-            rate = float(pol.get("sample_rate") or 0)
-            if rate > 0 and random.random() < rate:
-                from app.core import governance_alerts
-                governance_alerts.open_alert(
-                    "sampled_review",
-                    f"Sampled review: {req.intent} executed under policy "
-                    f"({owner}) — confirm it was right",
-                    rule=None, severity="low", source="a2a",
-                    affected_type="approval", affected_id=aid,
-                    detail={"intent": req.intent, "params": dict(req.params),
-                            "correlation_id": cid, "sample_rate": rate},
-                    owner_role=pol.get("approver_role"), correlation_id=cid)
+        governance.finish_policy_execution(claim, req.intent, data, ok)
     except Exception as exc:                                       # noqa: BLE001
-        logger.warning(f"[a2a] policy execution ledger skipped for {req.intent}: {exc}")
+        logger.warning(f"[a2a] policy claim {claim['approval_uuid'][:8]} not "
+                       f"finished for {req.intent}: {exc}")
+    # SAMPLED_REVIEW raises a review work item for a share of executions.
+    #
+    # GUARDED ON ok AND ON THE CLAIM, which the previous version was not: it
+    # ran off `aid`, and `record_preauthorized` returns None on failure, so a
+    # lost ledger row could still raise an alert whose affected_id pointed at
+    # an approval that was never written. A review item for a refused action
+    # is worse than none -- it sends someone to look at a row that is not there.
+    if not ok or pol.get("decision_mode") != "SAMPLED_REVIEW":
+        return
+    try:
+        rate = float(pol.get("sample_rate") or 0)
+        if rate <= 0 or random.random() >= rate:
+            return
+        from app.core import governance_alerts
+        owner = pol.get("policy_owner") or pol.get("approver_role") or "unowned"
+        governance_alerts.open_alert(
+            "sampled_review",
+            f"Sampled review: {req.intent} executed under policy "
+            f"({owner}) — confirm it was right",
+            rule=None, severity="low", source="a2a",
+            affected_type="approval", affected_id=claim["approval_uuid"],
+            detail={"intent": req.intent, "params": dict(req.params),
+                    "correlation_id": cid, "sample_rate": rate},
+            owner_role=pol.get("approver_role"), correlation_id=cid)
+    except Exception as exc:                                       # noqa: BLE001
+        logger.warning(f"[a2a] sampled review not raised for {req.intent}: {exc}")
 
 
 # ============================================================================
