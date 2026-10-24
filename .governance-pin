@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-58b1699023873986682c2b2335e9115913fd672d
+3f57514b389cef217c1a0567b85caeaa317930cf
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -818,3 +818,29 @@
 #
 # 58b1699 was pushed first and its remote resolution verified with
 # ls-remote at 2026-10-24 01:04 UTC before this line was written.
+
+# 56bea1c -- app_definer_function_grants.sql and
+# definer_public_execute_boundary.sql, the pair this commit promotes into
+# REQUIRED_MIGRATIONS. Production applied both on 2026-10-20 01:12:55 UTC;
+# the objects were verified separately on 2026-10-24 (0 of 22 SECURITY
+# DEFINER functions executable by PUBLIC, 22 named EXECUTE grants to
+# crm_app), because a ledger row records that an apply ran and not that
+# its objects survived.
+#
+# THE COMMITTED BYTES ARE THE APPLIED BYTES. Both hash to the checksums
+# recorded in production's schema_migrations, 472adc85a3756281 and
+# 8af55780fd082040. An applied migration is immutable here because the
+# ledger stores sha256(bytes)[:16]: editing even a comment would make
+# `migrate --check` report drift on every database carrying it.
+#
+# 56bea1c was pushed first and its remote resolution verified with
+# ls-remote at 2026-10-24 03:07 UTC before this line was written.
+
+# 3f57514 -- declares the two definer dispositions in the governed
+# vocabulary. The control that rejected them states the rule: adding a
+# disposition is a governance decision, not a naming choice. It also
+# restores the file's CRLF endings, which an earlier write had normalised
+# to LF and so rewrote all 1,634 lines; the committed change is 14 lines.
+#
+# 3f57514 was pushed first and its remote resolution verified with
+# ls-remote at 2026-10-24 03:28 UTC before this line was written.
