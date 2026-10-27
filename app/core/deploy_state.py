@@ -1611,6 +1611,39 @@ _APPLIED_DEFINER_PUBLIC_EXECUTE_BOUNDARY = (
     "make `migrate --check` report drift on every database carrying them."
 )
 
+_APPLIED_DEFINER_SEARCHPATH_PIN = (
+    "APPLIED TO PRODUCTION (`railway`) on 2026-10-25 under the Phase B10 "
+    "authorization. Artifact sha256 "
+    "ffe0780b2b72a1da5965f0add313b52729fcc18a371c5fe3d0c847d311280e15, "
+    "6499 bytes, published in governance 561097b and byte-identical to what "
+    "was executed. "
+    "THREE DATES, DELIBERATELY DISTINCT. Executed 2026-10-25; the artifact "
+    "was published to the governance repository 2026-10-26; this declaration "
+    "was added 2026-10-26. Governance control over the artifact begins at "
+    "publication and not before. "
+    "WHAT IT DID. Pinned search_path = pg_catalog, public on four SECURITY "
+    "DEFINER functions -- anonymise_old_erasure_log, "
+    "erase_memory_verifications, erase_verifications_for_entity, "
+    "purge_unattributable_verifications -- and changed nothing else. "
+    "Verified afterwards by thirteen independent checks on a fresh read-only "
+    "connection: exactly four proconfig changes, no body, owner, grant or "
+    "signature change anywhere, population still 22, crm_app still reaching "
+    "all 22. "
+    "IT BYPASSED BOTH GOVERNED RUNNERS. Execution was direct, as a single "
+    "transaction. It went through NEITHER migrate NOR apply_sql, so NO "
+    "contemporaneous schema_attestations row exists -- and none can be "
+    "created, because that table's `source` admits only those two values. "
+    "Fabricating one is refused. "
+    "THE AUTHORIZATION DEFECT STANDS RECORDED. Phase B10 permitted direct "
+    "execution without requiring a durable governed record of the artifact. "
+    "That is a defect in the authorization. This declaration preserves the "
+    "history; it does not make the execution retrospectively compliant with "
+    "a process it did not use. "
+    "THE ARTIFACT'S OWN HEADER IS STALE AND LEFT ALONE. It still reads "
+    "STATUS: CANDIDATE, false since 2026-10-25. Editing it would change the "
+    "identity being declared."
+)
+
 OUT_OF_BAND_SQL: Dict[str, str] = {
     "account_intelligence.sql": _SCHEMA_OOB,
     "accounting_invoice_pipeline.sql": (
@@ -1658,6 +1691,8 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     # acquire email-enabled recipients by being created.
     "definer_public_execute_boundary.sql": (
         _APPLIED_DEFINER_PUBLIC_EXECUTE_BOUNDARY),
+    "definer_searchpath_pin.sql": (
+        _APPLIED_DEFINER_SEARCHPATH_PIN),
     "employee_work_email_activation.sql": (
         _APPLIED_EMPLOYEE_WORK_EMAIL_ACTIVATION),
     # An owner id may never equal the employee id it links to. Reusing one as
