@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-561097b1c9e39616359dbc85e98adc9145f281ab
+597b731f9800d0b03649e0b1d4af1cbdf23bf034
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -861,3 +861,13 @@
 #
 # 561097b was pushed first and its remote resolution verified with
 # ls-remote and a fresh clone at 2026-10-26 before this line was written.
+
+# 597b731 -- adds _APPLIED_DEFINER_SEARCHPATH_PIN to the governed
+# disposition vocabulary. The control that rejected the previous pin states
+# the rule: adding a disposition is a governance decision, not a naming
+# choice, so a constant referenced by the manifest must be declared in
+# DISPOSITIONS. CI caught this at 561097b; the declaration and the
+# vocabulary entry are therefore one change in two repositories.
+#
+# 597b731 was pushed first and its remote resolution verified with
+# ls-remote at 2026-10-27 before this line was written.
