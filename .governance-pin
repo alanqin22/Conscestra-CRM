@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-e270a6276bd3bc417ef9c8933e3876f69facb0c7
+fe088616df04448d93ec930501aa45a7e98723ad
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -882,3 +882,12 @@ e270a6276bd3bc417ef9c8933e3876f69facb0c7
 #
 # The artifact is PUBLISHED AND PENDING, not applied. Nothing in this
 # change executes it against any database.
+
+# fe08861 -- _APPLIED_DEFINER_SEARCHPATH_TEMP_DEMOTION added to the
+# governed vocabulary. The artifact published in 9ca2059 was executed
+# against `railway` on 2026-10-28 01:59:52 UTC and attested at row id 30,
+# so the declaration naming it has to say APPLIED, and the name it uses
+# has to be declared. The _PENDING_ name is retained and unused.
+#
+# NO SQL RUNS because of this pin advance. The database already changed;
+# this is the release that admits it.
