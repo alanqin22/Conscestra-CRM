@@ -1263,6 +1263,46 @@ _APPLIED_APPEND_ONLY_ATTEST = (
     "sentence that no database had it was true until 2026-10-10 15:32 UTC and "
     "is kept as the record of that rather than rewritten to match today.")
 
+_PENDING_ERASURE_STAGE1_PRIVILEGE_CONTAINMENT = (
+    "PENDING DEPLOYMENT. Published and release-bound; NOT executed on any "
+    "database -- not local, not `railway`. Artifact sha256 "
+    "a0ea322e7733a1d31300834dd468b763a8a48d04278d3950818dd9afaadcba37, "
+    "12654 bytes, 0 CR; executable body "
+    "723481842eece15f830e7763a30e9f0664a3fb0255e7f4745eacfa9529766164. "
+    "Published in governance 7f570dc; bound to d186258, which declares "
+    "its name in the governed vocabulary. "
+    "WHAT IT DOES. Least privilege. It withdraws three unnecessary "
+    "privileges from the application role and nothing else: it creates "
+    "no object, drops nothing, defines no function, and contains exactly "
+    "three REVOKE statements between a fail-closed preflight and a "
+    "postcondition. "
+    "WHY IT IS SAFE. The affected capabilities have no application call "
+    "site -- established by a scan of the whole repository, not of a "
+    "named subset. Lawful GDPR erasure is unaffected: it runs through "
+    "SECURITY DEFINER procedures that execute with the owner's rights, "
+    "verified in a disposable fixture after the change. One privilege "
+    "that the deletion-audit path genuinely depends on is deliberately "
+    "RETAINED and withdrawn in a later stage instead; the dependency was "
+    "measured in production rather than assumed, and withdrawing it here "
+    "would have broken a working audit path. "
+    "EFFECTIVENESS IS ASSERTED, NOT ASSUMED. The postcondition tests "
+    "has_table_privilege and has_function_privilege before COMMIT, "
+    "because a successful REVOKE is not proof that a privilege is gone: "
+    "PUBLIC may hold it, a role membership may re-supply it, or a "
+    "default ACL may have granted it at creation. All three were "
+    "measured beforehand. "
+    "SCOPE. This is one stage of a multi-stage least-privilege "
+    "programme; it narrows the surface and does not complete it. The "
+    "remaining stages are separately authorized and separately "
+    "verified. The full rationale, measurements and adversarial evidence "
+    "are held in the private governance repository and in the "
+    "non-published audit record, deliberately -- a public manifest is "
+    "not the place for the detail of a control that is still being "
+    "closed. "
+    "ROLLBACK IS A REGRESSION, NOT AN UNDO. Re-granting these privileges "
+    "restores a capability this change exists to remove, so it requires "
+    "its own authorization and is never applied automatically.")
+
 _PENDING_ERASURE_E8 = (
     "PENDING DEPLOYMENT -- authored 2026-09-01 and applied to LOCAL only. "
     "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
@@ -1798,6 +1838,8 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
         _APPLIED_DEFINER_SEARCHPATH_TEMP_DEMOTION),
     "employee_work_email_activation.sql": (
         _APPLIED_EMPLOYEE_WORK_EMAIL_ACTIVATION),
+    "erasure_stage1_privilege_containment.sql": (
+        _PENDING_ERASURE_STAGE1_PRIVILEGE_CONTAINMENT),
     # An owner id may never equal the employee id it links to. Reusing one as
     # the other is exactly how the F1 collision was created, and it is the
     # shortest path to a working digest — so it is forbidden structurally

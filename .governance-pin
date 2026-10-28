@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-fe088616df04448d93ec930501aa45a7e98723ad
+d1862583f6803e83c2538e16cbb11bdfcf478065
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -891,3 +891,12 @@ fe088616df04448d93ec930501aa45a7e98723ad
 #
 # NO SQL RUNS because of this pin advance. The database already changed;
 # this is the release that admits it.
+
+# 7f570dc / d186258 -- Stage 1 of the erasure-boundary remediation.
+# 7f570dc publishes sql/erasure_stage1_privilege_containment.sql (inert
+# until declared); d186258 adds its name to DISPOSITIONS. Pinning below
+# either fails a different control.
+#
+# NO SQL RUNS because of this pin advance. The artifact withdraws three
+# privileges from crm_app and is executed separately, once, under its
+# own authorization.
