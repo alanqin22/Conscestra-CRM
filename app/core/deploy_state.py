@@ -1644,6 +1644,47 @@ _APPLIED_DEFINER_SEARCHPATH_PIN = (
     "identity being declared."
 )
 
+_PENDING_DEFINER_SEARCHPATH_TEMP_DEMOTION = (
+    "PENDING DEPLOYMENT. Published and release-bound; NOT executed on any "
+    "database -- not local, not `railway`. Artifact sha256 "
+    "1cc2f7485fd88e27163b6fd0b7e7835b3b1469dc1bbbf5eb4f6eca14d765c564, "
+    "13481 bytes, 0 CR; executable body "
+    "d632df1939b6ba851eaf18799690e5ee6b2805437661768adc0e6bef90554975. "
+    "Published to the governance repository in 9ca2059 and verified "
+    "byte-identical from a fresh clone of the remote; this declaration is "
+    "bound to e270a62, which adds its name to the governed vocabulary. "
+    "WHAT IT WILL DO. Append pg_temp as the LAST entry of search_path on "
+    "the same four SECURITY DEFINER erasure functions that "
+    "definer_searchpath_pin.sql pinned -- anonymise_old_erasure_log, "
+    "erase_memory_verifications, erase_verifications_for_entity, "
+    "purge_unattributable_verifications -- changing exactly four proconfig "
+    "values and nothing else. "
+    "WHY. It CORRECTS the security rationale of "
+    "_APPLIED_DEFINER_SEARCHPATH_PIN, which asserts that pg_temp being "
+    "absent from the path is better than being last. That is false. "
+    "PostgreSQL searches the session temporary schema for RELATION and "
+    "TYPE names whether or not pg_temp is listed, and when it is not "
+    "listed it is searched FIRST, ahead of pg_catalog. Listing it last is "
+    "the only demotion available. Measured on a disposable database: with "
+    "pg_catalog, public an unqualified reference resolved to a "
+    "caller-planted pg_temp table; with pg_catalog, public, pg_temp the "
+    "same reference resolved in public. "
+    "THE EARLIER MIGRATION DID NOT CREATE THE EXPOSURE. Before it those "
+    "four carried no search_path at all, so pg_temp was unlisted and "
+    "therefore already first. It pinned the rest of the path, which was an "
+    "improvement, and stopped one step short. "
+    "NOT A CLAIM OF REMEDIATION. Demotion lowers priority; it does not "
+    "remove reachability. An unqualified reference to a name absent from "
+    "pg_catalog AND public still resolves in the temporary schema. "
+    "EXECUTION IS SEPARATELY AUTHORIZED and must go through apply_sql "
+    "--target railway with an owner-capable DSN supplied in the shell for "
+    "that single invocation. ALTER FUNCTION requires ownership, and "
+    "neither crm_app nor crm_readonly is a member of the owning role -- "
+    "measured, and demonstrated at SQLSTATE 42501. This entry is amended "
+    "to APPLIED only after an independently verified execution, never on "
+    "a runner exit code alone."
+)
+
 OUT_OF_BAND_SQL: Dict[str, str] = {
     "account_intelligence.sql": _SCHEMA_OOB,
     "accounting_invoice_pipeline.sql": (
@@ -1693,6 +1734,8 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
         _APPLIED_DEFINER_PUBLIC_EXECUTE_BOUNDARY),
     "definer_searchpath_pin.sql": (
         _APPLIED_DEFINER_SEARCHPATH_PIN),
+    "definer_searchpath_temp_demotion.sql": (
+        _PENDING_DEFINER_SEARCHPATH_TEMP_DEMOTION),
     "employee_work_email_activation.sql": (
         _APPLIED_EMPLOYEE_WORK_EMAIL_ACTIVATION),
     # An owner id may never equal the employee id it links to. Reusing one as

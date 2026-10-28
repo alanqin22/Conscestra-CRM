@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-597b731f9800d0b03649e0b1d4af1cbdf23bf034
+e270a6276bd3bc417ef9c8933e3876f69facb0c7
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -871,3 +871,14 @@
 #
 # 597b731 was pushed first and its remote resolution verified with
 # ls-remote at 2026-10-27 before this line was written.
+
+# 9ca2059 / e270a62 -- the corrective search-path artifact and the
+# vocabulary entry its declaration needs. TWO governance commits, one pin:
+# 9ca2059 publishes sql/definer_searchpath_temp_demotion.sql (inert until
+# declared), e270a62 adds _PENDING_DEFINER_SEARCHPATH_TEMP_DEMOTION to
+# DISPOSITIONS. Pinning below e270a62 would fail
+# test_every_named_disposition_is_declared; pinning below 9ca2059 would
+# fail the corpus invariant with CLASSIFIED BUT ABSENT FROM DISK.
+#
+# The artifact is PUBLISHED AND PENDING, not applied. Nothing in this
+# change executes it against any database.
