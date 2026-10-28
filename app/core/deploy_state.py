@@ -1685,6 +1685,66 @@ _PENDING_DEFINER_SEARCHPATH_TEMP_DEMOTION = (
     "a runner exit code alone."
 )
 
+_APPLIED_DEFINER_SEARCHPATH_TEMP_DEMOTION = (
+    "APPLIED TO PRODUCTION (`railway`) on 2026-10-28 at 01:59:52 UTC, "
+    "out-of-band, through the governed runner -- `python -m scripts.apply_sql "
+    "governance/sql/definer_searchpath_temp_demotion.sql --target railway` -- "
+    "under the Phase B20 Stage 3 authorization. Executed ONCE; no retry, no "
+    "fallback, no direct SQL. Artifact sha256 "
+    "1cc2f7485fd88e27163b6fd0b7e7835b3b1469dc1bbbf5eb4f6eca14d765c564, "
+    "13481 bytes, 0 CR; executable body "
+    "d632df1939b6ba851eaf18799690e5ee6b2805437661768adc0e6bef90554975; "
+    "published in governance 9ca2059 and byte-identical in the pinned "
+    "checkout. "
+    "WHAT IT DID. Appended pg_temp as the LAST search_path entry on four "
+    "SECURITY DEFINER erasure functions -- anonymise_old_erasure_log, "
+    "erase_memory_verifications, erase_verifications_for_entity, "
+    "purge_unattributable_verifications -- moving each from "
+    "`pg_catalog, public` to `pg_catalog, public, pg_temp`. Exactly four "
+    "proconfig values; nothing else. "
+    "WHY, and it CORRECTS an earlier claim. "
+    "_APPLIED_DEFINER_SEARCHPATH_PIN asserts that pg_temp being absent from "
+    "the path is better than being last. That is false. PostgreSQL searches "
+    "the session temporary schema for RELATION and TYPE names whether or not "
+    "pg_temp is listed, and when it is NOT listed it is searched FIRST, "
+    "ahead of pg_catalog. Listing it last is the only demotion available. "
+    "Measured on a disposable database: with `pg_catalog, public` an "
+    "unqualified reference resolved to a caller-planted pg_temp table; with "
+    "`pg_catalog, public, pg_temp` the same reference resolved in public. "
+    "WHAT WAS OBSERVED, and how. Gate 4, 34 checks on FRESH read-only "
+    "connections after the apply: all four at exactly the target value with "
+    "one setting each; all four body md5s, owners, signatures and definer "
+    "flags unchanged and none PUBLIC-executable; the other 18 definer "
+    "functions unchanged against contract v2.0.0 across all nine fingerprint "
+    "properties; population 22; schema_migrations still 52; user triggers "
+    "still 98; no role gained superuser. apply_sql recorded attestation row "
+    "id=30, source `apply_sql`, database `railway`, detail "
+    "definer_searchpath_temp_demotion.sql, fingerprint 6d0d83646334f339 -- "
+    "and that fingerprint was INDEPENDENTLY RECOMPUTED from the live schema "
+    "and matched. Exactly one attestation names this artifact, so no repeat "
+    "execution occurred. "
+    "WHAT THIS DOES NOT CLAIM. The attestation does not record the "
+    "connecting role or the artifact digest, so it does not identify a human "
+    "operator; the ledger is append-only by GRANT (crm_app=ar) and NOT by "
+    "trigger, so `postgres` -- the identity that executed this -- retains "
+    "UPDATE and DELETE on it and it is not an immutable audit record. "
+    "Mutation and attestation are separate transactions; they agreed here, "
+    "which was verified rather than assumed. "
+    "NOR IS THE SUBJECT CLOSED. Demotion lowers priority; it does not remove "
+    "reachability. An unqualified reference to a name absent from BOTH "
+    "pg_catalog AND public still resolves in the temporary schema, and "
+    "TEMPORARY remains granted to PUBLIC. Qualification remains a "
+    "convention, not a control. "
+    "NO LEDGER ROW, by design: apply_sql records none for an out-of-band "
+    "file, and the classification IS the provenance record. "
+    "EXECUTION AND PUBLICATION ARE DISTINCT. The database changed "
+    "2026-10-28 01:59:52 UTC; this declaration was published afterwards, as "
+    "a separate reviewed release. "
+    "_PENDING_DEFINER_SEARCHPATH_TEMP_DEMOTION is left defined and unused, "
+    "as _PENDING_APPEND_ONLY_ATTEST and the superseded names before it are: "
+    "its sentence that no database had the artifact was true until the "
+    "execution and is kept as the record of that rather than rewritten.")
+
 OUT_OF_BAND_SQL: Dict[str, str] = {
     "account_intelligence.sql": _SCHEMA_OOB,
     "accounting_invoice_pipeline.sql": (
@@ -1735,7 +1795,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "definer_searchpath_pin.sql": (
         _APPLIED_DEFINER_SEARCHPATH_PIN),
     "definer_searchpath_temp_demotion.sql": (
-        _PENDING_DEFINER_SEARCHPATH_TEMP_DEMOTION),
+        _APPLIED_DEFINER_SEARCHPATH_TEMP_DEMOTION),
     "employee_work_email_activation.sql": (
         _APPLIED_EMPLOYEE_WORK_EMAIL_ACTIVATION),
     # An owner id may never equal the employee id it links to. Reusing one as
