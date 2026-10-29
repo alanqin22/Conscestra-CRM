@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-d1862583f6803e83c2538e16cbb11bdfcf478065
+012e5cadfa86b816c9c5b8a53e1580079f68d556
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -900,3 +900,14 @@ d1862583f6803e83c2538e16cbb11bdfcf478065
 # NO SQL RUNS because of this pin advance. The artifact withdraws three
 # privileges from crm_app and is executed separately, once, under its
 # own authorization.
+
+# d905860 / 012e5ca -- Stage 2 of the erasure-boundary remediation, and the
+# reconciliation of Stage 1.
+# d905860 publishes sql/erasure_s2_object_creation.sql (inert until
+# declared); 012e5ca adds _PENDING_ERASURE_S2_OBJECT_CREATION and
+# _APPLIED_ERASURE_STAGE1_PRIVILEGE_CONTAINMENT to DISPOSITIONS. Pinning
+# below either fails a different control.
+#
+# NO SQL RUNS because of this pin advance. S2 is published and PENDING, not
+# applied; Stage 1 was applied 2026-10-28 23:44:24 UTC and attested at row
+# id 31, and this release admits it.
