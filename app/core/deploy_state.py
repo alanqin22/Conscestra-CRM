@@ -1303,6 +1303,75 @@ _PENDING_ERASURE_STAGE1_PRIVILEGE_CONTAINMENT = (
     "restores a capability this change exists to remove, so it requires "
     "its own authorization and is never applied automatically.")
 
+_APPLIED_ERASURE_STAGE1_PRIVILEGE_CONTAINMENT = (
+    "APPLIED TO PRODUCTION (`railway`) on 2026-10-28 at 23:44:24 UTC, "
+    "out-of-band, through the governed runner -- `python -m scripts.apply_sql "
+    "governance/sql/erasure_stage1_privilege_containment.sql --target "
+    "railway`. Executed ONCE; no retry, no fallback, no direct SQL. Artifact "
+    "sha256 a0ea322e7733a1d31300834dd468b763a8a48d04278d3950818dd9afaadcba37, "
+    "12654 bytes, 0 CR; executable body "
+    "723481842eece15f830e7763a30e9f0664a3fb0255e7f4745eacfa9529766164; "
+    "published in governance 7f570dc and byte-identical in the pinned "
+    "checkout. "
+    "WHAT IT DID. Withdrew exactly five effective privileges from the "
+    "application role and nothing else: DELETE and UPDATE on "
+    "memory_verifications, DELETE and UPDATE on governed_deletions, and "
+    "EXECUTE on purge_unattributable_verifications(). INSERT on "
+    "governed_deletions was deliberately RETAINED -- the deletion-audit path "
+    "depends on it -- and is withdrawn in a later stage. "
+    "WHAT WAS OBSERVED, and how. Fresh read-only connections after the "
+    "apply (63 checks, then 23): the five privileges absent as EFFECTIVE "
+    "privileges, PUBLIC holding none of them, the retained privileges "
+    "present, the three sanctioned erasure functions still executable and "
+    "SECURITY DEFINER with bodies unchanged, table ownership, user trigger "
+    "count (98) and schema_migrations (52) unchanged, and no later-stage "
+    "object present. apply_sql recorded attestation row id=31, source "
+    "`apply_sql`, database `railway`, detail "
+    "erasure_stage1_privilege_containment.sql, and exactly one attestation "
+    "names this artifact, so no repeat execution occurred. Re-measured "
+    "2026-10-29 before this declaration: all five still absent. "
+    "WHAT THIS DOES NOT CLAIM. The attestation does not record the "
+    "connecting role or the artifact digest, so it identifies no human "
+    "operator. Mutation and attestation are separate transactions; they "
+    "agreed here, which was verified rather than assumed. The erasure "
+    "authorization boundary is NOT closed by this stage: it narrows the "
+    "direct paths and leaves the remaining stages unauthorized. "
+    "ROLLBACK IS A REGRESSION, NOT AN UNDO, and is never applied "
+    "automatically. "
+    "EXECUTION AND PUBLICATION ARE DISTINCT. The database changed "
+    "2026-10-28 23:44:24 UTC; this declaration was published afterwards, as "
+    "a separate reviewed release. "
+    "_PENDING_ERASURE_STAGE1_PRIVILEGE_CONTAINMENT is left defined and "
+    "unused: its sentence that no database had the artifact was true until "
+    "the execution and is kept as the record of that rather than "
+    "rewritten.")
+
+_PENDING_ERASURE_S2_OBJECT_CREATION = (
+    "PENDING DEPLOYMENT. Published and release-bound; NOT executed on any "
+    "database -- not local, not `railway`. Artifact sha256 "
+    "3131360bb834488488164cd5ba04b4917d0dc8f2adb3eaa1fae75b83f94c9459, "
+    "18402 bytes, 0 CR; executable body "
+    "4d7249442319fa74c493d880a7e0741b5e98830f662c36ac46a1bbe75629f7dd. "
+    "Published in governance d905860; bound to 012e5ca, which declares its "
+    "name in the governed vocabulary. "
+    "WHAT IT DOES. Stage 2 of six in the erasure-boundary remediation. It "
+    "creates two tables, erasure_tickets and erasure_events, and three "
+    "functions, erasure_events_append_only(), fn_erasure_open(text, uuid) "
+    "and fn_erasure_close(). It replaces no existing guard, withdraws and "
+    "grants no privilege on any existing object, and changes no erasure "
+    "behaviour: nothing reads the new objects until a later stage. "
+    "SAFE ORDER. It must be executed as the database owner in one "
+    "transaction; the preflight refuses any other identity, a repeat "
+    "execution, and a database on which Stage 1 was reverted, and the "
+    "postcondition asserts EFFECTIVE privileges before COMMIT. "
+    "SCOPE. The remaining stages are separately authorized and separately "
+    "verified; this stage does not complete the boundary. The rationale, "
+    "measurements and adversarial evidence are held in the private "
+    "governance repository and the non-published audit record, "
+    "deliberately -- a public manifest is not the place for the detail of "
+    "a control that is still being closed. "
+    "ROLLBACK drops only the five objects it created.")
+
 _PENDING_ERASURE_E8 = (
     "PENDING DEPLOYMENT -- authored 2026-09-01 and applied to LOCAL only. "
     "Governed schema; promote to REQUIRED_MIGRATIONS in the same change that "
@@ -1838,8 +1907,10 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
         _APPLIED_DEFINER_SEARCHPATH_TEMP_DEMOTION),
     "employee_work_email_activation.sql": (
         _APPLIED_EMPLOYEE_WORK_EMAIL_ACTIVATION),
+    "erasure_s2_object_creation.sql": (
+        _PENDING_ERASURE_S2_OBJECT_CREATION),
     "erasure_stage1_privilege_containment.sql": (
-        _PENDING_ERASURE_STAGE1_PRIVILEGE_CONTAINMENT),
+        _APPLIED_ERASURE_STAGE1_PRIVILEGE_CONTAINMENT),
     # An owner id may never equal the employee id it links to. Reusing one as
     # the other is exactly how the F1 collision was created, and it is the
     # shortest path to a working digest — so it is forbidden structurally
