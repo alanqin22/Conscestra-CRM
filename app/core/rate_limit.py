@@ -116,6 +116,9 @@ reset_requests = SlidingWindowLimiter(5, 3600)  # password-reset: 5/identifier/h
 # Planner EXECUTION (plan: … confirm) — runs reads + queues governance proposals,
 # so throttle per-IP to bound queue-flooding + LLM cost even for authorized callers.
 plan_exec_ip = SlidingWindowLimiter(_int_env("PLAN_EXEC_MAX_PER_HOUR", 20), 3600)
+# One-click guest demo session (POST /auth/guest): no password to guess, so the
+# only brake on minting sessions is a per-IP ceiling.
+guest_demo_ip = SlidingWindowLimiter(_int_env("GUEST_DEMO_MAX_PER_HOUR", 30), 3600)
 
 # ANONYMOUS CRM READS under the public-read posture.
 #

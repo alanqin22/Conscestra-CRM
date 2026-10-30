@@ -55,7 +55,7 @@ from pydantic import BaseModel
 
 from app.core.database import get_connection
 from app.core.rate_limit import (
-    AUTH_RATE_LIMIT, client_ip, reset_requests,
+    AUTH_RATE_LIMIT, client_ip, guest_demo_ip, reset_requests,
     signin_ip_attempts, signin_user_fails,
 )
 from app.agents.email.smtp_imap import send_email
@@ -744,6 +744,70 @@ async def signin(req: SignInRequest, request: Request):
         last_name=last_name,
         source_table=source_table,
         role=access_role,
+    )
+
+
+# ---------------------------------------------------------------------------
+# One-click guest demo
+#
+# Mints a READ-ONLY session for one pre-created viewer credential, so the
+# "Try the demo" button needs no password in the page source. OFF unless
+# GUEST_DEMO_ENABLED=1 and GUEST_DEMO_IDENTIFIER names the credential.
+#
+# The credential row is the control: it must exist, be active, and carry
+# access_role='viewer'. Anything else is refused, so this endpoint can never be
+# used to obtain a member or admin session, and disabling the account in the
+# admin console turns the button off. The session role is pinned to 'viewer'
+# here rather than copied from the row.
+# ---------------------------------------------------------------------------
+def _guest_demo_config() -> str:
+    """The configured guest identifier, or '' when the feature is off."""
+    on = os.getenv("GUEST_DEMO_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    return os.getenv("GUEST_DEMO_IDENTIFIER", "").strip().lower() if on else ""
+
+
+@router.post("/auth/guest", response_model=AuthResponse)
+async def guest_demo(request: Request):
+    identifier = _guest_demo_config()
+    if not identifier:
+        # Looks absent, not forbidden: a disabled feature should not advertise itself.
+        raise HTTPException(status_code=404, detail="Not found")
+
+    ip = client_ip(request)
+    if AUTH_RATE_LIMIT and guest_demo_ip.record(ip) > guest_demo_ip.max_events:
+        logger.warning(f"[security] guest demo RATE-LIMITED — ip={ip}")
+        raise HTTPException(status_code=429,
+                            detail="Too many requests. Please try again later.")
+
+    try:
+        row = _db_fetchone(
+            "SELECT credential_id, is_active, access_role "
+            "FROM auth_credentials WHERE identifier = %s",
+            (identifier,),
+        )
+    except psycopg2.Error as exc:
+        logger.error(f"guest demo lookup failed: {exc}")
+        raise HTTPException(status_code=500, detail="Authentication error")
+
+    if not row or row[1] is not True or row[2] != "viewer":
+        logger.warning(f"[security] guest demo REFUSED — identifier={identifier!r} "
+                       f"found={bool(row)} active={row[1] if row else None} "
+                       f"role={row[2] if row else None} ip={ip}")
+        raise HTTPException(status_code=403, detail="Guest demo is unavailable.")
+
+    credential_id = str(row[0])
+    # No lead/contact/account link: a shared guest session must not carry the
+    # identity of any real record into the portal or store.
+    session_token = _new_session(
+        account_id="", credential_id=credential_id, identifier=identifier,
+        first_name="Guest", last_name="", source_table="leads", role="viewer",
+    )
+    logger.info(f"Guest demo session issued — ip={ip}")
+    return AuthResponse(
+        success=True, message="Guest session started",
+        session_token=session_token, credential_id=credential_id,
+        identifier=identifier, email=identifier,
+        first_name="Guest", last_name="", source_table="leads", role="viewer",
     )
 
 
