@@ -126,6 +126,10 @@ def send_email(
     is checked against the email_suppression opt-out list (send is skipped if
     unsubscribed) and the compliance footer (sender identification +
     unsubscribe link) is appended. Transactional callers leave the default."""
+    from app.core.guest_demo import refuse_if_guest
+    if refuse_if_guest("send_email"):
+        return {'success': False, 'message': 'Email is not available in the guest demo',
+                'to': to, 'subject': subject}
     # Outbound guard (guardrail 3): the last deterministic wall before a
     # customer sees the message — toxic tone, binding promises, leaked
     # internals, over-cap discounts. Applies to EVERY path through here.

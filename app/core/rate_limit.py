@@ -150,10 +150,24 @@ public_read_ip = SlidingWindowLimiter(PUBLIC_READ_MAX_PER_IP,
                                       PUBLIC_READ_WINDOW_SECONDS)
 
 
+# Proxies in front of the app that append to X-Forwarded-For. Railway's edge is
+# one. Put a CDN in front of it and this becomes 2.
+TRUSTED_PROXY_HOPS = max(_int_env("TRUSTED_PROXY_HOPS", 1), 1)
+
+
 def client_ip(request: Request) -> str:
-    """Best-effort client address; honours the proxy's X-Forwarded-For (Railway
-    fronts the app with a proxy, so the socket peer is the proxy itself)."""
+    """Best-effort client address from X-Forwarded-For (Railway fronts the app
+    with a proxy, so the socket peer is the proxy itself).
+
+    The address is taken counting TRUSTED_PROXY_HOPS entries from the RIGHT.
+    The leftmost entry is whatever the client sent, so keying limits on it let
+    any caller choose their own bucket and walk past every per-IP limit. The
+    rightmost entries are appended by the trusted proxies and cannot be forged.
+    If the edge overwrites the header instead of appending, the header holds
+    one entry and the result is the same."""
     fwd = request.headers.get("x-forwarded-for", "")
     if fwd:
-        return fwd.split(",")[0].strip()
+        hops = [h.strip() for h in fwd.split(",") if h.strip()]
+        if hops:
+            return hops[-min(TRUSTED_PROXY_HOPS, len(hops))]
     return request.client.host if request.client else "unknown"

@@ -470,6 +470,19 @@ async def require_data_access(request: Request) -> Optional[Dict[str, Any]]:
     mode = await _request_mode(request)
     is_write = bool(mode and mode in WRITE_MODES)
 
+    # Guest demo boundary. A guest session is signed in, so it would otherwise
+    # skip the anonymous read limit below; it is a public entry point, so the
+    # limit applies to it as well, together with the route allowlist and the
+    # AI caps. The marker is inherited by in-process agent calls, which carry
+    # no bearer token of their own.
+    from app.core import guest_demo
+    if guest_demo.is_guest_session(sess):
+        guest_demo.mark_guest()
+    if guest_demo.is_guest_request():
+        guest_demo.enforce(request, mode, _bearer(request) or "")
+        if sess:
+            _enforce_public_read_limit(request)
+
     # Public reads: allow anonymous when nothing needs a session (role already
     # stamped above for the deep write guard).
     if API_PUBLIC_READ and not is_write:
