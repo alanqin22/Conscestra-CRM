@@ -100,6 +100,9 @@ def web_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
     if not settings.web_search_enabled:
         logger.info("web_search disabled via settings")
         return []
+    from app.core.guest_demo import refuse_if_guest
+    if refuse_if_guest("web_search"):
+        return []
 
     try:
         results = _ddgs_search(query, max_results)
@@ -130,6 +133,9 @@ def fetch_page(url: str, max_chars: Optional[int] = None) -> str:
     (defaults to settings.web_fetch_max_chars). Never raises — returns ""
     when the page cannot be fetched or yields no text.
     """
+    from app.core.guest_demo import refuse_if_guest
+    if refuse_if_guest("fetch_page"):
+        return ""
     settings = get_settings()
     limit = max_chars or settings.web_fetch_max_chars
 

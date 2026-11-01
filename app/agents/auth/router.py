@@ -49,7 +49,7 @@ from typing import Any, Dict, Optional
 
 import psycopg2
 
-from app.core import release_guard
+from app.core import guest_demo, release_guard
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
@@ -236,11 +236,14 @@ def _new_session(
     last_name: Optional[str] = None,
     source_table: Optional[str] = None,
     role: str = "member",
+    ttl_minutes: Optional[int] = None,
 ) -> str:
     """Create a DB-backed session; return the plaintext token (sent to the client).
-    Only the token hash is persisted."""
+    Only the token hash is persisted. `ttl_minutes` overrides the default
+    lifetime (the guest demo uses a short one)."""
     token = secrets.token_urlsafe(32)
-    expires = datetime.now(timezone.utc) + timedelta(hours=_SESSION_TTL_HOURS)
+    ttl = timedelta(minutes=ttl_minutes) if ttl_minutes else timedelta(hours=_SESSION_TTL_HOURS)
+    expires = datetime.now(timezone.utc) + ttl
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -284,6 +287,13 @@ def get_session(token: str) -> Optional[Dict[str, Any]]:
                 cur.execute("DELETE FROM auth_sessions WHERE token_hash = %s", (_token_hash(token),))
                 conn.commit()
                 return None
+            # A guest session is re-validated on every use: it dies as soon as
+            # the feature is switched off or the guest credential is
+            # deactivated, instead of surviving to its expiry.
+            if guest_demo.is_guest_session(sess) and not _guest_still_valid(cur, sess):
+                cur.execute("DELETE FROM auth_sessions WHERE token_hash = %s", (_token_hash(token),))
+                conn.commit()
+                return None
             if last_seen is not None and (now - last_seen).total_seconds() > _LAST_SEEN_TOUCH_SECONDS:
                 cur.execute("UPDATE auth_sessions SET last_seen_at = now() WHERE token_hash = %s",
                             (_token_hash(token),))
@@ -295,6 +305,16 @@ def get_session(token: str) -> Optional[Dict[str, Any]]:
             return sess
     finally:
         conn.close()
+
+
+def _guest_still_valid(cur, sess: Dict[str, Any]) -> bool:
+    """The feature is on and the guest credential is still active."""
+    if not guest_demo.identifier():
+        return False
+    cur.execute("SELECT is_active FROM auth_credentials WHERE identifier = %s",
+                (sess.get("identifier"),))
+    row = cur.fetchone()
+    return bool(row) and row[0] is True
 
 
 def _invalidate_session(token: str) -> None:
@@ -663,6 +683,11 @@ async def signin(req: SignInRequest, request: Request):
                        "Please wait a few minutes or reset your password.",
             )
 
+    # The guest credential is passwordless by policy: guest sessions are issued
+    # only by POST /auth/guest, never by a password, whatever hash the row holds.
+    if guest_demo.is_guest_identifier(identifier):
+        raise _signin_rejected(identifier, ip)
+
     try:
         row = _db_fetchone(
             "SELECT public.sp_signin_multi_table(%s::text, %s::text) AS payload",
@@ -759,15 +784,25 @@ async def signin(req: SignInRequest, request: Request):
 # used to obtain a member or admin session, and disabling the account in the
 # admin console turns the button off. The session role is pinned to 'viewer'
 # here rather than copied from the row.
+#
+# The wider guest boundary (route allowlist, AI caps, outbound refusal, session
+# lifetime, release-guard posture) lives in app/core/guest_demo.py.
 # ---------------------------------------------------------------------------
 def _guest_demo_config() -> str:
     """The configured guest identifier, or '' when the feature is off."""
-    on = os.getenv("GUEST_DEMO_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
-    return os.getenv("GUEST_DEMO_IDENTIFIER", "").strip().lower() if on else ""
+    return guest_demo.identifier()
+
+
+def _live_guest_sessions(identifier: str) -> int:
+    row = _db_fetchone(
+        "SELECT count(*) FROM auth_sessions WHERE identifier = %s AND expires_at > now()",
+        (identifier,),
+    )
+    return int(row[0]) if row else 0
 
 
 @router.post("/auth/guest", response_model=AuthResponse)
-async def guest_demo(request: Request):
+async def guest_demo_session(request: Request):
     identifier = _guest_demo_config()
     if not identifier:
         # Looks absent, not forbidden: a disabled feature should not advertise itself.
@@ -778,6 +813,27 @@ async def guest_demo(request: Request):
         logger.warning(f"[security] guest demo RATE-LIMITED — ip={ip}")
         raise HTTPException(status_code=429,
                             detail="Too many requests. Please try again later.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    turnstile_token = body.get("turnstileToken") if isinstance(body, dict) else None
+    if not guest_demo.verify_turnstile(turnstile_token, ip):
+        logger.warning(f"[security] guest demo REFUSED — turnstile failed ip={ip}")
+        raise HTTPException(status_code=403,
+                            detail="Please complete the verification and try again.")
+
+    try:
+        if _live_guest_sessions(identifier) >= guest_demo.MAX_CONCURRENT:
+            logger.warning(f"[security] guest demo FULL — "
+                           f"{guest_demo.MAX_CONCURRENT} live sessions ip={ip}")
+            raise HTTPException(
+                status_code=503,
+                detail="The guest demo is busy right now. Please try again in a few minutes.")
+    except psycopg2.Error as exc:
+        logger.error(f"guest demo session count failed: {exc}")
+        raise HTTPException(status_code=500, detail="Authentication error")
 
     try:
         row = _db_fetchone(
@@ -801,6 +857,7 @@ async def guest_demo(request: Request):
     session_token = _new_session(
         account_id="", credential_id=credential_id, identifier=identifier,
         first_name="Guest", last_name="", source_table="leads", role="viewer",
+        ttl_minutes=guest_demo.SESSION_MINUTES,
     )
     logger.info(f"Guest demo session issued — ip={ip}")
     return AuthResponse(
@@ -956,6 +1013,15 @@ async def password_reset_request(req: PasswordResetRequestModel, request: Reques
         raise HTTPException(
             status_code=429,
             detail="Too many reset requests for this account. Please try again later.",
+        )
+    # No reset for the passwordless guest credential. The response is the same
+    # one an unknown account receives, so the refusal reveals nothing.
+    if guest_demo.is_guest_identifier(identifier):
+        logger.warning(f"[security] password-reset REFUSED for guest identifier "
+                       f"ip={client_ip(request)}")
+        return AuthResponse(
+            success=True,
+            message="If that account exists, a reset link has been sent",
         )
     try:
         row = _db_fetchone(

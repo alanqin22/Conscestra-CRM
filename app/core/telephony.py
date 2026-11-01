@@ -407,6 +407,9 @@ def send_sms(to: str, body: str, *, lead_id=None, account_id=None,
     security code (voice OTP) is useless as a draft — the caller is on the
     line waiting for it. Transactional bodies carry secrets, so the activity
     log records THAT a message went out, never its content."""
+    from app.core.guest_demo import refuse_if_guest
+    if refuse_if_guest("send_sms"):
+        return {"ok": False, "error": "not available in the guest demo"}
     to_n = normalize_phone(to)
     if not to_n:
         return {"ok": False, "error": f"unusable phone number {to!r}"}
@@ -515,6 +518,9 @@ def transfer_call(call_control_id: str, to: str, from_number: str = "",
     `call_control_id` arrives in the stream's `start` event. Returns
     {"ok": bool, ...}; never raises, because failing to transfer must degrade
     to taking a message rather than dropping the call."""
+    from app.core.guest_demo import refuse_if_guest
+    if refuse_if_guest("transfer_call"):
+        return {"ok": False, "error": "not available in the guest demo"}
     key = _telnyx_key()
     if not key:
         return {"ok": False, "error": "TELNYX_API_KEY not set"}
@@ -577,6 +583,9 @@ def place_call(to: str, say_text: str, *, lead_id=None, account_id=None,
                from_number: Optional[str] = None) -> Dict[str, Any]:
     """Place a call that speaks `say_text`. Twilio: inline TwiML (no public
     URL). Telnyx: a TeXML application call pointed at a signed say URL."""
+    from app.core.guest_demo import refuse_if_guest
+    if refuse_if_guest("place_call"):
+        return {"ok": False, "error": "not available in the guest demo"}
     to_n = normalize_phone(to)
     if not to_n:
         return {"ok": False, "error": f"unusable phone number {to!r}"}

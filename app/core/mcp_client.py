@@ -379,6 +379,9 @@ def call_tool(server: str, tool: str, params: Dict[str, Any],
     t0 = time.time()
     if not ENABLED:
         return {"ok": False, "outcome": "refused", "reason": "mcp client disabled"}
+    from app.core.guest_demo import refuse_if_guest
+    if refuse_if_guest("mcp.call_tool"):
+        return {"ok": False, "outcome": "refused", "reason": "guest demo"}
 
     allowed, why = may_call(server, data_class)
     if not allowed:

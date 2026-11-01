@@ -402,6 +402,31 @@ def _check_public_read_corpus() -> Dict[str, Any]:
                        "demonstration data or unclassified-with-no-signal."}
 
 
+def _check_guest_demo() -> Dict[str, Any]:
+    """The public guest session is permitted only on an attested demo dataset.
+
+    The guest is a no-password entry point that reads every customer record.
+    That is acceptable on demo data (owner attestation, 2026-11-01) and is a
+    disclosure on real data. Tying the flag to an explicit attestation means
+    the day real customers are onboarded and the attestation is withdrawn, a
+    deployed start refuses until the guest is switched off as well."""
+    from app.core import guest_demo
+    if not guest_demo.enabled():
+        return {"control": "guest_demo", "ok": True, "severity": "ok",
+                "message": "guest demo is off"}
+    if not guest_demo.dataset_attested():
+        return {"control": "guest_demo", "ok": False, "severity": "blocking",
+                "message": "GUEST_DEMO_ENABLED=1 without GUEST_DEMO_DATASET_ATTESTED=1 "
+                           "— a public guest session must not read a dataset that "
+                           "is not attested as demo data."}
+    return {"control": "guest_demo", "ok": True, "severity": "ok",
+            "message": (f"guest demo ON on an attested demo dataset "
+                        f"({guest_demo.SESSION_MINUTES}-min sessions, "
+                        f"≤{guest_demo.MAX_CONCURRENT} concurrent, AI "
+                        f"{guest_demo.AI_PER_SESSION}/session, "
+                        f"{guest_demo.AI_PER_DAY}/day per worker)")}
+
+
 def _check_admin_token() -> Dict[str, Any]:
     tok = (os.getenv("ADMIN_API_TOKEN") or "").strip()
     if not tok:
@@ -842,7 +867,7 @@ def _check_db_privileges() -> Dict[str, Any]:
 
 
 CHECKS = (_check_calendar_feed, _check_api_auth,
-          _check_public_read_corpus, _check_admin_token,
+          _check_public_read_corpus, _check_guest_demo, _check_admin_token,
           _check_training_ack, _check_secret_strength,
           _check_configuration_integrity, _check_public_url,
           _check_email_call_sites, _check_capability_registry,
