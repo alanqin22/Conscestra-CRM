@@ -175,6 +175,13 @@ def _tokens_from(resp: Any, messages: Any, out_text: str) -> Tuple[int, int, boo
     return max(p_chars // 4, 1), max(len(out_text or "") // 4, 1), True
 
 
+def _guest_gate(caller: str) -> None:
+    """Charge a guest request's model call against the guest demo caps
+    (app/core/guest_demo). Imported lazily: guest_demo imports this module."""
+    from app.core import guest_demo
+    guest_demo.charge_llm_call(caller)
+
+
 class MeteredLLM:
     """Transparent proxy over a LangChain chat model: invoke/ainvoke are
     budget-checked and metered; everything else passes straight through.
@@ -279,6 +286,7 @@ class MeteredLLM:
     # -- public surface (signatures unchanged) --------------------------------
 
     def invoke(self, input: Any, *args: Any, **kwargs: Any) -> Any:
+        _guest_gate(self.caller)           # guest AI caps, before any provider
         check_budget(self.caller)          # ONE budget decision, before any provider
         R = self._router()
         if R is not None:
@@ -293,6 +301,7 @@ class MeteredLLM:
         return resp
 
     async def ainvoke(self, input: Any, *args: Any, **kwargs: Any) -> Any:
+        _guest_gate(self.caller)
         check_budget(self.caller)
         R = self._router()
         if R is not None:

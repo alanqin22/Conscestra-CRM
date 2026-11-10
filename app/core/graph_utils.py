@@ -182,6 +182,9 @@ def _call_ollama_direct(system_prompt: str, messages: list) -> str:
     answer inside <think> blocks.
     """
     import httpx
+    from app.core import guest_demo
+    # This path bypasses MeteredLLM, so it applies the guest AI caps itself.
+    guest_demo.charge_llm_call("ollama_direct")
     settings = get_settings()
 
     payload = {
