@@ -427,6 +427,25 @@ def _check_guest_demo() -> Dict[str, Any]:
                         f"{guest_demo.AI_PER_DAY}/day per worker)")}
 
 
+def _check_blocked_passwords() -> Dict[str, Any]:
+    """AC-1c: the blocked-password list the sign-in handler is using.
+
+    Reads the count from the auth router itself, so the report describes the
+    list the running code consults rather than a second reading of the
+    environment. Reports the number of entries only, never a value. Advisory:
+    an empty list leaves logins created with a retired default password open,
+    but it is not a configuration that should stop a start."""
+    from app.agents.auth.router import blocked_password_count
+    n = blocked_password_count()
+    if n == 0:
+        return {"control": "blocked_passwords", "ok": False, "severity": "advisory",
+                "message": "AUTH_BLOCKED_PASSWORDS is empty: logins created with "
+                           "a retired default password are not refused."}
+    return {"control": "blocked_passwords", "ok": True, "severity": "ok",
+            "message": f"{n} blocked password{'' if n == 1 else 's'} refused at "
+                       f"sign-in and as a new password"}
+
+
 def _check_admin_token() -> Dict[str, Any]:
     tok = (os.getenv("ADMIN_API_TOKEN") or "").strip()
     if not tok:
@@ -867,7 +886,8 @@ def _check_db_privileges() -> Dict[str, Any]:
 
 
 CHECKS = (_check_calendar_feed, _check_api_auth,
-          _check_public_read_corpus, _check_guest_demo, _check_admin_token,
+          _check_public_read_corpus, _check_guest_demo, _check_blocked_passwords,
+          _check_admin_token,
           _check_training_ack, _check_secret_strength,
           _check_configuration_integrity, _check_public_url,
           _check_email_call_sites, _check_capability_registry,

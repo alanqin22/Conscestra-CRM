@@ -96,6 +96,15 @@ _FEATURE_FLAG = ("Reports one boolean: whether the guest demo is offered. The "
                  "whether to show the demo button. It reads configuration only, "
                  "touches no data, and discloses no identifier, limit or count.")
 
+_GUEST_DEMO = ("Issues the shared guest demo session. It cannot require a "
+               "session, because obtaining one is its purpose. Answers 404 "
+               "unless GUEST_DEMO_ENABLED=1, and the release guard refuses a "
+               "deployed start with the demo on unless the dataset is attested "
+               "as demo data. Protected by a per-IP limit (30/hour), Turnstile "
+               "when configured, and a cap on concurrent guest sessions. The "
+               "session it issues is confined by the guest boundary to an "
+               "allowlist of read routes, with AI caps.")
+
 _WEBHOOK = ("Inbound provider webhook. The sender is WhatsApp, Slack, Teams or "
             "Telnyx, none of which can present a CRM session. Authenticity is "
             "established by the provider's own signature or shared secret, not "
@@ -249,6 +258,7 @@ UNGATED_ROUTES: Dict[str, str] = {
     "POST /auth/verify-code": _AUTH,
     "POST /auth/verify-email": _AUTH,
     "POST /auth/resend-verification": _AUTH,
+    "POST /auth/guest": _GUEST_DEMO,
     "GET /auth/guest/status": _FEATURE_FLAG,
 
     # Inbound provider webhooks
