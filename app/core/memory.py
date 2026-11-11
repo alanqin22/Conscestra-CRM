@@ -20,6 +20,27 @@ Retention: rows idle longer than SESSION_MEMORY_TTL_DAYS are pruned
 opportunistically (1-in-50 saves), so the table stays a few KB per active
 session and needs no scheduled job.
 
+Containment (SF-1)
+------------------
+The key above is chosen by the caller, and nothing binds it to the
+authenticated principal, so two callers who send the same key share one
+history. Until memory is keyed by the server-validated principal, two classes
+of key are refused outright: both reads and writes return as if memory were
+disabled.
+
+  * Guest requests. Every guest shares one credential, so no key a guest sends
+    can identify that guest, and a guest could otherwise name a key another
+    caller uses. Detected from the request marker the data gate sets, which is
+    inherited by in-process agent calls.
+  * Shared keys (SHARED_SESSION_KEYS). Fixed values that many unrelated
+    callers send: the router defaults used when a request carries no
+    sessionId, and the constants sent by the MCP server, the premise audit and
+    the CRM pages' shared helpers. A history under such a key belongs to no
+    one, so serving it mixes one caller's turns into another's prompt.
+
+This is containment, not isolation. A signed-in caller who learns another
+caller's random key can still read and write that history.
+
 CONFIG (env)
   MEMORY_WINDOW_SIZE       5   turns kept per session (0 disables memory)
   SESSION_MEMORY_DB        1   write-through persistence kill switch
@@ -44,6 +65,33 @@ def _flag(name: str, default: str = "1") -> bool:
 
 DB_ENABLED = _flag("SESSION_MEMORY_DB", "1")
 TTL_DAYS = int(os.getenv("SESSION_MEMORY_TTL_DAYS", "7"))
+
+# Fixed session keys sent by many unrelated callers. See "Containment (SF-1)"
+# in the module docstring. Compared after strip() and lower().
+SHARED_SESSION_KEYS = frozenset({
+    "",                        # empty or missing
+    "default-session",         # default in the agent routers and graphs
+    "orch-session",            # orchestrator router default
+    "store-session",           # store router default
+    "cases",                   # cases router and graph default
+    "mcp-session",             # app/mcp_server.py, every ask_agent call
+    "premise-audit",           # app/core/kb_premise_audit.py
+    "auth-shim",               # CRM pages' shared admin/structured helper
+    "activity-rel-typeahead",  # activities page typeahead helper
+})
+
+
+def _memory_refused(session_id: str) -> bool:
+    """True when this request must neither read nor write session memory."""
+    try:
+        from app.core import guest_demo
+        if guest_demo.is_guest_request():
+            return True
+    except Exception:
+        # The marker could not be read: fail closed rather than serve history.
+        return True
+    return (session_id or "").strip().lower() in SHARED_SESSION_KEYS
+
 
 # { session_id: deque([{role, content}, ...]) }
 # Each pair of user + assistant messages = one "turn".
@@ -133,10 +181,14 @@ def get_history(session_id: str) -> List[Dict[str, Any]]:
     Return conversation history for session_id as a list of message dicts:
         [{"role": "user", "content": "..."}, {"role": "assistant", ...}, ...]
     Oldest first; ready to prepend before the current user message.
-    Returns [] when memory is disabled (window_size == 0) or session is new.
+    Returns [] when memory is disabled (window_size == 0), the session is new,
+    or the request is refused memory (see "Containment (SF-1)").
     A cache miss (restart / other worker) reloads the window from the DB.
     """
     if get_settings().memory_window_size <= 0:
+        return []
+    if _memory_refused(session_id):
+        logger.debug("Memory get_history refused (guest request or shared key)")
         return []
 
     dq = _store.get(session_id)
@@ -159,9 +211,13 @@ def save_turn(session_id: str, user_message: str, assistant_message: str) -> Non
     """
     Persist one turn (user + assistant) to the rolling window — in process AND
     written through to the DB. Oldest turns are evicted automatically once
-    maxlen is reached. No-op when memory is disabled (window_size == 0).
+    maxlen is reached. No-op when memory is disabled (window_size == 0) or the
+    request is refused memory (see "Containment (SF-1)").
     """
     if get_settings().memory_window_size <= 0:
+        return
+    if _memory_refused(session_id):
+        logger.debug("Memory save_turn refused (guest request or shared key)")
         return
 
     dq = _get_deque(session_id)
