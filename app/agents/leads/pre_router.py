@@ -72,6 +72,21 @@ _TRAILING_FILLER = re.compile(
     r'\s+(?:company|companies|firm|business|organi[sz]ation|leads?)$', re.IGNORECASE)
 
 
+# Courtesy at the start of a request ("Please find ...", "Hi, could you
+# please show me ...") and punctuation at the end. Removed only for the
+# natural-language name search below, so that the search verb is recognised;
+# every other rule still sees the message as typed.
+_POLITE_OPENING = re.compile(
+    r'^(?:(?:hi|hello|hey)\b[\s,!.]*)?'
+    r'(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+)*'
+    r'(?:please\s+)?',
+    re.IGNORECASE)
+
+
+def _without_courtesy(raw: str) -> str:
+    return _POLITE_OPENING.sub('', raw.strip()).rstrip(' ?.!').strip()
+
+
 def _clean_search_term(term: str) -> str:
     """The name inside a natural-language search, without filler words.
 
@@ -610,7 +625,7 @@ def route_request(body: dict, chat_input: dict, session_id: str) -> dict:
         r'^(?:find|search(?:\s+for)?|show(?:\s+me)?|look\s*up|fetch|get|display|list)\s+(.+)$',
         re.IGNORECASE,
     )
-    m = _SEARCH_VERBS.match(raw)
+    m = _SEARCH_VERBS.match(_without_courtesy(raw))
     if m:
         term = _clean_search_term(m.group(1))
         # Only treat as a name search if the term has no command keywords and no UUID
