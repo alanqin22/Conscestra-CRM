@@ -42,6 +42,23 @@ ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
 # Roles allowed to write. viewer + anonymous are read-only.
 WRITE_ROLES = {"admin", "member"}
 
+# THE REGISTRANT ROLE (AC-1 interim containment).
+#
+# Public signup creates a credential, and until this role existed every new
+# credential took the column default, `viewer`. The data gate grants every read
+# to any valid session, so registering was sufficient to read the whole CRM
+# under the locked posture. Staff accounts are created by the same signup and
+# then promoted by an administrator, so nothing in the credential distinguished
+# a member of staff from a member of the public.
+#
+# `registrant` is what signup now assigns. It identifies a person and entitles
+# them to nothing behind the data gate; an administrator promotes it through
+# the existing user administration. It is also what an unrecognised stored role
+# resolves to, so a value this code does not know can never become a role that
+# reads or writes.
+REGISTRANT_ROLE = "registrant"
+KNOWN_ROLES = frozenset({"admin", "member", "viewer", REGISTRANT_ROLE})
+
 # Two ways to choose the data-endpoint posture, in priority order:
 #   1) API_SECURITY_MODE — a single switch (recommended; foolproof):
 #        open        → no auth (anyone read + write)
@@ -482,6 +499,20 @@ async def require_data_access(request: Request) -> Optional[Dict[str, Any]]:
         guest_demo.enforce(request, mode, _bearer(request) or "")
         if sess:
             _enforce_public_read_limit(request)
+
+    # Registrant boundary. A registrant holds a valid session and no
+    # entitlement, so it is treated exactly as an anonymous caller: under
+    # public-read it may read within the anonymous limit, and wherever a
+    # session is required it is refused. Without the limit, registering would
+    # be a way to obtain the exemption that signed-in callers receive below.
+    if role == REGISTRANT_ROLE:
+        if API_PUBLIC_READ and not is_write:
+            _enforce_public_read_limit(request)
+            return None
+        raise HTTPException(
+            status_code=403,
+            detail="Your account has no access to CRM data yet. An "
+                   "administrator must activate it.")
 
     # Public reads: allow anonymous when nothing needs a session (role already
     # stamped above for the deep write guard).
