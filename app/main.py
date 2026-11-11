@@ -1817,9 +1817,15 @@ app.include_router(supervisor_router, dependencies=_ADMIN)
 # -- Analytics trend anomalies (blindspot A1 — win-rate WoW / stalled / slump)
 from app.core.analytics_signals import router as analytics_signals_router, act_router as analytics_act_router
 app.include_router(analytics_signals_router, dependencies=_ADMIN)
-# The on-demand "act on this" (A5) is _DATA-gated so the analytics page can call
-# it; the proposal it creates still needs admin approval in the governance queue.
-app.include_router(analytics_act_router, dependencies=_DATA)
+# The on-demand "act on this" (A5) keeps the data gate, which stamps the request
+# principal that proposal creation requires, and now also requires an
+# administrator (AC-1b interim containment). Under the data gate alone any
+# signed-in session, including a self-registered viewer, could compose plans
+# and queue governance proposals, because the route carries no write `mode`.
+# Requiring an administrator removes no legitimate caller: the anomalies this
+# acts on are listed only by the admin-gated router above, so the analytics
+# page can offer the action only to an administrator.
+app.include_router(analytics_act_router, dependencies=_DATA + _ADMIN)
 
 # -- Governed READ authorization (P0 Trusted Semantic Core, step 3). Cross-record
 # aggregate reads (metrics / explore) are gated to authorized roles ON TOP of the

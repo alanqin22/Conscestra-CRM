@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-012e5cadfa86b816c9c5b8a53e1580079f68d556
+c8318412634e9a39a780d57391643e80861f3525
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -911,3 +911,10 @@
 # NO SQL RUNS because of this pin advance. S2 is published and PENDING, not
 # applied; Stage 1 was applied 2026-10-28 23:44:24 UTC and attested at row
 # id 31, and this release admits it.
+
+# c831841 -- AC-1b interim containment. Adds
+# tests/test_ac1b_admin_containment.py, which requires the six case-routing
+# write routes and POST /analytics/anomalies/act to carry require_admin. It
+# is a direct child of 012e5ca and changes nothing else in governance.
+#
+# NO SQL RUNS because of this pin advance.

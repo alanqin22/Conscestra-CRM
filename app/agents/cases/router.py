@@ -9,10 +9,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from app.core import cases as case_layer
+from app.core.auth_dep import require_admin
 
 from . import pre_router
 from .graph import get_graph
@@ -111,6 +112,26 @@ def cases_analytics_semantics() -> Dict[str, Any]:
 
 
 # ── C2.1 routing: recommendation and policy. NEVER assignment. ─────────────
+#
+# THE WRITES BELOW REQUIRE AN ADMINISTRATOR (AC-1b interim containment).
+#
+# This router is mounted behind the data gate, which decides read versus write
+# from a `mode` or `action` field in the request body. These routes carry no
+# such field, so the data gate classified every one of them as a read and
+# admitted any signed-in session, including a self-registered viewer, and any
+# anonymous caller under the public-read posture. They write through
+# `get_connection()` directly rather than `execute_sp`, so the role-based write
+# guard never observed them either.
+#
+# The consequence was integrity, not disclosure: a viewer could rewrite case
+# routing policy, change the staff assignment directory and, through
+# `provision_owner`, create owner identities. The handlers already describe
+# these as administrative acts; this dependency makes that description true.
+#
+# This is containment only. The permanent remedy is the server-declared
+# operation class and record-level authorization approved in D-01, under
+# which no route's operation is inferred from the request body.
+_ADMIN_ONLY = [Depends(require_admin)]
 
 @router.get("/routing/rules")
 def routing_rules(include_inactive: bool = True) -> Dict[str, Any]:
@@ -118,7 +139,7 @@ def routing_rules(include_inactive: bool = True) -> Dict[str, Any]:
     return {"ok": True, "rules": routing.rules(include_inactive)}
 
 
-@router.post("/routing/rules")
+@router.post("/routing/rules", dependencies=_ADMIN_ONLY)
 def routing_save_rule(body: Dict[str, Any]) -> Dict[str, Any]:
     """Edit the policy. The human owns the rule; nothing infers it."""
     from app.core import routing
@@ -126,7 +147,7 @@ def routing_save_rule(body: Dict[str, Any]) -> Dict[str, Any]:
                                                    or "admin"))
 
 
-@router.delete("/routing/rules/{rule_id}")
+@router.delete("/routing/rules/{rule_id}", dependencies=_ADMIN_ONLY)
 def routing_delete_rule(rule_id: str) -> Dict[str, Any]:
     from app.core import routing
     return routing.delete_rule(rule_id)
@@ -155,7 +176,7 @@ def routing_directory() -> Dict[str, Any]:
             "environment": assignable.environment()}
 
 
-@router.post("/routing/directory")
+@router.post("/routing/directory", dependencies=_ADMIN_ONLY)
 def routing_grant(body: Dict[str, Any]) -> Dict[str, Any]:
     """Grant assignability — an ADMIN ACT, never a side effect of routing."""
     from app.core import assignable
@@ -168,7 +189,7 @@ def routing_grant(body: Dict[str, Any]) -> Dict[str, Any]:
                             added_by=str(b.get("actor") or "admin"))
 
 
-@router.post("/routing/directory/attributes")
+@router.post("/routing/directory/attributes", dependencies=_ADMIN_ONLY)
 def routing_set_attributes(body: dict) -> Dict[str, Any]:
     """Record what a person can work in. CURATED by a human — nothing infers a
     language from a name, a domain or a job title."""
@@ -180,7 +201,7 @@ def routing_set_attributes(body: dict) -> Dict[str, Any]:
         by=str(b.get("actor") or "admin"))
 
 
-@router.post("/routing/directory/provision")
+@router.post("/routing/directory/provision", dependencies=_ADMIN_ONLY)
 def routing_provision(body: Dict[str, Any]) -> Dict[str, Any]:
     """Mint the CRM owner identity a granted person needs to hold work.
     Explicit and separate — routing never creates a worker."""
@@ -191,7 +212,7 @@ def routing_provision(body: Dict[str, Any]) -> Dict[str, Any]:
                                       by=str(b.get("actor") or "admin"))
 
 
-@router.delete("/routing/directory/{email}")
+@router.delete("/routing/directory/{email}", dependencies=_ADMIN_ONLY)
 def routing_revoke(email: str) -> Dict[str, Any]:
     from app.core import assignable
     return assignable.revoke(email, by="admin")
