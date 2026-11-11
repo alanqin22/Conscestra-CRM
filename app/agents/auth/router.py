@@ -947,6 +947,18 @@ def _live_guest_sessions(identifier: str) -> int:
     return int(row[0]) if row else 0
 
 
+@router.get("/auth/guest/status")
+async def guest_demo_status():
+    """Whether the one-click guest demo is offered, for the sign-in page.
+
+    The page shows its "Try the Demo" button only when this reports true. The
+    answer is the same condition POST /auth/guest applies, read from the same
+    function, so the button and the endpoint cannot disagree. Nothing else is
+    disclosed: no identifier, limit or session count.
+    """
+    return {"enabled": bool(_guest_demo_config())}
+
+
 @router.post("/auth/guest", response_model=AuthResponse)
 async def guest_demo_session(request: Request):
     identifier = _guest_demo_config()

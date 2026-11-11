@@ -91,6 +91,11 @@ _AUTH = ("Authentication endpoint. It cannot require a session, because "
          "per-account rate limiting (20/900s and 3 failures/900s), and by "
          "single-use tokens on the reset path.")
 
+_FEATURE_FLAG = ("Reports one boolean: whether the guest demo is offered. The "
+                 "sign-in page reads it before anyone has a session, to decide "
+                 "whether to show the demo button. It reads configuration only, "
+                 "touches no data, and discloses no identifier, limit or count.")
+
 _WEBHOOK = ("Inbound provider webhook. The sender is WhatsApp, Slack, Teams or "
             "Telnyx, none of which can present a CRM session. Authenticity is "
             "established by the provider's own signature or shared secret, not "
@@ -244,6 +249,7 @@ UNGATED_ROUTES: Dict[str, str] = {
     "POST /auth/verify-code": _AUTH,
     "POST /auth/verify-email": _AUTH,
     "POST /auth/resend-verification": _AUTH,
+    "GET /auth/guest/status": _FEATURE_FLAG,
 
     # Inbound provider webhooks
     "GET /whatsapp/inbound": _WEBHOOK,
