@@ -61,6 +61,32 @@ def _extract_uuid(s: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+# Generic words a person adds around a name ("find the Moore Consulting
+# company") that are not part of the name. The lead search matches the term as
+# a substring, so a term carrying one of these words matches nothing, while
+# removing it can only widen the match: "Coca-Cola Company" still finds
+# "The Coca-Cola Company". Only whole words at either end are removed.
+_LEADING_FILLER = re.compile(
+    r'^(?:(?:the|a|an)\s+|leads?\s+|(?:for|at|from|named?|called)\s+)', re.IGNORECASE)
+_TRAILING_FILLER = re.compile(
+    r'\s+(?:company|companies|firm|business|organi[sz]ation|leads?)$', re.IGNORECASE)
+
+
+def _clean_search_term(term: str) -> str:
+    """The name inside a natural-language search, without filler words.
+
+    Returns the original term when cleaning would leave nothing, so a search
+    for the word "company" alone still searches for it."""
+    cleaned = term.strip()
+    while True:
+        shorter = _TRAILING_FILLER.sub('', _LEADING_FILLER.sub('', cleaned))
+        shorter = shorter.strip().strip('"\'').strip()
+        if shorter == cleaned:
+            break
+        cleaned = shorter
+    return cleaned or term.strip()
+
+
 def _routed(params: dict) -> dict:
     logger.info(f"→ ROUTED: mode={params.get('mode')}  params={str(params)[:250]}")
     return {'router_action': True, 'params': params}
@@ -586,7 +612,7 @@ def route_request(body: dict, chat_input: dict, session_id: str) -> dict:
     )
     m = _SEARCH_VERBS.match(raw)
     if m:
-        term = m.group(1).strip()
+        term = _clean_search_term(m.group(1))
         # Only treat as a name search if the term has no command keywords and no UUID
         if term and not UUID_RE.search(term) and not _COMMAND_KEYWORDS.search(term):
             logger.info(f'→ NL NAME SEARCH: term={term!r}')
