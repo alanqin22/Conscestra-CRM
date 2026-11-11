@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from app.core.auth_dep import require_admin
+from app.core.auth_dep import KNOWN_ROLES, require_admin
 from app.core.database import get_connection
 from app.agents.auth.router import _db_fetchone
 from app.agents.email.smtp_imap import send_email
@@ -22,7 +22,10 @@ logger = logging.getLogger("admin_users")
 # Admin-gated for ALL routes in this router.
 router = APIRouter(tags=["admin-users"], dependencies=[Depends(require_admin)])
 
-VALID_ROLES = {"admin", "member", "viewer"}
+# Includes `registrant`, so an administrator can both activate a new signup
+# (registrant -> viewer or member) and withdraw access from an existing account
+# (-> registrant) without deactivating the login.
+VALID_ROLES = set(KNOWN_ROLES)
 
 
 # ── models ──────────────────────────────────────────────────────────────────

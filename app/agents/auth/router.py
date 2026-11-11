@@ -53,16 +53,73 @@ from app.core import guest_demo, release_guard
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from app.core.auth_dep import KNOWN_ROLES, REGISTRANT_ROLE
 from app.core.database import get_connection
 from app.core.rate_limit import (
     AUTH_RATE_LIMIT, client_ip, guest_demo_ip, reset_requests,
-    signin_ip_attempts, signin_user_fails,
+    signin_ip_attempts, signin_user_fails, signup_ip,
 )
 from app.agents.email.smtp_imap import send_email
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="", tags=["Auth"])
+
+
+def _env_on(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# Signup controls (AC-1 interim containment)
+#
+#   SIGNUP_ENABLED             1   0 makes POST /auth/signup answer 404
+#   SIGNUP_MAX_PER_HOUR        10  per-IP ceiling (app.core.rate_limit)
+#   SIGNUP_TURNSTILE_REQUIRED  0   1 requires a Turnstile token on signup
+#
+# The Turnstile switch defaults off because the signup page is deployed
+# separately and does not yet send a token; switching it on before the page
+# does would refuse every legitimate signup. Once on, it fails closed: a
+# missing secret is a refusal, never a skipped check.
+# ---------------------------------------------------------------------------
+SIGNUP_ENABLED = _env_on("SIGNUP_ENABLED", "1")
+SIGNUP_TURNSTILE_REQUIRED = _env_on("SIGNUP_TURNSTILE_REQUIRED", "0")
+
+# ---------------------------------------------------------------------------
+# Blocked passwords (AC-1c interim containment)
+#
+#   AUTH_BLOCKED_PASSWORDS   ''   comma-separated passwords that may not be
+#                                 used to sign in, and may not be chosen
+#
+# A retired database trigger gave every new lead an active login with one
+# fixed password. The trigger was disabled; the logins it had already created
+# were left in place. Anyone who knows a lead's email address could therefore
+# sign in. The list is read from the environment so the password itself never
+# enters this public repository, and it closes those logins without changing
+# a row: the holder of the mailbox recovers through the reset email, which an
+# impostor cannot receive. Neither the list nor any submitted password is
+# ever logged; only the number of entries is.
+# ---------------------------------------------------------------------------
+_BLOCKED_PASSWORDS = frozenset(
+    p.strip() for p in os.getenv("AUTH_BLOCKED_PASSWORDS", "").split(",") if p.strip())
+logger.info(f"[security] blocked-password list: {len(_BLOCKED_PASSWORDS)} entr"
+            f"{'y' if len(_BLOCKED_PASSWORDS) == 1 else 'ies'} configured")
+
+_BLOCKED_PASSWORD_DETAIL = (
+    "This password can no longer be used. Reset your password using the "
+    "'Forgot password' link, and choose a new one.")
+
+
+def _is_blocked_password(password: Optional[str]) -> bool:
+    """True when the password is on the blocked list. Constant-time per entry,
+    and every entry is compared, so timing does not reveal which one matched."""
+    if not password or not _BLOCKED_PASSWORDS:
+        return False
+    supplied = password.encode("utf-8")
+    hit = False
+    for blocked in _BLOCKED_PASSWORDS:
+        hit |= secrets.compare_digest(supplied, blocked.encode("utf-8"))
+    return hit
 
 # ---------------------------------------------------------------------------
 # Optional Argon2id support — only imported when HASH_ALGO=argon2id
@@ -377,6 +434,9 @@ class SignUpRequest(BaseModel):
     employee_band:  Optional[str] = None
     revenue_band:   Optional[str] = None
     marketing_consent: bool = False
+    # Sent by the signup page once it carries the Turnstile widget. Ignored
+    # unless SIGNUP_TURNSTILE_REQUIRED is on.
+    turnstileToken: Optional[str] = None
     # Legacy: supply existing IDs instead of auto-creating
     account_id:     Optional[str] = None
     contact_id:     Optional[str] = None
@@ -531,30 +591,88 @@ async def auth_health():
     }
 
 
+def _signup_as_registrant(params: tuple) -> Any:
+    """Create the signup credential and mark it `registrant`, in ONE transaction.
+
+    The stored procedure inserts the credential without naming a role, so the
+    role it receives is whatever the column default happens to be in this
+    database. That default was `member`, a writing role, until an out-of-band
+    change made it `viewer`, and neither is acceptable for a member of the
+    public. Setting the role here means the default is never relied on.
+
+    One transaction, so there is no moment at which the credential exists with
+    the default role, and no outcome in which it is left with it: if the role
+    cannot be set, the signup is rolled back and no account is created.
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT public.sp_signup_with_lead("
+                "  %s::text, %s::text,"
+                "  %s::text, %s::text, %s::text, %s::text, %s::text,"
+                "  %s::text, %s::text, %s::text, %s::text, %s::text, %s::text"
+                ") AS payload", params)
+            row = cur.fetchone()
+            payload = row[0] if row else None
+            if payload and payload.get("success") and payload.get("credential_id"):
+                cur.execute(
+                    "UPDATE public.auth_credentials SET access_role = %s "
+                    "WHERE credential_id = %s::uuid",
+                    (REGISTRANT_ROLE, str(payload["credential_id"])))
+                if cur.rowcount != 1:
+                    raise RuntimeError(
+                        "signup credential could not be marked registrant "
+                        f"(rows updated: {cur.rowcount})")
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 @router.post("/auth/signup", response_model=AuthResponse)
-async def signup(req: SignUpRequest):
+async def signup(req: SignUpRequest, request: Request):
     """Register a new user. Creates auth_credentials + lead record atomically via sp_signup_with_lead."""
+    if not SIGNUP_ENABLED:
+        # Looks absent, not forbidden, as the guest demo does when disabled.
+        raise HTTPException(status_code=404, detail="Not found")
+
+    ip = client_ip(request)
+    if AUTH_RATE_LIMIT and signup_ip.record(ip) > signup_ip.max_events:
+        logger.warning(f"[security] signup RATE-LIMITED — ip={ip}")
+        raise HTTPException(status_code=429,
+                            detail="Too many sign-up attempts. Please try again later.")
+
+    if SIGNUP_TURNSTILE_REQUIRED:
+        # Fails closed: `verify_turnstile` passes when no secret is configured,
+        # which is right for the guest demo and wrong for a check that has
+        # been declared required.
+        if not guest_demo.turnstile_secret() or \
+                not guest_demo.verify_turnstile(req.turnstileToken, ip):
+            logger.warning(f"[security] signup REFUSED — turnstile failed ip={ip}")
+            raise HTTPException(status_code=403,
+                                detail="Please complete the verification and try again.")
+
     identifier = req.identifier.strip().lower()
     logger.info(f"Signup — identifier={identifier!r}")
 
     # Client-side password match check (belt-and-suspenders)
     if req.confirm_password is not None and req.password != req.confirm_password:
         raise HTTPException(status_code=422, detail="Passwords do not match")
+    if _is_blocked_password(req.password):
+        raise HTTPException(status_code=422,
+                            detail="That password is not allowed. Please choose another.")
 
     try:
-        row = _db_fetchone(
-            "SELECT public.sp_signup_with_lead("
-            "  %s::text, %s::text,"
-            "  %s::text, %s::text, %s::text, %s::text, %s::text,"
-            "  %s::text, %s::text, %s::text, %s::text, %s::text, %s::text"
-            ") AS payload",
-            (
-                identifier, req.password,
-                req.first_name, req.last_name, req.company_name, req.phone, req.role,
-                req.address_line1, req.address_line2,
-                req.city, req.province, req.postal_code, req.country,
-            ),
-        )
+        row = _signup_as_registrant((
+            identifier, req.password,
+            req.first_name, req.last_name, req.company_name, req.phone, req.role,
+            req.address_line1, req.address_line2,
+            req.city, req.province, req.postal_code, req.country,
+        ))
     except psycopg2.errors.UniqueViolation:
         raise HTTPException(status_code=409, detail="That email is already registered")
     except psycopg2.Error as exc:
@@ -562,6 +680,12 @@ async def signup(req: SignUpRequest):
         if "23505" in msg or "unique" in msg.lower() or "duplicate" in msg.lower() or "email_exists" in msg.lower():
             raise HTTPException(status_code=409, detail="That email is already registered")
         logger.error(f"sp_signup_with_lead error: {exc}")
+        raise HTTPException(status_code=500, detail="Registration failed")
+    except RuntimeError as exc:
+        # The role could not be set; the transaction was rolled back, so no
+        # account exists. Refusing is the point: an account is never created
+        # with a role nobody chose.
+        logger.error(f"[security] signup ABORTED — {exc}")
         raise HTTPException(status_code=500, detail="Registration failed")
 
     if not row or not row[0]:
@@ -688,6 +812,15 @@ async def signin(req: SignInRequest, request: Request):
     if guest_demo.is_guest_identifier(identifier):
         raise _signin_rejected(identifier, ip)
 
+    # Blocked passwords are refused before the credential is consulted, so the
+    # answer is the same whether or not the account exists and discloses
+    # nothing about it. Not counted against the account: the caller may be the
+    # owner of a login that was created with the default password.
+    if _is_blocked_password(req.password):
+        logger.warning(f"[security] signin REFUSED — blocked password "
+                       f"identifier={identifier!r} ip={ip}")
+        raise HTTPException(status_code=403, detail=_BLOCKED_PASSWORD_DETAIL)
+
     try:
         row = _db_fetchone(
             "SELECT public.sp_signin_multi_table(%s::text, %s::text) AS payload",
@@ -729,17 +862,30 @@ async def signin(req: SignInRequest, request: Request):
         except Exception as exc:
             logger.warning(f"Could not check email verification status: {exc}")
 
-    # Resolve the access tier (admin | member | viewer) from the login identity.
-    access_role = "member"
+    # Resolve the access tier from the login identity. FAILS CLOSED.
+    #
+    # This used to start from `member` and keep it whenever the lookup raised
+    # or returned a value outside the three it knew, so a database error at
+    # sign-in, or any role added later, produced a session that could write.
+    # A lookup that fails now refuses the sign-in, and a stored role this code
+    # does not recognise resolves to `registrant`, which is entitled to nothing.
     try:
         role_row = _db_fetchone(
             "SELECT access_role FROM auth_credentials WHERE credential_id = %s::uuid",
             (credential_id,),
         )
-        if role_row and role_row[0] in ("admin", "member", "viewer"):
-            access_role = role_row[0]
     except Exception as exc:
-        logger.warning(f"access_role lookup failed (defaulting to member): {exc}")
+        logger.error(f"[security] signin REFUSED — access_role lookup failed: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Sign-in is temporarily unavailable. Please try again.")
+    stored_role = role_row[0] if role_row else None
+    if stored_role in KNOWN_ROLES:
+        access_role = stored_role
+    else:
+        logger.warning(f"[security] signin — unrecognised access_role "
+                       f"{stored_role!r} resolved to {REGISTRANT_ROLE!r}")
+        access_role = REGISTRANT_ROLE
 
     session_token = _new_session(
         account_id=account_id or "",
@@ -878,6 +1024,17 @@ async def signout(req: SignOutRequest):
 @router.post("/auth/change-password", response_model=AuthResponse)
 async def change_password(req: ChangePasswordRequest):
     """Rotate password (requires the current password for verification)."""
+    # This route takes an identifier and a current password and no session, so
+    # without this check anyone holding a blocked password could use it to set
+    # a password of their own and then sign in normally. A login created with
+    # a blocked password is recovered through the reset email instead.
+    if _is_blocked_password(req.current_password):
+        logger.warning(f"[security] change-password REFUSED — blocked current "
+                       f"password identifier={req.identifier.strip().lower()!r}")
+        raise HTTPException(status_code=403, detail=_BLOCKED_PASSWORD_DETAIL)
+    if _is_blocked_password(req.new_password):
+        raise HTTPException(status_code=422,
+                            detail="That password is not allowed. Please choose another.")
     try:
         if _HASH_ALGO == "argon2id" and _PH and _argon2_exc:
             # Fetch stored hash
@@ -1111,6 +1268,10 @@ async def password_reset_request(req: PasswordResetRequestModel, request: Reques
 @router.post("/auth/password-reset/confirm", response_model=AuthResponse)
 async def password_reset_confirm(req: PasswordResetConfirmRequest):
     """Consume a reset token and set a new password."""
+    # Checked before the token is consumed, so a refused choice does not spend it.
+    if _is_blocked_password(req.new_password):
+        raise HTTPException(status_code=422,
+                            detail="That password is not allowed. Please choose another.")
     try:
         row = _db_fetchone(
             "SELECT public.consume_password_reset_token(%s::text,%s::text) AS ok",

@@ -119,6 +119,10 @@ plan_exec_ip = SlidingWindowLimiter(_int_env("PLAN_EXEC_MAX_PER_HOUR", 20), 3600
 # One-click guest demo session (POST /auth/guest): no password to guess, so the
 # only brake on minting sessions is a per-IP ceiling.
 guest_demo_ip = SlidingWindowLimiter(_int_env("GUEST_DEMO_MAX_PER_HOUR", 30), 3600)
+# Public signup (POST /auth/signup). Each success creates a credential, a lead
+# and a verification email, and until this limiter existed nothing bounded how
+# many one address could create. Like every limiter here it is per worker.
+signup_ip = SlidingWindowLimiter(_int_env("SIGNUP_MAX_PER_HOUR", 10), 3600)
 
 # ANONYMOUS CRM READS under the public-read posture.
 #
