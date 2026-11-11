@@ -99,11 +99,18 @@ SIGNUP_TURNSTILE_REQUIRED = _env_on("SIGNUP_TURNSTILE_REQUIRED", "0")
 # a row: the holder of the mailbox recovers through the reset email, which an
 # impostor cannot receive. Neither the list nor any submitted password is
 # ever logged; only the number of entries is.
+#
+# The number is reported at startup by the release guard
+# (blocked_password_count). It is not logged here: this module is imported
+# before logging is configured, so a module-level log line is discarded.
 # ---------------------------------------------------------------------------
 _BLOCKED_PASSWORDS = frozenset(
     p.strip() for p in os.getenv("AUTH_BLOCKED_PASSWORDS", "").split(",") if p.strip())
-logger.info(f"[security] blocked-password list: {len(_BLOCKED_PASSWORDS)} entr"
-            f"{'y' if len(_BLOCKED_PASSWORDS) == 1 else 'ies'} configured")
+
+
+def blocked_password_count() -> int:
+    """How many passwords the running process refuses. Never the values."""
+    return len(_BLOCKED_PASSWORDS)
 
 _BLOCKED_PASSWORD_DETAIL = (
     "This password can no longer be used. Reset your password using the "
