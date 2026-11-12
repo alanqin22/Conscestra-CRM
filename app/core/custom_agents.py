@@ -597,7 +597,13 @@ async def api_chat(slug: str, request: Request):
         return Response('{"ok":false,"error":"sign-in required for this agent"}',
                         status_code=403, media_type="application/json")
     if agent["scope"] == "external":
-        ip = request.client.host if request.client else "?"
+        # The address the limiter keys on is the visitor's, taken from the
+        # forwarded header by rate_limit.client_ip. The socket peer is the
+        # platform's proxy, so keying on it put every visitor in one bucket:
+        # one sender could exhaust the limit for all of them, and no
+        # individual sender was bounded.
+        from app.core.rate_limit import client_ip
+        ip = client_ip(request)
         if not _rate_ok(ip):
             return Response('{"ok":false,"error":"too many messages — slow down"}',
                             status_code=429, media_type="application/json")

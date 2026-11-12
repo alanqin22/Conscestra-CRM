@@ -303,7 +303,13 @@ async def embed_chat(embed_key: str, request: Request):
     cors = _cors_headers(key, origin)
     if not _origin_allowed(key, origin):
         return _json({"ok": False, "error": "origin not allowed for this key"}, {}, 403)
-    ip = request.client.host if request.client else "?"
+    # The address the limiter keys on is the visitor's, taken from the
+    # forwarded header by rate_limit.client_ip. The socket peer is the
+    # platform's proxy, so keying on it put every visitor in one bucket:
+    # one sender could exhaust the limit for all of them, and no
+    # individual sender was bounded.
+    from app.core.rate_limit import client_ip
+    ip = client_ip(request)
     if not _rate_ok(embed_key, ip, key.get("rate_limit", 30)):
         return _json({"ok": False, "error": "too many messages — slow down"},
                      cors, 429)
