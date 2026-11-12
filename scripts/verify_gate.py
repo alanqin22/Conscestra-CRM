@@ -68,6 +68,7 @@ CONTROL_TESTS: List[str] = control_test_paths([
     "test_public_chat_limiter_address.py",  # limiters key on the visitor
     "test_session_credential_revalidation.py",  # revocation is immediate
     "test_demo_order_jobs_gate.py",        # demo order jobs are opt-in
+    "test_scheduler_banner.py",            # the banner claims no time that does not fire
     "test_schema_drift_rules.py",          # R-17/R-18 drift checker
     "test_profile_change_audit.py",        # R-13
     "test_u4_action_execution.py",         # R-14

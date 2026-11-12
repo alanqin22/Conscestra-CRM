@@ -166,8 +166,12 @@ def _register_demo_order_jobs(scheduler, cron) -> list:
         replace_existing=True,
         misfire_grace_time=3600,
     )
+    # Their times are stated here and not in the startup banner. The banner
+    # lists only what always runs; naming these there claimed a 22:05 and a
+    # 22:15 run on every deployment, including the ones where they are off.
     logger.info("[Scheduler] demonstration order jobs are ON "
-                "(DEMO_ORDER_JOBS_ENABLED=1)")
+                "(DEMO_ORDER_JOBS_ENABLED=1) — orders advance 22:05 ET | "
+                "orders seed 22:15 ET")
     return ["advance_order_statuses", "generate_daily_orders"]
 
 
@@ -1548,8 +1552,7 @@ async def lifespan(app: FastAPI):
             logger.info(
                 "[Scheduler] Started (America/New_York) — "
             "opps advance 22:00 ET | lead rescore 22:00 ET (Mon) | "
-            "orders advance 22:05 ET | "
-            "activity sweep 22:10 ET | orders seed 22:15 ET | "
+            "activity sweep 22:10 ET | "
             "pipeline seed 22:20 ET | overdue-invoice emit 22:25 ET | "
             "hot-lead emit 22:30 ET | supervisor tick 9/12/15/18 ET (Mon-Fri)"
         )
