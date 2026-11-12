@@ -112,6 +112,65 @@ def _run_generate_daily_orders() -> None:
         logger.error(f"[DailyOrders] Scheduled job failed: {exc}", exc_info=True)
 
 
+def demo_order_jobs_enabled() -> bool:
+    """Whether the two demonstration order jobs may run. Off unless
+    DEMO_ORDER_JOBS_ENABLED=1."""
+    return os.getenv("DEMO_ORDER_JOBS_ENABLED", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _register_demo_order_jobs(scheduler, cron) -> list:
+    """Register the daily order generator and the order status advancer, and
+    return the ids registered.
+
+    BOTH ARE DEMONSTRATION MACHINERY, AND BOTH ARE OFF BY DEFAULT.
+
+    `generate_daily_orders` inserts 20 to 30 orders a day. The status advancer
+    moves EVERY order that is not deleted through its lifecycle by elapsed time
+    alone, and reaching `shipped` issues the order's invoice. Neither function
+    can tell a generated order from a real one, so on a database that holds a
+    real order the advancer would mark it shipped and invoice it with nothing
+    having shipped.
+
+    They are therefore an explicit choice for a demonstration dataset, made by
+    setting DEMO_ORDER_JOBS_ENABLED=1, and not something a deployment gets by
+    default. With the variable unset the jobs are not registered at all, so
+    they do not appear in the scheduler, the job ledger or /health.
+
+    `cron` is the caller's trigger factory. The scheduler builds its triggers
+    through a wrapper that pins the America/New_York zone, and a trigger built
+    any other way would resolve the host's zone and fire at a different hour
+    on the server than on a workstation.
+
+    The two jobs are switched together on purpose. The generator without the
+    advancer leaves every new order pending for ever; the advancer without the
+    generator still acts on every existing order.
+    """
+    if not demo_order_jobs_enabled():
+        logger.info("[Scheduler] demonstration order jobs are OFF "
+                    "(generate_daily_orders, advance_order_statuses). "
+                    "Set DEMO_ORDER_JOBS_ENABLED=1 to run them on a "
+                    "demonstration dataset.")
+        return []
+    scheduler.add_job(
+        _run_advance_order_statuses,
+        trigger=cron(hour=22, minute=5),          # 10:05 PM ET
+        id="advance_order_statuses",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        _run_generate_daily_orders,
+        trigger=cron(hour=22, minute=15),         # 10:15 PM ET
+        id="generate_daily_orders",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    logger.info("[Scheduler] demonstration order jobs are ON "
+                "(DEMO_ORDER_JOBS_ENABLED=1)")
+    return ["advance_order_statuses", "generate_daily_orders"]
+
+
 def _run_advance_opportunity_stages() -> None:
     """Scheduled job: advance opportunity pipeline stages nightly.
 
@@ -949,13 +1008,9 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
             misfire_grace_time=3600,
         )
-        _scheduler.add_job(
-            _run_advance_order_statuses,
-            trigger=CronTrigger(hour=22, minute=5),  # 10:05 PM ET — advance order statuses
-            id="advance_order_statuses",
-            replace_existing=True,
-            misfire_grace_time=3600,
-        )
+        # The two demonstration order jobs are registered only when
+        # DEMO_ORDER_JOBS_ENABLED=1. See _register_demo_order_jobs.
+        _register_demo_order_jobs(_scheduler, CronTrigger)
         _scheduler.add_job(
             _run_activities_auto_sweep,
             trigger=CronTrigger(hour=22, minute=10), # 10:10 PM ET — snooze non-critical overdue activities
@@ -967,13 +1022,6 @@ async def lifespan(app: FastAPI):
             _run_complete_settled_activities,
             trigger=CronTrigger(hour=22, minute=12), # 10:12 PM ET — close milestone records whose invoice/order settled
             id="complete_settled_activities",
-            replace_existing=True,
-            misfire_grace_time=3600,
-        )
-        _scheduler.add_job(
-            _run_generate_daily_orders,
-            trigger=CronTrigger(hour=22, minute=15), # 10:15 PM ET — seed 20-30 new orders
-            id="generate_daily_orders",
             replace_existing=True,
             misfire_grace_time=3600,
         )
