@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-aff216c96164794effdf99adf828567aaa4e445f
+4b73b58099ec2b55290a17fa319ef23bf2bcb07b
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -923,5 +923,12 @@ aff216c96164794effdf99adf828567aaa4e445f
 # tests/test_ac1_registrant_containment.py: the registrant role at the data
 # gate, fail-closed role resolution at sign-in, signup controls and the
 # blocked-password list. A direct child of c831841.
+#
+# NO SQL RUNS because of this pin advance.
+
+# 4b73b58 -- case write authorization. Adds
+# tests/test_case_write_authorization.py: every case write reached through
+# POST /case-chat requires a caller who may write, checked by effect. A direct
+# child of aff216c and changes nothing else in governance.
 #
 # NO SQL RUNS because of this pin advance.

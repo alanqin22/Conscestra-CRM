@@ -64,6 +64,7 @@ CONTROL_TESTS: List[str] = control_test_paths([
     "test_approved_execution_params.py",   # R-11
     "test_irreversible_write_contracts.py",  # R-09 + R-12
     "test_write_call_sites.py",            # R-03 direct-write surface
+    "test_case_write_authorization.py",    # case writes need a writer role
     "test_schema_drift_rules.py",          # R-17/R-18 drift checker
     "test_profile_change_audit.py",        # R-13
     "test_u4_action_execution.py",         # R-14
