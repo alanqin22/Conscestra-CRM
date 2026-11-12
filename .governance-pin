@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-59a0244389e777b767416cb8a15ee7e6ac3afac4
+55aec121d2b68398a9442ad824a8a46291eec2c7
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -945,3 +945,11 @@
 # its credential on every use. A direct child of b3becef.
 #
 # NO SQL RUNS because of this pin advance.
+
+# 55aec12 -- demonstration order job gate, and the SS.1 replacement's test.
+# Adds tests/test_demo_order_jobs_gate.py and commits
+# tests/test_invoice_issued_followup.py, which existed only as an untracked
+# local file. A direct child of 59a0244. No SQL file is changed.
+#
+# NO SQL RUNS because of this pin advance. Applying
+# sql/invoice_issued_followup.sql to a database is a separate, explicit act.
