@@ -96,11 +96,16 @@ def _clean_search_term(term: str) -> str:
     cleaned = term.strip()
     while True:
         shorter = _TRAILING_FILLER.sub('', _LEADING_FILLER.sub('', cleaned))
-        shorter = shorter.strip().strip('"\'').strip()
+        shorter = shorter.strip().strip('"\'?.!,').strip()
         if shorter == cleaned:
             break
         cleaned = shorter
     return cleaned or term.strip()
+
+
+def _clean_if_text(value: Any) -> Any:
+    """_clean_search_term for a string; any other value unchanged."""
+    return _clean_search_term(value) if isinstance(value, str) else value
 
 
 def _routed(params: dict) -> dict:
@@ -230,7 +235,9 @@ def route_request(body: dict, chat_input: dict, session_id: str) -> dict:
             'mode':       'list',
             'pageNumber': _val(chat_input.get('pageNumber')) or 1,
             'pageSize':   _val(chat_input.get('pageSize'))   or 50,
-            'search':     _val(chat_input.get('search')),
+            # The lead page builds this filter itself from "find ..." messages,
+            # so it can carry the same filler words as a typed request.
+            'search':     _clean_if_text(_val(chat_input.get('search'))),
             'status':     _val(chat_input.get('status')),
             'rating':     _val(chat_input.get('rating')),
             'source':     _val(chat_input.get('source')),
