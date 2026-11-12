@@ -102,7 +102,7 @@ async def set_role(req: RoleReq):
     if not n:
         raise HTTPException(404, "Account not found")
     return {"success": True,
-            "message": f"Role set to '{role}'. The user must sign in again for it to take effect."}
+            "message": f"Role set to '{role}'. It applies from the user's next request."}
 
 
 # ── enable / disable ─────────────────────────────────────────────────────────

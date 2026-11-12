@@ -358,6 +358,41 @@ def get_session(token: str) -> Optional[Dict[str, Any]]:
                 cur.execute("DELETE FROM auth_sessions WHERE token_hash = %s", (_token_hash(token),))
                 conn.commit()
                 return None
+            # Every session issued for a credential is checked against that
+            # credential on each use. A session row carries the role it was
+            # given at sign-in, so without this a deactivated account kept
+            # working, and a demoted one kept its former role, until the
+            # session expired on its own. Deactivation and a role change now
+            # take effect on the next request.
+            #
+            # A lookup that fails ends the request without a session. The
+            # alternative is to trust the stored role when the credential
+            # cannot be read, which is the case this check exists to remove.
+            if sess.get("credential_id"):
+                try:
+                    current = _credential_state(cur, sess["credential_id"])
+                except psycopg2.Error as exc:
+                    conn.rollback()
+                    logger.error("[security] session refused: credential "
+                                 "state unreadable: %s",
+                                 str(exc).splitlines()[0][:160])
+                    return None
+                if current is None:
+                    cur.execute("DELETE FROM auth_sessions WHERE token_hash = %s",
+                                (_token_hash(token),))
+                    conn.commit()
+                    logger.info("[security] session ended: its credential is "
+                                "inactive or no longer exists")
+                    return None
+                if current != sess.get("role"):
+                    cur.execute("UPDATE auth_sessions SET role = %s "
+                                "WHERE token_hash = %s",
+                                (current, _token_hash(token)))
+                    conn.commit()
+                    logger.info("[security] session role changed from %r to %r "
+                                "to match its credential",
+                                sess.get("role"), current)
+                    sess["role"] = current
             if last_seen is not None and (now - last_seen).total_seconds() > _LAST_SEEN_TOUCH_SECONDS:
                 cur.execute("UPDATE auth_sessions SET last_seen_at = now() WHERE token_hash = %s",
                             (_token_hash(token),))
@@ -369,6 +404,21 @@ def get_session(token: str) -> Optional[Dict[str, Any]]:
             return sess
     finally:
         conn.close()
+
+
+def _credential_state(cur, credential_id: Any) -> Optional[str]:
+    """The role an active credential holds now, or None when the credential is
+    inactive or absent.
+
+    A stored role this application does not recognise resolves to the
+    registrant role, as it does at sign-in, so an unknown value can never
+    become a role that reads or writes."""
+    cur.execute("SELECT is_active, access_role FROM auth_credentials "
+                "WHERE credential_id = %s::uuid", (str(credential_id),))
+    row = cur.fetchone()
+    if not row or row[0] is not True:
+        return None
+    return row[1] if row[1] in KNOWN_ROLES else REGISTRANT_ROLE
 
 
 def _guest_still_valid(cur, sess: Dict[str, Any]) -> bool:
