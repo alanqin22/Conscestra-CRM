@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-b3becef29cf90f24a79d7b884aa6007ac6e8d43b
+59a0244389e777b767416cb8a15ee7e6ac3afac4
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -937,5 +937,11 @@ b3becef29cf90f24a79d7b884aa6007ac6e8d43b
 # tests/test_public_chat_limiter_address.py: the three public chat limiters
 # key on the visitor's address, and the SDR limiter purges expired rows for
 # every address. A direct child of 4b73b58.
+#
+# NO SQL RUNS because of this pin advance.
+
+# 59a0244 -- session credential re-validation. Adds
+# tests/test_session_credential_revalidation.py: a session is checked against
+# its credential on every use. A direct child of b3becef.
 #
 # NO SQL RUNS because of this pin advance.
