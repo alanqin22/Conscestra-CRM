@@ -1178,9 +1178,14 @@ def _rate_ok(ip: str) -> bool:
         conn = get_connection()
         try:
             with conn.cursor() as cur:
+                # Expired rows are removed for EVERY address, not only this
+                # one. The key is now the visitor's address, so a row purged
+                # only when the same address returned would be kept
+                # indefinitely for a visitor who never came back. No row
+                # outlives the window by more than the gap between requests.
                 cur.execute("DELETE FROM sdr_rate_events "
-                            "WHERE ip=%s AND at < now() - make_interval(secs => %s)",
-                            (ip, _RATE_WINDOW))
+                            "WHERE at < now() - make_interval(secs => %s)",
+                            (_RATE_WINDOW,))
                 cur.execute("INSERT INTO sdr_rate_events (ip) VALUES (%s)", (ip,))
                 cur.execute("SELECT count(*) FROM sdr_rate_events WHERE ip=%s", (ip,))
                 n = cur.fetchone()[0]
@@ -1205,7 +1210,13 @@ async def sdr_chat(request: Request):
     if not CHAT_ENABLED:
         return Response('{"error": "SDR chat is not enabled"}',
                         status_code=503, media_type="application/json")
-    ip = (request.client.host if request.client else "?")
+    # The address the limiter keys on is the visitor's, taken from the
+    # forwarded header by rate_limit.client_ip. The socket peer is the
+    # platform's proxy, so keying on it put every visitor in one bucket:
+    # one sender could exhaust the limit for all of them, and no
+    # individual sender was bounded.
+    from app.core.rate_limit import client_ip
+    ip = client_ip(request)
     if not _rate_ok(ip):
         return Response('{"error": "too many messages — please slow down"}',
                         status_code=429, media_type="application/json")

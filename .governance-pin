@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-4b73b58099ec2b55290a17fa319ef23bf2bcb07b
+b3becef29cf90f24a79d7b884aa6007ac6e8d43b
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -930,5 +930,12 @@
 # tests/test_case_write_authorization.py: every case write reached through
 # POST /case-chat requires a caller who may write, checked by effect. A direct
 # child of aff216c and changes nothing else in governance.
+#
+# NO SQL RUNS because of this pin advance.
+
+# b3becef -- public chat limiter address. Adds
+# tests/test_public_chat_limiter_address.py: the three public chat limiters
+# key on the visitor's address, and the SDR limiter purges expired rows for
+# every address. A direct child of 4b73b58.
 #
 # NO SQL RUNS because of this pin advance.
