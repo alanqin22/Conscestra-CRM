@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-55aec121d2b68398a9442ad824a8a46291eec2c7
+bcad32380c965d7d8ded3cb60753c03619e5b6ca
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -953,3 +953,9 @@
 #
 # NO SQL RUNS because of this pin advance. Applying
 # sql/invoice_issued_followup.sql to a database is a separate, explicit act.
+
+# bcad323 -- the invoice follow-up replacement is declared applied. Changes
+# one name in the disposition vocabulary of
+# tests/test_sql_disposition_governance.py. A direct child of 55aec12.
+#
+# NO SQL RUNS because of this pin advance.
