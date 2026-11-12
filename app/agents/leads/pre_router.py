@@ -67,9 +67,25 @@ def _extract_uuid(s: str) -> Optional[str]:
 # removing it can only widen the match: "Coca-Cola Company" still finds
 # "The Coca-Cola Company". Only whole words at either end are removed.
 _LEADING_FILLER = re.compile(
-    r'^(?:(?:the|a|an)\s+|leads?\s+|(?:for|at|from|named?|called)\s+)', re.IGNORECASE)
+    r'^(?:(?:the|a|an)\s+|leads?\s+|(?:for|at|from|named?|called)\s+'
+    r'|(?:company|companies|firm|business|organi[sz]ation)\s+)', re.IGNORECASE)
 _TRAILING_FILLER = re.compile(
     r'\s+(?:company|companies|firm|business|organi[sz]ation|leads?)$', re.IGNORECASE)
+
+
+# Courtesy at the start of a request ("Please find ...", "Hi, could you
+# please show me ...") and punctuation at the end. Removed only for the
+# natural-language name search below, so that the search verb is recognised;
+# every other rule still sees the message as typed.
+_POLITE_OPENING = re.compile(
+    r'^(?:(?:hi|hello|hey)\b[\s,!.]*)?'
+    r'(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+)*'
+    r'(?:please\s+)?',
+    re.IGNORECASE)
+
+
+def _without_courtesy(raw: str) -> str:
+    return _POLITE_OPENING.sub('', raw.strip()).rstrip(' ?.!').strip()
 
 
 def _clean_search_term(term: str) -> str:
@@ -80,11 +96,16 @@ def _clean_search_term(term: str) -> str:
     cleaned = term.strip()
     while True:
         shorter = _TRAILING_FILLER.sub('', _LEADING_FILLER.sub('', cleaned))
-        shorter = shorter.strip().strip('"\'').strip()
+        shorter = shorter.strip().strip('"\'?.!,').strip()
         if shorter == cleaned:
             break
         cleaned = shorter
     return cleaned or term.strip()
+
+
+def _clean_if_text(value: Any) -> Any:
+    """_clean_search_term for a string; any other value unchanged."""
+    return _clean_search_term(value) if isinstance(value, str) else value
 
 
 def _routed(params: dict) -> dict:
@@ -214,7 +235,9 @@ def route_request(body: dict, chat_input: dict, session_id: str) -> dict:
             'mode':       'list',
             'pageNumber': _val(chat_input.get('pageNumber')) or 1,
             'pageSize':   _val(chat_input.get('pageSize'))   or 50,
-            'search':     _val(chat_input.get('search')),
+            # The lead page builds this filter itself from "find ..." messages,
+            # so it can carry the same filler words as a typed request.
+            'search':     _clean_if_text(_val(chat_input.get('search'))),
             'status':     _val(chat_input.get('status')),
             'rating':     _val(chat_input.get('rating')),
             'source':     _val(chat_input.get('source')),
@@ -610,7 +633,7 @@ def route_request(body: dict, chat_input: dict, session_id: str) -> dict:
         r'^(?:find|search(?:\s+for)?|show(?:\s+me)?|look\s*up|fetch|get|display|list)\s+(.+)$',
         re.IGNORECASE,
     )
-    m = _SEARCH_VERBS.match(raw)
+    m = _SEARCH_VERBS.match(_without_courtesy(raw))
     if m:
         term = _clean_search_term(m.group(1))
         # Only treat as a name search if the term has no command keywords and no UUID

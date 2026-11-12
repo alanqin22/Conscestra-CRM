@@ -24,7 +24,7 @@ from app.core.config import get_settings
 from app.core.database import execute_sp
 
 from .prompt import LEAD_AGENT_SYSTEM_PROMPT
-from .pre_router import route_request, UUID_RE
+from .pre_router import route_request, UUID_RE, _clean_search_term
 from .sql_builder import build_leads_query
 from .formatter import format_response
 from app.core.write_guard import WritePermissionError
@@ -137,6 +137,16 @@ def parse_output_node(state: Dict[str, Any]) -> Dict[str, Any]:
         if name_m:
             parsed["search"] = name_m.group(1).strip()
             logger.info(f"Recovered search term from user_input: {parsed['search']!r}")
+
+    # A request the pre-router passed to the model can come back with filler
+    # words in the term ("Brooks Manufacturing company"), which the substring
+    # search then fails to match. The same cleaning the pre-router applies is
+    # applied here; it can only widen the match.
+    if parsed and parsed.get("mode") == "list" and isinstance(parsed.get("search"), str):
+        cleaned = _clean_search_term(parsed["search"])
+        if cleaned != parsed["search"]:
+            logger.info(f"Search term cleaned: {parsed['search']!r} -> {cleaned!r}")
+            parsed["search"] = cleaned
 
     if parsed:
         return {**state, "parsed_json": parsed, "should_call_api": True}
