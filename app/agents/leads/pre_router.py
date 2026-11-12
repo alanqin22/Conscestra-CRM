@@ -67,7 +67,8 @@ def _extract_uuid(s: str) -> Optional[str]:
 # removing it can only widen the match: "Coca-Cola Company" still finds
 # "The Coca-Cola Company". Only whole words at either end are removed.
 _LEADING_FILLER = re.compile(
-    r'^(?:(?:the|a|an)\s+|leads?\s+|(?:for|at|from|named?|called)\s+)', re.IGNORECASE)
+    r'^(?:(?:the|a|an)\s+|leads?\s+|(?:for|at|from|named?|called)\s+'
+    r'|(?:company|companies|firm|business|organi[sz]ation)\s+)', re.IGNORECASE)
 _TRAILING_FILLER = re.compile(
     r'\s+(?:company|companies|firm|business|organi[sz]ation|leads?)$', re.IGNORECASE)
 
