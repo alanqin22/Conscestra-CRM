@@ -168,7 +168,25 @@ def _dispatch(action: str, p: Dict[str, Any]) -> Dict[str, Any]:
                 "rows": cases.history(cid, limit=int(p.get("limit") or 100))}
 
     # ── writes — every one of these goes through the case write layer ───────
-    actor = str(p.get("actor") or "cases-agent")
+    #
+    # THE CALLER'S ROLE IS CHECKED HERE, before any write function is reached.
+    # Case writes do not pass through execute_sp, so neither its mode check nor
+    # its read-only transaction ever sees them, and the HTTP gate recognises a
+    # write only by a `mode` on its own list, which names `assign` and none of
+    # `transition`, `priority` or `comment`. Without this check a read-only
+    # session, including the guest demo session, could change a case.
+    #
+    # Every action below this line is a write, whether it arrived as a direct
+    # mode or was chosen by the model, so one check covers both routes.
+    denial = _write_denial()
+    if denial:
+        logger.warning(f"[cases-agent] write refused for a read-only caller: "
+                       f"action={action} subject={denial['subject']}")
+        return {"ok": False, "action": action, "refused": True,
+                "error": denial["message"],
+                "http_status": denial["http_status"]}
+
+    actor = _session_actor() or str(p.get("actor") or "cases-agent")
     if action == "open_case":
         r = cases.open_case(str(p.get("subject") or "").strip(),
                             actor=actor, source="cases-agent",
@@ -208,6 +226,33 @@ def _dispatch(action: str, p: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "action": action, "result": r}
 
     return {"ok": False, "action": action, "error": "unhandled action"}
+
+
+def _write_denial() -> Dict[str, Any] | None:
+    """Why the current caller may not write a case, or None when it may.
+
+    Uses the same decision as the stored-procedure choke point
+    (`write_guard.readonly_context`), so a role that is read-only there is
+    read-only here. Outside a request the role is unset, which is the scheduler
+    and other system callers, and they are not restricted."""
+    from app.core.write_guard import readonly_context
+    return readonly_context()
+
+
+def _session_actor() -> str | None:
+    """The signed-in caller's identifier, for the history record.
+
+    The actor used to come from the request body or the model's output, so a
+    caller could name anyone. When the request carries a session, the session
+    decides. Without one the previous value is kept."""
+    try:
+        from app.core.a2a import current_principal
+        principal = current_principal()
+    except Exception:                                        # noqa: BLE001
+        return None
+    if principal is None or principal.kind != "user" or not principal.id:
+        return None
+    return str(principal.id)[:120]
 
 
 def _need(p: Dict[str, Any], key: str) -> str:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.core import cases as case_layer
@@ -80,10 +80,18 @@ def case_chat(req: CaseChatRequest) -> Dict[str, Any]:
         logger.exception("[cases] graph invocation failed")
         return {"output": f"Case agent error: {str(exc)[:200]}",
                 "sessionId": session_id}
+    # A write refused for the caller's role is answered with its real status,
+    # 401 for an anonymous caller and 403 for a read-only session, as the other
+    # modules do. The sign-in prompt on the page keys on those codes; a 200
+    # carrying a refusal would read as a successful request.
+    rows = result.get("db_rows")
+    if isinstance(rows, dict) and rows.get("refused") and rows.get("http_status"):
+        raise HTTPException(status_code=int(rows["http_status"]),
+                            detail=str(rows.get("error") or "Not permitted."))
     return {"output": result.get("final_output") or "",
             "sessionId": session_id,
             "mode": (result.get("parsed_json") or {}).get("action"),
-            "data": result.get("db_rows")}
+            "data": rows}
 
 
 @router.get("/cases/analytics")

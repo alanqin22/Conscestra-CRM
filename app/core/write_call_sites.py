@@ -32,8 +32,8 @@ file is that enumeration, and `release_guard` checks it, so a NEW module that
 starts writing directly has to be declared rather than merely noticed.
 
 THE NUMBER THAT MATTERS. Of 75 modules, 64 are reachable only through an
-admin-gated router or not through HTTP at all. **Eleven can be reached without
-authentication**, and those eleven are the ones worth a reviewer's attention.
+admin-gated router or not through HTTP at all. **Twelve can be reached without
+authentication**, and those twelve are the ones worth a reviewer's attention.
 They are listed first, individually, with the control that protects them.
 
 ADVISORY FIRST, DELIBERATELY. This ships reporting drift rather than blocking
@@ -77,7 +77,7 @@ _DML = re.compile(
 # PUBLIC SURFACE — reachable without authentication. Review these.
 # ============================================================================
 # Each entry names the control that stands in for authentication. These are the
-# eleven modules where "no uniform boundary" actually costs something, because
+# twelve modules where "no uniform boundary" actually costs something, because
 # the compensating control is per-path and can only be verified by reading it.
 PUBLIC_SURFACE: Dict[str, str] = {
     "app/agents/auth/router.py":
@@ -120,6 +120,15 @@ PUBLIC_SURFACE: Dict[str, str] = {
         "store chat and the embedded widget. Anonymous by design — a visitor "
         "has no account. Writes conversations, escalations and OTP rows; "
         "external scope restricts it to the public KB tier (reach_invariant).",
+    "app/core/cases.py":
+        "the case write layer. It was declared as background work with no HTTP "
+        "surface, which was wrong: POST /case-chat reaches it, and that route "
+        "carries only the data gate, so under public-read an anonymous caller "
+        "arrives here. Its writes do not pass execute_sp. The control is the "
+        "role check in app/agents/cases/sql_builder.py, which refuses every "
+        "case write for a caller who may not write. The escalation bridge and "
+        "the agent console also call this module, from system and "
+        "administrator contexts.",
     "app/core/booking.py":
         "meeting booking from a public link; writes activities for the slot it "
         "confirms.",
@@ -184,7 +193,7 @@ ADMIN_GATED: Set[str] = {
 BACKGROUND: Set[str] = {
     "app/agents/email/auto_reply.py", "app/agents/email/graph.py",
     "app/agents/email/inbound_bridge.py", "app/agents/email/structured.py",
-    "app/core/assignable.py", "app/core/cases.py", "app/core/critic.py",
+    "app/core/assignable.py", "app/core/critic.py",
     "app/core/dsar.py", "app/core/dsar_api.py", "app/core/enrichment.py",
     "app/core/grounding.py", "app/core/history.py", "app/core/job_ledger.py",
     "app/core/memory.py", "app/core/memory_eval.py",
