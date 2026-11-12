@@ -706,8 +706,36 @@ _APPLIED_LOCAL_SOFT_DELETED_AR = (
     "$71,994.65, paid rate 82.5% -> 91.5%, affecting exactly the 260 "
     "soft-deleted rows and nothing else.")
 
-_PENDING_INVOICE_ISSUED_FOLLOWUP = (
-    "PENDING DEPLOYMENT -- authored 2026-09-20. The replacement for "
+_APPLIED_INVOICE_ISSUED_FOLLOWUP = (
+    "APPLIED TO PRODUCTION (`railway`) on 2026-11-12, by the owner, connected "
+    "as `postgres`, through `python -m scripts.apply_sql "
+    "governance/sql/invoice_issued_followup.sql --target railway`. The tool "
+    "reported APPLIED, one NOTICE (the new trigger did not yet exist, so its "
+    "DROP IF EXISTS was skipped), and schema attestation 2d0a2f9ad57ec1c7 over "
+    "2600 objects. A dry run in the same session rolled back cleanly first. "
+    "BEFORE STATE, read-only as `crm_readonly` on 2026-11-12 03:53:56 UTC: "
+    "trg_invoice_create_payment present and enabled on invoices; "
+    "trgfn_invoice_issued_followup absent; 18 to 26 payments created on each "
+    "of the preceding 14 days, every one with no payment_source and no "
+    "reference. "
+    "AFTER STATE, read on 2026-11-12 07:13:03 UTC in a read-only session: "
+    "trg_invoice_issued_followup present and enabled on invoices, executing "
+    "trgfn_invoice_issued_followup; trg_invoice_create_payment absent; "
+    "trgfn_invoice_create_payment absent from pg_proc. That read was made as "
+    "`postgres` and not as `crm_readonly`, because the applying window was "
+    "still open; the session was read-only either way. "
+    "NOT OBSERVED: an invoice issued after the apply producing no payment. The "
+    "demonstration order jobs were switched off the same day, so no invoice "
+    "has been issued since; the behaviour is established on a disposable "
+    "database by tests/test_invoice_issued_followup.py, and in production by "
+    "the trigger's absence. Payments dated before the apply are unchanged and "
+    "still carry no source, as SS.1 requires. "
+    "OUT-OF-BAND, NOT PROMOTED: the file is not in REQUIRED_MIGRATIONS and the "
+    "committed baseline still carries the old trigger, which is what "
+    "tests/test_invoice_issued_followup.py measures against. A database built "
+    "from the baseline alone therefore still fabricates payments until this "
+    "file is applied to it. NOT APPLIED to the local databases. "
+    "Authored 2026-09-20. The replacement for "
     "trgfn_invoice_create_payment, and its retirement, in one file. "
     "WHAT SS.1 RATIFIED. The demonstration-payment trigger must not remain a "
     "producer of real payment rows; app.ar_unpaid_pct and app.ar_partial_pct "
@@ -732,7 +760,7 @@ _PENDING_INVOICE_ISSUED_FOLLOWUP = (
     "revive it on a re-apply. "
     "NOT DECIDED HERE: whether demonstration realism is still required, the "
     "disposition of the 2,286 unattributed historical payments, or anything "
-    "about invoice.status semantics. Not applied to crmdb.")
+    "about invoice.status semantics.")
 
 _APPLIED_LOCAL_CANCELLATION_REVERSAL = (
     "PENDING DEPLOYMENT on both databases. CURRENT OBSERVED STATE, 2026-10-16: "
@@ -2038,7 +2066,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "synthetic_order_provenance.sql": _PENDING_SYNTHETIC_ORDER_PROVENANCE,
     "cancelled_not_invoiceable.sql": _PENDING_CANCELLED_NOT_INVOICEABLE,
     "cancellation_reversal.sql": _APPLIED_LOCAL_CANCELLATION_REVERSAL,
-    "invoice_issued_followup.sql": _PENDING_INVOICE_ISSUED_FOLLOWUP,
+    "invoice_issued_followup.sql": _APPLIED_INVOICE_ISSUED_FOLLOWUP,
     "soft_deleted_invoices_are_not_receivable.sql": _APPLIED_LOCAL_SOFT_DELETED_AR,
     "settlement_authority.sql": _PENDING_SETTLEMENT_AUTHORITY,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
