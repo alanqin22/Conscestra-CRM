@@ -706,6 +706,88 @@ _APPLIED_LOCAL_SOFT_DELETED_AR = (
     "$71,994.65, paid rate 82.5% -> 91.5%, affecting exactly the 260 "
     "soft-deleted rows and nothing else.")
 
+_PENDING_PAYMENT_NO_FABRICATION = (
+    "PENDING DEPLOYMENT -- authored 2026-11-13. trgfn_payment_before no longer "
+    "invents anything. Read from production on 2026-11-12, it set "
+    "processing_fee to amount * (0.015 + random() * 0.02), net_amount to the "
+    "amount less that fee, payment_method to 'credit card' and status to "
+    "'confirmed' when either was missing, and amount to the invoice total when "
+    "it was missing or zero. It runs BEFORE INSERT OR UPDATE on payments, so it "
+    "shaped every payment, including one recorded for money actually received. "
+    "A missing amount, method or status is now refused under its own constraint "
+    "name; the fee is whatever the caller stated, or NULL, and the net amount "
+    "follows from it. Every other line is production's text. "
+    "MEASURED on a disposable database built from the committed baseline "
+    "(tests/test_assessment_sql_fixes.py): before, a bare (invoice_id) row "
+    "became a confirmed card payment for the whole invoice with a fee between "
+    "1.5% and 3.5%, and twelve identical payments stored more than one fee; "
+    "after, the bare row is refused and twelve identical payments store "
+    "identical money. "
+    "ORDER, ENFORCED BY THE FILE: it refuses to apply while "
+    "trg_invoice_create_payment exists, because that retired trigger inserts "
+    "the bare rows this file refuses. Production removed it on 2026-11-12; the "
+    "committed baseline still carries it. "
+    "THE LIVE WRITER, sp_accounting's record_payment, already passes a "
+    "positive amount, a method and a status, and is unaffected. NOT EXERCISED "
+    "through that procedure in the test. Historical payments are not touched. "
+    "Not applied to any database.")
+
+_PENDING_INVOICE_NO_RANDOM_ATTRIBUTION = (
+    "PENDING DEPLOYMENT -- authored 2026-11-13. trgfn_invoice_before no longer "
+    "picks people at random. Read from production on 2026-11-12, it filled "
+    "created_by, updated_by and owner_id on INSERT, when NULL, with a random "
+    "employee, a random employee and a random owner. An invoice inserted "
+    "without them was attributed to and owned by a person chosen by chance. "
+    "The three columns are now left as the caller supplied them; all three are "
+    "nullable. Every other line is production's text: the invoice number, the "
+    "tax resolution, the totals and the status are computed as before. "
+    "MEASURED (tests/test_assessment_sql_fixes.py): the function's source "
+    "holds three random() calls before and none after, and an invoice inserted "
+    "with no creator or owner keeps NULL in all three columns. "
+    "CONSEQUENCE TO EXPECT: invoices raised from an order that has no owner "
+    "will have no owner, where they used to acquire a random one. Anything "
+    "that assumes every invoice has an owner will now see the truth. "
+    "Historical invoices are not touched. Not applied to any database.")
+
+_PENDING_DELETION_LOG_SURVIVES_ERASURE = (
+    "PENDING DEPLOYMENT -- authored 2026-11-13. log_governed_deletion records "
+    "a deletion even when the erasure setting is on. It is the AFTER DELETE "
+    "trigger on action_approvals, governance_action_policies, "
+    "customer_memories, content_embeddings and agent_utterances. Read from "
+    "production on 2026-11-12, it returned without writing when app.erasure or "
+    "app.memory_audit_erase was 'on'. Those are session settings, and the "
+    "application role may DELETE from all five tables, so a deletion could be "
+    "made to leave no trace. "
+    "Under either setting it now writes a record with NO CONTENT of the row: "
+    "the table, the row key, the actor, the transaction and the time; old_row "
+    "is a fixed marker saying only that the row was erased, and entity_id is "
+    "NULL. Outside erasure the function is production's text and still stores "
+    "the full row. "
+    "MEASURED (tests/test_assessment_sql_fixes.py), on a probe table carrying "
+    "the real function: before, a deletion under either setting leaves zero "
+    "rows; after, one row whose old_row does not contain the deleted content. "
+    "DOES NOT FIX: the actor is still read from the session setting app.actor, "
+    "and the role may still delete from these tables. "
+    "REQUIRES A PRIVACY DECISION BEFORE IT IS APPLIED: an erasure will leave a "
+    "content-free record per deleted row for governed_deletions' retention "
+    "period. Not applied to any database.")
+
+_PENDING_REVOKE_LATENT_AND_LEDGER_PRIVILEGES = (
+    "PENDING DEPLOYMENT -- authored 2026-11-13. Two privilege corrections for "
+    "crm_app; no table changes. (1) n8n_legacy holds 59 tables from a retired "
+    "workflow tool. Read from production on 2026-11-12, crm_app holds INSERT, "
+    "UPDATE and DELETE on every one and cannot use them, having no USAGE on "
+    "the schema; one GRANT USAGE would activate them. They are revoked. The "
+    "schema is neither dropped nor read: what it contains is a separate "
+    "question. (2) crm_app holds UPDATE and DELETE on schema_migrations with "
+    "no trigger. The application inserts a row when it records an applied "
+    "artifact and never updates or deletes one. UPDATE, DELETE and TRUNCATE "
+    "are revoked; INSERT is kept. "
+    "MEASURED (tests/test_assessment_sql_fixes.py): the grants are present "
+    "before and absent after, INSERT on the ledger survives, and a second "
+    "apply changes nothing. Skips cleanly where the role or the schema is "
+    "absent. Not applied to any database.")
+
 _APPLIED_INVOICE_ISSUED_FOLLOWUP = (
     "APPLIED TO PRODUCTION (`railway`) on 2026-11-12, by the owner, connected "
     "as `postgres`, through `python -m scripts.apply_sql "
@@ -724,11 +806,13 @@ _APPLIED_INVOICE_ISSUED_FOLLOWUP = (
     "trgfn_invoice_create_payment absent from pg_proc. That read was made as "
     "`postgres` and not as `crm_readonly`, because the applying window was "
     "still open; the session was read-only either way. "
-    "NOT OBSERVED: an invoice issued after the apply producing no payment. The "
-    "demonstration order jobs were switched off the same day, so no invoice "
-    "has been issued since; the behaviour is established on a disposable "
-    "database by tests/test_invoice_issued_followup.py, and in production by "
-    "the trigger's absence. Payments dated before the apply are unchanged and "
+    "NOT OBSERVED: a newly issued invoice producing no payment. No net "
+    "increase in the 2026-11-12 invoice and payment populations was detected "
+    "across four catalog reads spanning the apply (03:53, 06:37, 07:13 and "
+    "20:33 UTC); individual creation or deletion events were not independently "
+    "excluded. The behaviour is established on a disposable database by "
+    "tests/test_invoice_issued_followup.py, and in production by the "
+    "trigger's absence. Payments dated before the apply are unchanged and "
     "still carry no source, as SS.1 requires. "
     "OUT-OF-BAND, NOT PROMOTED: the file is not in REQUIRED_MIGRATIONS and the "
     "committed baseline still carries the old trigger, which is what "
@@ -2067,6 +2151,10 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "cancelled_not_invoiceable.sql": _PENDING_CANCELLED_NOT_INVOICEABLE,
     "cancellation_reversal.sql": _APPLIED_LOCAL_CANCELLATION_REVERSAL,
     "invoice_issued_followup.sql": _APPLIED_INVOICE_ISSUED_FOLLOWUP,
+    "payment_no_fabrication.sql": _PENDING_PAYMENT_NO_FABRICATION,
+    "invoice_no_random_attribution.sql": _PENDING_INVOICE_NO_RANDOM_ATTRIBUTION,
+    "deletion_log_survives_erasure.sql": _PENDING_DELETION_LOG_SURVIVES_ERASURE,
+    "revoke_latent_and_ledger_privileges.sql": _PENDING_REVOKE_LATENT_AND_LEDGER_PRIVILEGES,
     "soft_deleted_invoices_are_not_receivable.sql": _APPLIED_LOCAL_SOFT_DELETED_AR,
     "settlement_authority.sql": _PENDING_SETTLEMENT_AUTHORITY,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
