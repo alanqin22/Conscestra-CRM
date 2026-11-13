@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-bdadff0a9d679872a7f5ea0e58124eea7ae0114a
+f49fdd1dfd4ab9c90fde19987ac7e5be17ae6e7e
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -961,5 +961,9 @@ bdadff0a9d679872a7f5ea0e58124eea7ae0114a
 # NO SQL RUNS because of this pin advance.
 
 # bdadff0 -- an approval executes the verified row. Adds tests/test_approval_executes_verified_row.py. A direct child of bcad323.
+#
+# NO SQL RUNS because of this pin advance.
+
+# f49fdd1 -- the release guard refuses the development transport flags. Adds tests/test_release_guard_transport_flags.py. A direct child of bdadff0.
 #
 # NO SQL RUNS because of this pin advance.
