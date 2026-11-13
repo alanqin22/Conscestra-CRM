@@ -85,6 +85,41 @@ class AgentState(TypedDict):
 # LLM FACTORY
 # ============================================================================
 
+class LLMMeterUnavailable(RuntimeError):
+    """A model call was refused because it could not be metered."""
+
+
+class _RefusingLLM:
+    """Stands in for the model when the meter could not be built.
+
+    It has no provider client inside it, so there is nothing to reach through
+    to: `invoke`, `ainvoke` and every other attribute a caller might use to
+    start a call raise. Returning the provider client here, even wrapped, would
+    leave a path to an unmetered call.
+    """
+
+    def __init__(self, caller: str, reason: str):
+        self.caller = caller
+        self._reason = reason
+
+    def _refuse(self, *_args, **_kwargs):
+        raise LLMMeterUnavailable(
+            f"model call refused for caller={self.caller}: usage metering is "
+            f"unavailable ({self._reason}). No provider was contacted.")
+
+    invoke = _refuse
+
+    async def ainvoke(self, *args, **kwargs):
+        self._refuse()
+
+    def __getattr__(self, name: str):
+        # Reached only for attributes not defined above: stream, batch,
+        # bind_tools and the rest. Each of those would start a call.
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return self._refuse
+
+
 def _get_llm(tier: str = "standard", caller: str = None,
              data_internal: bool = False):
     """Return the configured LLM (OpenAI or Ollama ChatModel), wrapped in the
@@ -131,9 +166,22 @@ def _get_llm(tier: str = "standard", caller: str = None,
                           provider=settings.llm_provider,
                           alt_factory=_alt_client_factory(tier),
                           data_internal=data_internal)
-    except Exception as exc:                  # the meter must never break the fleet
-        logger.warning(f"LLM meter unavailable — returning unmetered model: {exc}")
-        return inner
+    except Exception as exc:
+        # THE METER IS THE BOUNDARY, SO WITHOUT IT THERE IS NO MODEL.
+        #
+        # This used to return `inner`, the bare provider client, on the
+        # reasoning that the meter must never break the fleet. But the meter is
+        # where budgets are checked, where usage is recorded and where a guest
+        # request is charged against its caps. Handing back the unmetered client
+        # removed all three at once, silently, for every call made through it.
+        #
+        # What is returned instead builds without error, so an agent graph that
+        # constructs its model at import time still starts, and refuses at the
+        # moment of a call. Every call site already treats a failed model call
+        # as a reason to use its deterministic fallback.
+        logger.error(f"LLM meter unavailable — model calls from caller={caller} "
+                     f"will be REFUSED until it is restored: {exc}")
+        return _RefusingLLM(caller=caller, reason=str(exc))
 
 
 def _alt_client_factory(tier: str):

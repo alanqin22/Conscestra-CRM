@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-f49fdd1dfd4ab9c90fde19987ac7e5be17ae6e7e
+e6c1f0d24f2f892c8cd10c1cfbee0eef8180d420
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -965,5 +965,9 @@ f49fdd1dfd4ab9c90fde19987ac7e5be17ae6e7e
 # NO SQL RUNS because of this pin advance.
 
 # f49fdd1 -- the release guard refuses the development transport flags. Adds tests/test_release_guard_transport_flags.py. A direct child of bdadff0.
+#
+# NO SQL RUNS because of this pin advance.
+
+# e6c1f0d -- a model that cannot be metered is refused. Adds tests/test_unmetered_model_is_refused.py. A direct child of f49fdd1.
 #
 # NO SQL RUNS because of this pin advance.
