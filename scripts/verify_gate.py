@@ -115,6 +115,7 @@ CONTROL_TESTS: List[str] = control_test_paths([
     # database before the control tests run. That is a design change with its
     # own decisions (what a fixture executive attests to, whether a seeded
     # identity may ever be eligible) and belongs in its own change.
+    "test_approval_executes_verified_row.py",  # an approval executes the row it verified
 ])
 
 
