@@ -116,6 +116,7 @@ CONTROL_TESTS: List[str] = control_test_paths([
     # own decisions (what a fixture executive attests to, whether a seeded
     # identity may ever be eligible) and belongs in its own change.
     "test_approval_executes_verified_row.py",  # an approval executes the row it verified
+    "test_release_guard_transport_flags.py",  # dev transport flags block a deployed start
 ])
 
 

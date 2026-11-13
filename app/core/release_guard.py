@@ -446,6 +446,37 @@ def _check_blocked_passwords() -> Dict[str, Any]:
                        f"sign-in and as a new password"}
 
 
+def _check_transport_dev_flags() -> Dict[str, Any]:
+    """Refuse a deployed start with inbound-channel authentication switched off.
+
+    Two flags exist for local work on the Slack and Teams channels:
+
+      TRANSPORTS_DEV_INSECURE             accept a Slack or Teams request with
+                                          no signing secret configured
+      TRANSPORTS_ALLOW_UNLINKED_INTERNAL  let a staff id that is not linked to
+                                          an employee ask the CRM
+
+    Each turns a fail-closed control into an open door, and each is one
+    environment variable. Set for a local test and carried into a deployment,
+    either would let anyone who can reach the webhook act as staff. This guard
+    exists for exactly that class of mistake and did not cover these two.
+
+    Blocking, because there is no legitimate deployed use: a deployment that
+    wants Slack or Teams sets the real secret and links its staff.
+    """
+    on = [name for name in ("TRANSPORTS_DEV_INSECURE",
+                            "TRANSPORTS_ALLOW_UNLINKED_INTERNAL") if _flag(name)]
+    if not on:
+        return {"control": "transport_dev_flags", "ok": True, "severity": "ok",
+                "message": "no development override is set on the inbound "
+                           "chat channels"}
+    return {"control": "transport_dev_flags", "ok": False, "severity": "blocking",
+            "message": (f"{' and '.join(on)} {'is' if len(on) == 1 else 'are'} "
+                        f"set. These switch off authentication on the Slack and "
+                        f"Teams channels and are for local development only. "
+                        f"Unset {'it' if len(on) == 1 else 'them'}.")}
+
+
 def _check_admin_token() -> Dict[str, Any]:
     tok = (os.getenv("ADMIN_API_TOKEN") or "").strip()
     if not tok:
@@ -887,7 +918,7 @@ def _check_db_privileges() -> Dict[str, Any]:
 
 CHECKS = (_check_calendar_feed, _check_api_auth,
           _check_public_read_corpus, _check_guest_demo, _check_blocked_passwords,
-          _check_admin_token,
+          _check_admin_token, _check_transport_dev_flags,
           _check_training_ack, _check_secret_strength,
           _check_configuration_integrity, _check_public_url,
           _check_email_call_sites, _check_capability_registry,
