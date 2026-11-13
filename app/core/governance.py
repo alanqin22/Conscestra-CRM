@@ -2310,6 +2310,19 @@ async def approve(approval_uuid: str, decided_by: str = "human",
     # between approval and execution changes the money, and the executive
     # authorised the earlier figure.
     fresh = _row(approval_uuid) or {}
+    # EVERYTHING BELOW ACTS ON `fresh`, the row read after the claim. It used to
+    # verify `fresh` and then execute `ap`, the row read BEFORE the claim. If a
+    # proposal's parameters changed between the two reads, the proposition that
+    # was checked and the parameters that were dispatched were different rows.
+    # A row that has vanished cannot be executed at all.
+    if not fresh:
+        _finish_execution(approval_uuid, token, "failed",
+                          {"ok": False, "error": "approval row not found after claim"},
+                          {"ok": False, "checks": [],
+                           "note": "row missing after claim; nothing dispatched"})
+        return {"ok": False, "error": "approval row not found after claim",
+                "approval_uuid": approval_uuid}
+    ap = fresh
     verdict = _verify_proposition_unchanged(fresh)
     if not verdict["ok"]:
         _finish_execution(approval_uuid, token, "failed",
