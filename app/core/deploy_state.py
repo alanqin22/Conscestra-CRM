@@ -847,8 +847,31 @@ _APPLIED_REVOKE_LATENT_AND_LEDGER_PRIVILEGES = (
     "apply changes nothing. Skips cleanly where the role or the schema is "
     "absent. Not applied to the local databases.")
 
-_PENDING_DROP_N8N_LEGACY_SCHEMA = (
-    "PENDING DEPLOYMENT -- authored 2026-11-14. Removes the schema n8n_legacy, "
+_APPLIED_DROP_N8N_LEGACY_SCHEMA = (
+    "APPLIED TO PRODUCTION (`railway`) on 2026-11-14 at about 22:55 UTC, by the "
+    "owner, connected as `postgres`, through stage2 apply_n8n_removal.py, which "
+    "takes the connection string at a hidden prompt and calls scripts.apply_sql. "
+    "BEFORE THE DROP, the same session counted every table exactly, read-only: "
+    "59 tables, 751 rows -- migrations 143, role_scope 415, scope 174, role 13, "
+    "settings 3, and one each in user, project and project_relation; every "
+    "credential, API-key, OAuth, secrets-provider and variables table held zero "
+    "rows, so the tool held no access to any other service. These are the counts "
+    "the 2026-10-05 dump recorded in scripts/backup_railway.py. The dry run, "
+    "rolled back, cascaded to exactly the schema's 59 tables and nothing outside "
+    "it; the apply did the same and reported 'dropped schema n8n_legacy and its "
+    "59 table(s)'. The schema attestation after it, 6f18f9f9d2dd7ffa (2600 "
+    "objects), equals the one before: the attestation covers only `public`, so "
+    "an unchanged hash shows the cascade changed nothing there; it is not "
+    "evidence of the drop. "
+    "AFTER STATE, read from the catalog as `crm_readonly` in a read-only "
+    "session on 2026-11-14 23:07 UTC (A-19b): n8n_legacy is absent; no schema, "
+    "relation, function or type remains in any schema named n8n*; public still "
+    "holds its 176 tables. "
+    "CORRECTION to the pending text below: the project's nightly dump has "
+    "excluded n8n_legacy since 2026-10-08 (scripts/backup_railway.py), so it was "
+    "not carried in those backups; Railway's own volume backups copy the whole "
+    "database and hold it until they expire. "
+    "Authored 2026-11-14. Removes the schema n8n_legacy, "
     "left by a retired n8n installation the application no longer uses. Read "
     "from production's catalog on 2026-11-14 as crm_readonly (A-19): 59 tables, "
     "about 1.5 MB; non-zero row estimates only on role_scope, scope, "
@@ -870,8 +893,8 @@ _PENDING_DROP_N8N_LEGACY_SCHEMA = (
     "dependent view, on a foreign key pointing into it and on a USAGE grant, "
     "leaving the schema and the outside object intact. "
     "DOES NOT remove the data from backups already taken, or revoke anything "
-    "the old tool may have held for another service. Not applied to any "
-    "database.")
+    "the old tool may have held for another service. Not applied to the local "
+    "databases.")
 
 _APPLIED_INVOICE_ISSUED_FOLLOWUP = (
     "APPLIED TO PRODUCTION (`railway`) on 2026-11-12, by the owner, connected "
@@ -2236,7 +2259,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "cancelled_not_invoiceable.sql": _PENDING_CANCELLED_NOT_INVOICEABLE,
     "cancellation_reversal.sql": _APPLIED_LOCAL_CANCELLATION_REVERSAL,
     "invoice_issued_followup.sql": _APPLIED_INVOICE_ISSUED_FOLLOWUP,
-    "drop_n8n_legacy_schema.sql": _PENDING_DROP_N8N_LEGACY_SCHEMA,
+    "drop_n8n_legacy_schema.sql": _APPLIED_DROP_N8N_LEGACY_SCHEMA,
     "payment_no_fabrication.sql": _APPLIED_PAYMENT_NO_FABRICATION,
     "invoice_no_random_attribution.sql": _APPLIED_INVOICE_NO_RANDOM_ATTRIBUTION,
     "deletion_log_survives_erasure.sql": _APPLIED_DELETION_LOG_SURVIVES_ERASURE,

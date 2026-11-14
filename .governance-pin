@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-3d62888e56e3b9c8bd61bdc8f580e63a5372b727
+ad608a999049fc67d0075637a624bd92d82cc72f
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -987,5 +987,10 @@
 
 # 3d62888 -- the removal of the retired n8n_legacy schema, with its rehearsal
 # test and its disposition name. A direct child of b355aee.
+#
+# NO SQL RUNS because of this pin advance.
+
+# ad608a9 -- the n8n_legacy removal's disposition renamed from pending to
+# applied, after the owner applied it to Railway. A direct child of 3d62888.
 #
 # NO SQL RUNS because of this pin advance.
