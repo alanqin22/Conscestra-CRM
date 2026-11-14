@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-12b3212d86e7a6bcb7ac95fae1f231b5e564bb39
+b355aee44735edb3472f6c6109f5617ea6d78ea6
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -978,3 +978,9 @@
 #
 # NO SQL RUNS because of this pin advance. The four files are declared PENDING
 # DEPLOYMENT; applying any of them to a database is a separate, explicit act.
+
+# b355aee -- the four assessment SQL corrections are declared applied. Renames
+# four disposition names in tests/test_sql_disposition_governance.py. A direct
+# child of 12b3212.
+#
+# NO SQL RUNS because of this pin advance.
