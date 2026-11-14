@@ -15,7 +15,7 @@
 #
 # Update this whenever governance changes, in the same commit that depends on
 # the change -- exactly as the gitlink had to be updated.
-b355aee44735edb3472f6c6109f5617ea6d78ea6
+3d62888e56e3b9c8bd61bdc8f580e63a5372b727
 
 # e802469 -- the governance chain PROMOTED into REQUIRED_MIGRATIONS, and the
 # baseline regenerated to carry the resulting ledger. The pin matters more
@@ -982,5 +982,10 @@ b355aee44735edb3472f6c6109f5617ea6d78ea6
 # b355aee -- the four assessment SQL corrections are declared applied. Renames
 # four disposition names in tests/test_sql_disposition_governance.py. A direct
 # child of 12b3212.
+#
+# NO SQL RUNS because of this pin advance.
+
+# 3d62888 -- the removal of the retired n8n_legacy schema, with its rehearsal
+# test and its disposition name. A direct child of b355aee.
 #
 # NO SQL RUNS because of this pin advance.

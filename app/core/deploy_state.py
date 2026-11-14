@@ -847,6 +847,32 @@ _APPLIED_REVOKE_LATENT_AND_LEDGER_PRIVILEGES = (
     "apply changes nothing. Skips cleanly where the role or the schema is "
     "absent. Not applied to the local databases.")
 
+_PENDING_DROP_N8N_LEGACY_SCHEMA = (
+    "PENDING DEPLOYMENT -- authored 2026-11-14. Removes the schema n8n_legacy, "
+    "left by a retired n8n installation the application no longer uses. Read "
+    "from production's catalog on 2026-11-14 as crm_readonly (A-19): 59 tables, "
+    "about 1.5 MB; non-zero row estimates only on role_scope, scope, "
+    "migrations, role, settings, and one row each in user, project and "
+    "project_relation; no row written since statistics were last reset; the "
+    "credential, API-key and OAuth tables estimate zero rows. Estimates come "
+    "from the catalog, not a count. Nothing outside the schema depends on it "
+    "except each table's own TOAST storage, and no function mentions it. "
+    "Neither application role holds USAGE on it, and crm_app's table grants "
+    "were revoked on 2026-11-14. "
+    "WHY: it holds a user record with password and MFA columns and tables built "
+    "to hold credentials for other services, it is carried in every nightly "
+    "backup, and it is one GRANT away from being usable. "
+    "GUARDS IN THE FILE: refuses, dropping nothing, if any object outside the "
+    "schema other than TOAST depends on it, or if crm_app or crm_readonly holds "
+    "USAGE on it; reports and does nothing if the schema is absent. "
+    "MEASURED on a disposable database (tests/test_drop_n8n_legacy_schema.py, 6 "
+    "tests): drops a stand-in schema; a second apply does nothing; refuses on a "
+    "dependent view, on a foreign key pointing into it and on a USAGE grant, "
+    "leaving the schema and the outside object intact. "
+    "DOES NOT remove the data from backups already taken, or revoke anything "
+    "the old tool may have held for another service. Not applied to any "
+    "database.")
+
 _APPLIED_INVOICE_ISSUED_FOLLOWUP = (
     "APPLIED TO PRODUCTION (`railway`) on 2026-11-12, by the owner, connected "
     "as `postgres`, through `python -m scripts.apply_sql "
@@ -2210,6 +2236,7 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "cancelled_not_invoiceable.sql": _PENDING_CANCELLED_NOT_INVOICEABLE,
     "cancellation_reversal.sql": _APPLIED_LOCAL_CANCELLATION_REVERSAL,
     "invoice_issued_followup.sql": _APPLIED_INVOICE_ISSUED_FOLLOWUP,
+    "drop_n8n_legacy_schema.sql": _PENDING_DROP_N8N_LEGACY_SCHEMA,
     "payment_no_fabrication.sql": _APPLIED_PAYMENT_NO_FABRICATION,
     "invoice_no_random_attribution.sql": _APPLIED_INVOICE_NO_RANDOM_ATTRIBUTION,
     "deletion_log_survives_erasure.sql": _APPLIED_DELETION_LOG_SURVIVES_ERASURE,
