@@ -706,8 +706,26 @@ _APPLIED_LOCAL_SOFT_DELETED_AR = (
     "$71,994.65, paid rate 82.5% -> 91.5%, affecting exactly the 260 "
     "soft-deleted rows and nothing else.")
 
-_PENDING_PAYMENT_NO_FABRICATION = (
-    "PENDING DEPLOYMENT -- authored 2026-11-13. trgfn_payment_before no longer "
+_APPLIED_PAYMENT_NO_FABRICATION = (
+    "APPLIED TO PRODUCTION (`railway`) on 2026-11-14 at about 04:29 UTC, by "
+    "the owner, connected as `postgres`, through stage2 "
+    "apply_assessment_sql.py, which takes the connection string at a hidden "
+    "prompt and calls scripts.apply_sql for each file. All four files were "
+    "dry-run against production first and rolled back; then applied in "
+    "order: revoke, invoice, payment, deletion log. Schema attestations "
+    "after each: 2d0a2f9ad57ec1c7, 3c656abd3ca0aaee, 3be7db6fa2904f15, "
+    "6f18f9f9d2dd7ffa. The script was run a second time by mistake a minute "
+    "later; every file reported 6f18f9f9d2dd7ffa again, so the second run "
+    "changed nothing. AFTER STATE, read as `crm_readonly` on 2026-11-14 "
+    "04:32 and 04:34 UTC: the definition hash of trgfn_payment_before "
+    "changed from 369631c4 to fb06303a; in production's own definition the "
+    "three refusals are present, and 'credit card', status 'confirmed' and "
+    "the invoice-total amount are absent from the code. The A-14 "
+    "'calls_random' column still reads True: it searches the whole "
+    "definition, comments included, and a comment in this function names "
+    "the expression it removed. Production's code contains no random() "
+    "call. "
+    "Authored 2026-11-13. trgfn_payment_before no longer "
     "invents anything. Read from production on 2026-11-12, it set "
     "processing_fee to amount * (0.015 + random() * 0.02), net_amount to the "
     "amount less that fee, payment_method to 'credit card' and status to "
@@ -730,10 +748,23 @@ _PENDING_PAYMENT_NO_FABRICATION = (
     "THE LIVE WRITER, sp_accounting's record_payment, already passes a "
     "positive amount, a method and a status, and is unaffected. NOT EXERCISED "
     "through that procedure in the test. Historical payments are not touched. "
-    "Not applied to any database.")
+    "Not applied to the local databases.")
 
-_PENDING_INVOICE_NO_RANDOM_ATTRIBUTION = (
-    "PENDING DEPLOYMENT -- authored 2026-11-13. trgfn_invoice_before no longer "
+_APPLIED_INVOICE_NO_RANDOM_ATTRIBUTION = (
+    "APPLIED TO PRODUCTION (`railway`) on 2026-11-14 at about 04:29 UTC, by "
+    "the owner, connected as `postgres`, through stage2 "
+    "apply_assessment_sql.py, which takes the connection string at a hidden "
+    "prompt and calls scripts.apply_sql for each file. All four files were "
+    "dry-run against production first and rolled back; then applied in "
+    "order: revoke, invoice, payment, deletion log. Schema attestations "
+    "after each: 2d0a2f9ad57ec1c7, 3c656abd3ca0aaee, 3be7db6fa2904f15, "
+    "6f18f9f9d2dd7ffa. The script was run a second time by mistake a minute "
+    "later; every file reported 6f18f9f9d2dd7ffa again, so the second run "
+    "changed nothing. AFTER STATE, read as `crm_readonly` on 2026-11-14 "
+    "04:32 and 04:34 UTC: trgfn_invoice_before calls_random is False, its "
+    "definition hash changed from 54b85638 to bb8d4416, and the code no "
+    "longer reads employees or owners to pick from. "
+    "Authored 2026-11-13. trgfn_invoice_before no longer "
     "picks people at random. Read from production on 2026-11-12, it filled "
     "created_by, updated_by and owner_id on INSERT, when NULL, with a random "
     "employee, a random employee and a random owner. An invoice inserted "
@@ -747,10 +778,25 @@ _PENDING_INVOICE_NO_RANDOM_ATTRIBUTION = (
     "CONSEQUENCE TO EXPECT: invoices raised from an order that has no owner "
     "will have no owner, where they used to acquire a random one. Anything "
     "that assumes every invoice has an owner will now see the truth. "
-    "Historical invoices are not touched. Not applied to any database.")
+    "Historical invoices are not touched. Not applied to the local databases.")
 
-_PENDING_DELETION_LOG_SURVIVES_ERASURE = (
-    "PENDING DEPLOYMENT -- authored 2026-11-13. log_governed_deletion records "
+_APPLIED_DELETION_LOG_SURVIVES_ERASURE = (
+    "APPLIED TO PRODUCTION (`railway`) on 2026-11-14 at about 04:29 UTC, by "
+    "the owner, connected as `postgres`, through stage2 "
+    "apply_assessment_sql.py, which takes the connection string at a hidden "
+    "prompt and calls scripts.apply_sql for each file. All four files were "
+    "dry-run against production first and rolled back; then applied in "
+    "order: revoke, invoice, payment, deletion log. Schema attestations "
+    "after each: 2d0a2f9ad57ec1c7, 3c656abd3ca0aaee, 3be7db6fa2904f15, "
+    "6f18f9f9d2dd7ffa. The script was run a second time by mistake a minute "
+    "later; every file reported 6f18f9f9d2dd7ffa again, so the second run "
+    "changed nothing. THE PRIVACY DECISION was made by the owner by "
+    "choosing to include this file: an erasure now leaves a content-free "
+    "record per deleted row. AFTER STATE, read as `crm_readonly` on "
+    "2026-11-14 04:34 UTC: production's definition of log_governed_deletion "
+    "writes the erased marker under the erasure settings. Not exercised by "
+    "a deletion in production. "
+    "Authored 2026-11-13. log_governed_deletion records "
     "a deletion even when the erasure setting is on. It is the AFTER DELETE "
     "trigger on action_approvals, governance_action_policies, "
     "customer_memories, content_embeddings and agent_utterances. Read from "
@@ -770,10 +816,23 @@ _PENDING_DELETION_LOG_SURVIVES_ERASURE = (
     "and the role may still delete from these tables. "
     "REQUIRES A PRIVACY DECISION BEFORE IT IS APPLIED: an erasure will leave a "
     "content-free record per deleted row for governed_deletions' retention "
-    "period. Not applied to any database.")
+    "period. Not applied to the local databases.")
 
-_PENDING_REVOKE_LATENT_AND_LEDGER_PRIVILEGES = (
-    "PENDING DEPLOYMENT -- authored 2026-11-13. Two privilege corrections for "
+_APPLIED_REVOKE_LATENT_AND_LEDGER_PRIVILEGES = (
+    "APPLIED TO PRODUCTION (`railway`) on 2026-11-14 at about 04:29 UTC, by "
+    "the owner, connected as `postgres`, through stage2 "
+    "apply_assessment_sql.py, which takes the connection string at a hidden "
+    "prompt and calls scripts.apply_sql for each file. All four files were "
+    "dry-run against production first and rolled back; then applied in "
+    "order: revoke, invoice, payment, deletion log. Schema attestations "
+    "after each: 2d0a2f9ad57ec1c7, 3c656abd3ca0aaee, 3be7db6fa2904f15, "
+    "6f18f9f9d2dd7ffa. The script was run a second time by mistake a minute "
+    "later; every file reported 6f18f9f9d2dd7ffa again, so the second run "
+    "changed nothing. AFTER STATE, read as `crm_readonly` on 2026-11-14 "
+    "04:32 UTC: crm_app holds no INSERT, UPDATE or DELETE on any of the 59 "
+    "n8n_legacy tables, where it held all three on every one; on "
+    "schema_migrations it holds INSERT only. "
+    "Authored 2026-11-13. Two privilege corrections for "
     "crm_app; no table changes. (1) n8n_legacy holds 59 tables from a retired "
     "workflow tool. Read from production on 2026-11-12, crm_app holds INSERT, "
     "UPDATE and DELETE on every one and cannot use them, having no USAGE on "
@@ -786,7 +845,7 @@ _PENDING_REVOKE_LATENT_AND_LEDGER_PRIVILEGES = (
     "MEASURED (tests/test_assessment_sql_fixes.py): the grants are present "
     "before and absent after, INSERT on the ledger survives, and a second "
     "apply changes nothing. Skips cleanly where the role or the schema is "
-    "absent. Not applied to any database.")
+    "absent. Not applied to the local databases.")
 
 _APPLIED_INVOICE_ISSUED_FOLLOWUP = (
     "APPLIED TO PRODUCTION (`railway`) on 2026-11-12, by the owner, connected "
@@ -2151,10 +2210,10 @@ OUT_OF_BAND_SQL: Dict[str, str] = {
     "cancelled_not_invoiceable.sql": _PENDING_CANCELLED_NOT_INVOICEABLE,
     "cancellation_reversal.sql": _APPLIED_LOCAL_CANCELLATION_REVERSAL,
     "invoice_issued_followup.sql": _APPLIED_INVOICE_ISSUED_FOLLOWUP,
-    "payment_no_fabrication.sql": _PENDING_PAYMENT_NO_FABRICATION,
-    "invoice_no_random_attribution.sql": _PENDING_INVOICE_NO_RANDOM_ATTRIBUTION,
-    "deletion_log_survives_erasure.sql": _PENDING_DELETION_LOG_SURVIVES_ERASURE,
-    "revoke_latent_and_ledger_privileges.sql": _PENDING_REVOKE_LATENT_AND_LEDGER_PRIVILEGES,
+    "payment_no_fabrication.sql": _APPLIED_PAYMENT_NO_FABRICATION,
+    "invoice_no_random_attribution.sql": _APPLIED_INVOICE_NO_RANDOM_ATTRIBUTION,
+    "deletion_log_survives_erasure.sql": _APPLIED_DELETION_LOG_SURVIVES_ERASURE,
+    "revoke_latent_and_ledger_privileges.sql": _APPLIED_REVOKE_LATENT_AND_LEDGER_PRIVILEGES,
     "soft_deleted_invoices_are_not_receivable.sql": _APPLIED_LOCAL_SOFT_DELETED_AR,
     "settlement_authority.sql": _PENDING_SETTLEMENT_AUTHORITY,
     "readonly_role.sql": _PENDING_READONLY_ROLE,
